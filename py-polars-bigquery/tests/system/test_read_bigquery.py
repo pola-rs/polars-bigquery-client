@@ -11,7 +11,7 @@ TABLE_IDS = [
 
 @pytest.mark.parametrize("table_id", TABLE_IDS)
 def test_read_bigquery_public_data(table_id, benchmark):
-    df = benchmark(polars_bigquery.read_bigquery, table_id)
+    df = benchmark(polars_bigquery.read_bigquery, table=table_id, quota_project_id="swast-scratch")
     assert isinstance(df, polars.DataFrame)
     # Make sure we got all of the expected data, not just a subset.
     assert df.height > 5_000_000  # rows

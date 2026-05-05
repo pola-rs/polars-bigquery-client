@@ -7,6 +7,7 @@ use gcloud_sdk::google::cloud::bigquery::storage::v1::{
     read_rows_response, read_session, CreateReadSessionRequest, DataFormat, ReadRowsRequest,
     ReadRowsResponse, ReadSession,
 };
+use gcloud_sdk::google::shopping::merchant::quota;
 use gcloud_sdk::*;
 use polars::prelude::*;
 use polars_io::ipc::IpcStreamReader;
@@ -92,16 +93,11 @@ fn table_id_to_table_path(table_id: &str) -> Result<String, Box<dyn std::error::
 
 static INIT_CRYPTO: std::sync::Once = std::sync::Once::new();
 
-pub async fn read_bigquery_async(table_id: &str) -> Result<DataFrame, Box<dyn std::error::Error>> {
+pub async fn read_bigquery_async(table_id: &str, quota_project_id: &str) -> Result<DataFrame, Box<dyn std::error::Error>> {
     INIT_CRYPTO.call_once(|| {
         let _ = rustls::crypto::ring::default_provider().install_default();
         // ignore if another crate already set the default provider.
     });
-
-    // Detect Google project ID using environment variables PROJECT_ID/GCP_PROJECT_ID
-    // or GKE metadata server when the app runs inside GKE
-    let google_project_id = GoogleEnvironment::detect_google_project_id().await
-        .expect("No Google Project ID detected. Please specify it explicitly using env variable: PROJECT_ID");
 
     // TODO(tswast): Set the user-agent header. See
     // https://github.com/abdolence/gcloud-sdk-rs/issues/226 for some attempts
@@ -123,7 +119,7 @@ pub async fn read_bigquery_async(table_id: &str) -> Result<DataFrame, Box<dyn st
     };
 
     let request = CreateReadSessionRequest {
-        parent: format!("projects/{google_project_id}"),
+        parent: format!("projects/{quota_project_id}"),
         // If you are reading from a query results table where order matters,
         // limit this to a single stream.
         max_stream_count: match std::thread::available_parallelism() {
