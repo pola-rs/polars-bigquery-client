@@ -14,6 +14,7 @@ def read_bigquery(
     query: str | None = None,
     quota_project_id: str,
     credentials_provider: pl.CredentialProviderGCP | None = None,
+    is_ordered: bool = False,
 ) -> pl.DataFrame:
     if not table and not query:
         raise ValueError("One of `table` or `query` must be provided.")
@@ -30,5 +31,6 @@ def read_bigquery(
     # TODO(tswast): Take the credentials_provider argument and make sure we can translate
     # that into something that can be used from Rust, ideally including info on
     # how to refresh the credentials.
+    # TODO(tswast): Limit parallelism is is_ordered=True.
     return polars_bigquery.read_bigquery(table, quota_project_id)
 

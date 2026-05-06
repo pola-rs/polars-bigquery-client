@@ -93,7 +93,11 @@ fn table_id_to_table_path(table_id: &str) -> Result<String, Box<dyn std::error::
 
 static INIT_CRYPTO: std::sync::Once = std::sync::Once::new();
 
-pub async fn read_bigquery_async(table_id: &str, quota_project_id: &str) -> Result<DataFrame, Box<dyn std::error::Error>> {
+pub async fn read_bigquery_async(
+    table_id: &str,
+    quota_project_id: &str,
+    is_ordered: bool,
+) -> Result<DataFrame, Box<dyn std::error::Error>> {
     INIT_CRYPTO.call_once(|| {
         let _ = rustls::crypto::ring::default_provider().install_default();
         // ignore if another crate already set the default provider.
@@ -106,7 +110,7 @@ pub async fn read_bigquery_async(table_id: &str, quota_project_id: &str) -> Resu
         GoogleApi::from_function(
             // Maximum row size in BigQuery is 100 MB, so this should allow for
             // the largest possible row plus some overhead.
-            |inner| BigQueryReadClient::new(inner).max_decoding_message_size(128* 1024 * 1024),
+            |inner| BigQueryReadClient::new(inner).max_decoding_message_size(128 * 1024 * 1024),
             "https://bigquerystorage.googleapis.com",
             None,
         )
@@ -122,9 +126,13 @@ pub async fn read_bigquery_async(table_id: &str, quota_project_id: &str) -> Resu
         parent: format!("projects/{quota_project_id}"),
         // If you are reading from a query results table where order matters,
         // limit this to a single stream.
-        max_stream_count: match std::thread::available_parallelism() {
-            Ok(value) => value.get() as i32,
-            Err(_) => 1,
+        max_stream_count: if is_ordered {
+            1
+        } else {
+            match std::thread::available_parallelism() {
+                Ok(value) => value.get() as i32,
+                Err(_) => 1,
+            }
         },
         read_session: Some(read_session),
         ..Default::default()
