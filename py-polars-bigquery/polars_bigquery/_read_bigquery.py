@@ -1,12 +1,20 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Dict
 
 import polars as pl
 
 from . import polars_bigquery
 from .core.run_query import run_query
 
+_DEFAULT_CREDENTIAL_PROVIDERS: Dict[str, pl.CredentialProviderGCP] = {}
+
+def _get_default_provider(quota_project_id: str) -> pl.CredentialProviderGCP:
+    if quota_project_id not in _DEFAULT_CREDENTIAL_PROVIDERS:
+        _DEFAULT_CREDENTIAL_PROVIDERS[quota_project_id] = pl.CredentialProviderGCP(
+            quota_project_id=quota_project_id
+        )
+    return _DEFAULT_CREDENTIAL_PROVIDERS[quota_project_id]
 
 def read_bigquery(
     *,
@@ -23,14 +31,9 @@ def read_bigquery(
         raise ValueError("Only one of `table` or `query` can be provided.")
 
     if not credentials_provider:
-        credentials_provider = pl.CredentialProviderGCP(quota_project_id=quota_project_id)
+        credentials_provider = _get_default_provider(quota_project_id)
 
     if query:
         table = run_query(query, quota_project_id, credentials_provider)
 
-    # TODO(tswast): Take the credentials_provider argument and make sure we can translate
-    # that into something that can be used from Rust, ideally including info on
-    # how to refresh the credentials.
-    # TODO(tswast): Limit parallelism is is_ordered=True.
-    return polars_bigquery.read_bigquery(table, quota_project_id, is_ordered)
-
+    return polars_bigquery.read_bigquery(table, quota_project_id, is_ordered, credentials_provider)

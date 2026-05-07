@@ -7,7 +7,6 @@ use gcloud_sdk::google::cloud::bigquery::storage::v1::{
     read_rows_response, read_session, CreateReadSessionRequest, DataFormat, ReadRowsRequest,
     ReadRowsResponse, ReadSession,
 };
-use gcloud_sdk::google::shopping::merchant::quota;
 use gcloud_sdk::*;
 use polars::prelude::*;
 use polars_io::ipc::IpcStreamReader;
@@ -97,6 +96,7 @@ pub async fn read_bigquery_async(
     table_id: &str,
     quota_project_id: &str,
     is_ordered: bool,
+    token_source_type: gcloud_sdk::TokenSourceType,
 ) -> Result<DataFrame, Box<dyn std::error::Error>> {
     INIT_CRYPTO.call_once(|| {
         let _ = rustls::crypto::ring::default_provider().install_default();
@@ -107,12 +107,14 @@ pub async fn read_bigquery_async(
     // https://github.com/abdolence/gcloud-sdk-rs/issues/226 for some attempts
     // so far.
     let read_client: GoogleApi<BigQueryReadClient<GoogleAuthMiddleware>> =
-        GoogleApi::from_function(
+        GoogleApi::from_function_with_token_source(
             // Maximum row size in BigQuery is 100 MB, so this should allow for
             // the largest possible row plus some overhead.
             |inner| BigQueryReadClient::new(inner).max_decoding_message_size(128 * 1024 * 1024),
             "https://bigquerystorage.googleapis.com",
             None,
+            vec!["https://www.googleapis.com/auth/cloud-platform".to_string()],
+            token_source_type,
         )
         .await?;
 

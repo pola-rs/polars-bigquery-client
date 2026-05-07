@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+chrono = "0.4"
 gcloud-sdk = { version = "0.29.0", features = ["google-cloud-bigquery-storage-v1"] }
 polars = { version = "0.53.0", features = ["fmt", "dtype-date", "timezones", "lazy"], default-features = false }
 polars-arrow = { version = "0.53.0", default-features = false }
@@ -12,6 +13,7 @@ polars-io = { version="0.53.0", features = ["ipc", "ipc_streaming"] }
 rand = { version = "0.10.0", features = [] }
 regex = "1.12.3"
 rustls = { version = "0.23.37", features = ["ring"] }
+secret-vault-value = "1.0"
 tokio = "1.51.0"
 tracing = "0.1"
 tracing-subscriber = { version ="0.3", features = ["env-filter"] }

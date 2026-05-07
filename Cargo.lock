@@ -394,8 +394,10 @@ checksum = "c469d952047f47f91b68d1cba3f10d63c11d73e4636f24f08daf0278abf01c4d"
 dependencies = [
  "android-tzdata",
  "iana-time-zone",
+ "js-sys",
  "num-traits",
  "serde",
+ "wasm-bindgen",
  "windows-link 0.1.3",
 ]
 
@@ -2007,6 +2009,7 @@ dependencies = [
 name = "polars-bigquery"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "gcloud-sdk",
  "polars",
  "polars-arrow",
@@ -2015,6 +2018,7 @@ dependencies = [
  "rand 0.10.0",
  "regex",
  "rustls",
+ "secret-vault-value",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -2649,11 +2653,15 @@ dependencies = [
 name = "py-polars-bigquery"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
+ "chrono",
+ "gcloud-sdk",
  "polars-bigquery",
  "pyo3",
  "pyo3-async-runtimes",
  "pyo3-polars",
  "rustls",
+ "secret-vault-value",
 ]
 
 [[package]]
