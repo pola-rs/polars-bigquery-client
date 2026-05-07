@@ -28,9 +28,5 @@ def read_bigquery(
     if query:
         table = run_query(query, quota_project_id, credentials_provider)
 
-    # TODO(tswast): Take the credentials_provider argument and make sure we can translate
-    # that into something that can be used from Rust, ideally including info on
-    # how to refresh the credentials.
-    # TODO(tswast): Limit parallelism is is_ordered=True.
-    return polars_bigquery.read_bigquery(table, quota_project_id, is_ordered)
+    return polars_bigquery.read_bigquery(table, quota_project_id, is_ordered, credentials_provider)
 
