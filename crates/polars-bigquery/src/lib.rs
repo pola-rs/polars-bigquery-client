@@ -9,6 +9,8 @@ use gcloud_sdk::google::cloud::bigquery::storage::v1::{
 };
 use gcloud_sdk::*;
 use gcloud_sdk::tonic::async_trait;
+use hyper::header::{HeaderValue, USER_AGENT};
+use hyper::HeaderMap;
 use polars::prelude::*;
 use polars_io::ipc::IpcStreamReader;
 use polars_io::SerReader;
@@ -49,6 +51,7 @@ pub struct PolarsBigQueryClientBuilder {
     max_decoding_message_size: usize,
     token_source_type: TokenSourceType,
     scopes: Vec<String>,
+    user_agent: Option<String>,
 }
 
 impl PolarsBigQueryClientBuilder {
@@ -57,6 +60,7 @@ impl PolarsBigQueryClientBuilder {
             max_decoding_message_size: 128 * 1024 * 1024, // 128MB default
             token_source_type: TokenSourceType::Default,
             scopes: vec!["https://www.googleapis.com/auth/cloud-platform".to_string()],
+            user_agent: None,
         }
     }
 
@@ -75,6 +79,11 @@ impl PolarsBigQueryClientBuilder {
         self
     }
 
+    pub fn with_user_agent(mut self, extension: String) -> Self {
+        self.user_agent = Some(extension);
+        self
+    }
+
     pub async fn build(self) -> Result<
         GoogleApiClient<BigQueryReadClientBuilder, BigQueryReadClient<GoogleAuthMiddleware>>,
         Box<dyn std::error::Error>
@@ -84,12 +93,26 @@ impl PolarsBigQueryClientBuilder {
             max_decoding_message_size: self.max_decoding_message_size,
         };
 
-        let client = GoogleApiClient::with_token_source(
+        // Construct User-Agent header
+        let default_user_agent = format!("polars-bigquery/{}", env!("CARGO_PKG_VERSION"));
+        let user_agent = match self.user_agent {
+            Some(ext) => format!("{} {}", default_user_agent, ext),
+            None => default_user_agent,
+        };
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            USER_AGENT,
+            HeaderValue::from_str(&user_agent)?,
+        );
+
+        let client = GoogleApiClient::with_token_source_and_headers(
             builder,
             "https://bigquerystorage.googleapis.com",
             None,
             self.token_source_type,
             self.scopes,
+            headers,
         )
         .await?;
 

@@ -34,12 +34,12 @@ def _parse_table_id(table_id: Any) -> str:
         # Actually the rust regex is: (.+)\.([^.]+)\.([^.]+)
         # so it just needs at least 2 dots.
         pass
-    
-    # Let's just follow the rust regex logic: 
+
+    # Let's just follow the rust regex logic:
     # it must have at least two dots, and the last two parts must not have dots.
     if len(parts) >= 3:
         return table_id
-    
+
     raise ValueError("Invalid table ID")
 
 
@@ -50,6 +50,7 @@ def read_bigquery(
     quota_project_id: str,
     credentials_provider: pl.CredentialProviderGCP | None = None,
     is_ordered: bool = False,
+    user_agent: str | None = None,
 ) -> pl.DataFrame:
     if not table and not query:
         raise ValueError("One of `table` or `query` must be provided.")
@@ -66,5 +67,5 @@ def read_bigquery(
         table = _parse_table_id(table)
 
     return polars_bigquery.read_bigquery(
-        table, quota_project_id, is_ordered, credentials_provider
+        table, quota_project_id, is_ordered, credentials_provider, user_agent
     )

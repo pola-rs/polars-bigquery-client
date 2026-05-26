@@ -56,7 +56,7 @@ def test_read_bigquery_calls_rust_with_parsed_id(mock_rust_read):
     result = read_bigquery(table="my-project.my_dataset.my_table", quota_project_id="q")
 
     # Assert
-    mock_rust_read.assert_called_once_with("my-project.my_dataset.my_table")
+    mock_rust_read.assert_called_once_with("my-project.my_dataset.my_table", "q", False, ANY, None)
     assert result.equals(mock_df)
 
 
@@ -64,16 +64,16 @@ def test_read_bigquery_with_query(mock_rust_read):
     # Prepare
     mock_df = pl.DataFrame({"col1": [1, 2]})
     mock_rust_read.return_value = mock_df
-    
+
     with patch("polars_bigquery._read_bigquery.run_query") as mock_run_query:
         mock_run_query.return_value = "project.dataset.temp_table"
-        
+
         # Execute
         result = read_bigquery(query="SELECT 1", quota_project_id="q")
-        
+
         # Assert
         mock_run_query.assert_called_once_with("SELECT 1", "q", ANY)
-        mock_rust_read.assert_called_once_with("project.dataset.temp_table")
+        mock_rust_read.assert_called_once_with("project.dataset.temp_table", "q", False, ANY, None)
         assert result.equals(mock_df)
 
 
@@ -89,7 +89,7 @@ def test_read_bigquery_handles_bigquery_objects(mock_rust_read):
     read_bigquery(table=mock_ref, quota_project_id="q")
 
     # Assert
-    mock_rust_read.assert_called_once_with("p.d.t")
+    mock_rust_read.assert_called_once_with("p.d.t", "q", False, ANY, None)
 
 
 def test_read_bigquery_propagates_errors(mock_rust_read):
@@ -99,3 +99,24 @@ def test_read_bigquery_propagates_errors(mock_rust_read):
     # Execute & Assert
     with pytest.raises(Exception, match="Rust error"):
         read_bigquery(table="p.d.t", quota_project_id="q")
+
+
+def test_read_bigquery_with_user_agent(mock_rust_read):
+    # Prepare
+    mock_rust_read.return_value = pl.DataFrame()
+
+    # Execute
+    read_bigquery(
+        table="p.d.t",
+        quota_project_id="q",
+        user_agent="custom-extension/1.0"
+    )
+
+    # Assert
+    mock_rust_read.assert_called_once_with(
+        "p.d.t",
+        "q",
+        False,
+        ANY,
+        "custom-extension/1.0"
+    )

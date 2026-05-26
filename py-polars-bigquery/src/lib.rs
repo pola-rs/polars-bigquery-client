@@ -95,6 +95,7 @@ pub fn read_bigquery(
     quota_project_id: &str,
     is_ordered: bool,
     credentials_provider: Py<PyAny>,
+    user_agent: Option<String>,
 ) -> pyo3::PyResult<PyDataFrame> {
     INIT_CRYPTO.call_once(|| {
         let _ = rustls::crypto::ring::default_provider().install_default();
@@ -108,11 +109,17 @@ pub fn read_bigquery(
     let token_source_type = gcloud_sdk::TokenSourceType::ExternalSource(Box::new(token_source));
 
     let rt = pyo3_async_runtimes::tokio::get_runtime();
-    
+
     let result = rt.block_on(async {
-        let client = polars_bigquery_lib::PolarsBigQueryClientBuilder::new()
+        let mut builder = polars_bigquery_lib::PolarsBigQueryClientBuilder::new()
             .with_token_source(token_source_type)
-            .with_max_decoding_message_size(128 * 1024 * 1024)
+            .with_max_decoding_message_size(128 * 1024 * 1024);
+
+        if let Some(ext) = user_agent {
+            builder = builder.with_user_agent(ext);
+        }
+
+        let client = builder
             .build()
             .await
             .map_err(|err| pyo3::exceptions::PyRuntimeError::new_err(err.to_string()))?;

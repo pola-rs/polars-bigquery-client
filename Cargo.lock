@@ -2011,6 +2011,7 @@ version = "0.1.0"
 dependencies = [
  "chrono",
  "gcloud-sdk",
+ "hyper",
  "polars",
  "polars-arrow",
  "polars-core",
