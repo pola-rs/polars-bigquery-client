@@ -36,13 +36,16 @@ def test_run_query_success():
             }
         }
         
-        mock_get.side_effect = [m1, m2]
+        m_poll = MagicMock()
+        m_poll.json.return_value = {}
+
+        mock_get.side_effect = [m1, m_poll, m2]
 
         result = run_query("SELECT 1", "quota-project", mock_cp)
         
         assert result == "p.d.t"
         mock_post.assert_called_once()
-        assert mock_get.call_count == 2
+        assert mock_get.call_count == 3
         
         # Verify headers
         called_headers = mock_post.call_args.kwargs["headers"]

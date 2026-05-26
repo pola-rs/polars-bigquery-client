@@ -16,7 +16,7 @@ dependencies = [
     "google-auth>=2.40.3",
     "google-cloud-bigquery>=3.38.0",
     "google-cloud-bigquery-storage>=2.33.1",
-    "polars==1.34.0",
+    "polars==1.41.0",
 ]
 
 [dependency-groups]

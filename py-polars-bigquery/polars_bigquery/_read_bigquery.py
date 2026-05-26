@@ -29,11 +29,8 @@ def _parse_table_id(table_id: Any) -> str:
     parts = table_id.split(".")
     if len(parts) < 3:
         raise ValueError("Invalid table ID")
-    if len(parts) > 3 and ":" not in parts[0] and ":" not in parts[1]:
-        # This is a bit of a hack to match the tests and the rust regex.
-        # Actually the rust regex is: (.+)\.([^.]+)\.([^.]+)
-        # so it just needs at least 2 dots.
-        pass
+    if len(parts) > 3 and not any(":" in part for part in parts[:-2]):
+        raise TypeError("BigLake tables are not supported yet")
 
     # Let's just follow the rust regex logic:
     # it must have at least two dots, and the last two parts must not have dots.
