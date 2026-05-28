@@ -16,13 +16,13 @@ dependencies = [
     "google-auth>=2.40.3",
     "google-cloud-bigquery>=3.38.0",
     "google-cloud-bigquery-storage>=2.33.1",
-    "polars==1.41.0",
+    "polars~=1.41.0",
 ]
 
 [dependency-groups]
 dev = [
     "ipython>=8.37.0",
-    "maturin>=1.13.1",
+    "maturin[patchelf]>=1.13.1",
     "pre-commit>=4.3.0",
     "pytest>=8.4.1",
     "pytest-benchmark>=5.1.0",
