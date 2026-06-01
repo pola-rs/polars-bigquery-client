@@ -1,5 +1,7 @@
 # How to contribute
 
+To contribute to this project, you agree to follow the [Polars Code of Conduct](https://github.com/pola-rs/.github/blob/master/CODE_OF_CONDUCT.md).
+
 ## Setting up a development environment
 
 Install `uv`.
