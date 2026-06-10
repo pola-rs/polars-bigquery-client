@@ -103,7 +103,6 @@ jobs:
       - name: Install Polars BigQuery
         run: |
           pip install --no-deps -e .
-          maturin develop
 
       - name: Run tests
-        run: pytest -n auto -m tests/unit
+        run: pytest -n auto tests/unit
