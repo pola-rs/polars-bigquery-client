@@ -16,7 +16,7 @@ pyo3 = { version = "0.27", features = ["abi3-py310"] }
 pyo3-async-runtimes = { version = "0.27", features = ["attributes", "tokio-runtime"] }
 pyo3-polars = { version = "0.26.0", features = ["derive", "lazy"] }
 polars-arrow = { version = "0.53.0", default-features = false }
-rustls = { version = "0.23.37", features = ["ring"] }
+rustls = { version = "0.23.37", features = ["aws_lc_rs"] }
 secret-vault-value = "1.0"
 
 [features]

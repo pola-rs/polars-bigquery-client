@@ -153,7 +153,7 @@ pub fn read_bigquery(
     user_agent: Option<String>,
 ) -> pyo3::PyResult<ArrowStreamExporter> {
     INIT_CRYPTO.call_once(|| {
-        let _ = rustls::crypto::ring::default_provider().install_default();
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
         // ignore if another crate already set the default provider.
     });
 
@@ -196,7 +196,7 @@ pub fn read_bigquery(
 #[pymodule]
 fn polars_bigquery(m: &Bound<PyModule>) -> PyResult<()> {
     INIT_CRYPTO.call_once(|| {
-        let _ = rustls::crypto::ring::default_provider().install_default();
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
         // ignore if another crate already set the default provider.
     });
 

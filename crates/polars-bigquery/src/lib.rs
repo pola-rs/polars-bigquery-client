@@ -192,7 +192,7 @@ static INIT_CRYPTO: std::sync::Once = std::sync::Once::new();
 
 pub fn init_crypto() {
     INIT_CRYPTO.call_once(|| {
-        let _ = rustls::crypto::ring::default_provider().install_default();
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
         // ignore if another crate already set the default provider.
     });
 }
