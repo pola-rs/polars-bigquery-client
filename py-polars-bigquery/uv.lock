@@ -228,21 +228,6 @@ wheels = [
 ]
 
 [[package]]
-name = "google-cloud-bigquery-storage"
-version = "2.33.1"
-source = { registry = "https://pypi.org/simple" }
-dependencies = [
-    { name = "google-api-core", extra = ["grpc"] },
-    { name = "google-auth" },
-    { name = "proto-plus" },
-    { name = "protobuf" },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/75/5e/85869233deabd369b076486836f5d8389ac95a8ce692dd27cde767f89e2b/google_cloud_bigquery_storage-2.33.1.tar.gz", hash = "sha256:3fd25bef364ac5fb9bbd6560f0dd11b90b1845883df8e0a8c706ad53d00fc23b", size = 292622, upload-time = "2025-09-09T19:26:30.074Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/55/80/f4bb233912ab62b46b30618adbc840a02322a47c4f4f8a1e9f0494dac7db/google_cloud_bigquery_storage-2.33.1-py3-none-any.whl", hash = "sha256:24952aba0d69acc4d6bfbdc7a09dddbb728496b1780bd224f1056361a1b51044", size = 293619, upload-time = "2025-09-09T19:26:25.183Z" },
-]
-
-[[package]]
 name = "google-cloud-core"
 version = "2.4.3"
 source = { registry = "https://pypi.org/simple" }
@@ -625,7 +610,6 @@ dependencies = [
     { name = "google-api-core" },
     { name = "google-auth" },
     { name = "google-cloud-bigquery" },
-    { name = "google-cloud-bigquery-storage" },
     { name = "polars" },
 ]
 
@@ -646,7 +630,6 @@ requires-dist = [
     { name = "google-api-core", specifier = ">=2.25.1" },
     { name = "google-auth", specifier = ">=2.40.3" },
     { name = "google-cloud-bigquery", specifier = ">=3.38.0" },
-    { name = "google-cloud-bigquery-storage", specifier = ">=2.33.1" },
     { name = "polars", specifier = "~=1.41.0" },
 ]
 

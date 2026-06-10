@@ -11,6 +11,7 @@ TABLE_IDS = [
 ]
 
 
+@pytest.mark.benchmark(min_rounds=10, warmup=True)
 @pytest.mark.parametrize("table_id", TABLE_IDS)
 def test_read_bigquery_public_data(table_id, benchmark):
     project = os.environ["GOOGLE_CLOUD_PROJECT"]
