@@ -4,7 +4,6 @@ TODO(tswast): Implement this in Rust using jobs.query and the
 JOB_CREATION_OPTIONAL parameter to improve latency in small query results.
 """
 
-
 import polars as pl
 import requests
 
