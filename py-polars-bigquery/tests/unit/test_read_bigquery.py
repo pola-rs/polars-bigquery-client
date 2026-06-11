@@ -1,7 +1,7 @@
 from unittest.mock import patch, MagicMock, ANY
 import polars as pl
 import pytest
-from polars_bigquery import read_bigquery
+from polars_bigquery import read_bigquery, read_bigquery_query
 from polars_bigquery._read_bigquery import _parse_table_id
 
 
@@ -62,7 +62,7 @@ def test_read_bigquery_calls_rust_with_parsed_id(mock_rust_read):
     assert result.equals(mock_df)
 
 
-def test_read_bigquery_with_query(mock_rust_read):
+def test_read_bigquery_query(mock_rust_read):
     # Prepare
     mock_df = pl.DataFrame({"col1": [1, 2]})
     mock_rust_read.return_value = mock_df
@@ -71,7 +71,7 @@ def test_read_bigquery_with_query(mock_rust_read):
         mock_run_query.return_value = "project.dataset.temp_table"
 
         # Execute
-        result = read_bigquery(query="SELECT 1", quota_project_id="q")
+        result = read_bigquery_query(query="SELECT 1", quota_project_id="q")
 
         # Assert
         mock_run_query.assert_called_once_with("SELECT 1", "q", ANY, user_agent=None)
@@ -81,7 +81,7 @@ def test_read_bigquery_with_query(mock_rust_read):
         assert result.equals(mock_df)
 
 
-def test_read_bigquery_with_query_and_user_agent(mock_rust_read):
+def test_read_bigquery_query_with_user_agent(mock_rust_read):
     # Prepare
     mock_df = pl.DataFrame({"col1": [1, 2]})
     mock_rust_read.return_value = mock_df
@@ -90,7 +90,7 @@ def test_read_bigquery_with_query_and_user_agent(mock_rust_read):
         mock_run_query.return_value = "project.dataset.temp_table"
 
         # Execute
-        result = read_bigquery(
+        result = read_bigquery_query(
             query="SELECT 1", quota_project_id="q", user_agent="custom-ua/1.0"
         )
 

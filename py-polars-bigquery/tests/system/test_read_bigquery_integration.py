@@ -9,7 +9,7 @@ def test_read_bigquery_public_data_ordered():
     project = os.environ["GOOGLE_CLOUD_PROJECT"]
 
     # Use a query so that the test can run using BigQuery sandbox quota.
-    df = polars_bigquery.read_bigquery(
+    df = polars_bigquery.read_bigquery_query(
         query="""
         SELECT SUM(number) AS total_born,
         name
@@ -32,7 +32,7 @@ def test_read_bigquery_public_data_unordered():
     project = os.environ["GOOGLE_CLOUD_PROJECT"]
 
     # Use a query so that the test can run using BigQuery sandbox quota.
-    df = polars_bigquery.read_bigquery(
+    df = polars_bigquery.read_bigquery_query(
         query="""
         SELECT * FROM `bigquery-public-data.utility_us.country_code_iso`
         """,

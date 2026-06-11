@@ -43,28 +43,13 @@ def _parse_table_id(table_id: Any) -> str:
 
 
 def read_bigquery(
-    table: str | None = None,
+    table: str,
     *,
-    query: str | None = None,
     quota_project_id: str,
     credentials_provider: pl.CredentialProviderGCP | None = None,
     maintain_order: bool = False,
     user_agent: str | None = None,
 ) -> pl.DataFrame:
-    if table is None and query is None:
-        raise ValueError("Either table or query must be provided")
-    if table is not None and query is not None:
-        raise ValueError("Only one of table or query can be provided")
-
-    if query is not None:
-        return read_bigquery_query(
-            query,
-            quota_project_id=quota_project_id,
-            credentials_provider=credentials_provider,
-            maintain_order=maintain_order,
-            user_agent=user_agent,
-        )
-
     if not credentials_provider:
         credentials_provider = _get_default_provider(quota_project_id)
 
