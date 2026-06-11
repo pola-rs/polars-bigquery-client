@@ -48,7 +48,7 @@ def read_bigquery(
     query: str | None = None,
     quota_project_id: str,
     credentials_provider: pl.CredentialProviderGCP | None = None,
-    is_ordered: bool = False,
+    maintain_order: bool = False,
     user_agent: str | None = None,
 ) -> pl.DataFrame:
     if not table and not query:
@@ -66,6 +66,6 @@ def read_bigquery(
         table = _parse_table_id(table)
 
     res = polars_bigquery.read_bigquery(
-        table, quota_project_id, is_ordered, credentials_provider, user_agent
+        table, quota_project_id, maintain_order, credentials_provider, user_agent
     )
     return pl.DataFrame(res)

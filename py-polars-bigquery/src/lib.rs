@@ -148,7 +148,7 @@ impl ArrowStreamExporter {
 pub fn read_bigquery(
     table: &str,
     quota_project_id: &str,
-    is_ordered: bool,
+    maintain_order: bool,
     credentials_provider: Py<PyAny>,
     user_agent: Option<String>,
 ) -> pyo3::PyResult<ArrowStreamExporter> {
@@ -179,7 +179,7 @@ pub fn read_bigquery(
             .await
             .map_err(|err| pyo3::exceptions::PyRuntimeError::new_err(err.to_string()))?;
 
-        polars_bigquery_lib::read_bigquery_with_client(client, table, quota_project_id, is_ordered)
+        polars_bigquery_lib::read_bigquery_with_client(client, table, quota_project_id, maintain_order)
             .await
             .map_err(|err| pyo3::exceptions::PyRuntimeError::new_err(err.to_string()))
     });

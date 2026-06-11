@@ -201,7 +201,7 @@ pub async fn read_bigquery_with_client<B>(
     read_client: GoogleApiClient<B, BigQueryReadClient<GoogleAuthMiddleware>>,
     table_id: &str,
     quota_project_id: &str,
-    is_ordered: bool,
+    maintain_order: bool,
 ) -> Result<(ArrowSchemaRef, Vec<RecordBatch>), Box<dyn std::error::Error>>
 where
     B: GoogleApiClientBuilder<BigQueryReadClient<GoogleAuthMiddleware>> + Send + Sync + 'static,
@@ -218,7 +218,7 @@ where
         parent: format!("projects/{quota_project_id}"),
         // If you are reading from a query results table where order matters,
         // limit this to a single stream.
-        max_stream_count: if is_ordered {
+        max_stream_count: if maintain_order {
             1
         } else {
             match std::thread::available_parallelism() {
@@ -285,7 +285,7 @@ where
 pub async fn read_bigquery_async(
     table_id: &str,
     quota_project_id: &str,
-    is_ordered: bool,
+    maintain_order: bool,
     token_source_type: gcloud_sdk::TokenSourceType,
 ) -> Result<(ArrowSchemaRef, Vec<RecordBatch>), Box<dyn std::error::Error>> {
     let read_client = PolarsBigQueryClientBuilder::new()
@@ -294,7 +294,7 @@ pub async fn read_bigquery_async(
         .build()
         .await?;
 
-    read_bigquery_with_client(read_client, table_id, quota_project_id, is_ordered).await
+    read_bigquery_with_client(read_client, table_id, quota_project_id, maintain_order).await
 }
 
 #[cfg(test)]

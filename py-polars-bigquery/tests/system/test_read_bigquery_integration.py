@@ -19,7 +19,7 @@ def test_read_bigquery_public_data_ordered():
         LIMIT 100
         """,
         quota_project_id=project,
-        is_ordered=True,
+        maintain_order=True,
     )
     assert isinstance(df, polars.DataFrame)
     # Make sure we got all of the expected data, not just a subset.
@@ -37,7 +37,7 @@ def test_read_bigquery_public_data_unordered():
         SELECT * FROM `bigquery-public-data.utility_us.country_code_iso`
         """,
         quota_project_id=project,
-        is_ordered=False,
+        maintain_order=False,
     )
     assert isinstance(df, polars.DataFrame)
     # Make sure we got all of the expected data, not just a subset.
