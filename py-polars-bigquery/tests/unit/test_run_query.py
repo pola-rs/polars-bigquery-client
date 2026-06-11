@@ -78,3 +78,37 @@ def test_run_query_error():
 
         with pytest.raises(BigQueryError, match="Something went wrong"):
             run_query("SELECT 1", "quota-project", mock_cp)
+
+
+def test_run_query_with_user_agent():
+    mock_cp = MagicMock()
+    mock_cp.return_value = ({"bearer_token": "fake-token"}, 12345)
+
+    with (
+        patch("requests.post") as mock_post,
+        patch("requests.get") as mock_get,
+        patch("time.sleep"),
+    ):
+        mock_post.return_value.json.return_value = {
+            "jobReference": {"jobId": "job-123"}
+        }
+        mock_post.return_value.raise_for_status = MagicMock()
+
+        mock_get.return_value.json.return_value = {
+            "status": {"state": "DONE"},
+            "configuration": {
+                "query": {
+                    "destinationTable": {
+                        "projectId": "p",
+                        "datasetId": "d",
+                        "tableId": "t",
+                    }
+                }
+            },
+        }
+
+        run_query("SELECT 1", "quota-project", mock_cp, user_agent="custom-ua/1.0")
+
+        called_headers = mock_post.call_args.kwargs["headers"]
+        assert "custom-ua/1.0" in called_headers["User-Agent"]
+        assert called_headers["User-Agent"].startswith("polars-bigquery/")

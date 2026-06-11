@@ -66,14 +66,21 @@ def _wait_for_job(job_id: str, quota_project_id: str, headers: dict) -> dict:
 
 
 def run_query(
-    query: str, quota_project_id: str, credentials_provider: pl.CredentialProviderGCP
+    query: str,
+    quota_project_id: str,
+    credentials_provider: pl.CredentialProviderGCP,
+    *,
+    user_agent: str | None = None,
 ) -> str:
     """Run a query and return the destination table from the job resource."""
     token_data, _ = credentials_provider()
     token = token_data["bearer_token"]
+    ua = _get_user_agent()
+    if user_agent:
+        ua = f"{ua} {user_agent}"
     headers = {
         "Authorization": f"Bearer {token}",
-        "User-Agent": _get_user_agent(),
+        "User-Agent": ua,
         "Content-Type": "application/json",
         "x-goog-user-project": quota_project_id,
     }

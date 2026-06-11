@@ -43,29 +43,57 @@ def _parse_table_id(table_id: Any) -> str:
 
 
 def read_bigquery(
-    *,
     table: str | None = None,
+    *,
     query: str | None = None,
     quota_project_id: str,
     credentials_provider: pl.CredentialProviderGCP | None = None,
     maintain_order: bool = False,
     user_agent: str | None = None,
 ) -> pl.DataFrame:
-    if not table and not query:
-        raise ValueError("One of `table` or `query` must be provided.")
+    if table is None and query is None:
+        raise ValueError("Either table or query must be provided")
+    if table is not None and query is not None:
+        raise ValueError("Only one of table or query can be provided")
 
-    if table and query:
-        raise ValueError("Only one of `table` or `query` can be provided.")
+    if query is not None:
+        return read_bigquery_query(
+            query,
+            quota_project_id=quota_project_id,
+            credentials_provider=credentials_provider,
+            maintain_order=maintain_order,
+            user_agent=user_agent,
+        )
 
     if not credentials_provider:
         credentials_provider = _get_default_provider(quota_project_id)
 
-    if query:
-        table = run_query(query, quota_project_id, credentials_provider)
-    else:
-        table = _parse_table_id(table)
-
+    table_ref = _parse_table_id(table)
     res = polars_bigquery.read_bigquery(
-        table, quota_project_id, maintain_order, credentials_provider, user_agent
+        table_ref, quota_project_id, maintain_order, credentials_provider, user_agent
+    )
+    return pl.DataFrame(res)
+
+
+def read_bigquery_query(
+    query: str,
+    *,
+    quota_project_id: str,
+    credentials_provider: pl.CredentialProviderGCP | None = None,
+    maintain_order: bool = False,
+    user_agent: str | None = None,
+) -> pl.DataFrame:
+    if not credentials_provider:
+        credentials_provider = _get_default_provider(quota_project_id)
+
+    table = run_query(
+        query,
+        quota_project_id,
+        credentials_provider,
+        user_agent=user_agent,
+    )
+    table_ref = _parse_table_id(table)
+    res = polars_bigquery.read_bigquery(
+        table_ref, quota_project_id, maintain_order, credentials_provider, user_agent
     )
     return pl.DataFrame(res)
