@@ -1,0 +1,17 @@
+[package]
+name = "polars-bigquery"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+chrono = "0.4"
+gcloud-sdk = { version = "0.30.0", features = ["google-cloud-bigquery-storage-v1"] }
+hyper = "1.0"
+polars-arrow = { version = "0.53.0", default-features = false }
+rand = { version = "0.10.0", features = [] }
+regex = "1.12.3"
+rustls = { version = "0.23.37", features = ["aws_lc_rs"] }
+secret-vault-value = "1.0"
+tokio = "1.51.0"
+tracing = "0.1"
+tracing-subscriber = { version ="0.3", features = ["env-filter"] }

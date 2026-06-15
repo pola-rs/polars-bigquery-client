@@ -1,0 +1,25 @@
+[package]
+name = "py-polars-bigquery"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "polars_bigquery"
+crate-type= ["cdylib"]
+
+[dependencies]
+async-trait = "0.1"
+chrono = "0.4"
+gcloud-sdk = { version = "0.30.0", features = ["google-cloud-bigquery-storage-v1"] }
+polars-bigquery-lib = { package = "polars-bigquery", path = "../crates/polars-bigquery" }
+pyo3 = { version = "0.27", features = ["abi3-py310"] }
+pyo3-async-runtimes = { version = "0.27", features = ["attributes", "tokio-runtime"] }
+pyo3-polars = { version = "0.26.0", features = ["derive", "lazy"] }
+polars-arrow = { version = "0.53.0", default-features = false }
+rustls = { version = "0.23.37", features = ["aws_lc_rs"] }
+secret-vault-value = "1.0"
+
+[features]
+extension-module = ["pyo3/extension-module"]
+default = []
+

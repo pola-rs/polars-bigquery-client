@@ -1,0 +1,6 @@
+[workspace]
+members = [
+    "crates/polars-bigquery",
+    "py-polars-bigquery",
+]
+resolver = "2"

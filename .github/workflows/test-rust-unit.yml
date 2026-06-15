@@ -1,0 +1,51 @@
+name: Test Rust (Unit)
+
+on:
+  pull_request:
+    paths:
+      - crates/**
+      - Cargo.toml
+      - .github/workflows/test-rust-unit.yml
+  push:
+    branches:
+      - main
+    paths:
+      - creates/**
+      - Cargo.toml
+      - .github/workflows/test-rust-unit.yml
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  RUSTFLAGS: -C debuginfo=0  # Do not produce debug symbols to keep memory usage down
+  RUST_BACKTRACE: 1
+
+jobs:
+  test:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up Rust
+        run: rustup show
+
+      - name: Cache Rust
+        uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref_name == 'main' }}
+
+      # Note that we specify --lib, --bins etc
+      # to exclude the integration and doc tests.
+      - name: Compile tests
+        run: cargo test --lib --bins --all-features --no-run
+
+      - name: Run tests
+        if: github.ref_name != 'main'
+        run: >
+          cargo test --lib --tests --bins --all-features

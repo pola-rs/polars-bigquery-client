@@ -1,0 +1,52 @@
+name: Test Python (Integration)
+
+on:
+  pull_request:
+    paths:
+      - Cargo.lock
+      - crates/**
+      - docs/source/src/python/**
+      - py-polars-bigquery/**
+      - .github/workflows/test-python-integration.yml
+  push:
+    branches:
+      - main
+    paths:
+      - Cargo.lock
+      - crates/**
+      - docs/source/src/python/**
+      - py-polars-bigquery/**
+      - .github/workflows/test-python-integration.yml
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  RUSTFLAGS: -C debuginfo=0 # Do not produce debug symbols to keep memory usage down
+  RUST_BACKTRACE: 1
+  PYTHONUTF8: 1
+
+defaults:
+  run:
+    working-directory: py-polars-bigquery
+    shell: bash
+
+jobs:
+  test-python-integration:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest]
+        python-version: ['3.14']
+
+    steps:
+      - uses: actions/checkout@v6
+      - name: Free some disk space (remove unused packages)
+        uses: jlumbroso/free-disk-space@v1.3.1
+        if: ${{ matrix.os != 'windows-latest' }}
+      - uses: 'google-github-actions/auth@v3'
+        with:
+          service_account: 'github-actions-sa@polars-bigquery.iam.gserviceaccount.com'
+          workload_identity_provider: projects/700739494367/locations/global/workloadIdentityPools/github/providers/polars-bigquery-client
