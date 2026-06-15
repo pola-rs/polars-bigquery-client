@@ -3,7 +3,6 @@ use std::sync::{Mutex, Once};
 use async_trait::async_trait;
 use chrono::Utc;
 use polars_arrow::datatypes::ArrowSchemaRef;
-use polars_arrow::record_batch::RecordBatch;
 use pyo3::prelude::*;
 use pyo3::pyfunction;
 
@@ -93,7 +92,27 @@ impl gcloud_sdk::Source for PythonTokenSource {
 #[pyclass]
 pub struct ArrowStreamExporter {
     schema: ArrowSchemaRef,
-    batches: std::sync::Mutex<Option<Vec<RecordBatch>>>,
+    receiver: std::sync::Mutex<Option<polars_bigquery_lib::BigQueryRecordBatchReceiver>>,
+}
+
+struct ReceiverIterator {
+    rx: polars_bigquery_lib::BigQueryRecordBatchReceiver,
+    dtype: polars_arrow::datatypes::ArrowDataType,
+}
+
+impl Iterator for ReceiverIterator {
+    type Item = pyo3_polars::export::polars_error::PolarsResult<Box<dyn polars_arrow::array::Array>>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let rt = pyo3_async_runtimes::tokio::get_runtime();
+        let batch = rt.block_on(self.rx.recv())?;
+
+        let len = batch.len();
+        let (_, arrays) = batch.into_schema_and_arrays();
+        let struct_array =
+            polars_arrow::array::StructArray::new(self.dtype.clone(), len, arrays, None);
+        Some(Ok(Box::new(struct_array) as Box<dyn polars_arrow::array::Array>))
+    }
 }
 
 #[pymethods]
@@ -105,8 +124,8 @@ impl ArrowStreamExporter {
         requested_schema: Option<Py<PyAny>>,
     ) -> PyResult<Py<PyAny>> {
         let _ = requested_schema;
-        let mut batches_guard = self.batches.lock().unwrap();
-        let batches = batches_guard
+        let mut rx_guard = self.receiver.lock().unwrap();
+        let rx = rx_guard
             .take()
             .ok_or_else(|| pyo3::exceptions::PyValueError::new_err("Stream already consumed"))?;
 
@@ -114,18 +133,7 @@ impl ArrowStreamExporter {
             self.schema.iter().map(|(_, field)| field.clone()).collect();
         let dtype = polars_arrow::datatypes::ArrowDataType::Struct(fields);
 
-        let struct_arrays: Vec<Box<dyn polars_arrow::array::Array>> = batches
-            .into_iter()
-            .map(|batch| {
-                let len = batch.len();
-                let (_, arrays) = batch.into_schema_and_arrays();
-                let struct_array =
-                    polars_arrow::array::StructArray::new(dtype.clone(), len, arrays, None);
-                Box::new(struct_array) as Box<dyn polars_arrow::array::Array>
-            })
-            .collect();
-
-        let iter = struct_arrays.into_iter().map(Ok);
+        let iter = ReceiverIterator { rx, dtype: dtype.clone() };
         let box_iter = Box::new(iter)
             as Box<
                 dyn Iterator<
@@ -185,9 +193,9 @@ pub fn read_bigquery(
     });
 
     match result {
-        Ok((schema, batches)) => Ok(ArrowStreamExporter {
+        Ok((schema, receiver)) => Ok(ArrowStreamExporter {
             schema,
-            batches: std::sync::Mutex::new(Some(batches)),
+            receiver: std::sync::Mutex::new(Some(receiver)),
         }),
         Err(err) => Err(err),
     }

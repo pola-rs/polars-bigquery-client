@@ -128,11 +128,30 @@ impl PolarsBigQueryClientBuilder {
     }
 }
 
+pub struct BigQueryRecordBatchReceiver {
+    rx: tokio::sync::mpsc::Receiver<RecordBatch>,
+    _handles: Vec<tokio::task::JoinHandle<()>>,
+}
+
+impl BigQueryRecordBatchReceiver {
+    pub async fn recv(&mut self) -> Option<RecordBatch> {
+        self.rx.recv().await
+    }
+}
+
+impl Drop for BigQueryRecordBatchReceiver {
+    fn drop(&mut self) {
+        for handle in &self._handles {
+            handle.abort();
+        }
+    }
+}
+
 async fn read_stream<B>(
     read_client: Arc<GoogleApiClient<B, BigQueryReadClient<GoogleAuthMiddleware>>>,
     schema: Arc<Vec<u8>>,
     stream_name: String,
-    tx: Arc<tokio::sync::mpsc::Sender<RecordBatch>>,
+    tx: tokio::sync::mpsc::Sender<RecordBatch>,
 ) where
     B: GoogleApiClientBuilder<BigQueryReadClient<GoogleAuthMiddleware>> + Send + Sync + 'static,
 {
@@ -154,12 +173,11 @@ async fn read_stream<B>(
         let message = messages.message().await.unwrap();
         match message {
             Some(value) => {
-                // If there's an error here, that means the receiver dropped, so
-                // we should just exit rather than try to restart the stream at
-                // offset.
-                tx.send(read_rows_response_to_record_batch(value, &schema))
-                    .await
-                    .unwrap();
+                let batch = read_rows_response_to_record_batch(value, &schema);
+                if tx.send(batch).await.is_err() {
+                    // Receiver was dropped, stop reading.
+                    break 'messages;
+                }
             },
             None => {
                 break 'messages;
@@ -202,7 +220,7 @@ pub async fn read_bigquery_with_client<B>(
     table_id: &str,
     quota_project_id: &str,
     maintain_order: bool,
-) -> Result<(ArrowSchemaRef, Vec<RecordBatch>), Box<dyn std::error::Error>>
+) -> Result<(ArrowSchemaRef, BigQueryRecordBatchReceiver), Box<dyn std::error::Error>>
 where
     B: GoogleApiClientBuilder<BigQueryReadClient<GoogleAuthMiddleware>> + Send + Sync + 'static,
 {
@@ -244,8 +262,7 @@ where
     let metadata = read_stream_metadata(&mut schema_cursor)?;
     let schema_ref = Arc::new(metadata.schema);
 
-    let (tx, mut rx) = tokio::sync::mpsc::channel(1024); // Create an MPSC channel
-    let shared_tx = Arc::new(tx);
+    let (tx, rx) = tokio::sync::mpsc::channel(1024);
     let shared_client = Arc::new(read_client);
     let shared_schema = Arc::new(schema);
     let mut handles = Vec::new();
@@ -256,45 +273,12 @@ where
             shared_client.clone(),
             shared_schema.clone(),
             stream_name,
-            shared_tx.clone(),
+            tx.clone(),
         ));
         handles.push(handle);
     }
 
-    // Don't need the sender here anymore. Drop it so that the receiver can know
-    // when all the other uses of sender have finished.
-    std::mem::drop(shared_tx);
-
-    let mut batches = Vec::new();
-
-    loop {
-        match rx.recv().await {
-            Some(value) => batches.push(value),
-            None => break,
-        }
-    }
-
-    // Wait for all spawned threads to complete
-    for handle in handles {
-        handle.await?;
-    }
-
-    Ok((schema_ref, batches))
-}
-
-pub async fn read_bigquery_async(
-    table_id: &str,
-    quota_project_id: &str,
-    maintain_order: bool,
-    token_source_type: gcloud_sdk::TokenSourceType,
-) -> Result<(ArrowSchemaRef, Vec<RecordBatch>), Box<dyn std::error::Error>> {
-    let read_client = PolarsBigQueryClientBuilder::new()
-        .with_token_source(token_source_type)
-        .with_max_decoding_message_size(128 * 1024 * 1024)
-        .build()
-        .await?;
-
-    read_bigquery_with_client(read_client, table_id, quota_project_id, maintain_order).await
+    Ok((schema_ref, BigQueryRecordBatchReceiver { rx, _handles: handles }))
 }
 
 #[cfg(test)]
