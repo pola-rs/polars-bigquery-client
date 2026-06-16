@@ -8,8 +8,17 @@ use pyo3::pyfunction;
 
 static INIT_CRYPTO: Once = Once::new();
 
+/// A token source that delegates authentication to a Python callable.
+///
+/// This struct implements the [`gcloud_sdk::Source`] trait, allowing the Rust
+/// Google Cloud SDK to retrieve OAuth2 tokens by calling back into Python code
+/// (e.g., using `google-auth`). It includes a thread-safe cache to avoid
+/// the overhead of calling into Python on every request if the token is still valid.
 struct PythonTokenSource {
+    /// The Python callable (e.g., a function or method) that returns a tuple of
+    /// `(token_bytes, expiration_timestamp_float)`.
     provider: Py<PyAny>,
+    /// A thread-safe cache for the retrieved token.
     cache: Mutex<Option<gcloud_sdk::Token>>,
 }
 
@@ -89,14 +98,29 @@ impl gcloud_sdk::Source for PythonTokenSource {
     }
 }
 
+/// A Python-exposed class that implements the Arrow C Stream interface.
+///
+/// This class acts as a bridge between the Rust BigQuery reader and Python Polars,
+/// allowing Polars to consume the data stream directly via the Arrow C Data Interface
+/// (`__arrow_c_stream__`) without copying data.
 #[pyclass]
 pub struct ArrowStreamExporter {
+    /// The schema of the Arrow stream.
     schema: ArrowSchemaRef,
+    /// The underlying BigQuery record batch receiver, wrapped in a mutex.
+    /// It is an `Option` because the stream can only be consumed once.
     receiver: std::sync::Mutex<Option<polars_bigquery_lib::BigQueryRecordBatchReceiver>>,
 }
 
+/// An iterator that adapts the asynchronous [`BigQueryRecordBatchReceiver`] into
+/// a synchronous iterator yielding Arrow arrays.
+///
+/// This is used internally by [`ArrowStreamExporter`] to feed the Arrow C Stream.
+/// Each iteration blocks on the Tokio runtime to receive the next batch.
 struct ReceiverIterator {
+    /// The receiver yielding record batches from the BigQuery Storage Read API.
     rx: polars_bigquery_lib::BigQueryRecordBatchReceiver,
+    /// The Arrow datatype (specifically a `Struct` type) matching the schema of the batches.
     dtype: polars_arrow::datatypes::ArrowDataType,
 }
 
@@ -158,6 +182,18 @@ impl ArrowStreamExporter {
     }
 }
 
+/// Reads a BigQuery table and returns an [`ArrowStreamExporter`] which can be
+/// consumed by Polars in Python.
+///
+/// This function initializes the connection, sets up the BigQuery Storage Read API session,
+/// spawns background tasks to read the streams, and returns the stream exporter.
+///
+/// # Arguments
+/// * `table` - The BigQuery table ID in the format `project.dataset.table`.
+/// * `quota_project_id` - The billing/quota project ID.
+/// * `maintain_order` - If true, restricts the read session to a single stream to preserve row order.
+/// * `credentials_provider` - A Python callable that returns Google OAuth2 credentials.
+/// * `user_agent` - An optional user agent extension to append to the client header.
 #[pyfunction]
 pub fn read_bigquery(
     table: &str,
