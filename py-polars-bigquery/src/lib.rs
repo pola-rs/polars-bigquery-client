@@ -101,7 +101,8 @@ struct ReceiverIterator {
 }
 
 impl Iterator for ReceiverIterator {
-    type Item = pyo3_polars::export::polars_error::PolarsResult<Box<dyn polars_arrow::array::Array>>;
+    type Item =
+        pyo3_polars::export::polars_error::PolarsResult<Box<dyn polars_arrow::array::Array>>;
 
     fn next(&mut self) -> Option<Self::Item> {
         let rt = pyo3_async_runtimes::tokio::get_runtime();
@@ -111,7 +112,9 @@ impl Iterator for ReceiverIterator {
         let (_, arrays) = batch.into_schema_and_arrays();
         let struct_array =
             polars_arrow::array::StructArray::new(self.dtype.clone(), len, arrays, None);
-        Some(Ok(Box::new(struct_array) as Box<dyn polars_arrow::array::Array>))
+        Some(Ok(
+            Box::new(struct_array) as Box<dyn polars_arrow::array::Array>
+        ))
     }
 }
 
@@ -133,7 +136,10 @@ impl ArrowStreamExporter {
             self.schema.iter().map(|(_, field)| field.clone()).collect();
         let dtype = polars_arrow::datatypes::ArrowDataType::Struct(fields);
 
-        let iter = ReceiverIterator { rx, dtype: dtype.clone() };
+        let iter = ReceiverIterator {
+            rx,
+            dtype: dtype.clone(),
+        };
         let box_iter = Box::new(iter)
             as Box<
                 dyn Iterator<
@@ -187,9 +193,14 @@ pub fn read_bigquery(
             .await
             .map_err(|err| pyo3::exceptions::PyRuntimeError::new_err(err.to_string()))?;
 
-        polars_bigquery_lib::read_bigquery_with_client(client, table, quota_project_id, maintain_order)
-            .await
-            .map_err(|err| pyo3::exceptions::PyRuntimeError::new_err(err.to_string()))
+        polars_bigquery_lib::read_bigquery_with_client(
+            client,
+            table,
+            quota_project_id,
+            maintain_order,
+        )
+        .await
+        .map_err(|err| pyo3::exceptions::PyRuntimeError::new_err(err.to_string()))
     });
 
     match result {

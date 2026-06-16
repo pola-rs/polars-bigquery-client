@@ -128,8 +128,17 @@ impl PolarsBigQueryClientBuilder {
     }
 }
 
+/// A receiver that yields [`RecordBatch`]es read from BigQuery.
+///
+/// It manages the background tasks reading from the BigQuery Storage API streams
+/// and provides a stream-like interface to receive the data.
 pub struct BigQueryRecordBatchReceiver {
+    /// The channel receiver for receiving [`RecordBatch`]es produced by the background tasks.
     rx: tokio::sync::mpsc::Receiver<RecordBatch>,
+    /// Join handles for the background tasks reading from the BigQuery streams.
+    ///
+    /// These handles are kept so that the background tasks can be aborted when
+    /// the receiver is dropped, preventing resource leaks from orphan background tasks.
     _handles: Vec<tokio::task::JoinHandle<()>>,
 }
 
@@ -278,7 +287,13 @@ where
         handles.push(handle);
     }
 
-    Ok((schema_ref, BigQueryRecordBatchReceiver { rx, _handles: handles }))
+    Ok((
+        schema_ref,
+        BigQueryRecordBatchReceiver {
+            rx,
+            _handles: handles,
+        },
+    ))
 }
 
 #[cfg(test)]
