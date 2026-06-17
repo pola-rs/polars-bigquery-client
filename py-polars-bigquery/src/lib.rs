@@ -333,7 +333,7 @@ pub fn _test_create_exporter_with_drop_flag() -> (ArrowStreamExporter, DropFlag)
     let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let flag_clone = flag.clone();
 
-    // Spawn a dummy task that runs forever until aborted, and sets the flag when dropped
+    // Spawn a placeholder task that runs forever until aborted, and sets the flag when dropped
     let handle = rt.spawn(async move {
         struct SetOnDrop(std::sync::Arc<std::sync::atomic::AtomicBool>);
         impl Drop for SetOnDrop {
@@ -352,7 +352,7 @@ pub fn _test_create_exporter_with_drop_flag() -> (ArrowStreamExporter, DropFlag)
     Box::leak(Box::new(tx));
 
     let field = polars_arrow::datatypes::Field::new(
-        "dummy".into(),
+        "placeholder".into(),
         polars_arrow::datatypes::ArrowDataType::Int32,
         true,
     );
