@@ -136,9 +136,11 @@ impl Iterator for ReceiverIterator {
             // occasionally check to see if there were any interrupts.
             if let Err(py_err) = Python::attach(|py| py.check_signals()) {
                 Python::attach(|py| py_err.restore(py));
-                return Some(Err(pyo3_polars::export::polars_error::PolarsError::ComputeError(
-                    "Python interrupt".into()
-                )));
+                return Some(Err(
+                    pyo3_polars::export::polars_error::PolarsError::ComputeError(
+                        "Python interrupt".into(),
+                    ),
+                ));
             }
 
             let timeout_duration = std::time::Duration::from_millis(100);
@@ -154,20 +156,24 @@ impl Iterator for ReceiverIterator {
                 Ok(Some(batch)) => {
                     let len = batch.len();
                     let (_, arrays) = batch.into_schema_and_arrays();
-                    let struct_array =
-                        polars_arrow::array::StructArray::new(self.dtype.clone(), len, arrays, None);
+                    let struct_array = polars_arrow::array::StructArray::new(
+                        self.dtype.clone(),
+                        len,
+                        arrays,
+                        None,
+                    );
                     return Some(Ok(
                         Box::new(struct_array) as Box<dyn polars_arrow::array::Array>
                     ));
-                }
+                },
                 Ok(None) => {
                     // Stream finished
                     return None;
-                }
+                },
                 Err(_) => {
                     // Timeout elapsed, loop again to check signals
                     continue;
-                }
+                },
             }
         }
     }
@@ -298,7 +304,8 @@ pub fn _create_test_exporter() -> ArrowStreamExporter {
     );
     let schema = polars_arrow::datatypes::ArrowSchema::from_iter(vec![field]);
     let schema_ref = std::sync::Arc::new(schema);
-    let receiver = polars_bigquery_lib::BigQueryRecordBatchReceiver::new_for_testing(rx, Vec::new());
+    let receiver =
+        polars_bigquery_lib::BigQueryRecordBatchReceiver::new_for_testing(rx, Vec::new());
 
     ArrowStreamExporter {
         schema: schema_ref,
@@ -322,10 +329,10 @@ impl DropFlag {
 #[pyfunction]
 pub fn _test_create_exporter_with_drop_flag() -> (ArrowStreamExporter, DropFlag) {
     let rt = pyo3_async_runtimes::tokio::get_runtime();
-    
+
     let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let flag_clone = flag.clone();
-    
+
     // Spawn a dummy task that runs forever until aborted, and sets the flag when dropped
     let handle = rt.spawn(async move {
         struct SetOnDrop(std::sync::Arc<std::sync::atomic::AtomicBool>);
@@ -335,15 +342,15 @@ pub fn _test_create_exporter_with_drop_flag() -> (ArrowStreamExporter, DropFlag)
             }
         }
         let _cleanup = SetOnDrop(flag_clone);
-        
+
         loop {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
     });
-    
+
     let (tx, rx) = tokio::sync::mpsc::channel(10);
     Box::leak(Box::new(tx));
-    
+
     let field = polars_arrow::datatypes::Field::new(
         "dummy".into(),
         polars_arrow::datatypes::ArrowDataType::Int32,
@@ -351,16 +358,17 @@ pub fn _test_create_exporter_with_drop_flag() -> (ArrowStreamExporter, DropFlag)
     );
     let schema = polars_arrow::datatypes::ArrowSchema::from_iter(vec![field]);
     let schema_ref = std::sync::Arc::new(schema);
-    
-    let receiver = polars_bigquery_lib::BigQueryRecordBatchReceiver::new_for_testing(rx, vec![handle]);
-    
+
+    let receiver =
+        polars_bigquery_lib::BigQueryRecordBatchReceiver::new_for_testing(rx, vec![handle]);
+
     let exporter = ArrowStreamExporter {
         schema: schema_ref,
         receiver: std::sync::Mutex::new(Some(receiver)),
     };
-    
+
     let drop_flag = DropFlag { value: flag };
-    
+
     (exporter, drop_flag)
 }
 
@@ -372,10 +380,11 @@ fn polars_bigquery(m: &Bound<PyModule>) -> PyResult<()> {
     });
 
     m.add_wrapped(wrap_pyfunction!(read_bigquery)).unwrap();
-    m.add_wrapped(wrap_pyfunction!(_create_test_exporter)).unwrap();
-    m.add_wrapped(wrap_pyfunction!(_test_create_exporter_with_drop_flag)).unwrap();
+    m.add_wrapped(wrap_pyfunction!(_create_test_exporter))
+        .unwrap();
+    m.add_wrapped(wrap_pyfunction!(_test_create_exporter_with_drop_flag))
+        .unwrap();
     m.add_class::<DropFlag>().unwrap();
 
     Ok(())
 }
-

@@ -148,8 +148,14 @@ impl BigQueryRecordBatchReceiver {
     }
 
     /// Creates a placeholder receiver for testing purposes.
-    pub fn new_for_testing(rx: tokio::sync::mpsc::Receiver<RecordBatch>, handles: Vec<tokio::task::JoinHandle<()>>) -> Self {
-        Self { rx, _handles: handles }
+    pub fn new_for_testing(
+        rx: tokio::sync::mpsc::Receiver<RecordBatch>,
+        handles: Vec<tokio::task::JoinHandle<()>>,
+    ) -> Self {
+        Self {
+            rx,
+            _handles: handles,
+        }
     }
 }
 
