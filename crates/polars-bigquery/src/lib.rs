@@ -146,6 +146,11 @@ impl BigQueryRecordBatchReceiver {
     pub async fn recv(&mut self) -> Option<RecordBatch> {
         self.rx.recv().await
     }
+
+    /// Creates a placeholder receiver for testing purposes.
+    pub fn new_for_testing(rx: tokio::sync::mpsc::Receiver<RecordBatch>) -> Self {
+        Self { rx, _handles: Vec::new() }
+    }
 }
 
 impl Drop for BigQueryRecordBatchReceiver {

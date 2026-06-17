@@ -130,15 +130,46 @@ impl Iterator for ReceiverIterator {
 
     fn next(&mut self) -> Option<Self::Item> {
         let rt = pyo3_async_runtimes::tokio::get_runtime();
-        let batch = rt.block_on(self.rx.recv())?;
 
-        let len = batch.len();
-        let (_, arrays) = batch.into_schema_and_arrays();
-        let struct_array =
-            polars_arrow::array::StructArray::new(self.dtype.clone(), len, arrays, None);
-        Some(Ok(
-            Box::new(struct_array) as Box<dyn polars_arrow::array::Array>
-        ))
+        loop {
+            // We need to be able to stop if the Python side decides to, so
+            // occasionally check to see if there were any interrupts.
+            if let Err(py_err) = Python::attach(|py| py.check_signals()) {
+                Python::attach(|py| py_err.restore(py));
+                return Some(Err(pyo3_polars::export::polars_error::PolarsError::ComputeError(
+                    "Python interrupt".into()
+                )));
+            }
+
+            let timeout_duration = std::time::Duration::from_millis(100);
+            let result = Python::attach(|py| {
+                py.detach(|| {
+                    rt.block_on(async {
+                        tokio::time::timeout(timeout_duration, self.rx.recv()).await
+                    })
+                })
+            });
+
+            match result {
+                Ok(Some(batch)) => {
+                    let len = batch.len();
+                    let (_, arrays) = batch.into_schema_and_arrays();
+                    let struct_array =
+                        polars_arrow::array::StructArray::new(self.dtype.clone(), len, arrays, None);
+                    return Some(Ok(
+                        Box::new(struct_array) as Box<dyn polars_arrow::array::Array>
+                    ));
+                }
+                Ok(None) => {
+                    // Stream finished
+                    return None;
+                }
+                Err(_) => {
+                    // Timeout elapsed, loop again to check signals
+                    continue;
+                }
+            }
+        }
     }
 }
 
@@ -248,6 +279,33 @@ pub fn read_bigquery(
     }
 }
 
+#[pyfunction]
+pub fn _create_test_exporter() -> ArrowStreamExporter {
+    // Force initialization of the Tokio runtime inside a #[pyfunction] context
+    let rt = pyo3_async_runtimes::tokio::get_runtime();
+    rt.block_on(async {
+        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+    });
+
+    let (tx, rx) = tokio::sync::mpsc::channel(10);
+    // Leak the sender so the channel never closes, causing rx.recv() to block indefinitely.
+    Box::leak(Box::new(tx));
+
+    let field = polars_arrow::datatypes::Field::new(
+        "placeholder".into(),
+        polars_arrow::datatypes::ArrowDataType::Int32,
+        true,
+    );
+    let schema = polars_arrow::datatypes::ArrowSchema::from_iter(vec![field]);
+    let schema_ref = std::sync::Arc::new(schema);
+    let receiver = polars_bigquery_lib::BigQueryRecordBatchReceiver::new_for_testing(rx);
+
+    ArrowStreamExporter {
+        schema: schema_ref,
+        receiver: std::sync::Mutex::new(Some(receiver)),
+    }
+}
+
 #[pymodule]
 fn polars_bigquery(m: &Bound<PyModule>) -> PyResult<()> {
     INIT_CRYPTO.call_once(|| {
@@ -256,6 +314,8 @@ fn polars_bigquery(m: &Bound<PyModule>) -> PyResult<()> {
     });
 
     m.add_wrapped(wrap_pyfunction!(read_bigquery)).unwrap();
+    m.add_wrapped(wrap_pyfunction!(_create_test_exporter)).unwrap();
 
     Ok(())
 }
+

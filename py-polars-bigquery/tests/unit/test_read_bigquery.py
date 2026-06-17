@@ -141,3 +141,39 @@ def test_read_bigquery_with_user_agent(mock_rust_read):
     mock_rust_read.assert_called_once_with(
         "p.d.t", "q", False, ANY, "custom-extension/1.0"
     )
+
+
+def test_receiver_iterator_interrupt():
+    import threading
+    import _thread
+    import time
+    from polars_bigquery import polars_bigquery
+
+    exporter = polars_bigquery._create_test_exporter()
+
+    interrupted = False
+
+    def trigger_interrupt():
+        # Wait a bit to ensure we are blocking in the iterator
+        time.sleep(0.3)
+        _thread.interrupt_main()
+
+    # Start the interrupt thread
+    thread = threading.Thread(target=trigger_interrupt)
+    thread.start()
+
+    try:
+        # Constructing the DataFrame will consume the C-stream.
+        # Since the channel is empty and kept open, it will block.
+        # The interrupt should break it.
+        pl.DataFrame(exporter)
+    except BaseException as err:
+        # This catches KeyboardInterrupt, ComputeError, and PanicException (from Polars unwrap).
+        if isinstance(err, KeyboardInterrupt) or "Python interrupt" in str(err):
+            interrupted = True
+        else:
+            raise
+
+    thread.join()
+    assert interrupted, "The C-stream consumption was not interrupted"
+
