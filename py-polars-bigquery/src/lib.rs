@@ -298,12 +298,70 @@ pub fn _create_test_exporter() -> ArrowStreamExporter {
     );
     let schema = polars_arrow::datatypes::ArrowSchema::from_iter(vec![field]);
     let schema_ref = std::sync::Arc::new(schema);
-    let receiver = polars_bigquery_lib::BigQueryRecordBatchReceiver::new_for_testing(rx);
+    let receiver = polars_bigquery_lib::BigQueryRecordBatchReceiver::new_for_testing(rx, Vec::new());
 
     ArrowStreamExporter {
         schema: schema_ref,
         receiver: std::sync::Mutex::new(Some(receiver)),
     }
+}
+
+#[pyclass]
+#[derive(Clone)]
+pub struct DropFlag {
+    value: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+#[pymethods]
+impl DropFlag {
+    fn is_set(&self) -> bool {
+        self.value.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+#[pyfunction]
+pub fn _test_create_exporter_with_drop_flag() -> (ArrowStreamExporter, DropFlag) {
+    let rt = pyo3_async_runtimes::tokio::get_runtime();
+    
+    let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let flag_clone = flag.clone();
+    
+    // Spawn a dummy task that runs forever until aborted, and sets the flag when dropped
+    let handle = rt.spawn(async move {
+        struct SetOnDrop(std::sync::Arc<std::sync::atomic::AtomicBool>);
+        impl Drop for SetOnDrop {
+            fn drop(&mut self) {
+                self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        let _cleanup = SetOnDrop(flag_clone);
+        
+        loop {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    });
+    
+    let (tx, rx) = tokio::sync::mpsc::channel(10);
+    Box::leak(Box::new(tx));
+    
+    let field = polars_arrow::datatypes::Field::new(
+        "dummy".into(),
+        polars_arrow::datatypes::ArrowDataType::Int32,
+        true,
+    );
+    let schema = polars_arrow::datatypes::ArrowSchema::from_iter(vec![field]);
+    let schema_ref = std::sync::Arc::new(schema);
+    
+    let receiver = polars_bigquery_lib::BigQueryRecordBatchReceiver::new_for_testing(rx, vec![handle]);
+    
+    let exporter = ArrowStreamExporter {
+        schema: schema_ref,
+        receiver: std::sync::Mutex::new(Some(receiver)),
+    };
+    
+    let drop_flag = DropFlag { value: flag };
+    
+    (exporter, drop_flag)
 }
 
 #[pymodule]
@@ -315,6 +373,8 @@ fn polars_bigquery(m: &Bound<PyModule>) -> PyResult<()> {
 
     m.add_wrapped(wrap_pyfunction!(read_bigquery)).unwrap();
     m.add_wrapped(wrap_pyfunction!(_create_test_exporter)).unwrap();
+    m.add_wrapped(wrap_pyfunction!(_test_create_exporter_with_drop_flag)).unwrap();
+    m.add_class::<DropFlag>().unwrap();
 
     Ok(())
 }

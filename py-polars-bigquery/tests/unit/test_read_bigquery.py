@@ -177,3 +177,13 @@ def test_receiver_iterator_interrupt():
     thread.join()
     assert interrupted, "The C-stream consumption was not interrupted"
 
+
+def test_exporter_drop_direct():
+    from polars_bigquery._testing import run_exporter_drop_test
+    assert run_exporter_drop_test(), "The background task was not aborted within 1s"
+
+
+def test_exporter_drop_after_stream_created():
+    from polars_bigquery._testing import run_exporter_drop_after_stream_created_test
+    assert run_exporter_drop_after_stream_created_test(), "The background task was not aborted within 1s"
+
