@@ -282,7 +282,11 @@ where
     let metadata = read_stream_metadata(&mut schema_cursor)?;
     let schema_ref = Arc::new(metadata.schema);
 
-    let (tx, rx) = tokio::sync::mpsc::channel(1024);
+    let channel_size = match std::thread::available_parallelism() {
+        Ok(value) => value.get() * 2,
+        Err(_) => 2,
+    };
+    let (tx, rx) = tokio::sync::mpsc::channel(channel_size);
     let shared_client = Arc::new(read_client);
     let shared_schema = Arc::new(schema);
     let mut handles = Vec::new();
