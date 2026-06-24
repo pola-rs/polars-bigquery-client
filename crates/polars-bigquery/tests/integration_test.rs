@@ -14,13 +14,18 @@ async fn test_read_small_public_table() {
         .await
         .expect("should build client");
 
-    let result = read_bigquery_with_client(
+    let (_, mut receiver) = read_bigquery_with_client(
         client,
         "bigquery-public-data.usa_names.usa_1910_2013",
         &quota_project_id,
         false,
     )
-    .await;
+    .await
+    .expect("public table read should work with default credentials");
 
-    result.expect("public table read should work with default credentials");
+    let mut total_rows = 0;
+    while let Some(batch) = receiver.recv().await {
+        total_rows += batch.len();
+    }
+    assert!(total_rows > 0);
 }

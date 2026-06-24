@@ -2508,6 +2508,7 @@ dependencies = [
  "pyo3-polars",
  "rustls",
  "secret-vault-value",
+ "tokio",
 ]
 
 [[package]]
