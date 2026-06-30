@@ -1,20 +1,18 @@
 mod bigquery_read_stream;
 
 use std::io::Cursor;
-use std::iter::Iterator;
 use std::sync::Arc;
 
 use gcloud_sdk::google::cloud::bigquery::storage::v1::big_query_read_client::BigQueryReadClient;
 use gcloud_sdk::google::cloud::bigquery::storage::v1::{
-    read_rows_response, read_session, CreateReadSessionRequest, DataFormat, ReadRowsRequest,
-    ReadRowsResponse, ReadSession,
+    read_session, CreateReadSessionRequest, DataFormat, ReadSession,
 };
 use gcloud_sdk::tonic::async_trait;
 use gcloud_sdk::*;
 use hyper::header::{HeaderValue, USER_AGENT};
 use hyper::HeaderMap;
 use polars_arrow::datatypes::ArrowSchemaRef;
-use polars_arrow::io::ipc::read::{read_stream_metadata, StreamReader, StreamState};
+use polars_arrow::io::ipc::read::read_stream_metadata;
 use polars_arrow::record_batch::RecordBatch;
 
 #[derive(Clone)]
