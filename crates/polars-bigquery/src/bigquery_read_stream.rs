@@ -1,5 +1,3 @@
-mod retry;
-
 use std::io::Cursor;
 use std::iter::Iterator;
 use std::sync::Arc;
@@ -12,6 +10,8 @@ use gcloud_sdk::google::cloud::bigquery::storage::v1::{
 use gcloud_sdk::*;
 use polars_arrow::io::ipc::read::{read_stream_metadata, StreamReader, StreamState};
 use polars_arrow::record_batch::RecordBatch;
+
+use super::bigquery_read_retry;
 
 fn read_rows_response_to_record_batch(response: ReadRowsResponse, schema: &[u8]) -> RecordBatch {
     let mut buffer = Vec::new();
@@ -41,7 +41,7 @@ pub async fn read_stream<B>(
     read_client: Arc<GoogleApiClient<B, BigQueryReadClient<GoogleAuthMiddleware>>>,
     schema: Arc<Vec<u8>>,
     stream_name: String,
-    tx: tokio::sync::mpsc::Sender<RecordBatch>,
+    tx: tokio::sync::mpsc::Sender<Result<RecordBatch, tonic::Status>>,
 ) where
     B: GoogleApiClientBuilder<BigQueryReadClient<GoogleAuthMiddleware>> + Send + Sync + 'static,
 {
@@ -50,14 +50,22 @@ pub async fn read_stream<B>(
         offset: 0,
     };
 
-    let messages = Arc::new(read_client
-    .get()
-    .read_rows(read_rows_request)
-    .retry(retry::READ_ROWS_RETRY)
-    .sleep(tokio::time::sleep)
-    .when(retry::read_rows_predicate))
-    .await?;
-    let mut messages = messages.into_inner();
+    let read_rows_response = Arc::new(
+        read_client
+            .get()
+            .read_rows(read_rows_request)
+            .retry(bigquery_read_retry::READ_ROWS_RETRY)
+            .sleep(tokio::time::sleep)
+            .when(bigquery_read_retry::read_rows_predicate),
+    )
+    .await;
+    let mut messages = match read_rows_response {
+        Ok(messages) => messages.into_inner(),
+        Err(status) => {
+            tx.send(Err(status));
+            return;
+        },
+    };
 
     'messages: loop {
         // TODO: if there's an error, call read_rows with the most recent
@@ -66,7 +74,7 @@ pub async fn read_stream<B>(
         match message {
             Some(value) => {
                 let batch = read_rows_response_to_record_batch(value, &schema);
-                if tx.send(batch).await.is_err() {
+                if tx.send(Ok(batch)).await.is_err() {
                     // Receiver was dropped, stop reading.
                     break 'messages;
                 }

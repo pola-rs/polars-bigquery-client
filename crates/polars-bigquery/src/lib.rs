@@ -1,5 +1,5 @@
+mod bigquery_read_retry;
 mod bigquery_read_stream;
-mod retry;
 
 use std::io::Cursor;
 use std::sync::Arc;
@@ -111,7 +111,7 @@ impl PolarsBigQueryClientBuilder {
 /// and provides a stream-like interface to receive the data.
 pub struct BigQueryRecordBatchReceiver {
     /// The channel receiver for receiving [`RecordBatch`]es produced by the background tasks.
-    rx: tokio::sync::mpsc::Receiver<RecordBatch>,
+    rx: tokio::sync::mpsc::Receiver<Result<RecordBatch, tonic::Status>>,
     /// Join handles for the background tasks reading from the BigQuery streams.
     ///
     /// These handles are kept so that the background tasks can be aborted when
@@ -120,13 +120,13 @@ pub struct BigQueryRecordBatchReceiver {
 }
 
 impl BigQueryRecordBatchReceiver {
-    pub async fn recv(&mut self) -> Option<RecordBatch> {
+    pub async fn recv(&mut self) -> Option<Result<RecordBatch, tonic::Status>> {
         self.rx.recv().await
     }
 
     /// Creates a placeholder receiver for testing purposes.
     pub fn new_for_testing(
-        rx: tokio::sync::mpsc::Receiver<RecordBatch>,
+        rx: tokio::sync::mpsc::Receiver<Result<RecordBatch, tonic::Status>>,
         handles: Vec<tokio::task::JoinHandle<()>>,
     ) -> Self {
         Self {
