@@ -50,19 +50,16 @@ pub async fn read_stream<B>(
         offset: 0,
     };
 
-    let read_rows_response = Arc::new(
-        read_client
-            .get()
-            .read_rows(read_rows_request)
+    let read_rows_response =
+        (|| async { read_client.get().read_rows(read_rows_request.clone()).await })
             .retry(bigquery_read_retry::READ_ROWS_RETRY)
             .sleep(tokio::time::sleep)
-            .when(bigquery_read_retry::read_rows_predicate),
-    )
-    .await;
+            .when(bigquery_read_retry::read_rows_predicate)
+            .await;
     let mut messages = match read_rows_response {
         Ok(messages) => messages.into_inner(),
         Err(status) => {
-            tx.send(Err(status));
+            let _ = tx.send(Err(status)).await;
             return;
         },
     };
