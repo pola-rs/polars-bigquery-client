@@ -1,11 +1,13 @@
+mod retry;
+
 use std::io::Cursor;
 use std::iter::Iterator;
 use std::sync::Arc;
 
+use backon::Retryable;
 use gcloud_sdk::google::cloud::bigquery::storage::v1::big_query_read_client::BigQueryReadClient;
 use gcloud_sdk::google::cloud::bigquery::storage::v1::{
-    read_rows_response, ReadRowsRequest,
-    ReadRowsResponse,
+    read_rows_response, ReadRowsRequest, ReadRowsResponse,
 };
 use gcloud_sdk::*;
 use polars_arrow::io::ipc::read::{read_stream_metadata, StreamReader, StreamState};
@@ -48,11 +50,13 @@ pub async fn read_stream<B>(
         offset: 0,
     };
 
-    let messages = read_client
-        .get()
-        .read_rows(read_rows_request)
-        .await
-        .unwrap();
+    let messages = Arc::new(read_client
+    .get()
+    .read_rows(read_rows_request)
+    .retry(retry::READ_ROWS_RETRY)
+    .sleep(tokio::time::sleep)
+    .when(retry::read_rows_predicate))
+    .await?;
     let mut messages = messages.into_inner();
 
     'messages: loop {

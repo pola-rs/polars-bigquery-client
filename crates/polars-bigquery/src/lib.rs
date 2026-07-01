@@ -1,4 +1,5 @@
 mod bigquery_read_stream;
+mod retry;
 
 use std::io::Cursor;
 use std::sync::Arc;
