@@ -153,7 +153,7 @@ impl Iterator for ReceiverIterator {
             });
 
             match result {
-                Ok(Some(batch)) => {
+                Ok(Some(Ok(batch))) => {
                     let len = batch.len();
                     let (_, arrays) = batch.into_schema_and_arrays();
                     let struct_array = polars_arrow::array::StructArray::new(
@@ -165,6 +165,11 @@ impl Iterator for ReceiverIterator {
                     return Some(Ok(
                         Box::new(struct_array) as Box<dyn polars_arrow::array::Array>
                     ));
+                },
+                Ok(Some(Err(status))) => {
+                    // Stream failed.
+                    // TODO(tswast): bubble this error up.
+                    return None;
                 },
                 Ok(None) => {
                     // Stream finished
