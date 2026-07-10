@@ -49,7 +49,7 @@ fn read_rows_response_to_record_batch(
     match reader.next() {
         Some(Ok(StreamState::Some(batch))) => Ok(Some((batch, row_count))),
         Some(Ok(StreamState::Waiting)) | None => Ok(None),
-        Some(Err(e)) => panic!("{:?}", e),
+        Some(Err(e)) => return Err(BigQueryError::Arrow(e))
     }
 }
 
