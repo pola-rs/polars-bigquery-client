@@ -4,6 +4,7 @@ mod bigquery_read_stream;
 use std::io::Cursor;
 use std::sync::Arc;
 
+use backon::Retryable;
 use gcloud_sdk::google::cloud::bigquery::storage::v1::big_query_read_client::BigQueryReadClient;
 use gcloud_sdk::google::cloud::bigquery::storage::v1::{
     read_session, CreateReadSessionRequest, DataFormat, ReadSession,
@@ -15,6 +16,39 @@ use hyper::HeaderMap;
 use polars_arrow::datatypes::ArrowSchemaRef;
 use polars_arrow::io::ipc::read::read_stream_metadata;
 use polars_arrow::record_batch::RecordBatch;
+
+#[derive(Debug)]
+pub enum BigQueryError {
+    Grpc(tonic::Status),
+    Arrow(polars_error::PolarsError),
+    Protocol(String),
+    Other(Box<dyn std::error::Error + Send + Sync>),
+}
+
+impl std::fmt::Display for BigQueryError {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        match self {
+            Self::Grpc(s) => write!(f, "gRPC transport error: {}", s),
+            Self::Arrow(e) => write!(f, "Arrow decoding error: {}", e),
+            Self::Protocol(msg) => write!(f, "BigQuery protocol error: {}", msg),
+            Self::Other(e) => write!(f, "BigQuery client error: {}", e),
+        }
+    }
+}
+
+impl std::error::Error for BigQueryError {}
+
+impl From<tonic::Status> for BigQueryError {
+    fn from(s: tonic::Status) -> Self {
+        Self::Grpc(s)
+    }
+}
+
+impl From<polars_error::PolarsError> for BigQueryError {
+    fn from(e: polars_error::PolarsError) -> Self {
+        Self::Arrow(e)
+    }
+}
 
 #[derive(Clone)]
 pub struct BigQueryReadClientBuilder {
@@ -111,7 +145,7 @@ impl PolarsBigQueryClientBuilder {
 /// and provides a stream-like interface to receive the data.
 pub struct BigQueryRecordBatchReceiver {
     /// The channel receiver for receiving [`RecordBatch`]es produced by the background tasks.
-    rx: tokio::sync::mpsc::Receiver<Result<RecordBatch, tonic::Status>>,
+    rx: tokio::sync::mpsc::Receiver<Result<RecordBatch, BigQueryError>>,
     /// Join handles for the background tasks reading from the BigQuery streams.
     ///
     /// These handles are kept so that the background tasks can be aborted when
@@ -120,13 +154,13 @@ pub struct BigQueryRecordBatchReceiver {
 }
 
 impl BigQueryRecordBatchReceiver {
-    pub async fn recv(&mut self) -> Option<Result<RecordBatch, tonic::Status>> {
+    pub async fn recv(&mut self) -> Option<Result<RecordBatch, BigQueryError>> {
         self.rx.recv().await
     }
 
     /// Creates a placeholder receiver for testing purposes.
     pub fn new_for_testing(
-        rx: tokio::sync::mpsc::Receiver<Result<RecordBatch, tonic::Status>>,
+        rx: tokio::sync::mpsc::Receiver<Result<RecordBatch, BigQueryError>>,
         handles: Vec<tokio::task::JoinHandle<()>>,
     ) -> Self {
         Self {
@@ -206,14 +240,19 @@ where
         ..Default::default()
     };
 
-    let read_session = read_client
-        .get()
-        .create_read_session(request)
+    let read_session = (|| async { read_client.get().create_read_session(request.clone()).await })
+        .retry(bigquery_read_retry::CREATE_READ_SESSION_RETRY)
+        .sleep(tokio::time::sleep)
+        .when(bigquery_read_retry::create_read_session_predicate)
         .await?
         .into_inner();
-    let schema = match read_session.schema.unwrap() {
-        read_session::Schema::ArrowSchema(value) => value.serialized_schema,
-        _ => panic!("unexpectedly got schema type other than arrow"),
+    let schema = match read_session.schema {
+        Some(read_session::Schema::ArrowSchema(value)) => value.serialized_schema,
+        _ => {
+            return Err(Box::new(BigQueryError::Protocol(
+                "Unexpectedly got schema type other than arrow".into(),
+            )))
+        }
     };
 
     let mut schema_cursor = Cursor::new(schema.clone());

@@ -12,28 +12,44 @@ use polars_arrow::io::ipc::read::{read_stream_metadata, StreamReader, StreamStat
 use polars_arrow::record_batch::RecordBatch;
 
 use super::bigquery_read_retry;
+use crate::BigQueryError;
 
-fn read_rows_response_to_record_batch(response: ReadRowsResponse, schema: &[u8]) -> RecordBatch {
+fn read_rows_response_to_record_batch(
+    response: ReadRowsResponse,
+    schema: &[u8],
+) -> Result<Option<(RecordBatch, i64)>, BigQueryError> {
+    let row_count = response.row_count;
+
     let mut buffer = Vec::new();
     buffer.extend_from_slice(schema);
-    // TODO: Bubble up if we unexpectedly get a record batch with no rows.
-    // TODO: This might not actually be unexpected? What happens when there's a
-    // super selective row filter?
-    let mut serialized_record_batch = match response.rows.unwrap() {
-        read_rows_response::Rows::ArrowRecordBatch(value) => value.serialized_record_batch,
-        _ => panic!("unexpectedly got some format other than arrow bytes"),
+
+    let mut serialized_record_batch = match response.rows {
+        Some(read_rows_response::Rows::ArrowRecordBatch(value)) => value.serialized_record_batch,
+        None => return Ok(None),
+        _ => {
+            return Err(BigQueryError::Protocol(
+                "Unexpectedly got some format other than arrow bytes".into(),
+            ))
+        }
     };
+
+    if serialized_record_batch.is_empty() || row_count == 0 {
+        return Ok(None);
+    }
     buffer.append(&mut serialized_record_batch);
 
     let mut cursor = Cursor::new(buffer);
-    let metadata = read_stream_metadata(&mut cursor).unwrap();
+    let metadata = match
+        read_stream_metadata(&mut cursor) {
+            Ok(metadata) => metadata,
+            Err(e) => return Err(BigQueryError::Arrow(e))
+        };
     let mut reader = StreamReader::new(cursor, metadata, None);
 
-    // TODO: maybe double-check that there are no recordbatches after this?
-    // There should only be one if the API returned the expected results.
-    match reader.next().unwrap().unwrap() {
-        StreamState::Some(batch) => batch,
-        _ => panic!("expected a batch"),
+    match reader.next() {
+        Some(Ok(StreamState::Some(batch))) => Ok(Some((batch, row_count))),
+        Some(Ok(StreamState::Waiting)) | None => Ok(None),
+        Some(Err(e)) => panic!("{:?}", e),
     }
 }
 
@@ -41,44 +57,68 @@ pub async fn read_stream<B>(
     read_client: Arc<GoogleApiClient<B, BigQueryReadClient<GoogleAuthMiddleware>>>,
     schema: Arc<Vec<u8>>,
     stream_name: String,
-    tx: tokio::sync::mpsc::Sender<Result<RecordBatch, tonic::Status>>,
+    tx: tokio::sync::mpsc::Sender<Result<RecordBatch, BigQueryError>>,
 ) where
     B: GoogleApiClientBuilder<BigQueryReadClient<GoogleAuthMiddleware>> + Send + Sync + 'static,
 {
-    let read_rows_request = ReadRowsRequest {
-        read_stream: stream_name.clone(),
-        offset: 0,
-    };
+    let mut current_offset = 0i64;
 
-    let read_rows_response =
-        (|| async { read_client.get().read_rows(read_rows_request.clone()).await })
-            .retry(bigquery_read_retry::READ_ROWS_RETRY)
-            .sleep(tokio::time::sleep)
-            .when(bigquery_read_retry::read_rows_predicate)
-            .await;
-    let mut messages = match read_rows_response {
-        Ok(messages) => messages.into_inner(),
-        Err(status) => {
-            let _ = tx.send(Err(status)).await;
-            return;
-        },
-    };
+    loop {
+        let read_rows_request = ReadRowsRequest {
+            read_stream: stream_name.clone(),
+            offset: current_offset,
+        };
 
-    'messages: loop {
-        // TODO: if there's an error, call read_rows with the most recent
-        // offset to resume.
-        let message = messages.message().await.unwrap();
-        match message {
-            Some(value) => {
-                let batch = read_rows_response_to_record_batch(value, &schema);
-                if tx.send(Ok(batch)).await.is_err() {
-                    // Receiver was dropped, stop reading.
-                    break 'messages;
+        let read_rows_response =
+            (|| async { read_client.get().read_rows(read_rows_request.clone()).await })
+                .retry(bigquery_read_retry::READ_ROWS_RETRY)
+                .sleep(tokio::time::sleep)
+                .when(bigquery_read_retry::read_rows_predicate)
+                .await;
+
+        let mut messages = match read_rows_response {
+            Ok(messages) => messages.into_inner(),
+            Err(status) => {
+                let _ = tx.send(Err(BigQueryError::Grpc(status))).await;
+                return;
+            }
+        };
+
+        'messages: loop {
+            match messages.message().await {
+                Ok(Some(value)) => {
+                    match read_rows_response_to_record_batch(
+                        value,
+                        &schema,
+                    ) {
+                        Ok(Some((batch, row_count))) => {
+                            current_offset += row_count;
+                            if tx.send(Ok(batch)).await.is_err() {
+                                // Receiver dropped on consumer side, stop reading.
+                                return;
+                            }
+                        }
+                        Ok(None) => {} // Skip empty chunks / control payloads
+                        Err(err) => {
+                            let _ = tx.send(Err(err)).await;
+                            return;
+                        }
+                    }
                 }
-            },
-            None => {
-                break 'messages;
-            },
+                Ok(None) => {
+                    // Stream finished cleanly.
+                    return;
+                }
+                Err(status) => {
+                    if bigquery_read_retry::reconnect_stream_predicate(&status) {
+                        // Transient gRPC error mid-stream, break inner loop to retry read_rows at current_offset.
+                        break 'messages;
+                    } else {
+                        let _ = tx.send(Err(BigQueryError::Grpc(status))).await;
+                        return;
+                    }
+                }
+            }
         }
     }
 }

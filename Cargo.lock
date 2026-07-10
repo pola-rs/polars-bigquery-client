@@ -1946,6 +1946,7 @@ dependencies = [
  "gcloud-sdk",
  "hyper",
  "polars-arrow",
+ "polars-error",
  "rand 0.10.0",
  "regex",
  "rustls",

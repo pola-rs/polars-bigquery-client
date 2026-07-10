@@ -166,10 +166,11 @@ impl Iterator for ReceiverIterator {
                         Box::new(struct_array) as Box<dyn polars_arrow::array::Array>
                     ));
                 },
-                Ok(Some(Err(status))) => {
-                    // Stream failed.
-                    // TODO(tswast): bubble this error up.
-                    return None;
+                Ok(Some(Err(err))) => {
+                    // Stream failed: bubble up exception immediately to prevent silent truncation.
+                    return Some(Err(
+                        pyo3_polars::export::polars_error::PolarsError::ComputeError(format!("BigQuery Storage API read error: {}", err).into())
+                    ));
                 },
                 Ok(None) => {
                     // Stream finished
