@@ -189,7 +189,19 @@ impl std::fmt::Display for InvalidTableId {
 
 impl std::error::Error for InvalidTableId {}
 
-fn table_id_to_table_path(table_id: &str) -> Result<String, Box<dyn std::error::Error>> {
+impl From<InvalidTableId> for BigQueryError {
+    fn from(e: InvalidTableId) -> Self {
+        Self::Other(Box::new(e))
+    }
+}
+
+impl From<regex::Error> for BigQueryError {
+    fn from(e: regex::Error) -> Self {
+        Self::Other(Box::new(e))
+    }
+}
+
+fn table_id_to_table_path(table_id: &str) -> Result<String, BigQueryError> {
     let re = regex::Regex::new(r"(?<project>.+)\.(?<dataset>[^.]+)\.(?<table>[^.]+)")?;
     let caps = re.captures(table_id).ok_or(InvalidTableId)?;
     Ok(format!(
@@ -212,7 +224,7 @@ pub async fn read_bigquery_with_client<B>(
     table_id: &str,
     quota_project_id: &str,
     maintain_order: bool,
-) -> Result<(ArrowSchemaRef, BigQueryRecordBatchReceiver), Box<dyn std::error::Error>>
+) -> Result<(ArrowSchemaRef, BigQueryRecordBatchReceiver), BigQueryError>
 where
     B: GoogleApiClientBuilder<BigQueryReadClient<GoogleAuthMiddleware>> + Send + Sync + 'static,
 {
@@ -249,9 +261,9 @@ where
     let schema = match read_session.schema {
         Some(read_session::Schema::ArrowSchema(value)) => value.serialized_schema,
         _ => {
-            return Err(Box::new(BigQueryError::Protocol(
+            return Err(BigQueryError::Protocol(
                 "Unexpectedly got schema type other than arrow".into(),
-            )))
+            ))
         }
     };
 
