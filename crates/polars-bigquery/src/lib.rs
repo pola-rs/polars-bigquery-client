@@ -36,7 +36,16 @@ impl std::fmt::Display for BigQueryError {
     }
 }
 
-impl std::error::Error for BigQueryError {}
+impl std::error::Error for BigQueryError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Grpc(e) => Some(e),
+            Self::Arrow(e) => Some(e),
+            Self::Protocol(_) => None,
+            Self::Other(e) => Some(e.as_ref()),
+        }
+    }
+}
 
 impl From<tonic::Status> for BigQueryError {
     fn from(s: tonic::Status) -> Self {
@@ -72,6 +81,12 @@ pub struct PolarsBigQueryClientBuilder {
     token_source_type: TokenSourceType,
     scopes: Vec<String>,
     user_agent: Option<String>,
+}
+
+impl Default for PolarsBigQueryClientBuilder {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl PolarsBigQueryClientBuilder {
@@ -202,7 +217,11 @@ impl From<regex::Error> for BigQueryError {
 }
 
 fn table_id_to_table_path(table_id: &str) -> Result<String, BigQueryError> {
-    let re = regex::Regex::new(r"(?<project>.+)\.(?<dataset>[^.]+)\.(?<table>[^.]+)")?;
+    static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let re = RE.get_or_init(|| {
+        regex::Regex::new(r"(?<project>.+)\.(?<dataset>[^.]+)\.(?<table>[^.]+)")
+            .expect("valid regex pattern")
+    });
     let caps = re.captures(table_id).ok_or(InvalidTableId)?;
     Ok(format!(
         "projects/{}/datasets/{}/tables/{}",
