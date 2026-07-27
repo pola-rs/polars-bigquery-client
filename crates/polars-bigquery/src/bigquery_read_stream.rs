@@ -2,7 +2,7 @@ use std::io::Cursor;
 use std::iter::Iterator;
 use std::sync::Arc;
 
-use backon::Retryable;
+use backon::{BackoffBuilder, Retryable};
 use gcloud_sdk::google::cloud::bigquery::storage::v1::big_query_read_client::BigQueryReadClient;
 use gcloud_sdk::google::cloud::bigquery::storage::v1::{
     read_rows_response, ReadRowsRequest, ReadRowsResponse,
@@ -33,7 +33,13 @@ fn read_rows_response_to_record_batch(
         }
     };
 
-    if serialized_record_batch.is_empty() || row_count == 0 {
+    if serialized_record_batch.is_empty() {
+        if row_count != 0 {
+            return Err(BigQueryError::Protocol(format!(
+                "Row count mismatch: gRPC protobuf reported {} rows, but Arrow IPC decoded 0 rows",
+                row_count
+            )));
+        }
         return Ok(None);
     }
     buffer.append(&mut serialized_record_batch);
@@ -53,7 +59,15 @@ fn read_rows_response_to_record_batch(
             }
             Ok(Some((batch, actual_rows)))
         }
-        Some(Ok(StreamState::Waiting)) | None => Ok(None),
+        Some(Ok(StreamState::Waiting)) | None => {
+            if row_count != 0 {
+                return Err(BigQueryError::Protocol(format!(
+                    "Row count mismatch: gRPC protobuf reported {} rows, but Arrow IPC decoded 0 rows",
+                    row_count
+                )));
+            }
+            Ok(None)
+        }
         Some(Err(e)) => Err(BigQueryError::Arrow(e)),
     }
 }
@@ -110,76 +124,142 @@ pub async fn read_stream<B>(
 ) where
     B: GoogleApiClientBuilder<BigQueryReadClient<GoogleAuthMiddleware>> + Send + Sync + 'static,
 {
-    read_stream_inner(read_client.as_ref(), schema, stream_name, tx).await;
+    read_stream_inner(
+        read_client.as_ref(),
+        schema,
+        stream_name,
+        tx,
+        bigquery_read_retry::STREAM_RECONNECT_RETRY,
+    )
+    .await;
 }
 
-pub(crate) async fn read_stream_inner<C>(
+/// Represents the state of the stream reading state machine.
+#[derive(Debug)]
+enum ReadStreamState {
+    /// Establishing or resuming the BigQuery read stream at `current_offset`.
+    Connecting,
+    /// Encountered a transient mid-stream disconnection; backing off before reconnecting.
+    BackingOff(gcloud_sdk::tonic::Status),
+    /// Stream completed cleanly, fatal error occurred, or consumer dropped the receiver.
+    Terminated,
+}
+
+/// Layer 1: Connects to a BigQuery read stream at `offset`, retrying transient gRPC connection errors.
+async fn connect_read_rows_stream<C: BigQueryReadClientTrait>(
+    read_client: &C,
+    stream_name: &str,
+    offset: i64,
+) -> Result<C::Stream, gcloud_sdk::tonic::Status> {
+    let read_rows_request = ReadRowsRequest {
+        read_stream: stream_name.to_string(),
+        offset,
+    };
+
+    (|| async { read_client.read_rows_stream(read_rows_request.clone()).await })
+        .retry(bigquery_read_retry::READ_ROWS_RETRY)
+        .sleep(tokio::time::sleep)
+        .when(bigquery_read_retry::read_rows_predicate)
+        .await
+}
+
+/// Layer 2: Consumes messages from an established read stream and returns the next [`ReadStreamState`].
+async fn consume_stream_until_disconnection<S: ReadRowsStreamTrait>(
+    mut stream: S,
+    schema: &[u8],
+    current_offset: &mut i64,
+    tx: &tokio::sync::mpsc::Sender<Result<RecordBatch, BigQueryError>>,
+    made_progress: &mut bool,
+) -> ReadStreamState {
+    loop {
+        match stream.next_message().await {
+            Ok(Some(value)) => match read_rows_response_to_record_batch(value, schema) {
+                Ok(Some((batch, row_count))) => {
+                    *current_offset += row_count;
+                    *made_progress = true; // Successfully made progress, allow resetting backoff timer
+                    // `tx.send` returns `Err` strictly when all `Receiver` handles (`rx`) have been
+                    // dropped. This happens when either:
+                    // 1) The consumer aborted reading early (e.g. stopped iteration or dropped receiver), or
+                    // 2) Another concurrent stream sent an `Err(...)` over `tx`, prompting the consumer
+                    //    to raise an exception and drop `rx`.
+                    // In either case, the consumer closed the channel and cannot receive more batches,
+                    // so terminating this stream cleanly prevents orphan background tasks.
+                    if tx.send(Ok(batch)).await.is_err() {
+                        return ReadStreamState::Terminated;
+                    }
+                }
+                Ok(None) => {}
+                Err(err) => {
+                    let _ = tx.send(Err(err)).await;
+                    return ReadStreamState::Terminated;
+                }
+            },
+            Ok(None) => {
+                return ReadStreamState::Terminated;
+            }
+            Err(status) => {
+                if bigquery_read_retry::reconnect_stream_predicate(&status) {
+                    return ReadStreamState::BackingOff(status);
+                } else {
+                    let _ = tx.send(Err(BigQueryError::Grpc(status))).await;
+                    return ReadStreamState::Terminated;
+                }
+            }
+        }
+    }
+}
+
+/// Layer 3: Orchestrates stream connection, consumption, and mid-stream reconnections as an explicit state machine.
+pub(crate) async fn read_stream_inner<C, B>(
     read_client: &C,
     schema: Arc<Vec<u8>>,
     stream_name: String,
     tx: tokio::sync::mpsc::Sender<Result<RecordBatch, BigQueryError>>,
+    backoff_builder: B,
 ) where
     C: BigQueryReadClientTrait,
+    B: BackoffBuilder + Clone,
 {
     let mut current_offset = 0i64;
+    let mut backoff = backoff_builder.clone().build();
+    let mut state = ReadStreamState::Connecting;
 
-    loop {
-        let read_rows_request = ReadRowsRequest {
-            read_stream: stream_name.clone(),
-            offset: current_offset,
-        };
-
-        let read_rows_response =
-            (|| async { read_client.read_rows_stream(read_rows_request.clone()).await })
-                .retry(bigquery_read_retry::READ_ROWS_RETRY)
-                .sleep(tokio::time::sleep)
-                .when(bigquery_read_retry::read_rows_predicate)
-                .await;
-
-        let mut messages = match read_rows_response {
-            Ok(messages) => messages,
-            Err(status) => {
-                let _ = tx.send(Err(BigQueryError::Grpc(status))).await;
-                return;
-            }
-        };
-
-        'messages: loop {
-            match messages.next_message().await {
-                Ok(Some(value)) => {
-                    match read_rows_response_to_record_batch(
-                        value,
-                        &schema,
-                    ) {
-                        Ok(Some((batch, row_count))) => {
-                            current_offset += row_count;
-                            if tx.send(Ok(batch)).await.is_err() {
-                                // Receiver dropped on consumer side, stop reading.
-                                return;
-                            }
+    while !matches!(state, ReadStreamState::Terminated) {
+        state = match state {
+            ReadStreamState::Connecting => {
+                match connect_read_rows_stream(read_client, &stream_name, current_offset).await {
+                    Ok(stream) => {
+                        let mut made_progress = false;
+                        let next_state = consume_stream_until_disconnection(
+                            stream,
+                            &schema,
+                            &mut current_offset,
+                            &tx,
+                            &mut made_progress,
+                        )
+                        .await;
+                        if made_progress {
+                            backoff = backoff_builder.clone().build();
                         }
-                        Ok(None) => {} // Skip empty chunks / control payloads
-                        Err(err) => {
-                            let _ = tx.send(Err(err)).await;
-                            return;
-                        }
+                        next_state
                     }
-                }
-                Ok(None) => {
-                    // Stream finished cleanly.
-                    return;
-                }
-                Err(status) => {
-                    if bigquery_read_retry::reconnect_stream_predicate(&status) {
-                        // Transient gRPC error mid-stream, break inner loop to retry read_rows at current_offset.
-                        break 'messages;
-                    } else {
+                    Err(status) => {
                         let _ = tx.send(Err(BigQueryError::Grpc(status))).await;
-                        return;
+                        ReadStreamState::Terminated
                     }
                 }
             }
-        }
+            ReadStreamState::BackingOff(last_status) => {
+                if let Some(delay) = backoff.next() {
+                    tokio::time::sleep(delay).await;
+                    ReadStreamState::Connecting
+                } else {
+                    let _ = tx.send(Err(BigQueryError::Grpc(last_status))).await;
+                    ReadStreamState::Terminated
+                }
+            }
+            ReadStreamState::Terminated => break,
+        };
     }
 }
 
@@ -252,7 +332,7 @@ mod tests {
         }
         let schema_len = schema_bytes.len();
 
-        let array = Int32Array::from_slice(&(0..num_rows as i32).collect::<Vec<_>>());
+        let array = Int32Array::from_slice((0..num_rows as i32).collect::<Vec<_>>());
         let batch = RecordBatch::try_new(
             num_rows,
             Arc::new(schema.clone()),
@@ -331,6 +411,26 @@ mod tests {
         }
     }
 
+    fn test_backoff() -> backon::ExponentialBuilder {
+        backon::ExponentialBuilder::default()
+            .with_max_times(3)
+            .with_min_delay(std::time::Duration::from_millis(1))
+            .with_max_delay(std::time::Duration::from_millis(1))
+    }
+
+    #[test]
+    fn test_read_rows_response_row_count_mismatch_when_reader_empty() {
+        let (schema_bytes, mut response) = create_test_arrow_payload(0);
+        // Replace empty serialized_record_batch with an Arrow IPC End-Of-Stream marker (8 bytes)
+        // so serialized_record_batch is non-empty, but StreamReader::next() returns None.
+        if let Some(read_rows_response::Rows::ArrowRecordBatch(ref mut arrow_batch)) = response.rows {
+            arrow_batch.serialized_record_batch = vec![0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00];
+        }
+        response.row_count = 10;
+        let err = read_rows_response_to_record_batch(response, &schema_bytes).unwrap_err();
+        assert!(matches!(err, BigQueryError::Protocol(_)));
+    }
+
     #[tokio::test]
     async fn test_stream_reconnection_offset() {
         let (schema_bytes, resp1) = create_test_arrow_payload(3);
@@ -356,7 +456,7 @@ mod tests {
         };
 
         let (tx, mut rx) = tokio::sync::mpsc::channel(10);
-        read_stream_inner(&mock_client, Arc::new(schema_bytes), "test_stream".into(), tx).await;
+        read_stream_inner(&mock_client, Arc::new(schema_bytes), "test_stream".into(), tx, test_backoff()).await;
 
         let batch1 = rx.recv().await.unwrap().unwrap();
         assert_eq!(batch1.len(), 3);
@@ -368,5 +468,28 @@ mod tests {
         assert_eq!(reqs.len(), 2);
         assert_eq!(reqs[0].offset, 0);
         assert_eq!(reqs[1].offset, 3);
+    }
+
+    #[tokio::test]
+    async fn test_stream_reconnection_exhaustion() {
+        // Stream repeatedly disconnects immediately without making progress.
+        // Verifies the state machine terminates and yields an Err after retries are exhausted.
+        struct InfiniteDisconnectClient;
+
+        #[gcloud_sdk::tonic::async_trait]
+        impl BigQueryReadClientTrait for InfiniteDisconnectClient {
+            type Stream = MockStream;
+            async fn read_rows_stream(&self, _request: ReadRowsRequest) -> Result<Self::Stream, Status> {
+                Ok(MockStream {
+                    messages: vec![Err(Status::new(Code::Unavailable, "persistent disconnect"))],
+                })
+            }
+        }
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        read_stream_inner(&InfiniteDisconnectClient, Arc::new(vec![]), "test_stream".into(), tx, test_backoff()).await;
+
+        let result = rx.recv().await.unwrap();
+        assert!(matches!(result, Err(BigQueryError::Grpc(_))));
     }
 }

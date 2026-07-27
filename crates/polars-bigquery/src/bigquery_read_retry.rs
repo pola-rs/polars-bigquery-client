@@ -56,6 +56,15 @@ pub const READ_ROWS_RETRY: ExponentialBuilder = ExponentialBuilder::new()
     .with_total_delay(Some(Duration::from_secs(900)))
     .with_jitter();
 
+/// Retry configuration for mid-stream read_rows reconnections.
+pub const STREAM_RECONNECT_RETRY: ExponentialBuilder = ExponentialBuilder::new()
+    .with_min_delay(Duration::from_millis(100))
+    .with_max_delay(Duration::from_secs(60))
+    .with_factor(1.3)
+    .with_max_times(10)
+    .with_jitter();
+
+
 /// When to retry read_rows requests.
 ///
 /// Inspired by the Python configuration at
@@ -63,14 +72,6 @@ pub const READ_ROWS_RETRY: ExponentialBuilder = ExponentialBuilder::new()
 pub fn read_rows_predicate(err: &tonic::Status) -> bool {
     is_retryable_status(err)
 }
-
-/// Backoff configuration between mid-stream reconnection attempts.
-pub const STREAM_RECONNECT_RETRY: ExponentialBuilder = ExponentialBuilder::new()
-    .with_min_delay(Duration::from_millis(100))
-    .with_max_delay(Duration::from_secs(30))
-    .with_factor(1.5)
-    .with_max_times(10)
-    .with_jitter();
 
 /// When to reconnect/resume an active read_rows stream after encountering a gRPC error mid-read.
 ///
