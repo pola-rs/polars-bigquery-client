@@ -18,23 +18,19 @@ fn is_retryable_status(err: &tonic::Status) -> bool {
     matches!(
         err.code(),
         tonic::Code::DeadlineExceeded
-            | tonic::Code::Unavailable
             | tonic::Code::Aborted
-            | tonic::Code::Internal
             | tonic::Code::ResourceExhausted
-    ) || is_retryable_transport_error(err)
-}
-
-fn is_retryable_transport_error(err: &tonic::Status) -> bool {
-    if err.code() != tonic::Code::Unknown {
-        return false;
-    }
-    let msg = err.message().to_ascii_lowercase();
-    msg.contains("broken pipe")
-        || msg.contains("connection reset")
-        || msg.contains("h2 protocol error")
-        || msg.contains("stream closed")
-        || msg.contains("transport error")
+            // Unavailable includes common transport-level failures such as,
+            // - Hyper/h2 connection errors, as seen in
+            //   https://github.com/grpc/grpc-rust/pull/629
+            // - Connection errors, like ConnectionReset, as seen in
+            //   https://github.com/grpc/grpc-rust/blob/230544e31ef9b513e493c273d4076e843478e934/tonic/src/status.rs#L757-L761
+            | tonic::Code::Unavailable
+            // Internal includes common transport-level failures such as,
+            // - broken pipe, as seen in
+            //   https://github.com/grpc/grpc-rust/blob/230544e31ef9b513e493c273d4076e843478e934/tonic/src/status.rs#L753-L756
+            | tonic::Code::Internal
+    )
 }
 
 /// When to retry create_read_session requests.
@@ -144,14 +140,5 @@ mod tests {
                 reconnect_stream_predicate(&status)
             );
         }
-    }
-
-    #[test]
-    fn test_reconnect_stream_predicate_unknown_transport_error() {
-        let retryable_unknown = Status::new(Code::Unknown, "h2 protocol error: broken pipe");
-        assert!(reconnect_stream_predicate(&retryable_unknown));
-
-        let non_retryable_unknown = Status::new(Code::Unknown, "some unknown application error");
-        assert!(!reconnect_stream_predicate(&non_retryable_unknown));
     }
 }
