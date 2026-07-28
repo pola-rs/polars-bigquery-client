@@ -20,9 +20,6 @@ fn read_rows_response_to_record_batch(
 ) -> Result<Option<(RecordBatch, i64)>, BigQueryError> {
     let row_count = response.row_count;
 
-    let mut buffer = Vec::new();
-    buffer.extend_from_slice(schema);
-
     let mut serialized_record_batch = match response.rows {
         Some(read_rows_response::Rows::ArrowRecordBatch(value)) => value.serialized_record_batch,
         None => return Ok(None),
@@ -42,6 +39,9 @@ fn read_rows_response_to_record_batch(
         }
         return Ok(None);
     }
+
+    let mut buffer = Vec::with_capacity(schema.len() + serialized_record_batch.len());
+    buffer.extend_from_slice(schema);
     buffer.append(&mut serialized_record_batch);
 
     let mut cursor = Cursor::new(buffer);
