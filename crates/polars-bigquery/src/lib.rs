@@ -283,7 +283,7 @@ where
             return Err(BigQueryError::Protocol(
                 "Unexpectedly got schema type other than arrow".into(),
             ))
-        }
+        },
     };
 
     let mut schema_cursor = Cursor::new(schema.clone());

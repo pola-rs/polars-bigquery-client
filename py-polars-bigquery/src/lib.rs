@@ -169,7 +169,9 @@ impl Iterator for ReceiverIterator {
                 Ok(Some(Err(err))) => {
                     // Stream failed: bubble up exception immediately to prevent silent truncation.
                     return Some(Err(
-                        pyo3_polars::export::polars_error::PolarsError::ComputeError(format!("BigQuery Storage API read error: {}", err).into())
+                        pyo3_polars::export::polars_error::PolarsError::ComputeError(
+                            format!("BigQuery Storage API read error: {}", err).into(),
+                        ),
                     ));
                 },
                 Ok(None) => {

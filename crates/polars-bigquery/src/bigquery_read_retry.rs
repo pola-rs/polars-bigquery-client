@@ -60,7 +60,6 @@ pub const STREAM_RECONNECT_RETRY: ExponentialBuilder = ExponentialBuilder::new()
     .with_max_times(10)
     .with_jitter();
 
-
 /// When to retry read_rows requests.
 ///
 /// Inspired by the Python configuration at
@@ -79,8 +78,9 @@ pub fn reconnect_stream_predicate(err: &tonic::Status) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use gcloud_sdk::tonic::{Code, Status};
+
+    use super::*;
 
     #[test]
     fn test_reconnect_stream_predicate_retryable_codes() {
@@ -132,7 +132,12 @@ mod tests {
     #[test]
     fn test_read_rows_predicate_matches_reconnect() {
         // Ensure initial request predicate and stream reconnection predicate currently match on behavior
-        let codes = [Code::Unavailable, Code::Aborted, Code::NotFound, Code::InvalidArgument];
+        let codes = [
+            Code::Unavailable,
+            Code::Aborted,
+            Code::NotFound,
+            Code::InvalidArgument,
+        ];
         for code in codes {
             let status = Status::new(code, "test");
             assert_eq!(

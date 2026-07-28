@@ -27,7 +27,7 @@ fn read_rows_response_to_record_batch(
             return Err(BigQueryError::Protocol(
                 "Unexpectedly got some format other than arrow bytes".into(),
             ))
-        }
+        },
     };
 
     if serialized_record_batch.is_empty() {
@@ -58,7 +58,7 @@ fn read_rows_response_to_record_batch(
                 )));
             }
             Ok(Some((batch, actual_rows)))
-        }
+        },
         Some(Ok(StreamState::Waiting)) | None => {
             if row_count != 0 {
                 return Err(BigQueryError::Protocol(format!(
@@ -67,7 +67,7 @@ fn read_rows_response_to_record_batch(
                 )));
             }
             Ok(None)
-        }
+        },
         Some(Err(e)) => Err(BigQueryError::Arrow(e)),
     }
 }
@@ -81,12 +81,15 @@ fn read_rows_response_to_record_batch(
 /// `#[async_trait]` is used to guarantee `Send` bounds across Tokio tasks, matching the `tonic` ecosystem.
 #[gcloud_sdk::tonic::async_trait]
 pub trait ReadRowsStreamTrait: Send + Unpin {
-    async fn next_message(&mut self) -> Result<Option<ReadRowsResponse>, gcloud_sdk::tonic::Status>;
+    async fn next_message(&mut self)
+        -> Result<Option<ReadRowsResponse>, gcloud_sdk::tonic::Status>;
 }
 
 #[gcloud_sdk::tonic::async_trait]
 impl ReadRowsStreamTrait for gcloud_sdk::tonic::Streaming<ReadRowsResponse> {
-    async fn next_message(&mut self) -> Result<Option<ReadRowsResponse>, gcloud_sdk::tonic::Status> {
+    async fn next_message(
+        &mut self,
+    ) -> Result<Option<ReadRowsResponse>, gcloud_sdk::tonic::Status> {
         self.message().await
     }
 }
@@ -101,7 +104,10 @@ impl ReadRowsStreamTrait for gcloud_sdk::tonic::Streaming<ReadRowsResponse> {
 #[gcloud_sdk::tonic::async_trait]
 pub trait BigQueryReadClientTrait: Send + Sync {
     type Stream: ReadRowsStreamTrait;
-    async fn read_rows_stream(&self, request: ReadRowsRequest) -> Result<Self::Stream, gcloud_sdk::tonic::Status>;
+    async fn read_rows_stream(
+        &self,
+        request: ReadRowsRequest,
+    ) -> Result<Self::Stream, gcloud_sdk::tonic::Status>;
 }
 
 #[gcloud_sdk::tonic::async_trait]
@@ -110,7 +116,10 @@ where
     B: GoogleApiClientBuilder<BigQueryReadClient<GoogleAuthMiddleware>> + Send + Sync + 'static,
 {
     type Stream = gcloud_sdk::tonic::Streaming<ReadRowsResponse>;
-    async fn read_rows_stream(&self, request: ReadRowsRequest) -> Result<Self::Stream, gcloud_sdk::tonic::Status> {
+    async fn read_rows_stream(
+        &self,
+        request: ReadRowsRequest,
+    ) -> Result<Self::Stream, gcloud_sdk::tonic::Status> {
         let resp = self.get().read_rows(request).await?;
         Ok(resp.into_inner())
     }
@@ -156,11 +165,15 @@ async fn connect_read_rows_stream<C: BigQueryReadClientTrait>(
         offset,
     };
 
-    (|| async { read_client.read_rows_stream(read_rows_request.clone()).await })
-        .retry(bigquery_read_retry::READ_ROWS_RETRY)
-        .sleep(tokio::time::sleep)
-        .when(bigquery_read_retry::read_rows_predicate)
-        .await
+    (|| async {
+        read_client
+            .read_rows_stream(read_rows_request.clone())
+            .await
+    })
+    .retry(bigquery_read_retry::READ_ROWS_RETRY)
+    .sleep(tokio::time::sleep)
+    .when(bigquery_read_retry::read_rows_predicate)
+    .await
 }
 
 /// Layer 2: Consumes messages from an established read stream and returns the next [`ReadStreamState`].
@@ -177,26 +190,26 @@ async fn consume_stream_until_disconnection<S: ReadRowsStreamTrait>(
                 Ok(Some((batch, row_count))) => {
                     *current_offset += row_count;
                     *made_progress = true; // Successfully made progress, allow resetting backoff timer
-                    // `tx.send` returns `Err` strictly when all `Receiver` handles (`rx`) have been
-                    // dropped. This happens when either:
-                    // 1) The consumer aborted reading early (e.g. stopped iteration or dropped receiver), or
-                    // 2) Another concurrent stream sent an `Err(...)` over `tx`, prompting the consumer
-                    //    to raise an exception and drop `rx`.
-                    // In either case, the consumer closed the channel and cannot receive more batches,
-                    // so terminating this stream cleanly prevents orphan background tasks.
+                                           // `tx.send` returns `Err` strictly when all `Receiver` handles (`rx`) have been
+                                           // dropped. This happens when either:
+                                           // 1) The consumer aborted reading early (e.g. stopped iteration or dropped receiver), or
+                                           // 2) Another concurrent stream sent an `Err(...)` over `tx`, prompting the consumer
+                                           //    to raise an exception and drop `rx`.
+                                           // In either case, the consumer closed the channel and cannot receive more batches,
+                                           // so terminating this stream cleanly prevents orphan background tasks.
                     if tx.send(Ok(batch)).await.is_err() {
                         return ReadStreamState::Terminated;
                     }
-                }
-                Ok(None) => {}
+                },
+                Ok(None) => {},
                 Err(err) => {
                     let _ = tx.send(Err(err)).await;
                     return ReadStreamState::Terminated;
-                }
+                },
             },
             Ok(None) => {
                 return ReadStreamState::Terminated;
-            }
+            },
             Err(status) => {
                 if bigquery_read_retry::reconnect_stream_predicate(&status) {
                     return ReadStreamState::BackingOff(status);
@@ -204,7 +217,7 @@ async fn consume_stream_until_disconnection<S: ReadRowsStreamTrait>(
                     let _ = tx.send(Err(BigQueryError::Grpc(status))).await;
                     return ReadStreamState::Terminated;
                 }
-            }
+            },
         }
     }
 }
@@ -242,13 +255,13 @@ pub(crate) async fn read_stream_inner<C, B>(
                             backoff = backoff_builder.clone().build();
                         }
                         next_state
-                    }
+                    },
                     Err(status) => {
                         let _ = tx.send(Err(BigQueryError::Grpc(status))).await;
                         ReadStreamState::Terminated
-                    }
+                    },
                 }
-            }
+            },
             ReadStreamState::BackingOff(last_status) => {
                 if let Some(delay) = backoff.next() {
                     tokio::time::sleep(delay).await;
@@ -257,7 +270,7 @@ pub(crate) async fn read_stream_inner<C, B>(
                     let _ = tx.send(Err(BigQueryError::Grpc(last_status))).await;
                     ReadStreamState::Terminated
                 }
-            }
+            },
             ReadStreamState::Terminated => break,
         };
     }
@@ -265,12 +278,14 @@ pub(crate) async fn read_stream_inner<C, B>(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use std::sync::Mutex;
+
     use gcloud_sdk::google::cloud::bigquery::storage::v1::{
         read_rows_response, ArrowRecordBatch, AvroRows,
     };
     use gcloud_sdk::tonic::{Code, Status};
-    use std::sync::Mutex;
+
+    use super::*;
 
     #[test]
     fn test_read_rows_response_empty() {
@@ -279,17 +294,23 @@ mod tests {
             row_count: 0,
             ..Default::default()
         };
-        assert!(read_rows_response_to_record_batch(response, &[]).unwrap().is_none());
+        assert!(read_rows_response_to_record_batch(response, &[])
+            .unwrap()
+            .is_none());
 
         let response2 = ReadRowsResponse {
-            rows: Some(read_rows_response::Rows::ArrowRecordBatch(ArrowRecordBatch {
-                serialized_record_batch: vec![],
-                ..Default::default()
-            })),
+            rows: Some(read_rows_response::Rows::ArrowRecordBatch(
+                ArrowRecordBatch {
+                    serialized_record_batch: vec![],
+                    ..Default::default()
+                },
+            )),
             row_count: 0,
             ..Default::default()
         };
-        assert!(read_rows_response_to_record_batch(response2, &[]).unwrap().is_none());
+        assert!(read_rows_response_to_record_batch(response2, &[])
+            .unwrap()
+            .is_none());
     }
 
     #[test]
@@ -306,10 +327,12 @@ mod tests {
     #[test]
     fn test_read_rows_response_arrow_error() {
         let response = ReadRowsResponse {
-            rows: Some(read_rows_response::Rows::ArrowRecordBatch(ArrowRecordBatch {
-                serialized_record_batch: vec![0x00, 0x01, 0x02, 0x03],
-                ..Default::default()
-            })),
+            rows: Some(read_rows_response::Rows::ArrowRecordBatch(
+                ArrowRecordBatch {
+                    serialized_record_batch: vec![0x00, 0x01, 0x02, 0x03],
+                    ..Default::default()
+                },
+            )),
             row_count: 5,
             ..Default::default()
         };
@@ -327,7 +350,8 @@ mod tests {
 
         let mut schema_bytes = Vec::new();
         {
-            let mut writer = StreamWriter::new(&mut schema_bytes, WriteOptions { compression: None });
+            let mut writer =
+                StreamWriter::new(&mut schema_bytes, WriteOptions { compression: None });
             writer.start(&schema, None).unwrap();
         }
         let schema_len = schema_bytes.len();
@@ -342,7 +366,8 @@ mod tests {
 
         let mut full_stream_bytes = Vec::new();
         {
-            let mut writer = StreamWriter::new(&mut full_stream_bytes, WriteOptions { compression: None });
+            let mut writer =
+                StreamWriter::new(&mut full_stream_bytes, WriteOptions { compression: None });
             writer.start(&schema, None).unwrap();
             writer.write(&batch, None).unwrap();
         }
@@ -350,10 +375,12 @@ mod tests {
         let batch_bytes = full_stream_bytes[schema_len..].to_vec();
 
         let response = ReadRowsResponse {
-            rows: Some(read_rows_response::Rows::ArrowRecordBatch(ArrowRecordBatch {
-                serialized_record_batch: batch_bytes,
-                ..Default::default()
-            })),
+            rows: Some(read_rows_response::Rows::ArrowRecordBatch(
+                ArrowRecordBatch {
+                    serialized_record_batch: batch_bytes,
+                    ..Default::default()
+                },
+            )),
             row_count: num_rows as i64,
             ..Default::default()
         };
@@ -423,8 +450,10 @@ mod tests {
         let (schema_bytes, mut response) = create_test_arrow_payload(0);
         // Replace empty serialized_record_batch with an Arrow IPC End-Of-Stream marker (8 bytes)
         // so serialized_record_batch is non-empty, but StreamReader::next() returns None.
-        if let Some(read_rows_response::Rows::ArrowRecordBatch(ref mut arrow_batch)) = response.rows {
-            arrow_batch.serialized_record_batch = vec![0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00];
+        if let Some(read_rows_response::Rows::ArrowRecordBatch(ref mut arrow_batch)) = response.rows
+        {
+            arrow_batch.serialized_record_batch =
+                vec![0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00];
         }
         response.row_count = 10;
         let err = read_rows_response_to_record_batch(response, &schema_bytes).unwrap_err();
@@ -443,10 +472,7 @@ mod tests {
             ],
         };
         let stream2 = MockStream {
-            messages: vec![
-                Ok(Some(resp2)),
-                Ok(None),
-            ],
+            messages: vec![Ok(Some(resp2)), Ok(None)],
         };
 
         let requests = Arc::new(Mutex::new(vec![]));
@@ -456,7 +482,14 @@ mod tests {
         };
 
         let (tx, mut rx) = tokio::sync::mpsc::channel(10);
-        read_stream_inner(&mock_client, Arc::new(schema_bytes), "test_stream".into(), tx, test_backoff()).await;
+        read_stream_inner(
+            &mock_client,
+            Arc::new(schema_bytes),
+            "test_stream".into(),
+            tx,
+            test_backoff(),
+        )
+        .await;
 
         let batch1 = rx.recv().await.unwrap().unwrap();
         assert_eq!(batch1.len(), 3);
@@ -479,7 +512,10 @@ mod tests {
         #[gcloud_sdk::tonic::async_trait]
         impl BigQueryReadClientTrait for InfiniteDisconnectClient {
             type Stream = MockStream;
-            async fn read_rows_stream(&self, _request: ReadRowsRequest) -> Result<Self::Stream, Status> {
+            async fn read_rows_stream(
+                &self,
+                _request: ReadRowsRequest,
+            ) -> Result<Self::Stream, Status> {
                 Ok(MockStream {
                     messages: vec![Err(Status::new(Code::Unavailable, "persistent disconnect"))],
                 })
@@ -487,7 +523,14 @@ mod tests {
         }
 
         let (tx, mut rx) = tokio::sync::mpsc::channel(1);
-        read_stream_inner(&InfiniteDisconnectClient, Arc::new(vec![]), "test_stream".into(), tx, test_backoff()).await;
+        read_stream_inner(
+            &InfiniteDisconnectClient,
+            Arc::new(vec![]),
+            "test_stream".into(),
+            tx,
+            test_backoff(),
+        )
+        .await;
 
         let result = rx.recv().await.unwrap();
         assert!(matches!(result, Err(BigQueryError::Grpc(_))));
