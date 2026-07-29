@@ -189,14 +189,14 @@ async fn consume_stream_until_disconnection<S: ReadRowsStreamTrait>(
                 Ok(Some((batch, row_count))) => {
                     *current_offset += row_count;
                     *made_progress = true; // Successfully made progress, allow resetting backoff timer
-                                           // `tx.send` returns `Err` strictly when all `Receiver` handles (`rx`) have been
-                                           // dropped. This happens when either:
-                                           // 1) The consumer aborted reading early (e.g. stopped iteration or dropped receiver), or
-                                           // 2) Another concurrent stream sent an `Err(...)` over `tx`, prompting the consumer
-                                           //    to raise an exception and drop `rx`.
-                                           // In either case, the consumer closed the channel and cannot receive more batches,
-                                           // so terminating this stream cleanly prevents orphan background tasks.
                     if tx.send(Ok(batch)).await.is_err() {
+                        // `tx.send` returns `Err` strictly when all `Receiver` handles (`rx`) have been
+                        // dropped. This happens when either:
+                        // 1) The consumer aborted reading early (e.g. stopped iteration or dropped receiver), or
+                        // 2) Another concurrent stream sent an `Err(...)` over `tx`, prompting the consumer
+                        //    to raise an exception and drop `rx`.
+                        // In either case, the consumer closed the channel and cannot receive more batches,
+                        // so terminating this stream cleanly prevents orphan background tasks.
                         return ReadStreamState::Terminated;
                     }
                 },
