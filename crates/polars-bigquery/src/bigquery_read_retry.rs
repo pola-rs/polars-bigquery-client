@@ -304,12 +304,14 @@ pub fn reconnect_stream_predicate(err: &tonic::Status) -> bool {
 
 /// Retry configuration policy for mid-stream read_rows reconnections.
 ///
+/// Important! If data progress is made (`made_progress == true`), the session
+/// must be reset reset to grant a fresh 10-attempt allowance.
+///
 /// ### Parameters
 /// - `min_delay` (100ms): Starts with a short initial backoff to quickly recover from brief network blips.
 /// - `max_delay` (60s): Caps the backoff delay so exponential growth (100ms -> 130ms -> 169ms ...) does not produce excessively long single delays.
 /// - `factor` (1.3): Multiplier scaling factor for exponential backoff (matching Python BigQuery Storage client standard).
 /// - `with_max_times` (10): Limits total consecutive failed reconnection attempts when no data progress is made.
-///   If data progress is made (`made_progress == true`), the session is reset to grant a fresh 10-attempt allowance.
 pub fn stream_reconnect_policy() -> RetryPolicy<fn(&tonic::Status) -> bool, HasherRng> {
     RetryPolicy::new(
         Duration::from_millis(100),
