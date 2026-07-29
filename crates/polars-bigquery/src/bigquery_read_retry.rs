@@ -67,24 +67,34 @@ impl<R: Rng> BackoffSession<R> {
         base + jitter
     }
 
-    /// Delay for the next backoff attempt if retries are not exhausted.
-    /// Returns `true` if it slept and can retry, `false` if retries were exhausted.
-    pub async fn next_delay(&mut self) -> bool {
+    /// Calculate and return the next delay if retries are not exhausted by limits.
+    /// Increments `attempts` and updates session start time if applicable.
+    pub fn advance_delay(&mut self) -> Option<Duration> {
         if let Some(max_times) = self.max_times {
             if self.attempts >= max_times {
-                return false;
+                return None;
             }
         }
         if let Some(max_total_delay) = self.max_total_delay {
             let start = *self.start_time.get_or_insert_with(Instant::now);
             if start.elapsed() >= max_total_delay {
-                return false;
+                return None;
             }
         }
         let delay = self.compute_next_delay();
         self.attempts += 1;
-        tokio::time::sleep(delay).await;
-        true
+        Some(delay)
+    }
+
+    /// Delay for the next backoff attempt if retries are not exhausted.
+    /// Returns `true` if it slept and can retry, `false` if retries were exhausted.
+    pub async fn next_delay(&mut self) -> bool {
+        if let Some(delay) = self.advance_delay() {
+            tokio::time::sleep(delay).await;
+            true
+        } else {
+            false
+        }
     }
 }
 
@@ -199,19 +209,7 @@ where
                     self.session = Some(self.make_session());
                 }
                 let session = self.session.as_mut().unwrap();
-                if let Some(max_times) = session.max_times {
-                    if session.attempts >= max_times {
-                        return None;
-                    }
-                }
-                if let Some(max_total_delay) = session.max_total_delay {
-                    let start = *session.start_time.get_or_insert_with(Instant::now);
-                    if start.elapsed() >= max_total_delay {
-                        return None;
-                    }
-                }
-                let delay = session.compute_next_delay();
-                session.attempts += 1;
+                let delay = session.advance_delay()?;
                 Some(tokio::time::sleep(delay))
             },
         }
