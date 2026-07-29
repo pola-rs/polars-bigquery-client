@@ -4,7 +4,6 @@ mod bigquery_read_stream;
 use std::io::Cursor;
 use std::sync::Arc;
 
-use backon::Retryable;
 use gcloud_sdk::google::cloud::bigquery::storage::v1::big_query_read_client::BigQueryReadClient;
 use gcloud_sdk::google::cloud::bigquery::storage::v1::{
     read_session, CreateReadSessionRequest, DataFormat, ReadSession,
@@ -16,6 +15,7 @@ use hyper::HeaderMap;
 use polars_arrow::datatypes::ArrowSchemaRef;
 use polars_arrow::io::ipc::read::read_stream_metadata;
 use polars_arrow::record_batch::RecordBatch;
+use tower::ServiceExt;
 
 #[derive(Debug)]
 pub enum BigQueryError {
@@ -271,10 +271,13 @@ where
         ..Default::default()
     };
 
-    let read_session = (|| async { read_client.get().create_read_session(request.clone()).await })
-        .retry(bigquery_read_retry::CREATE_READ_SESSION_RETRY)
-        .sleep(tokio::time::sleep)
-        .when(bigquery_read_retry::create_read_session_predicate)
+    let policy = bigquery_read_retry::create_read_session_policy();
+    let service = tower::service_fn(|req: CreateReadSessionRequest| {
+        let mut client = read_client.get();
+        async move { client.create_read_session(req).await }
+    });
+    let read_session = tower::retry::Retry::new(policy, service)
+        .oneshot(request)
         .await?
         .into_inner();
     let schema = match read_session.schema {

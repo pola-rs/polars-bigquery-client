@@ -2,7 +2,6 @@ use std::io::Cursor;
 use std::iter::Iterator;
 use std::sync::Arc;
 
-use backon::{BackoffBuilder, Retryable};
 use gcloud_sdk::google::cloud::bigquery::storage::v1::big_query_read_client::BigQueryReadClient;
 use gcloud_sdk::google::cloud::bigquery::storage::v1::{
     read_rows_response, ReadRowsRequest, ReadRowsResponse,
@@ -10,6 +9,7 @@ use gcloud_sdk::google::cloud::bigquery::storage::v1::{
 use gcloud_sdk::*;
 use polars_arrow::io::ipc::read::{read_stream_metadata, StreamReader, StreamState};
 use polars_arrow::record_batch::RecordBatch;
+use tower::ServiceExt;
 
 use super::bigquery_read_retry;
 use crate::BigQueryError;
@@ -138,7 +138,7 @@ pub async fn read_stream<B>(
         schema,
         stream_name,
         tx,
-        bigquery_read_retry::STREAM_RECONNECT_RETRY,
+        bigquery_read_retry::stream_reconnect_policy(),
     )
     .await;
 }
@@ -165,15 +165,14 @@ async fn connect_read_rows_stream<C: BigQueryReadClientTrait>(
         offset,
     };
 
-    (|| async {
-        read_client
-            .read_rows_stream(read_rows_request.clone())
-            .await
-    })
-    .retry(bigquery_read_retry::READ_ROWS_RETRY)
-    .sleep(tokio::time::sleep)
-    .when(bigquery_read_retry::read_rows_predicate)
-    .await
+    let policy = bigquery_read_retry::read_rows_policy();
+    let service =
+        tower::service_fn(
+            |req: ReadRowsRequest| async move { read_client.read_rows_stream(req).await },
+        );
+    tower::retry::Retry::new(policy, service)
+        .oneshot(read_rows_request)
+        .await
 }
 
 /// Layer 2: Consumes messages from an established read stream and returns the next [`ReadStreamState`].
@@ -223,18 +222,29 @@ async fn consume_stream_until_disconnection<S: ReadRowsStreamTrait>(
 }
 
 /// Layer 3: Orchestrates stream connection, consumption, and mid-stream reconnections as an explicit state machine.
-pub(crate) async fn read_stream_inner<C, B>(
+///
+/// Uses a [`bigquery_read_retry::BackoffSession`] instantiated from `retry_policy` to handle backoff delays
+/// upon mid-stream gRPC disconnections.
+///
+/// ### Backoff Reset Behavior
+/// - **On Disconnection**: The backoff state is **not** reset. Attempt counts accumulate and delay increases exponentially
+///   (up to `max_delay` / `max_times`) to prevent tight retry loops during a prolonged network outage.
+/// - **On Progress (`made_progress == true`)**: The backoff state **is reset** (`backoff_session = retry_policy.make_session()`).
+///   This ensures that long-lived data streams experiencing rare, transient network interruptions separated by minutes or hours
+///   always receive a full retry budget.
+pub(crate) async fn read_stream_inner<C, P, R>(
     read_client: &C,
     schema: Arc<Vec<u8>>,
     stream_name: String,
     tx: tokio::sync::mpsc::Sender<Result<RecordBatch, BigQueryError>>,
-    backoff_builder: B,
+    retry_policy: bigquery_read_retry::RetryPolicy<P, R>,
 ) where
     C: BigQueryReadClientTrait,
-    B: BackoffBuilder + Clone,
+    P: Fn(&gcloud_sdk::tonic::Status) -> bool + Clone,
+    R: tower::util::rng::Rng + Clone,
 {
     let mut current_offset = 0i64;
-    let mut backoff = backoff_builder.clone().build();
+    let mut backoff_session = retry_policy.make_session();
     let mut state = ReadStreamState::Connecting;
 
     while !matches!(state, ReadStreamState::Terminated) {
@@ -251,8 +261,9 @@ pub(crate) async fn read_stream_inner<C, B>(
                             &mut made_progress,
                         )
                         .await;
+                        // Reset backoff state after making data progress so future transient errors get a full retry budget.
                         if made_progress {
-                            backoff = backoff_builder.clone().build();
+                            backoff_session = retry_policy.make_session();
                         }
                         next_state
                     },
@@ -263,8 +274,7 @@ pub(crate) async fn read_stream_inner<C, B>(
                 }
             },
             ReadStreamState::BackingOff(last_status) => {
-                if let Some(delay) = backoff.next() {
-                    tokio::time::sleep(delay).await;
+                if backoff_session.next_delay().await {
                     ReadStreamState::Connecting
                 } else {
                     let _ = tx.send(Err(BigQueryError::Grpc(last_status))).await;
@@ -438,11 +448,17 @@ mod tests {
         }
     }
 
-    fn test_backoff() -> backon::ExponentialBuilder {
-        backon::ExponentialBuilder::default()
-            .with_max_times(3)
-            .with_min_delay(std::time::Duration::from_millis(1))
-            .with_max_delay(std::time::Duration::from_millis(1))
+    fn test_policy(
+    ) -> bigquery_read_retry::RetryPolicy<fn(&Status) -> bool, tower::util::rng::HasherRng> {
+        bigquery_read_retry::RetryPolicy::new(
+            std::time::Duration::from_millis(1),
+            std::time::Duration::from_millis(1),
+            1.3,
+            0.0,
+            tower::util::rng::HasherRng::default(),
+            bigquery_read_retry::reconnect_stream_predicate as fn(&Status) -> bool,
+        )
+        .with_max_times(3)
     }
 
     #[test]
@@ -487,7 +503,7 @@ mod tests {
             Arc::new(schema_bytes),
             "test_stream".into(),
             tx,
-            test_backoff(),
+            test_policy(),
         )
         .await;
 
@@ -528,7 +544,7 @@ mod tests {
             Arc::new(vec![]),
             "test_stream".into(),
             tx,
-            test_backoff(),
+            test_policy(),
         )
         .await;
 
