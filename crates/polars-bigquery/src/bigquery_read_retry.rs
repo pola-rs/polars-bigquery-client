@@ -43,7 +43,9 @@ impl<R: Rng> BackoffSession<R> {
     fn base_delay(&self) -> Duration {
         let mult = self.factor.powi(self.attempts as i32);
         let secs = self.min_delay.as_secs_f64() * mult;
-        Duration::from_secs_f64(secs).min(self.max_delay)
+        Duration::try_from_secs_f64(secs)
+            .unwrap_or(self.max_delay)
+            .min(self.max_delay)
     }
 
     /// Calculate random uniform jitter added to base delay.
@@ -185,7 +187,10 @@ where
 
     fn retry(&mut self, _req: &mut Req, result: &mut Result<Res, E>) -> Option<Self::Future> {
         match result {
-            Ok(_) => None,
+            Ok(_) => {
+                self.session = None;
+                None
+            },
             Err(err) => {
                 if !(self.predicate)(err) {
                     return None;
@@ -429,5 +434,41 @@ mod tests {
         assert_eq!(session.compute_next_delay(), Duration::from_millis(130)); // 100 * 1.3^1
         session.attempts += 1;
         assert_eq!(session.compute_next_delay(), Duration::from_millis(169)); // 100 * 1.3^2
+    }
+
+    #[test]
+    fn test_backoff_overflow_safety() {
+        let policy = RetryPolicy::new(
+            Duration::from_millis(100),
+            Duration::from_secs(60),
+            1.3,
+            0.0,
+            HasherRng::default(),
+            |_: &Status| true,
+        );
+        let mut session = policy.make_session();
+        session.attempts = 1000; // 1.3^1000 is infinity in f64
+        assert_eq!(session.compute_next_delay(), Duration::from_secs(60));
+    }
+
+    #[tokio::test]
+    async fn test_retry_policy_session_reset_on_ok() {
+        let mut policy = RetryPolicy::new(
+            Duration::from_millis(1),
+            Duration::from_secs(60),
+            1.3,
+            0.0,
+            HasherRng::default(),
+            |_: &Status| true,
+        );
+
+        let mut req = ();
+        let mut err_res: Result<(), Status> = Err(Status::unavailable("transient"));
+        assert!(policy.retry(&mut req, &mut err_res).is_some());
+        assert!(policy.session.is_some());
+
+        let mut ok_res: Result<(), Status> = Ok(());
+        assert!(policy.retry(&mut req, &mut ok_res).is_none());
+        assert!(policy.session.is_none());
     }
 }
