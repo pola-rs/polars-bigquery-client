@@ -1,3 +1,4 @@
+mod bigquery_read_retry;
 mod bigquery_read_stream;
 
 use std::io::Cursor;
@@ -14,6 +15,49 @@ use hyper::HeaderMap;
 use polars_arrow::datatypes::ArrowSchemaRef;
 use polars_arrow::io::ipc::read::read_stream_metadata;
 use polars_arrow::record_batch::RecordBatch;
+use tower::ServiceExt;
+
+#[derive(Debug)]
+pub enum BigQueryError {
+    Grpc(tonic::Status),
+    Arrow(polars_error::PolarsError),
+    Protocol(String),
+    Other(Box<dyn std::error::Error + Send + Sync>),
+}
+
+impl std::fmt::Display for BigQueryError {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        match self {
+            Self::Grpc(s) => write!(f, "gRPC transport error: {}", s),
+            Self::Arrow(e) => write!(f, "Arrow decoding error: {}", e),
+            Self::Protocol(msg) => write!(f, "BigQuery protocol error: {}", msg),
+            Self::Other(e) => write!(f, "BigQuery client error: {}", e),
+        }
+    }
+}
+
+impl std::error::Error for BigQueryError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Grpc(e) => Some(e),
+            Self::Arrow(e) => Some(e),
+            Self::Protocol(_) => None,
+            Self::Other(e) => Some(e.as_ref()),
+        }
+    }
+}
+
+impl From<tonic::Status> for BigQueryError {
+    fn from(s: tonic::Status) -> Self {
+        Self::Grpc(s)
+    }
+}
+
+impl From<polars_error::PolarsError> for BigQueryError {
+    fn from(e: polars_error::PolarsError) -> Self {
+        Self::Arrow(e)
+    }
+}
 
 #[derive(Clone)]
 pub struct BigQueryReadClientBuilder {
@@ -37,6 +81,12 @@ pub struct PolarsBigQueryClientBuilder {
     token_source_type: TokenSourceType,
     scopes: Vec<String>,
     user_agent: Option<String>,
+}
+
+impl Default for PolarsBigQueryClientBuilder {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl PolarsBigQueryClientBuilder {
@@ -110,7 +160,7 @@ impl PolarsBigQueryClientBuilder {
 /// and provides a stream-like interface to receive the data.
 pub struct BigQueryRecordBatchReceiver {
     /// The channel receiver for receiving [`RecordBatch`]es produced by the background tasks.
-    rx: tokio::sync::mpsc::Receiver<RecordBatch>,
+    rx: tokio::sync::mpsc::Receiver<Result<RecordBatch, BigQueryError>>,
     /// Join handles for the background tasks reading from the BigQuery streams.
     ///
     /// These handles are kept so that the background tasks can be aborted when
@@ -119,13 +169,13 @@ pub struct BigQueryRecordBatchReceiver {
 }
 
 impl BigQueryRecordBatchReceiver {
-    pub async fn recv(&mut self) -> Option<RecordBatch> {
+    pub async fn recv(&mut self) -> Option<Result<RecordBatch, BigQueryError>> {
         self.rx.recv().await
     }
 
     /// Creates a placeholder receiver for testing purposes.
     pub fn new_for_testing(
-        rx: tokio::sync::mpsc::Receiver<RecordBatch>,
+        rx: tokio::sync::mpsc::Receiver<Result<RecordBatch, BigQueryError>>,
         handles: Vec<tokio::task::JoinHandle<()>>,
     ) -> Self {
         Self {
@@ -154,8 +204,24 @@ impl std::fmt::Display for InvalidTableId {
 
 impl std::error::Error for InvalidTableId {}
 
-fn table_id_to_table_path(table_id: &str) -> Result<String, Box<dyn std::error::Error>> {
-    let re = regex::Regex::new(r"(?<project>.+)\.(?<dataset>[^.]+)\.(?<table>[^.]+)")?;
+impl From<InvalidTableId> for BigQueryError {
+    fn from(e: InvalidTableId) -> Self {
+        Self::Other(Box::new(e))
+    }
+}
+
+impl From<regex::Error> for BigQueryError {
+    fn from(e: regex::Error) -> Self {
+        Self::Other(Box::new(e))
+    }
+}
+
+fn table_id_to_table_path(table_id: &str) -> Result<String, BigQueryError> {
+    static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let re = RE.get_or_init(|| {
+        regex::Regex::new(r"(?<project>.+)\.(?<dataset>[^.]+)\.(?<table>[^.]+)")
+            .expect("valid regex pattern")
+    });
     let caps = re.captures(table_id).ok_or(InvalidTableId)?;
     Ok(format!(
         "projects/{}/datasets/{}/tables/{}",
@@ -177,7 +243,7 @@ pub async fn read_bigquery_with_client<B>(
     table_id: &str,
     quota_project_id: &str,
     maintain_order: bool,
-) -> Result<(ArrowSchemaRef, BigQueryRecordBatchReceiver), Box<dyn std::error::Error>>
+) -> Result<(ArrowSchemaRef, BigQueryRecordBatchReceiver), BigQueryError>
 where
     B: GoogleApiClientBuilder<BigQueryReadClient<GoogleAuthMiddleware>> + Send + Sync + 'static,
 {
@@ -205,14 +271,22 @@ where
         ..Default::default()
     };
 
-    let read_session = read_client
-        .get()
-        .create_read_session(request)
+    let policy = bigquery_read_retry::create_read_session_policy();
+    let service = tower::service_fn(|req: CreateReadSessionRequest| {
+        let mut client = read_client.get();
+        async move { client.create_read_session(req).await }
+    });
+    let read_session = tower::retry::Retry::new(policy, service)
+        .oneshot(request)
         .await?
         .into_inner();
-    let schema = match read_session.schema.unwrap() {
-        read_session::Schema::ArrowSchema(value) => value.serialized_schema,
-        _ => panic!("unexpectedly got schema type other than arrow"),
+    let schema = match read_session.schema {
+        Some(read_session::Schema::ArrowSchema(value)) => value.serialized_schema,
+        _ => {
+            return Err(BigQueryError::Protocol(
+                "Unexpectedly got schema type other than arrow".into(),
+            ))
+        },
     };
 
     let mut schema_cursor = Cursor::new(schema.clone());

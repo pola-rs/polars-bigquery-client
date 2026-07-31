@@ -25,7 +25,7 @@ async fn test_read_small_public_table() {
 
     let mut total_rows = 0;
     while let Some(batch) = receiver.recv().await {
-        total_rows += batch.len();
+        total_rows += batch.expect("should receive valid record batch").len();
     }
     assert!(total_rows > 0);
 }

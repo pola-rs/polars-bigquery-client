@@ -153,7 +153,7 @@ impl Iterator for ReceiverIterator {
             });
 
             match result {
-                Ok(Some(batch)) => {
+                Ok(Some(Ok(batch))) => {
                     let len = batch.len();
                     let (_, arrays) = batch.into_schema_and_arrays();
                     let struct_array = polars_arrow::array::StructArray::new(
@@ -164,6 +164,14 @@ impl Iterator for ReceiverIterator {
                     );
                     return Some(Ok(
                         Box::new(struct_array) as Box<dyn polars_arrow::array::Array>
+                    ));
+                },
+                Ok(Some(Err(err))) => {
+                    // Stream failed: bubble up exception immediately to prevent silent truncation.
+                    return Some(Err(
+                        pyo3_polars::export::polars_error::PolarsError::ComputeError(
+                            format!("BigQuery Storage API read error: {}", err).into(),
+                        ),
                     ));
                 },
                 Ok(None) => {
