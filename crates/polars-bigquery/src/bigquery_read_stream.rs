@@ -20,10 +20,10 @@
 //! │  │               │                         ┌──────┼───────┐         │
 //! │  │       ┌───────▼──────┐ Exponential  connect_read_rows_stream     │
 //! │  │       │ Backing off  ┼──Back─off───────►│(Re)Connecting│         │
-//! │  ▼       └──────────────┘                  └───────┬──────┘         │
-//! │ Unrecoverable error                        ReadRows│error           │
-//! │ or no more messages                      after exhausting retries   │
-//! │  │                  ┌──────────────┐               │                │
+//! │  ▼       └─────────────┬┘                  └───────┬──────┘         │
+//! │ Unrecoverable error   Out of retries       ReadRows│error           │
+//! │ or no more messages    │                 after exhausting retries   │
+//! │  │                  ┌──▼───────────┐               │                │
 //! │  └──────────────────►  Terminated──◄───────────────┘                │
 //! │                     └──────────────┘                                │
 //! └─────────────────────────────────────────────────────────────────────┘
