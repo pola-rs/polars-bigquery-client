@@ -273,7 +273,7 @@ async fn consume_stream_until_disconnection<S: ReadRowsStreamTrait>(
 /// Uses a [`bigquery_read_retry::BackoffSession`] instantiated from `retry_policy` to handle backoff delays
 /// upon mid-stream gRPC disconnections.
 ///
-/// ### A not regarding the transition from BackingOff to Connecting
+/// ### A note regarding the transition from BackingOff to Connecting
 ///
 /// If we are able to successfully call ReadRows but don't receive a successful
 /// message, the exponential backoff session state is preserved from the
