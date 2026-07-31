@@ -9,7 +9,7 @@
 //!
 //! ```
 //! ┌─ read_stream_inner ─────────────────────────────────────────────────┐
-//! │              ┌─────┐                                                │
+//! │              ┌──►──┐                                                │
 //! │   Recieve valid message                                             │
 //! │  including empty/waiting                                            │
 //! │          ┌───┼─────▼────┐                                           │
@@ -20,9 +20,9 @@
 //! │  │               │                         ┌──────┼───────┐         │
 //! │  │       ┌───────▼──────┐ Exponential  connect_read_rows_stream     │
 //! │  │       │ Backing off  ┼──Back─off───────►│(Re)Connecting│         │
-//! │  │       └──────────────┘                  └───────┬──────┘         │
+//! │  ▼       └──────────────┘                  └───────┬──────┘         │
 //! │ Unrecoverable error                        ReadRows│error           │
-//! │  │                                       after exhausting retries   │
+//! │ or no more messages                      after exhausting retries   │
 //! │  │                  ┌──────────────┐               │                │
 //! │  └──────────────────►  Terminated──◄───────────────┘                │
 //! │                     └──────────────┘                                │
