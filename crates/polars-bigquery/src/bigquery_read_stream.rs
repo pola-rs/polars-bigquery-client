@@ -7,7 +7,7 @@
 //! machine, containing single API method retries and stream-level reconnection
 //! logic.
 //!
-//! ```
+//! ```text
 //! ┌─ read_stream_inner ─────────────────────────────────────────────────┐
 //! │              ┌──►──┐                                                │
 //! │   Recieve valid message                                             │
