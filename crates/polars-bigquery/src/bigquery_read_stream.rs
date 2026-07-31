@@ -1,3 +1,34 @@
+//! ## bigquery_read_stream.rs
+//!
+//! This module reads from BQ Storage Read API stream and writes the results
+//! as arrow record batches to a tokio mpsc queue as messages arrive.
+//!
+//! To robustly handle disruptions, this module uses the following state
+//! machine, containing single API method retries and stream-level reconnection
+//! logic.
+//!
+//! ```
+//! ┌─ read_stream_inner ─────────────────────────────────────────────────┐
+//! │              ┌─────┐                                                │
+//! │   Recieve valid message                                             │
+//! │  including empty/waiting                                            │
+//! │          ┌───┼─────▼────┐                                           │
+//! │ consume_stream_until_disconnected ◄───────────────┐                 │
+//! │  ┌───────┼   Running    │                         │                 │
+//! │  │       └───────┬──────┘                     ReadRows              │
+//! │  │    Recoverable│error                        success              │
+//! │  │               │                         ┌──────┼───────┐         │
+//! │  │       ┌───────▼──────┐ Exponential  connect_read_rows_stream     │
+//! │  │       │ Backing off  ┼──Back─off───────►│(Re)Connecting│         │
+//! │  │       └──────────────┘                  └───────┬──────┘         │
+//! │ Unrecoverable error                        ReadRows│error           │
+//! │  │                                       after exhausting retries   │
+//! │  │                  ┌──────────────┐               │                │
+//! │  └──────────────────►  Terminated──◄───────────────┘                │
+//! │                     └──────────────┘                                │
+//! └─────────────────────────────────────────────────────────────────────┘
+//! ```
+
 use std::io::Cursor;
 use std::iter::Iterator;
 use std::sync::Arc;
@@ -14,6 +45,10 @@ use tower::ServiceExt;
 use super::bigquery_read_retry;
 use crate::BigQueryError;
 
+/// Convert a ReadRowsResponse into an Arrow record batch + stream offset.
+///
+/// Returns an error if we got an invalid message. Rather than try to continue
+/// in an invalid state, this should terminate the reader.
 fn read_rows_response_to_record_batch(
     response: ReadRowsResponse,
     schema: &[u8],
@@ -176,6 +211,10 @@ async fn connect_read_rows_stream<C: BigQueryReadClientTrait>(
 }
 
 /// Layer 2: Consumes messages from an established read stream and returns the next [`ReadStreamState`].
+///
+/// This function represents a state not modeled in ReadStreamState itself
+/// called "Running". As long as we are still in the Ruunning state, we stay in
+/// the loop of this function.
 async fn consume_stream_until_disconnection<S: ReadRowsStreamTrait>(
     mut stream: S,
     schema: &[u8],
@@ -226,12 +265,17 @@ async fn consume_stream_until_disconnection<S: ReadRowsStreamTrait>(
 /// Uses a [`bigquery_read_retry::BackoffSession`] instantiated from `retry_policy` to handle backoff delays
 /// upon mid-stream gRPC disconnections.
 ///
-/// ### Backoff Reset Behavior
-/// - **On Disconnection**: The backoff state is **not** reset. Attempt counts accumulate and delay increases exponentially
-///   (up to `max_delay` / `max_times`) to prevent tight retry loops during a prolonged network outage.
-/// - **On Progress (`made_progress == true`)**: The backoff state **is reset** (`backoff_session = retry_policy.make_session()`).
-///   This ensures that long-lived data streams experiencing rare, transient network interruptions separated by minutes or hours
-///   always receive a full retry budget.
+/// ### A not regarding the transition from BackingOff to Connecting
+///
+/// If we are able to successfully call ReadRows but don't receive a successful
+/// message, the exponential backoff session state is preserved from the
+/// previous attempt. This ensures that we are able to make progress in the
+/// case of retriable/reconnectable failures.
+///
+/// When we do receive a successful message, the backoff state **is reset**
+/// (`backoff_session = retry_policy.make_session()`).  This ensures that
+/// long-lived data streams experiencing rare, transient network interruptions
+/// separated by minutes or hours always receive a full retry budget.
 pub(crate) async fn read_stream_inner<C, P, R>(
     read_client: &C,
     schema: Arc<Vec<u8>>,
@@ -261,7 +305,8 @@ pub(crate) async fn read_stream_inner<C, P, R>(
                             &mut made_progress,
                         )
                         .await;
-                        // Reset backoff state after making data progress so future transient errors get a full retry budget.
+                        // Reset backoff state after making data progress so
+                        // future transient errors get a full retry budget.
                         if made_progress {
                             backoff_session = retry_policy.make_session();
                         }
