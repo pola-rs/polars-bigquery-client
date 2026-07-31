@@ -57,7 +57,15 @@ fn read_rows_response_to_record_batch(
 
     let mut serialized_record_batch = match response.rows {
         Some(read_rows_response::Rows::ArrowRecordBatch(value)) => value.serialized_record_batch,
-        None => return Ok(None),
+        None => {
+            if row_count != 0 {
+                return Err(BigQueryError::Protocol(format!(
+                    "Row count mismatch: gRPC protobuf reported {} rows, rows field didn't included any rows",
+                    row_count
+                )));
+            }
+            return Ok(None)
+        },
         _ => {
             return Err(BigQueryError::Protocol(
                 "Unexpectedly got some format other than arrow bytes".into(),
