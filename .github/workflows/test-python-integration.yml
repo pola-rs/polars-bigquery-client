@@ -18,6 +18,9 @@ on:
       - py-polars-bigquery/**
       - .github/workflows/test-python-integration.yml
 
+permissions:
+  contents: read
+
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
@@ -34,7 +37,11 @@ defaults:
 
 jobs:
   test-python-integration:
+    name: Test Python (Integration)
     runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+      id-token: write # Google Cloud auth
     strategy:
       fail-fast: false
       matrix:
@@ -43,6 +50,8 @@ jobs:
 
     steps:
       - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
       - name: Free some disk space (remove unused packages)
         uses: jlumbroso/free-disk-space@v1.3.1
         if: ${{ matrix.os != 'windows-latest' }}

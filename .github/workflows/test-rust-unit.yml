@@ -10,9 +10,12 @@ on:
     branches:
       - main
     paths:
-      - creates/**
+      - crates/**
       - Cargo.toml
       - .github/workflows/test-rust-unit.yml
+
+permissions:
+  contents: read
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -24,6 +27,7 @@ env:
 
 jobs:
   test:
+    name: Test Rust (Unit)
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
@@ -31,6 +35,8 @@ jobs:
 
     steps:
       - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
 
       - name: Set up Rust
         run: rustup show
@@ -40,8 +46,6 @@ jobs:
         with:
           save-if: ${{ github.ref_name == 'main' }}
 
-      # Note that we specify --lib, --bins etc
-      # to exclude the integration and doc tests.
       - name: Compile tests
         run: cargo test --workspace --exclude py-polars-bigquery --lib --bins --all-features --no-run
 
