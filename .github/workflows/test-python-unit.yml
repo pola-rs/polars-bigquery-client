@@ -70,9 +70,9 @@ jobs:
           BIN: ${{ matrix.os == 'windows-latest' && 'Scripts' || 'bin' }}
         run: |
           python -m venv .venv
-          echo "$GITHUB_WORKSPACE/py-polars-bigquery/.venv/$BIN" >> $GITHUB_PATH
-          echo "VIRTUAL_ENV=$GITHUB_WORKSPACE/py-polars-bigquery/.venv" >> $GITHUB_ENV
-          echo "VENV=$GITHUB_WORKSPACE/py-polars-bigquery/.venv" >> $GITHUB_ENV
+          echo "$GITHUB_WORKSPACE/py-polars-bigquery/.venv/$BIN" >> "$GITHUB_PATH"
+          echo "VIRTUAL_ENV=$GITHUB_WORKSPACE/py-polars-bigquery/.venv" >> "$GITHUB_ENV"
+          echo "VENV=$GITHUB_WORKSPACE/py-polars-bigquery/.venv" >> "$GITHUB_ENV"
 
       - name: Install maturin
         if: matrix.python-version == '3.14t'
