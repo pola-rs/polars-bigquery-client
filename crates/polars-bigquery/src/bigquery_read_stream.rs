@@ -64,7 +64,7 @@ fn read_rows_response_to_record_batch(
                     row_count
                 )));
             }
-            return Ok(None)
+            return Ok(None);
         },
         _ => {
             return Err(BigQueryError::Protocol(
@@ -191,6 +191,8 @@ pub async fn read_stream<B>(
 enum ReadStreamState {
     /// Establishing or resuming the BigQuery read stream at `current_offset`.
     Connecting,
+    /// Waiting for the next message in a BigQuery read stream.
+    Running,
     /// Encountered a transient mid-stream disconnection; backing off before reconnecting.
     BackingOff(gcloud_sdk::tonic::Status),
     /// Stream completed cleanly, fatal error occurred, or consumer dropped the receiver.
@@ -220,51 +222,51 @@ async fn connect_read_rows_stream<C: BigQueryReadClientTrait>(
 
 /// Layer 2: Consumes messages from an established read stream and returns the next [`ReadStreamState`].
 ///
-/// This function represents a state not modeled in ReadStreamState itself
-/// called "Running". As long as we are still in the Ruunning state, we stay in
-/// the loop of this function.
+/// This function represents the "Running" state of ReadStreamState.
 async fn consume_stream_until_disconnection<S: ReadRowsStreamTrait>(
-    mut stream: S,
+    stream: &mut S,
     schema: &[u8],
     current_offset: &mut i64,
     tx: &tokio::sync::mpsc::Sender<Result<RecordBatch, BigQueryError>>,
     made_progress: &mut bool,
 ) -> ReadStreamState {
-    loop {
-        match stream.next_message().await {
-            Ok(Some(value)) => match read_rows_response_to_record_batch(value, schema) {
-                Ok(Some((batch, row_count))) => {
-                    *current_offset += row_count;
-                    *made_progress = true; // Successfully made progress, allow resetting backoff timer
-                    if tx.send(Ok(batch)).await.is_err() {
-                        // `tx.send` returns `Err` strictly when all `Receiver` handles (`rx`) have been
-                        // dropped. This happens when either:
-                        // 1) The consumer aborted reading early (e.g. stopped iteration or dropped receiver), or
-                        // 2) Another concurrent stream sent an `Err(...)` over `tx`, prompting the consumer
-                        //    to raise an exception and drop `rx`.
-                        // In either case, the consumer closed the channel and cannot receive more batches,
-                        // so terminating this stream cleanly prevents orphan background tasks.
-                        return ReadStreamState::Terminated;
-                    }
-                },
-                Ok(None) => {},
-                Err(err) => {
-                    let _ = tx.send(Err(err)).await;
+    match stream.next_message().await {
+        Ok(Some(value)) => match read_rows_response_to_record_batch(value, schema) {
+            Ok(Some((batch, row_count))) => {
+                *current_offset += row_count;
+                *made_progress = true; // Successfully made progress, allow resetting backoff timer
+                if tx.send(Ok(batch)).await.is_err() {
+                    // `tx.send` returns `Err` strictly when all `Receiver` handles (`rx`) have been
+                    // dropped. This happens when either:
+                    // 1) The consumer aborted reading early (e.g. stopped iteration or dropped receiver), or
+                    // 2) Another concurrent stream sent an `Err(...)` over `tx`, prompting the consumer
+                    //    to raise an exception and drop `rx`.
+                    // In either case, the consumer closed the channel and cannot receive more batches,
+                    // so terminating this stream cleanly prevents orphan background tasks.
                     return ReadStreamState::Terminated;
-                },
-            },
-            Ok(None) => {
-                return ReadStreamState::Terminated;
-            },
-            Err(status) => {
-                if bigquery_read_retry::reconnect_stream_predicate(&status) {
-                    return ReadStreamState::BackingOff(status);
                 } else {
-                    let _ = tx.send(Err(BigQueryError::Grpc(status))).await;
-                    return ReadStreamState::Terminated;
+                    return ReadStreamState::Running;
                 }
             },
-        }
+            Ok(None) => {
+                return ReadStreamState::Running;
+            },
+            Err(err) => {
+                let _ = tx.send(Err(err)).await;
+                return ReadStreamState::Terminated;
+            },
+        },
+        Ok(None) => {
+            return ReadStreamState::Terminated;
+        },
+        Err(status) => {
+            if bigquery_read_retry::reconnect_stream_predicate(&status) {
+                return ReadStreamState::BackingOff(status);
+            } else {
+                let _ = tx.send(Err(BigQueryError::Grpc(status))).await;
+                return ReadStreamState::Terminated;
+            }
+        },
     }
 }
 
@@ -298,15 +300,31 @@ pub(crate) async fn read_stream_inner<C, P, R>(
     let mut current_offset = 0i64;
     let mut backoff_session = retry_policy.make_session();
     let mut state = ReadStreamState::Connecting;
+    let mut stream: Option<C::Stream> = None;
+    let mut made_progress = false;
 
     while !matches!(state, ReadStreamState::Terminated) {
         state = match state {
             ReadStreamState::Connecting => {
-                match connect_read_rows_stream(read_client, &stream_name, current_offset).await {
-                    Ok(stream) => {
-                        let mut made_progress = false;
+                let connection =
+                    connect_read_rows_stream(read_client, &stream_name, current_offset).await;
+                match connection {
+                    Ok(inner_stream) => {
+                        stream = Some(inner_stream);
+                        made_progress = false;
+                        ReadStreamState::Running
+                    },
+                    Err(status) => {
+                        let _ = tx.send(Err(BigQueryError::Grpc(status))).await;
+                        ReadStreamState::Terminated
+                    },
+                }
+            },
+            ReadStreamState::Running => {
+                match stream {
+                    Some(ref mut inner_stream) => {
                         let next_state = consume_stream_until_disconnection(
-                            stream,
+                            inner_stream,
                             &schema,
                             &mut current_offset,
                             &tx,
@@ -320,8 +338,13 @@ pub(crate) async fn read_stream_inner<C, P, R>(
                         }
                         next_state
                     },
-                    Err(status) => {
-                        let _ = tx.send(Err(BigQueryError::Grpc(status))).await;
+                    None => {
+                        let _ = tx
+                            .send(Err(BigQueryError::Other(
+                                format!("Tried to read from {} but not connected", stream_name)
+                                    .into(),
+                            )))
+                            .await;
                         ReadStreamState::Terminated
                     },
                 }
