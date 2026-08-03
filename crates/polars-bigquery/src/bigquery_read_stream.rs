@@ -10,10 +10,10 @@
 //! ```text
 //! ┌─ read_stream_inner ─────────────────────────────────────────────────┐
 //! │              ┌──►──┐                                                │
-//! │   Recieve valid message                                             │
+//! │   Receive valid message                                             │
 //! │  including empty/waiting                                            │
 //! │          ┌───┼─────▼────┐                                           │
-//! │ consume_stream_until_disconnected ◄───────────────┐                 │
+//! │        consume_next_message ◄─────────────────────┐                 │
 //! │  ┌───────┼   Running    │                         │                 │
 //! │  │       └───────┬──────┘                     ReadRows              │
 //! │  │    Recoverable│error                        success              │
@@ -220,21 +220,19 @@ async fn connect_read_rows_stream<C: BigQueryReadClientTrait>(
         .await
 }
 
-/// Layer 2: Consumes messages from an established read stream and returns the next [`ReadStreamState`].
+/// Layer 2: Consumes a single message from an established read stream and returns the next [`ReadStreamState`].
 ///
-/// This function represents the "Running" state of ReadStreamState.
-async fn consume_stream_until_disconnection<S: ReadRowsStreamTrait>(
+/// Processes the next message from an active read stream while in [`ReadStreamState::Running`].
+async fn consume_next_message<S: ReadRowsStreamTrait>(
     stream: &mut S,
     schema: &[u8],
     current_offset: &mut i64,
     tx: &tokio::sync::mpsc::Sender<Result<RecordBatch, BigQueryError>>,
-    made_progress: &mut bool,
 ) -> ReadStreamState {
     match stream.next_message().await {
         Ok(Some(value)) => match read_rows_response_to_record_batch(value, schema) {
             Ok(Some((batch, row_count))) => {
                 *current_offset += row_count;
-                *made_progress = true; // Successfully made progress, allow resetting backoff timer
                 if tx.send(Ok(batch)).await.is_err() {
                     // `tx.send` returns `Err` strictly when all `Receiver` handles (`rx`) have been
                     // dropped. This happens when either:
@@ -243,28 +241,24 @@ async fn consume_stream_until_disconnection<S: ReadRowsStreamTrait>(
                     //    to raise an exception and drop `rx`.
                     // In either case, the consumer closed the channel and cannot receive more batches,
                     // so terminating this stream cleanly prevents orphan background tasks.
-                    return ReadStreamState::Terminated;
+                    ReadStreamState::Terminated
                 } else {
-                    return ReadStreamState::Running;
+                    ReadStreamState::Running
                 }
             },
-            Ok(None) => {
-                return ReadStreamState::Running;
-            },
+            Ok(None) => ReadStreamState::Running,
             Err(err) => {
                 let _ = tx.send(Err(err)).await;
-                return ReadStreamState::Terminated;
+                ReadStreamState::Terminated
             },
         },
-        Ok(None) => {
-            return ReadStreamState::Terminated;
-        },
+        Ok(None) => ReadStreamState::Terminated,
         Err(status) => {
             if bigquery_read_retry::reconnect_stream_predicate(&status) {
-                return ReadStreamState::BackingOff(status);
+                ReadStreamState::BackingOff(status)
             } else {
                 let _ = tx.send(Err(BigQueryError::Grpc(status))).await;
-                return ReadStreamState::Terminated;
+                ReadStreamState::Terminated
             }
         },
     }
@@ -301,7 +295,6 @@ pub(crate) async fn read_stream_inner<C, P, R>(
     let mut backoff_session = retry_policy.make_session();
     let mut state = ReadStreamState::Connecting;
     let mut stream: Option<C::Stream> = None;
-    let mut made_progress = false;
 
     while !matches!(state, ReadStreamState::Terminated) {
         state = match state {
@@ -311,7 +304,6 @@ pub(crate) async fn read_stream_inner<C, P, R>(
                 match connection {
                     Ok(inner_stream) => {
                         stream = Some(inner_stream);
-                        made_progress = false;
                         ReadStreamState::Running
                     },
                     Err(status) => {
@@ -323,17 +315,13 @@ pub(crate) async fn read_stream_inner<C, P, R>(
             ReadStreamState::Running => {
                 match stream {
                     Some(ref mut inner_stream) => {
-                        let next_state = consume_stream_until_disconnection(
-                            inner_stream,
-                            &schema,
-                            &mut current_offset,
-                            &tx,
-                            &mut made_progress,
-                        )
-                        .await;
+                        let prev_offset = current_offset;
+                        let next_state =
+                            consume_next_message(inner_stream, &schema, &mut current_offset, &tx)
+                                .await;
                         // Reset backoff state after making data progress so
                         // future transient errors get a full retry budget.
-                        if made_progress {
+                        if current_offset > prev_offset {
                             backoff_session = retry_policy.make_session();
                         }
                         next_state

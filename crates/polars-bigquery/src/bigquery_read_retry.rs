@@ -307,8 +307,8 @@ pub fn reconnect_stream_predicate(err: &tonic::Status) -> bool {
 
 /// Retry configuration policy for mid-stream read_rows reconnections.
 ///
-/// Important! If data progress is made (`made_progress == true`), the session
-/// must be reset reset to grant a fresh 10-attempt allowance.
+/// Important! If data progress is made (`current_offset > prev_offset`), the session
+/// must be reset to grant a fresh 10-attempt allowance.
 ///
 /// ### Parameters
 /// - `min_delay` (100ms): Starts with a short initial backoff to quickly recover from brief network blips.
