@@ -1,0 +1,24 @@
+name: Lint Actions
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    paths:
+      - '.github/workflows/**'
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: actionlint
+        run: |
+          bash <(curl https://raw.githubusercontent.com/rhysd/actionlint/main/scripts/download-actionlint.bash)
+          ./actionlint -color
+
+      - name: zizmor
+        uses: zizmorcore/zizmor-action@v0.6.2
+        with:
+          advanced-security: false
