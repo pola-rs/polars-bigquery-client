@@ -19,7 +19,7 @@ jobs:
         os: [ubuntu-latest, windows-latest, macos-latest]
 
     steps:
-      - uses: actions/checkout@v4.1.7
+      - uses: actions/checkout@v4
         with:
           persist-credentials: false
 
@@ -28,10 +28,10 @@ jobs:
         with:
           package-dir: py-polars-bigquery
         env:
-          CIBW_SKIP: pp*
+          CIBW_SKIP: pp* *i686 *-win32
 
       - name: Upload artifacts
-        uses: actions/upload-artifact@v4.3.3
+        uses: actions/upload-artifact@v4
         with:
           name: cibw-wheels-${{ matrix.os }}-${{ strategy.job-index }}
           path: ./wheelhouse/*.whl
