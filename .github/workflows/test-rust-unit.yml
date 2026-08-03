@@ -47,6 +47,7 @@ jobs:
           save-if: ${{ github.ref_name == 'main' }}
 
       - name: Compile tests
+        # Specify --lib and --bins to exclude the integration and doc tests.
         run: cargo test --workspace --exclude py-polars-bigquery --lib --bins --all-features --no-run
 
       - name: Run tests
