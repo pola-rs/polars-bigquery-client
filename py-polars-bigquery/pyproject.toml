@@ -39,6 +39,9 @@ test = [
 ]
 
 [tool.cibuildwheel]
+skip = "pp*"
+
+[tool.cibuildwheel.linux]
 before-all = """
 if [ -f /etc/alpine-release ]; then \
     apk add --no-cache openssl-dev pkgconfig; \
