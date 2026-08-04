@@ -24,12 +24,11 @@ jobs:
           persist-credentials: false
 
       - name: Build wheels
-        uses: pypa/cibuildwheel@v2.22.0
+        uses: pypa/cibuildwheel@v4.1.1
         with:
           package-dir: py-polars-bigquery
         env:
-          CIBW_SKIP: pp* *i686 *-win32
-          CIBW_BUILD_FRONTEND: build
+          CIBW_SKIP: pp* *i686 *-win32 *musllinux*
           CIBW_MANYLINUX_X86_64_IMAGE: manylinux_2_28
           CIBW_MANYLINUX_AARCH64_IMAGE: manylinux_2_28
 
