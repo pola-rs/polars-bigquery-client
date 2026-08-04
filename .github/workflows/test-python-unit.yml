@@ -32,8 +32,12 @@ defaults:
     working-directory: py-polars-bigquery
     shell: bash
 
+permissions:
+  contents: read
+
 jobs:
   test-python:
+    name: Test Python (Unit)
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -47,10 +51,12 @@ jobs:
             python-version: '3.14'
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 #v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Free some disk space (remove unused packages)
-        uses: jlumbroso/free-disk-space@v1.3.1
+        uses: endersonmenezes/free-disk-space@7901478139cff6e9d44df5972fd8ab8fcade4db1 #v3.2.2
         if: ${{ matrix.os != 'windows-latest' }}
 
       - name: Enable long paths on Windows
@@ -61,7 +67,7 @@ jobs:
           Set-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\FileSystem' -Name 'LongPathsEnabled' -Value 1
 
       - name: Set up Python
-        uses: actions/setup-python@v6
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 #v7.0.0
         with:
           python-version: ${{ matrix.python-version }}
 
@@ -70,9 +76,9 @@ jobs:
           BIN: ${{ matrix.os == 'windows-latest' && 'Scripts' || 'bin' }}
         run: |
           python -m venv .venv
-          echo "$GITHUB_WORKSPACE/py-polars-bigquery/.venv/$BIN" >> $GITHUB_PATH
-          echo "VIRTUAL_ENV=$GITHUB_WORKSPACE/py-polars-bigquery/.venv" >> $GITHUB_ENV
-          echo "VENV=$GITHUB_WORKSPACE/py-polars-bigquery/.venv" >> $GITHUB_ENV
+          echo "$GITHUB_WORKSPACE/py-polars-bigquery/.venv/$BIN" >> "$GITHUB_PATH"
+          echo "VIRTUAL_ENV=$GITHUB_WORKSPACE/py-polars-bigquery/.venv" >> "$GITHUB_ENV"
+          echo "VENV=$GITHUB_WORKSPACE/py-polars-bigquery/.venv" >> "$GITHUB_ENV"
 
       - name: Install maturin
         if: matrix.python-version == '3.14t'
@@ -81,9 +87,11 @@ jobs:
           uv pip install maturin
 
       - name: Install Python dependencies
+        env:
+          PYTHON_VERSION: ${{ matrix.python-version }}
         run: |
           pip install uv
-          if [ "${{ matrix.python-version }}" = "3.10" ]; then
+          if [ "$PYTHON_VERSION" = "3.10" ]; then
             uv sync --resolution lowest --no-install-project --group test --no-dev
           else
             # Install typing-extensions separately whilst the `--extra-index-url` in `requirements-ci.txt`
@@ -96,7 +104,7 @@ jobs:
         run: rustup show
 
       - name: Cache Rust
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 #v2.9.1
         with:
           workspaces: py-polars-bigquery
           save-if: ${{ github.ref_name == 'main' }}
