@@ -29,6 +29,9 @@ jobs:
           package-dir: py-polars-bigquery
         env:
           CIBW_SKIP: pp* *i686 *-win32
+          CIBW_BUILD_FRONTEND: build
+          CIBW_MANYLINUX_X86_64_IMAGE: manylinux_2_28
+          CIBW_MANYLINUX_AARCH64_IMAGE: manylinux_2_28
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4.3.3
