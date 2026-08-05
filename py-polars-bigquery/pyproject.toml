@@ -39,7 +39,7 @@ test = [
 ]
 
 [tool.cibuildwheel]
-skip = "pp* *i686 *-win32 *musllinux*"
+skip = "pp* *i686 *-win32"
 
 [tool.cibuildwheel.linux]
 before-all = """
