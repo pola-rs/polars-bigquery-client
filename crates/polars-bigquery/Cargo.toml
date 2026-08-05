@@ -6,6 +6,10 @@ edition = "2021"
 [dependencies]
 tower = { version = "0.5", features = ["retry"] }
 chrono = "0.4"
+# Using `default-features = false` and `tls-webpki-roots` forces gcloud-sdk to use rustls instead of native-tls.
+# This prevents openssl-sys from trying to link against a system OpenSSL library, which is notoriously
+# problematic when building musllinux wheels. rustls is a pure-Rust implementation, which compiles
+# easily for musl targets.
 gcloud-sdk = { version = "0.30.0", default-features = false, features = ["google-cloud-bigquery-storage-v1", "tls-webpki-roots"] }
 hyper = "1.0"
 polars-arrow = { version = "0.53.0", default-features = false, features = ["io_ipc"] }
