@@ -240,7 +240,7 @@ impl ArrowStreamExporter {
 /// * `credentials_provider` - A Python callable that returns Google OAuth2 credentials.
 /// * `user_agent` - An optional user agent extension to append to the client header.
 #[pyfunction]
-pub fn read_bigquery(
+pub fn read_bigquery_table(
     table: &str,
     quota_project_id: &str,
     maintain_order: bool,
@@ -387,7 +387,7 @@ fn polars_bigquery(m: &Bound<PyModule>) -> PyResult<()> {
         // ignore if another crate already set the default provider.
     });
 
-    m.add_wrapped(wrap_pyfunction!(read_bigquery)).unwrap();
+    m.add_wrapped(wrap_pyfunction!(read_bigquery_table)).unwrap();
     m.add_wrapped(wrap_pyfunction!(_create_test_exporter))
         .unwrap();
     m.add_wrapped(wrap_pyfunction!(_test_create_exporter_with_drop_flag))
