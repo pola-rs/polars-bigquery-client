@@ -1,10 +1,6 @@
 name: Build Wheels
 
 on:
-  push:
-    branches:
-      - main
-  pull_request:
   schedule:
     - cron: '0 0 * * *'
 
@@ -22,17 +18,13 @@ jobs:
           persist-credentials: false
       - id: check
         run: |
-          if [ "${{ github.event_name }}" != "schedule" ]; then
+          LATEST_COMMIT_TIME=$(git log -1 --format=%ct)
+          CURRENT_TIME=$(date +%s)
+          DIFF=$((CURRENT_TIME - LATEST_COMMIT_TIME))
+          if [ "$DIFF" -le 86400 ]; then
             echo "should_run=true" >> "$GITHUB_OUTPUT"
           else
-            LATEST_COMMIT_TIME=$(git log -1 --format=%ct)
-            CURRENT_TIME=$(date +%s)
-            DIFF=$((CURRENT_TIME - LATEST_COMMIT_TIME))
-            if [ "$DIFF" -le 86400 ]; then
-              echo "should_run=true" >> "$GITHUB_OUTPUT"
-            else
-              echo "should_run=false" >> "$GITHUB_OUTPUT"
-            fi
+            echo "should_run=false" >> "$GITHUB_OUTPUT"
           fi
 
   build_wheels:
