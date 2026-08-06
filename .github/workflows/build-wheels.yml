@@ -5,12 +5,39 @@ on:
     branches:
       - main
   pull_request:
+  schedule:
+    - cron: '0 0 * * *'
 
 permissions:
   contents: read
 
 jobs:
+  check_commits:
+    runs-on: ubuntu-latest
+    outputs:
+      should_run: ${{ steps.check.outputs.should_run }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - id: check
+        run: |
+          if [ "${{ github.event_name }}" != "schedule" ]; then
+            echo "should_run=true" >> "$GITHUB_OUTPUT"
+          else
+            LATEST_COMMIT_TIME=$(git log -1 --format=%ct)
+            CURRENT_TIME=$(date +%s)
+            DIFF=$((CURRENT_TIME - LATEST_COMMIT_TIME))
+            if [ "$DIFF" -le 86400 ]; then
+              echo "should_run=true" >> "$GITHUB_OUTPUT"
+            else
+              echo "should_run=false" >> "$GITHUB_OUTPUT"
+            fi
+          fi
+
   build_wheels:
+    needs: check_commits
+    if: needs.check_commits.outputs.should_run == 'true'
     name: Build wheels on ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
     strategy:
