@@ -1,13 +1,13 @@
 from unittest.mock import patch, MagicMock, ANY
 import polars as pl
 import pytest
-from polars_bigquery import read_bigquery, read_bigquery_query
+from polars_bigquery import read_bigquery_table, read_bigquery_query
 from polars_bigquery._read_bigquery import _parse_table_id
 
 
 @pytest.fixture
 def mock_rust_read():
-    with patch("polars_bigquery.polars_bigquery.read_bigquery") as mocked:
+    with patch("polars_bigquery.polars_bigquery.read_bigquery_table") as mocked:
         yield mocked
 
 
@@ -53,7 +53,7 @@ def test_read_bigquery_calls_rust_with_parsed_id(mock_rust_read):
     mock_rust_read.return_value = mock_df
 
     # Execute
-    result = read_bigquery(table="my-project.my_dataset.my_table", quota_project_id="q")
+    result = read_bigquery_table(table="my-project.my_dataset.my_table", quota_project_id="q")
 
     # Assert
     mock_rust_read.assert_called_once_with(
@@ -113,7 +113,7 @@ def test_read_bigquery_handles_bigquery_objects(mock_rust_read):
     mock_ref.table_id = "t"
 
     # Execute
-    read_bigquery(table=mock_ref, quota_project_id="q")
+    read_bigquery_table(table=mock_ref, quota_project_id="q")
 
     # Assert
     mock_rust_read.assert_called_once_with("p.d.t", "q", False, ANY, None)
@@ -125,7 +125,7 @@ def test_read_bigquery_propagates_errors(mock_rust_read):
 
     # Execute & Assert
     with pytest.raises(Exception, match="Rust error"):
-        read_bigquery(table="p.d.t", quota_project_id="q")
+        read_bigquery_table(table="p.d.t", quota_project_id="q")
 
 
 def test_read_bigquery_with_user_agent(mock_rust_read):
@@ -133,7 +133,7 @@ def test_read_bigquery_with_user_agent(mock_rust_read):
     mock_rust_read.return_value = pl.DataFrame()
 
     # Execute
-    read_bigquery(
+    read_bigquery_table(
         table="p.d.t", quota_project_id="q", user_agent="custom-extension/1.0"
     )
 
