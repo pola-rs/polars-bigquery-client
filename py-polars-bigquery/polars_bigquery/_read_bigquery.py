@@ -82,3 +82,21 @@ def read_bigquery_query(
         table_ref, quota_project_id, maintain_order, credentials_provider, user_agent
     )
     return pl.DataFrame(res)
+
+
+def scan_bigquery_table(
+    table: str,
+    *,
+    quota_project_id: str,
+    credentials_provider: pl.CredentialProviderGCP | None = None,
+    maintain_order: bool = False,
+    user_agent: str | None = None,
+) -> pl.LazyFrame:
+    if not credentials_provider:
+        credentials_provider = _get_default_provider(quota_project_id)
+
+    table_ref = _parse_table_id(table)
+    res = polars_bigquery.read_bigquery_table(
+        table_ref, quota_project_id, maintain_order, credentials_provider, user_agent
+    )
+    return pl.DataFrame(res)
