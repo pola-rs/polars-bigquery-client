@@ -13,13 +13,14 @@ classifiers = [
 ]
 dependencies = [
     "google-auth >= 2.40.3",
-    "polars >= 1.14.0, < 2.0.0",
+    "polars >= 1.43.0, < 2.0.0",
     "requests >= 2.33.0, < 3.0.0",
     "cachetools >= 5.0.0",
 ]
 
 [dependency-groups]
 dev = [
+    "ipython>=8.39.0",
     "maturin>=1.13.1; platform_system != 'Linux'",
     "maturin[patchelf]>=1.13.1; platform_system == 'Linux'",
     "nodeenv>=1.9.1",

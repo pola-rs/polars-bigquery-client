@@ -89,7 +89,6 @@ def scan_bigquery_table(
     *,
     quota_project_id: str,
     credentials_provider: pl.CredentialProviderGCP | None = None,
-    maintain_order: bool = False,
     user_agent: str | None = None,
 ) -> pl.LazyFrame:
     if not credentials_provider:
@@ -97,6 +96,10 @@ def scan_bigquery_table(
 
     table_ref = _parse_table_id(table)
     res = polars_bigquery.read_bigquery_table(
-        table_ref, quota_project_id, maintain_order, credentials_provider, user_agent
+        table_ref,
+        quota_project_id,
+        False,  # maintain_order
+        credentials_provider,
+        user_agent
     )
-    return pl.DataFrame(res)
+    return pl.scan_arrow_c_stream(res)
