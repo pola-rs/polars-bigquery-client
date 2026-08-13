@@ -6,10 +6,6 @@ import pytest
 import polars_bigquery
 
 
-TABLE_IDS = [
-]
-
-
 @pytest.mark.benchmark(min_rounds=10, warmup=True)
 def test_scan_bigquery_public_data(benchmark):
     project = os.environ["GOOGLE_CLOUD_PROJECT"]
