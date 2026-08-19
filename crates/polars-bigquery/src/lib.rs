@@ -38,9 +38,10 @@ impl GoogleApiClientBuilder<BigQueryReadClient<GoogleAuthMiddleware>>
 
 pub struct PolarsBigQueryClientBuilder {
     max_decoding_message_size: usize,
-    token_source_type: TokenSourceType,
+    token_source: gcloud_sdk::TokenSourceType,
     scopes: Vec<String>,
     user_agent: Option<String>,
+    bigquery_storage_endpoint: String,
 }
 
 impl Default for PolarsBigQueryClientBuilder {
@@ -53,9 +54,11 @@ impl PolarsBigQueryClientBuilder {
     pub fn new() -> Self {
         Self {
             max_decoding_message_size: 128 * 1024 * 1024, // 128MB default
-            token_source_type: TokenSourceType::Default,
-            scopes: vec!["https://www.googleapis.com/auth/cloud-platform".to_string()],
+            token_source: gcloud_sdk::TokenSourceType::Default,
+            scopes: vec!["https://www.googleapis.com/auth/cloud-platform".to_owned()],
             user_agent: None,
+            bigquery_storage_endpoint:
+            "https://bigquerystorage.googleapis.com".to_owned(),
         }
     }
 
@@ -65,7 +68,7 @@ impl PolarsBigQueryClientBuilder {
     }
 
     pub fn with_token_source(mut self, token_source: TokenSourceType) -> Self {
-        self.token_source_type = token_source;
+        self.token_source = token_source;
         self
     }
 
@@ -104,7 +107,7 @@ impl PolarsBigQueryClientBuilder {
             builder,
             "https://bigquerystorage.googleapis.com",
             None,
-            self.token_source_type,
+            self.token_source,
             self.scopes,
             headers,
         )
