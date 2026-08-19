@@ -108,12 +108,14 @@ def scan_bigquery_table(
     if not credentials_provider:
         credentials_provider = _get_default_provider(quota_project_id)
 
+    user_agent = _get_user_agent(user_agent)
+
     table_ref = _parse_table_id(table)
-    res = polars_bigquery.read_bigquery_table(
+    res = polars_bigquery.polars_bigquery.read_bigquery_table(
         table_ref,
         quota_project_id,
         False,  # maintain_order
         credentials_provider,
-        user_agent
+        user_agent,
     )
     return pl.scan_arrow_c_stream(res)
