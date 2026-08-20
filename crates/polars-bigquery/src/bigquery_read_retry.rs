@@ -61,7 +61,7 @@ impl<R: Rng> BackoffSession<R> {
     }
 
     /// Calculate next backoff duration (base + jitter).
-    pub fn compute_next_delay(&mut self) -> Duration {
+    fn compute_next_delay(&mut self) -> Duration {
         let base = self.base_delay();
         let jitter = self.jitter_delay(base);
         base + jitter
@@ -69,7 +69,7 @@ impl<R: Rng> BackoffSession<R> {
 
     /// Calculate and return the next delay if retries are not exhausted by limits.
     /// Increments `attempts` and updates session start time if applicable.
-    pub fn advance_delay(&mut self) -> Option<Duration> {
+    fn advance_delay(&mut self) -> Option<Duration> {
         if let Some(max_times) = self.max_times {
             if self.attempts >= max_times {
                 return None;
