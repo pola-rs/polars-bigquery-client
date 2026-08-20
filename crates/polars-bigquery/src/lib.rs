@@ -1,8 +1,11 @@
 mod bigquery_read_retry;
 mod bigquery_read_stream;
+pub mod client_builder;
 mod error;
 
-use crate::error::BigQueryError;
+pub use client_builder::*;
+pub use error::BigQueryError;
+
 use std::io::Cursor;
 use std::sync::Arc;
 
@@ -10,112 +13,11 @@ use gcloud_sdk::google::cloud::bigquery::storage::v1::big_query_read_client::Big
 use gcloud_sdk::google::cloud::bigquery::storage::v1::{
     read_session, CreateReadSessionRequest, DataFormat, ReadSession,
 };
-use gcloud_sdk::tonic::async_trait;
-use gcloud_sdk::*;
-use hyper::header::{HeaderValue, USER_AGENT};
-use hyper::HeaderMap;
+use gcloud_sdk::{GoogleApiClient, GoogleApiClientBuilder, GoogleAuthMiddleware};
 use polars_arrow::datatypes::ArrowSchemaRef;
 use polars_arrow::io::ipc::read::read_stream_metadata;
 use polars_arrow::record_batch::RecordBatch;
 use tower::ServiceExt;
-
-#[derive(Clone)]
-pub struct BigQueryReadClientBuilder {
-    max_decoding_message_size: usize,
-}
-
-#[async_trait]
-impl GoogleApiClientBuilder<BigQueryReadClient<GoogleAuthMiddleware>>
-    for BigQueryReadClientBuilder
-{
-    fn create_client(
-        &self,
-        channel: GoogleAuthMiddleware,
-    ) -> BigQueryReadClient<GoogleAuthMiddleware> {
-        BigQueryReadClient::new(channel).max_decoding_message_size(self.max_decoding_message_size)
-    }
-}
-
-pub struct PolarsBigQueryClientBuilder {
-    max_decoding_message_size: usize,
-    token_source: gcloud_sdk::TokenSourceType,
-    scopes: Vec<String>,
-    user_agent: Option<String>,
-    bigquery_storage_endpoint: String,
-}
-
-impl Default for PolarsBigQueryClientBuilder {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl PolarsBigQueryClientBuilder {
-    pub fn new() -> Self {
-        Self {
-            max_decoding_message_size: 128 * 1024 * 1024, // 128MB default
-            token_source: gcloud_sdk::TokenSourceType::Default,
-            scopes: vec!["https://www.googleapis.com/auth/cloud-platform".to_owned()],
-            user_agent: None,
-            bigquery_storage_endpoint:
-            "https://bigquerystorage.googleapis.com".to_owned(),
-        }
-    }
-
-    pub fn with_max_decoding_message_size(mut self, size: usize) -> Self {
-        self.max_decoding_message_size = size;
-        self
-    }
-
-    pub fn with_token_source(mut self, token_source: TokenSourceType) -> Self {
-        self.token_source = token_source;
-        self
-    }
-
-    pub fn with_scopes(mut self, scopes: Vec<String>) -> Self {
-        self.scopes = scopes;
-        self
-    }
-
-    pub fn with_user_agent(mut self, extension: String) -> Self {
-        self.user_agent = Some(extension);
-        self
-    }
-
-    pub async fn build(
-        self,
-    ) -> Result<
-        GoogleApiClient<BigQueryReadClientBuilder, BigQueryReadClient<GoogleAuthMiddleware>>,
-        Box<dyn std::error::Error>,
-    > {
-        init_crypto();
-        let builder = BigQueryReadClientBuilder {
-            max_decoding_message_size: self.max_decoding_message_size,
-        };
-
-        // Construct User-Agent header
-        let default_user_agent = format!("polars-bigquery/{}", env!("CARGO_PKG_VERSION"));
-        let user_agent = match self.user_agent {
-            Some(ext) => format!("{} {}", default_user_agent, ext),
-            None => default_user_agent,
-        };
-
-        let mut headers = HeaderMap::new();
-        headers.insert(USER_AGENT, HeaderValue::from_str(&user_agent)?);
-
-        let client = GoogleApiClient::with_token_source_and_headers(
-            builder,
-            "https://bigquerystorage.googleapis.com",
-            None,
-            self.token_source,
-            self.scopes,
-            headers,
-        )
-        .await?;
-
-        Ok(client)
-    }
-}
 
 /// A receiver that yields [`RecordBatch`]es read from BigQuery.
 ///

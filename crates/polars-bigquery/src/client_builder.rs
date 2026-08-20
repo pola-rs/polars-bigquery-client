@@ -3,21 +3,29 @@
 // and
 // https://github.com/googleapis/google-cloud-rust/blob/c2febbabe8f6db5f271aae4dc468b8d95198ce46/src/gax/src/options.rs#L35-L56
 
-struct ServiceConfigBuilder {
-    cred: gcloud_sdk::TokenSourceType,
+use gcloud_sdk::google::cloud::bigquery::storage::v1::big_query_read_client::BigQueryReadClient;
+use gcloud_sdk::tonic::async_trait;
+use gcloud_sdk::{GoogleApiClient, GoogleApiClientBuilder, GoogleAuthMiddleware, TokenSourceType};
+use hyper::header::{HeaderValue, USER_AGENT};
+use hyper::HeaderMap;
+
+const DEFAULT_BQSTORAGE_ENDPOINT: &str = "https://bigquerystorage.googleapis.com";
+const DEFAULT_GCP_SCOPE: &str = "https://www.googleapis.com/auth/cloud-platform";
+pub struct ServiceConfigBuilder {
+    cred: TokenSourceType,
     cred_scopes: Vec<String>,
     endpoint: String,
     user_agent: Option<String>,
 }
 
 impl ServiceConfigBuilder {
-    pub fn with_cred(mut self, cred: gcloud_sdk::TokenSourceType) -> Self {
-        self.cred = Some(cred);
+    pub fn with_cred(mut self, cred: TokenSourceType) -> Self {
+        self.cred = cred;
         self
     }
 
     pub fn with_cred_scopes(mut self, scopes: Vec<String>) -> Self {
-        self.scopes = scopes;
+        self.cred_scopes = scopes;
         self
     }
 
@@ -32,18 +40,97 @@ impl ServiceConfigBuilder {
     }
 }
 
-trait BigQueryReadServiceConfigBuilder {
-    pub fn new() -> ServiceConfigBuilder;
+#[async_trait]
+pub trait BigQueryReadClientBuilder {
+    fn new() -> Self;
+    async fn build(
+        self,
+    ) -> Result<
+        GoogleApiClient<BQStorageGoogleApiClientBuilder, BigQueryReadClient<GoogleAuthMiddleware>>,
+        Box<dyn std::error::Error>,
+    >;
 }
 
-impl BigQueryReadClientBuilder {
-    pub fn new() -> ServiceConfigBuilder {
+#[async_trait]
+impl BigQueryReadClientBuilder for ServiceConfigBuilder {
+    fn new() -> Self {
         ServiceConfigBuilder {
-            cred: gcloud_sdk::TokenSourceType::Default,
-            cred_scopes: vec!["https://www.googleapis.com/auth/cloud-platform".to_owned()],
-            endpoint: "https://bigquerystorage.googleapis.com".to_owned(),
+            cred: TokenSourceType::Default,
+            cred_scopes: vec![DEFAULT_GCP_SCOPE.to_owned()],
+            endpoint: DEFAULT_BQSTORAGE_ENDPOINT.to_owned(),
             user_agent: None,
         }
     }
+
+    async fn build(
+        self,
+    ) -> Result<
+        GoogleApiClient<BQStorageGoogleApiClientBuilder, BigQueryReadClient<GoogleAuthMiddleware>>,
+        Box<dyn std::error::Error>,
+    > {
+        crate::init_crypto();
+        let builder = BQStorageGoogleApiClientBuilder {};
+
+        let mut headers = HeaderMap::new();
+        if let Some(user_agent) = self.user_agent {
+            headers.insert(USER_AGENT, HeaderValue::from_str(&user_agent)?);
+        }
+
+        let client = GoogleApiClient::with_token_source_and_headers(
+            builder,
+            self.endpoint,
+            None, // cloud_resource_prefix
+            self.cred,
+            self.cred_scopes,
+            headers,
+        )
+        .await?;
+
+        Ok(client)
+    }
 }
 
+#[derive(Clone, Debug)]
+pub struct BQStorageGoogleApiClientBuilder;
+
+#[async_trait]
+impl GoogleApiClientBuilder<BigQueryReadClient<GoogleAuthMiddleware>>
+    for BQStorageGoogleApiClientBuilder
+{
+    fn create_client(
+        &self,
+        channel: GoogleAuthMiddleware,
+    ) -> BigQueryReadClient<GoogleAuthMiddleware> {
+        BigQueryReadClient::new(channel).max_decoding_message_size(
+            128 * 1024 * 1024, // 128MB, as recommended by the service team
+        )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_service_config_builder_defaults() {
+        let builder = ServiceConfigBuilder::new();
+        assert_eq!(builder.endpoint, DEFAULT_BQSTORAGE_ENDPOINT);
+        assert_eq!(
+            builder.cred_scopes,
+            vec!["https://www.googleapis.com/auth/cloud-platform"]
+        );
+        assert!(builder.user_agent.is_none());
+    }
+
+    #[test]
+    fn test_service_config_builder_custom() {
+        let builder = ServiceConfigBuilder::new()
+            .with_endpoint("https://custom.endpoint.com".to_string())
+            .with_cred_scopes(vec!["scope1".to_string(), "scope2".to_string()])
+            .with_user_agent(Some("custom-agent/1.0".to_string()));
+
+        assert_eq!(builder.endpoint, "https://custom.endpoint.com");
+        assert_eq!(builder.cred_scopes, vec!["scope1", "scope2"]);
+        assert_eq!(builder.user_agent, Some("custom-agent/1.0".to_string()));
+    }
+}
