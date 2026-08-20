@@ -3,12 +3,11 @@ mod bigquery_read_stream;
 pub mod client_builder;
 mod error;
 
-pub use client_builder::*;
-pub use error::BigQueryError;
-
 use std::io::Cursor;
 use std::sync::Arc;
 
+pub use client_builder::*;
+pub use error::BigQueryError;
 use gcloud_sdk::google::cloud::bigquery::storage::v1::big_query_read_client::BigQueryReadClient;
 use gcloud_sdk::google::cloud::bigquery::storage::v1::{
     read_session, CreateReadSessionRequest, DataFormat, ReadSession,

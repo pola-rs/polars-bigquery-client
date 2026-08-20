@@ -112,7 +112,17 @@ pub struct RetryPolicyBuilder<P, R = HasherRng> {
 
 impl<P, R> RetryPolicyBuilder<P, R> {
     pub fn new() -> Self {
-        Self { min_delay: None, max_delay: None, factor: None, jitter: None, rng: None, predicate: None, max_times: None, max_total_delay: None, session: None }
+        Self {
+            min_delay: None,
+            max_delay: None,
+            factor: None,
+            jitter: None,
+            rng: None,
+            predicate: None,
+            max_times: None,
+            max_total_delay: None,
+            session: None,
+        }
     }
 
     fn check_delay_bounds(self) -> Result<Self, String> {
@@ -130,7 +140,7 @@ impl<P, R> RetryPolicyBuilder<P, R> {
 
     pub fn with_min_delay(mut self, min_delay: Duration) -> Result<Self, String> {
         self.min_delay = Some(min_delay);
-        return self.check_delay_bounds()
+        return self.check_delay_bounds();
     }
 
     pub fn with_max_delay(mut self, max_delay: Duration) -> Result<Self, String> {
@@ -138,7 +148,7 @@ impl<P, R> RetryPolicyBuilder<P, R> {
             return Err("max_delay must be > 0".to_owned());
         }
         self.max_delay = Some(max_delay);
-        return self.check_delay_bounds()
+        return self.check_delay_bounds();
     }
 
     pub fn with_max_times(mut self, max_times: u32) -> Self {
@@ -176,8 +186,8 @@ impl<P, R> RetryPolicyBuilder<P, R> {
         let max_delay = self.max_delay.ok_or("max_delay is required")?;
         let factor = self.factor.ok_or("factor is required")?;
         let jitter = self.jitter.ok_or("jitter is required")?;
-        let rng= self.rng.ok_or("rng is required")?;
-        let predicate= self.predicate.ok_or("predicate is required")?;
+        let rng = self.rng.ok_or("rng is required")?;
+        let predicate = self.predicate.ok_or("predicate is required")?;
         Ok(RetryPolicy {
             min_delay: min_delay,
             max_delay: max_delay,
@@ -316,14 +326,17 @@ pub fn create_read_session_predicate(err: &tonic::Status) -> bool {
 /// https://github.com/googleapis/google-cloud-python/blob/c43caeee34e7c0878766d2806f69016c319697e2/packages/google-cloud-bigquery-storage/google/cloud/bigquery_storage_v1/services/big_query_read/transports/base.py#L148-L162
 pub fn create_read_session_policy() -> RetryPolicy<fn(&tonic::Status) -> bool, HasherRng> {
     RetryPolicyBuilder::new()
-        .with_min_delay(Duration::from_millis(100)).expect("hardcoded value guaranteed to be valid")
-        .with_max_delay(Duration::from_secs(60)).expect("hardcoded value guaranteed to be valid")
+        .with_min_delay(Duration::from_millis(100))
+        .expect("hardcoded value guaranteed to be valid")
+        .with_max_delay(Duration::from_secs(60))
+        .expect("hardcoded value guaranteed to be valid")
         .with_factor(1.3)
         .with_jitter(0.2)
         .with_rng(HasherRng::default())
         .with_predicate(create_read_session_predicate as fn(&tonic::Status) -> bool)
         .with_total_delay(Duration::from_secs(600))
-        .build().expect("hardcoded value guaranteed to be valid")
+        .build()
+        .expect("hardcoded value guaranteed to be valid")
 }
 
 /// When to retry read_rows requests.
@@ -345,14 +358,17 @@ pub fn read_rows_predicate(err: &tonic::Status) -> bool {
 /// https://github.com/googleapis/google-cloud-python/blob/c43caeee34e7c0878766d2806f69016c319697e2/packages/google-cloud-bigquery-storage/google/cloud/bigquery_storage_v1/services/big_query_read/transports/base.py#L163-L176
 pub fn read_rows_policy() -> RetryPolicy<fn(&tonic::Status) -> bool, HasherRng> {
     RetryPolicyBuilder::new()
-        .with_min_delay(Duration::from_millis(100)).expect("hardcoded value guaranteed to be valid")
-        .with_max_delay(Duration::from_secs(60)).expect("hardcoded value guaranteed to be valid")
+        .with_min_delay(Duration::from_millis(100))
+        .expect("hardcoded value guaranteed to be valid")
+        .with_max_delay(Duration::from_secs(60))
+        .expect("hardcoded value guaranteed to be valid")
         .with_factor(1.3)
         .with_jitter(0.2)
         .with_rng(HasherRng::default())
         .with_predicate(read_rows_predicate as fn(&tonic::Status) -> bool)
         .with_total_delay(Duration::from_secs(900))
-        .build().expect("hardcoded value guaranteed to be valid")
+        .build()
+        .expect("hardcoded value guaranteed to be valid")
 }
 
 /// When to reconnect/resume an active read_rows stream after encountering a gRPC error mid-read.
@@ -375,14 +391,17 @@ pub fn reconnect_stream_predicate(err: &tonic::Status) -> bool {
 /// - `with_max_times` (10): Limits total consecutive failed reconnection attempts when no data progress is made.
 pub fn stream_reconnect_policy() -> RetryPolicy<fn(&tonic::Status) -> bool, HasherRng> {
     RetryPolicyBuilder::new()
-        .with_min_delay(Duration::from_millis(100)).expect("hardcoded value guaranteed to be valid")
-        .with_max_delay(Duration::from_secs(60)).expect("hardcoded value guaranteed to be valid")
+        .with_min_delay(Duration::from_millis(100))
+        .expect("hardcoded value guaranteed to be valid")
+        .with_max_delay(Duration::from_secs(60))
+        .expect("hardcoded value guaranteed to be valid")
         .with_factor(1.3)
         .with_jitter(0.2)
         .with_rng(HasherRng::default())
         .with_predicate(reconnect_stream_predicate as fn(&tonic::Status) -> bool)
         .with_max_times(10)
-        .build().expect("hardcoded value guaranteed to be valid")
+        .build()
+        .expect("hardcoded value guaranteed to be valid")
 }
 
 #[cfg(test)]
@@ -458,15 +477,18 @@ mod tests {
 
     #[tokio::test]
     async fn test_retry_policy_max_times() {
-        let policy = RetryPolicy::new(
-            Duration::from_millis(1),
-            Duration::from_millis(1),
-            1.3,
-            0.0,
-            HasherRng::default(),
-            |_: &Status| true,
-        )
-        .with_max_times(2);
+        let policy = RetryPolicyBuilder::new()
+            .with_min_delay(Duration::from_millis(1))
+            .expect("hardcoded value guaranteed to be valid")
+            .with_max_delay(Duration::from_millis(1))
+            .expect("hardcoded value guaranteed to be valid")
+            .with_factor(1.3)
+            .with_jitter(0.0)
+            .with_rng(HasherRng::default())
+            .with_predicate(|_: &Status| true)
+            .with_max_times(2)
+            .build()
+            .expect("hardcoded value guaranteed to be valid");
 
         let mut session = policy.make_session();
         assert!(session.next_delay().await);
@@ -476,14 +498,17 @@ mod tests {
 
     #[test]
     fn test_backoff_factor_growth() {
-        let policy = RetryPolicy::new(
-            Duration::from_millis(100),
-            Duration::from_secs(60),
-            1.3,
-            0.0, // no jitter for deterministic check
-            HasherRng::default(),
-            |_: &Status| true,
-        );
+        let policy = RetryPolicyBuilder::new()
+            .with_min_delay(Duration::from_millis(100))
+            .expect("hardcoded value guaranteed to be valid")
+            .with_max_delay(Duration::from_secs(60))
+            .expect("hardcoded value guaranteed to be valid")
+            .with_factor(1.3)
+            .with_jitter(0.0) // no jitter for deterministic check
+            .with_rng(HasherRng::default())
+            .with_predicate(|_: &Status| true)
+            .build()
+            .expect("hardcoded value guaranteed to be valid");
         let mut session = policy.make_session();
         assert_eq!(session.compute_next_delay(), Duration::from_millis(100)); // 100 * 1.3^0
         session.attempts += 1;
@@ -494,14 +519,17 @@ mod tests {
 
     #[test]
     fn test_backoff_overflow_safety() {
-        let policy = RetryPolicy::new(
-            Duration::from_millis(100),
-            Duration::from_secs(60),
-            1.3,
-            0.0,
-            HasherRng::default(),
-            |_: &Status| true,
-        );
+        let policy = RetryPolicyBuilder::new()
+            .with_min_delay(Duration::from_millis(100))
+            .expect("hardcoded value guaranteed to be valid")
+            .with_max_delay(Duration::from_secs(60))
+            .expect("hardcoded value guaranteed to be valid")
+            .with_factor(1.3)
+            .with_jitter(0.0)
+            .with_rng(HasherRng::default())
+            .with_predicate(|_: &Status| true)
+            .build()
+            .expect("hardcoded value guaranteed to be valid");
         let mut session = policy.make_session();
         session.attempts = 1000; // 1.3^1000 is infinity in f64
         assert_eq!(session.compute_next_delay(), Duration::from_secs(60));
@@ -509,14 +537,17 @@ mod tests {
 
     #[tokio::test]
     async fn test_retry_policy_session_reset_on_ok() {
-        let mut policy = RetryPolicy::new(
-            Duration::from_millis(1),
-            Duration::from_secs(60),
-            1.3,
-            0.0,
-            HasherRng::default(),
-            |_: &Status| true,
-        );
+        let mut policy = RetryPolicyBuilder::new()
+            .with_min_delay(Duration::from_millis(1))
+            .expect("hardcoded value guaranteed to be valid")
+            .with_max_delay(Duration::from_secs(60))
+            .expect("hardcoded value guaranteed to be valid")
+            .with_factor(1.3)
+            .with_jitter(0.0)
+            .with_rng(HasherRng::default())
+            .with_predicate(|_: &Status| true)
+            .build()
+            .expect("hardcoded value guaranteed to be valid");
 
         let mut req = ();
         let mut err_res: Result<(), Status> = Err(Status::unavailable("transient"));

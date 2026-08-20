@@ -383,7 +383,8 @@ fn polars_bigquery(m: &Bound<PyModule>) -> PyResult<()> {
         // ignore if another crate already set the default provider.
     });
 
-    m.add_wrapped(wrap_pyfunction!(read_bigquery_table)).unwrap();
+    m.add_wrapped(wrap_pyfunction!(read_bigquery_table))
+        .unwrap();
     m.add_wrapped(wrap_pyfunction!(_create_test_exporter))
         .unwrap();
     m.add_wrapped(wrap_pyfunction!(_test_create_exporter_with_drop_flag))
