@@ -94,15 +94,6 @@ fn table_id_to_table_path(table_id: &str) -> Result<String, BigQueryError> {
     ))
 }
 
-static INIT_CRYPTO: std::sync::Once = std::sync::Once::new();
-
-pub fn init_crypto() {
-    INIT_CRYPTO.call_once(|| {
-        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
-        // ignore if another crate already set the default provider.
-    });
-}
-
 pub async fn read_bigquery_with_client<B>(
     read_client: GoogleApiClient<B, BigQueryReadClient<GoogleAuthMiddleware>>,
     table_id: &str,
@@ -112,8 +103,6 @@ pub async fn read_bigquery_with_client<B>(
 where
     B: GoogleApiClientBuilder<BigQueryReadClient<GoogleAuthMiddleware>> + Send + Sync + 'static,
 {
-    init_crypto();
-
     let read_session = ReadSession {
         data_format: DataFormat::Arrow as i32,
         table: table_id_to_table_path(table_id)?,

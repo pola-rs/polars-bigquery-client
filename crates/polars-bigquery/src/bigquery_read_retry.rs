@@ -98,6 +98,100 @@ impl<R: Rng> BackoffSession<R> {
     }
 }
 
+pub struct RetryPolicyBuilder<P, R = HasherRng> {
+    min_delay: Option<Duration>,
+    max_delay: Option<Duration>,
+    factor: Option<f64>,
+    jitter: Option<f64>,
+    rng: Option<R>,
+    predicate: Option<P>,
+    max_times: Option<u32>,
+    max_total_delay: Option<Duration>,
+    session: Option<BackoffSession<R>>,
+}
+
+impl<P, R> RetryPolicyBuilder<P, R> {
+    pub fn new() -> Self {
+        Self { min_delay: None, max_delay: None, factor: None, jitter: None, rng: None, predicate: None, max_times: None, max_total_delay: None, session: None }
+    }
+
+    fn check_delay_bounds(self) -> Result<Self, String> {
+        let Some(min_delay) = self.min_delay else {
+            return Ok(self);
+        };
+        let Some(max_delay) = self.max_delay else {
+            return Ok(self);
+        };
+        if min_delay > max_delay {
+            return Err("min_delay must be <= max_delay".to_owned());
+        }
+        Ok(self)
+    }
+
+    pub fn with_min_delay(mut self, min_delay: Duration) -> Result<Self, String> {
+        self.min_delay = Some(min_delay);
+        return self.check_delay_bounds()
+    }
+
+    pub fn with_max_delay(mut self, max_delay: Duration) -> Result<Self, String> {
+        if max_delay <= Duration::ZERO {
+            return Err("max_delay must be > 0".to_owned());
+        }
+        self.max_delay = Some(max_delay);
+        return self.check_delay_bounds()
+    }
+
+    pub fn with_max_times(mut self, max_times: u32) -> Self {
+        self.max_times = Some(max_times);
+        self
+    }
+
+    pub fn with_factor(mut self, factor: f64) -> Self {
+        self.factor = Some(factor);
+        self
+    }
+
+    pub fn with_jitter(mut self, jitter: f64) -> Self {
+        self.jitter = Some(jitter);
+        self
+    }
+
+    pub fn with_rng(mut self, rng: R) -> Self {
+        self.rng = Some(rng);
+        self
+    }
+
+    pub fn with_predicate(mut self, predicate: P) -> Self {
+        self.predicate = Some(predicate);
+        self
+    }
+
+    pub fn with_total_delay(mut self, total_delay: Duration) -> Self {
+        self.max_total_delay = Some(total_delay);
+        self
+    }
+
+    pub fn build(self) -> Result<RetryPolicy<P, R>, String> {
+        let min_delay = self.min_delay.ok_or("min_delay is required")?;
+        let max_delay = self.max_delay.ok_or("max_delay is required")?;
+        let factor = self.factor.ok_or("factor is required")?;
+        let jitter = self.jitter.ok_or("jitter is required")?;
+        let rng= self.rng.ok_or("rng is required")?;
+        let predicate= self.predicate.ok_or("predicate is required")?;
+        Ok(RetryPolicy {
+            min_delay: min_delay,
+            max_delay: max_delay,
+            factor: factor,
+            jitter: jitter,
+            rng: rng,
+            predicate: predicate,
+            max_times: self.max_times,
+            max_total_delay: self.max_total_delay,
+            session: self.session,
+        })
+    }
+}
+
 /// Immutable configuration blueprint for exponential backoff retries, implementing [`tower::retry::Policy`].
 ///
 /// `RetryPolicy` stores static configuration parameters (min/max delays, custom multiplier factor, jitter, attempt/delay limits, and predicate).
@@ -120,42 +214,6 @@ impl<P, R> RetryPolicy<P, R>
 where
     R: Rng + Clone,
 {
-    pub fn new(
-        min_delay: Duration,
-        max_delay: Duration,
-        factor: f64,
-        jitter: f64,
-        rng: R,
-        predicate: P,
-    ) -> Self {
-        assert!(min_delay <= max_delay, "min_delay must be <= max_delay");
-        assert!(max_delay > Duration::ZERO, "max_delay must be > 0");
-        assert!(factor >= 1.0, "factor must be >= 1.0");
-        assert!(jitter >= 0.0, "jitter must be >= 0.0");
-
-        Self {
-            min_delay,
-            max_delay,
-            factor,
-            jitter,
-            rng,
-            predicate,
-            max_times: None,
-            max_total_delay: None,
-            session: None,
-        }
-    }
-
-    pub fn with_max_times(mut self, max_times: u32) -> Self {
-        self.max_times = Some(max_times);
-        self
-    }
-
-    pub fn with_total_delay(mut self, total_delay: Duration) -> Self {
-        self.max_total_delay = Some(total_delay);
-        self
-    }
-
     pub fn make_session(&self) -> BackoffSession<R> {
         BackoffSession {
             min_delay: self.min_delay,
@@ -257,15 +315,15 @@ pub fn create_read_session_predicate(err: &tonic::Status) -> bool {
 /// Inspired by the Python configuration at
 /// https://github.com/googleapis/google-cloud-python/blob/c43caeee34e7c0878766d2806f69016c319697e2/packages/google-cloud-bigquery-storage/google/cloud/bigquery_storage_v1/services/big_query_read/transports/base.py#L148-L162
 pub fn create_read_session_policy() -> RetryPolicy<fn(&tonic::Status) -> bool, HasherRng> {
-    RetryPolicy::new(
-        Duration::from_millis(100),
-        Duration::from_secs(60),
-        1.3,
-        0.2,
-        HasherRng::default(),
-        create_read_session_predicate as fn(&tonic::Status) -> bool,
-    )
-    .with_total_delay(Duration::from_secs(600))
+    RetryPolicyBuilder::new()
+        .with_min_delay(Duration::from_millis(100)).expect("hardcoded value guaranteed to be valid")
+        .with_max_delay(Duration::from_secs(60)).expect("hardcoded value guaranteed to be valid")
+        .with_factor(1.3)
+        .with_jitter(0.2)
+        .with_rng(HasherRng::default())
+        .with_predicate(create_read_session_predicate as fn(&tonic::Status) -> bool)
+        .with_total_delay(Duration::from_secs(600))
+        .build().expect("hardcoded value guaranteed to be valid")
 }
 
 /// When to retry read_rows requests.
@@ -286,15 +344,15 @@ pub fn read_rows_predicate(err: &tonic::Status) -> bool {
 /// Inspired by the Python configuration at
 /// https://github.com/googleapis/google-cloud-python/blob/c43caeee34e7c0878766d2806f69016c319697e2/packages/google-cloud-bigquery-storage/google/cloud/bigquery_storage_v1/services/big_query_read/transports/base.py#L163-L176
 pub fn read_rows_policy() -> RetryPolicy<fn(&tonic::Status) -> bool, HasherRng> {
-    RetryPolicy::new(
-        Duration::from_millis(100),
-        Duration::from_secs(60),
-        1.3,
-        0.2,
-        HasherRng::default(),
-        read_rows_predicate as fn(&tonic::Status) -> bool,
-    )
-    .with_total_delay(Duration::from_secs(900))
+    RetryPolicyBuilder::new()
+        .with_min_delay(Duration::from_millis(100)).expect("hardcoded value guaranteed to be valid")
+        .with_max_delay(Duration::from_secs(60)).expect("hardcoded value guaranteed to be valid")
+        .with_factor(1.3)
+        .with_jitter(0.2)
+        .with_rng(HasherRng::default())
+        .with_predicate(read_rows_predicate as fn(&tonic::Status) -> bool)
+        .with_total_delay(Duration::from_secs(900))
+        .build().expect("hardcoded value guaranteed to be valid")
 }
 
 /// When to reconnect/resume an active read_rows stream after encountering a gRPC error mid-read.
@@ -316,15 +374,15 @@ pub fn reconnect_stream_predicate(err: &tonic::Status) -> bool {
 /// - `factor` (1.3): Multiplier scaling factor for exponential backoff (matching Python BigQuery Storage client standard).
 /// - `with_max_times` (10): Limits total consecutive failed reconnection attempts when no data progress is made.
 pub fn stream_reconnect_policy() -> RetryPolicy<fn(&tonic::Status) -> bool, HasherRng> {
-    RetryPolicy::new(
-        Duration::from_millis(100),
-        Duration::from_secs(60),
-        1.3,
-        0.2,
-        HasherRng::default(),
-        reconnect_stream_predicate as fn(&tonic::Status) -> bool,
-    )
-    .with_max_times(10)
+    RetryPolicyBuilder::new()
+        .with_min_delay(Duration::from_millis(100)).expect("hardcoded value guaranteed to be valid")
+        .with_max_delay(Duration::from_secs(60)).expect("hardcoded value guaranteed to be valid")
+        .with_factor(1.3)
+        .with_jitter(0.2)
+        .with_rng(HasherRng::default())
+        .with_predicate(reconnect_stream_predicate as fn(&tonic::Status) -> bool)
+        .with_max_times(10)
+        .build().expect("hardcoded value guaranteed to be valid")
 }
 
 #[cfg(test)]

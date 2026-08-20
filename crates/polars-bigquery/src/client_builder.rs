@@ -9,6 +9,15 @@ use gcloud_sdk::{GoogleApiClient, GoogleApiClientBuilder, GoogleAuthMiddleware, 
 use hyper::header::{HeaderValue, USER_AGENT};
 use hyper::HeaderMap;
 
+static INIT_CRYPTO: std::sync::Once = std::sync::Once::new();
+
+fn init_crypto() {
+    INIT_CRYPTO.call_once(|| {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        // ignore if another crate already set the default provider.
+    });
+}
+
 const DEFAULT_BQSTORAGE_ENDPOINT: &str = "https://bigquerystorage.googleapis.com";
 const DEFAULT_GCP_SCOPE: &str = "https://www.googleapis.com/auth/cloud-platform";
 pub struct ServiceConfigBuilder {
@@ -68,7 +77,7 @@ impl BigQueryReadClientBuilder for ServiceConfigBuilder {
         GoogleApiClient<BQStorageGoogleApiClientBuilder, BigQueryReadClient<GoogleAuthMiddleware>>,
         Box<dyn std::error::Error>,
     > {
-        crate::init_crypto();
+        init_crypto();
         let builder = BQStorageGoogleApiClientBuilder {};
 
         let mut headers = HeaderMap::new();
