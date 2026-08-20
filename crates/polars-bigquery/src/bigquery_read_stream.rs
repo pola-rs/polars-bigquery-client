@@ -514,18 +514,21 @@ mod tests {
 
     fn test_policy(
     ) -> bigquery_read_retry::RetryPolicy<fn(&Status) -> bool, tower::util::rng::HasherRng> {
-        bigquery_read_retry::RetryPolicyBuilder::new()
+        let params = bigquery_read_retry::RetryParameters::builder()
             .with_min_delay(std::time::Duration::from_millis(1))
             .expect("hardcoded value guaranteed to be valid")
             .with_max_delay(std::time::Duration::from_millis(1))
             .expect("hardcoded value guaranteed to be valid")
             .with_factor(1.3)
             .with_jitter(0.0)
-            .with_rng(tower::util::rng::HasherRng::default())
-            .with_predicate(bigquery_read_retry::reconnect_stream_predicate as fn(&Status) -> bool)
             .with_max_times(3)
             .build()
-            .expect("hardcoded value guaranteed to be valid")
+            .expect("hardcoded value guaranteed to be valid");
+        bigquery_read_retry::RetryPolicy::new(
+            params,
+            bigquery_read_retry::reconnect_stream_predicate as fn(&Status) -> bool,
+            tower::util::rng::HasherRng::default(),
+        )
     }
 
     #[test]
