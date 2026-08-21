@@ -228,6 +228,131 @@ impl<P, R> RetryPolicy<P, R> {
     }
 }
 
+impl RetryPolicy<fn(&tonic::Status) -> bool, HasherRng> {
+    /// When to retry create_read_session requests.
+    ///
+    /// Inspired by the Python configuration at
+    /// https://github.com/googleapis/google-cloud-python/blob/c43caeee34e7c0878766d2806f69016c319697e2/packages/google-cloud-bigquery-storage/google/cloud/bigquery_storage_v1/services/big_query_read/transports/base.py#L154-L157
+    pub fn create_read_session_predicate(err: &tonic::Status) -> bool {
+        is_retryable_status(err)
+    }
+
+    /// Retry parameters for create_read_session requests.
+    ///
+    /// - `min_delay` (100ms): Initial sleep duration before first retry.
+    /// - `max_delay` (60s): Upper bound cap on any single exponential backoff sleep.
+    /// - `factor` (1.3): Multiplier scaling factor for exponential backoff (matching Python BigQuery Storage client standard).
+    /// - `max_total_delay` (600s): Maximum cumulative duration across retries before giving up.
+    ///
+    /// Inspired by the Python configuration at
+    /// https://github.com/googleapis/google-cloud-python/blob/c43caeee34e7c0878766d2806f69016c319697e2/packages/google-cloud-bigquery-storage/google/cloud/bigquery_storage_v1/services/big_query_read/transports/base.py#L148-L162
+    pub fn create_read_session_parameters() -> RetryParameters {
+        RetryParameters::builder()
+            .with_min_delay(Duration::from_millis(100))
+            .expect("hardcoded value guaranteed to be valid")
+            .with_max_delay(Duration::from_secs(60))
+            .expect("hardcoded value guaranteed to be valid")
+            .with_factor(1.3)
+            .with_jitter(0.2)
+            .with_max_total_delay(Duration::from_secs(600))
+            .build()
+            .expect("hardcoded value guaranteed to be valid")
+    }
+
+    /// Retry configuration policy for create_read_session.
+    ///
+    /// Inspired by the Python configuration at
+    /// https://github.com/googleapis/google-cloud-python/blob/c43caeee34e7c0878766d2806f69016c319697e2/packages/google-cloud-bigquery-storage/google/cloud/bigquery_storage_v1/services/big_query_read/transports/base.py#L148-L162
+    pub fn create_read_session_policy() -> Self {
+        Self::new(
+            Self::create_read_session_parameters(),
+            Self::create_read_session_predicate,
+            HasherRng::default(),
+        )
+    }
+
+    /// When to retry read_rows requests.
+    ///
+    /// Inspired by the Python configuration at
+    /// https://github.com/googleapis/google-cloud-python/blob/c43caeee34e7c0878766d2806f69016c319697e2/packages/google-cloud-bigquery-storage/google/cloud/bigquery_storage_v1/services/big_query_read/transports/base.py#L169-L171
+    pub fn read_rows_predicate(err: &tonic::Status) -> bool {
+        is_retryable_status(err)
+    }
+
+    /// Retry parameters for initial read_rows requests.
+    ///
+    /// - `min_delay` (100ms): Initial sleep duration before first retry.
+    /// - `max_delay` (60s): Upper bound cap on any single exponential backoff sleep.
+    /// - `factor` (1.3): Multiplier scaling factor for exponential backoff (matching Python BigQuery Storage client standard).
+    /// - `max_total_delay` (900s): Maximum cumulative duration across retries before giving up.
+    ///
+    /// Inspired by the Python configuration at
+    /// https://github.com/googleapis/google-cloud-python/blob/c43caeee34e7c0878766d2806f69016c319697e2/packages/google-cloud-bigquery-storage/google/cloud/bigquery_storage_v1/services/big_query_read/transports/base.py#L163-L176
+    pub fn read_rows_parameters() -> RetryParameters {
+        RetryParameters::builder()
+            .with_min_delay(Duration::from_millis(100))
+            .expect("hardcoded value guaranteed to be valid")
+            .with_max_delay(Duration::from_secs(60))
+            .expect("hardcoded value guaranteed to be valid")
+            .with_factor(1.3)
+            .with_jitter(0.2)
+            .with_max_total_delay(Duration::from_secs(900))
+            .build()
+            .expect("hardcoded value guaranteed to be valid")
+    }
+
+    /// Retry configuration policy for initial read_rows requests.
+    ///
+    /// Inspired by the Python configuration at
+    /// https://github.com/googleapis/google-cloud-python/blob/c43caeee34e7c0878766d2806f69016c319697e2/packages/google-cloud-bigquery-storage/google/cloud/bigquery_storage_v1/services/big_query_read/transports/base.py#L163-L176
+    pub fn read_rows_policy() -> Self {
+        Self::new(
+            Self::read_rows_parameters(),
+            Self::read_rows_predicate,
+            HasherRng::default(),
+        )
+    }
+
+    /// When to reconnect/resume an active read_rows stream after encountering a gRPC error mid-read.
+    ///
+    /// While currently identical to [`read_rows_predicate`], having a dedicated predicate allows fine-tuning
+    /// reconnection behavior separately from initial request establishment.
+    pub fn stream_reconnect_predicate(err: &tonic::Status) -> bool {
+        is_retryable_status(err)
+    }
+
+    /// Retry parameters for mid-stream read_rows reconnections.
+    ///
+    /// - `min_delay` (100ms): Starts with a short initial backoff to quickly recover from brief network blips.
+    /// - `max_delay` (60s): Caps the backoff delay so exponential growth (100ms -> 130ms -> 169ms ...) does not produce excessively long single delays.
+    /// - `factor` (1.3): Multiplier scaling factor for exponential backoff (matching Python BigQuery Storage client standard).
+    /// - `max_times` (10): Limits total consecutive failed reconnection attempts when no data progress is made.
+    pub fn stream_reconnect_parameters() -> RetryParameters {
+        RetryParameters::builder()
+            .with_min_delay(Duration::from_millis(100))
+            .expect("hardcoded value guaranteed to be valid")
+            .with_max_delay(Duration::from_secs(60))
+            .expect("hardcoded value guaranteed to be valid")
+            .with_factor(1.3)
+            .with_jitter(0.2)
+            .with_max_times(10)
+            .build()
+            .expect("hardcoded value guaranteed to be valid")
+    }
+
+    /// Retry configuration policy for mid-stream read_rows reconnections.
+    ///
+    /// Important! If data progress is made (`current_offset > prev_offset`), the session
+    /// must be reset to grant a fresh 10-attempt allowance.
+    pub fn stream_reconnect_policy() -> Self {
+        Self::new(
+            Self::stream_reconnect_parameters(),
+            Self::stream_reconnect_predicate,
+            HasherRng::default(),
+        )
+    }
+}
+
 impl<P, R> RetryPolicy<P, R>
 where
     R: Rng + Clone,
@@ -305,129 +430,6 @@ fn is_retryable_status(err: &tonic::Status) -> bool {
     )
 }
 
-/// When to retry create_read_session requests.
-///
-/// Inspired by the Python configuration at
-/// https://github.com/googleapis/google-cloud-python/blob/c43caeee34e7c0878766d2806f69016c319697e2/packages/google-cloud-bigquery-storage/google/cloud/bigquery_storage_v1/services/big_query_read/transports/base.py#L154-L157
-pub fn create_read_session_predicate(err: &tonic::Status) -> bool {
-    is_retryable_status(err)
-}
-
-/// Retry parameters for create_read_session requests.
-///
-/// - `min_delay` (100ms): Initial sleep duration before first retry.
-/// - `max_delay` (60s): Upper bound cap on any single exponential backoff sleep.
-/// - `factor` (1.3): Multiplier scaling factor for exponential backoff (matching Python BigQuery Storage client standard).
-/// - `max_total_delay` (600s): Maximum cumulative duration across retries before giving up.
-///
-/// Inspired by the Python configuration at
-/// https://github.com/googleapis/google-cloud-python/blob/c43caeee34e7c0878766d2806f69016c319697e2/packages/google-cloud-bigquery-storage/google/cloud/bigquery_storage_v1/services/big_query_read/transports/base.py#L148-L162
-pub fn create_read_session_parameters() -> RetryParameters {
-    RetryParameters::builder()
-        .with_min_delay(Duration::from_millis(100))
-        .expect("hardcoded value guaranteed to be valid")
-        .with_max_delay(Duration::from_secs(60))
-        .expect("hardcoded value guaranteed to be valid")
-        .with_factor(1.3)
-        .with_jitter(0.2)
-        .with_max_total_delay(Duration::from_secs(600))
-        .build()
-        .expect("hardcoded value guaranteed to be valid")
-}
-
-/// Retry configuration policy for create_read_session.
-///
-/// Inspired by the Python configuration at
-/// https://github.com/googleapis/google-cloud-python/blob/c43caeee34e7c0878766d2806f69016c319697e2/packages/google-cloud-bigquery-storage/google/cloud/bigquery_storage_v1/services/big_query_read/transports/base.py#L148-L162
-pub fn create_read_session_policy() -> RetryPolicy<fn(&tonic::Status) -> bool, HasherRng> {
-    RetryPolicy::new(
-        create_read_session_parameters(),
-        create_read_session_predicate as fn(&tonic::Status) -> bool,
-        HasherRng::default(),
-    )
-}
-
-/// When to retry read_rows requests.
-///
-/// Inspired by the Python configuration at
-/// https://github.com/googleapis/google-cloud-python/blob/c43caeee34e7c0878766d2806f69016c319697e2/packages/google-cloud-bigquery-storage/google/cloud/bigquery_storage_v1/services/big_query_read/transports/base.py#L169-L171
-pub fn read_rows_predicate(err: &tonic::Status) -> bool {
-    is_retryable_status(err)
-}
-
-/// Retry parameters for initial read_rows requests.
-///
-/// - `min_delay` (100ms): Initial sleep duration before first retry.
-/// - `max_delay` (60s): Upper bound cap on any single exponential backoff sleep.
-/// - `factor` (1.3): Multiplier scaling factor for exponential backoff (matching Python BigQuery Storage client standard).
-/// - `max_total_delay` (900s): Maximum cumulative duration across retries before giving up.
-///
-/// Inspired by the Python configuration at
-/// https://github.com/googleapis/google-cloud-python/blob/c43caeee34e7c0878766d2806f69016c319697e2/packages/google-cloud-bigquery-storage/google/cloud/bigquery_storage_v1/services/big_query_read/transports/base.py#L163-L176
-pub fn read_rows_parameters() -> RetryParameters {
-    RetryParameters::builder()
-        .with_min_delay(Duration::from_millis(100))
-        .expect("hardcoded value guaranteed to be valid")
-        .with_max_delay(Duration::from_secs(60))
-        .expect("hardcoded value guaranteed to be valid")
-        .with_factor(1.3)
-        .with_jitter(0.2)
-        .with_max_total_delay(Duration::from_secs(900))
-        .build()
-        .expect("hardcoded value guaranteed to be valid")
-}
-
-/// Retry configuration policy for initial read_rows requests.
-///
-/// Inspired by the Python configuration at
-/// https://github.com/googleapis/google-cloud-python/blob/c43caeee34e7c0878766d2806f69016c319697e2/packages/google-cloud-bigquery-storage/google/cloud/bigquery_storage_v1/services/big_query_read/transports/base.py#L163-L176
-pub fn read_rows_policy() -> RetryPolicy<fn(&tonic::Status) -> bool, HasherRng> {
-    RetryPolicy::new(
-        read_rows_parameters(),
-        read_rows_predicate as fn(&tonic::Status) -> bool,
-        HasherRng::default(),
-    )
-}
-
-/// When to reconnect/resume an active read_rows stream after encountering a gRPC error mid-read.
-///
-/// While currently identical to [`read_rows_predicate`], having a dedicated predicate allows fine-tuning
-/// reconnection behavior separately from initial request establishment.
-pub fn reconnect_stream_predicate(err: &tonic::Status) -> bool {
-    is_retryable_status(err)
-}
-
-/// Retry parameters for mid-stream read_rows reconnections.
-///
-/// - `min_delay` (100ms): Starts with a short initial backoff to quickly recover from brief network blips.
-/// - `max_delay` (60s): Caps the backoff delay so exponential growth (100ms -> 130ms -> 169ms ...) does not produce excessively long single delays.
-/// - `factor` (1.3): Multiplier scaling factor for exponential backoff (matching Python BigQuery Storage client standard).
-/// - `max_times` (10): Limits total consecutive failed reconnection attempts when no data progress is made.
-pub fn stream_reconnect_parameters() -> RetryParameters {
-    RetryParameters::builder()
-        .with_min_delay(Duration::from_millis(100))
-        .expect("hardcoded value guaranteed to be valid")
-        .with_max_delay(Duration::from_secs(60))
-        .expect("hardcoded value guaranteed to be valid")
-        .with_factor(1.3)
-        .with_jitter(0.2)
-        .with_max_times(10)
-        .build()
-        .expect("hardcoded value guaranteed to be valid")
-}
-
-/// Retry configuration policy for mid-stream read_rows reconnections.
-///
-/// Important! If data progress is made (`current_offset > prev_offset`), the session
-/// must be reset to grant a fresh 10-attempt allowance.
-pub fn stream_reconnect_policy() -> RetryPolicy<fn(&tonic::Status) -> bool, HasherRng> {
-    RetryPolicy::new(
-        stream_reconnect_parameters(),
-        reconnect_stream_predicate as fn(&tonic::Status) -> bool,
-        HasherRng::default(),
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use gcloud_sdk::tonic::{Code, Status};
@@ -447,7 +449,7 @@ mod tests {
         for code in retryable_codes {
             let status = Status::new(code, "transient stream error");
             assert!(
-                reconnect_stream_predicate(&status),
+                RetryPolicy::stream_reconnect_predicate(&status),
                 "Expected reconnect_stream_predicate to be true for code {:?}",
                 code
             );
@@ -474,7 +476,7 @@ mod tests {
         for code in non_retryable_codes {
             let status = Status::new(code, "fatal stream error");
             assert!(
-                !reconnect_stream_predicate(&status),
+                !RetryPolicy::stream_reconnect_predicate(&status),
                 "Expected reconnect_stream_predicate to be false for code {:?}",
                 code
             );
@@ -493,8 +495,8 @@ mod tests {
         for code in codes {
             let status = Status::new(code, "test");
             assert_eq!(
-                read_rows_predicate(&status),
-                reconnect_stream_predicate(&status)
+                RetryPolicy::read_rows_predicate(&status),
+                RetryPolicy::stream_reconnect_predicate(&status)
             );
         }
     }
@@ -621,5 +623,3 @@ mod tests {
         assert_eq!(params.max_total_delay, Some(Duration::from_secs(300)));
     }
 }
-
-

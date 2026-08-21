@@ -124,7 +124,7 @@ where
         ..Default::default()
     };
 
-    let policy = bigquery_read_retry::create_read_session_policy();
+    let policy = bigquery_read_retry::RetryPolicy::create_read_session_policy();
     let service = tower::service_fn(|req: CreateReadSessionRequest| {
         let mut client = read_client.get();
         async move { client.create_read_session(req).await }
