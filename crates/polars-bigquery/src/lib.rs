@@ -1,118 +1,23 @@
 mod bigquery_read_retry;
 mod bigquery_read_stream;
+pub mod client_builder;
 mod error;
 
-use crate::error::BigQueryError;
 use std::io::Cursor;
 use std::sync::Arc;
 
+pub use client_builder::*;
+pub use error::BigQueryError;
 use gcloud_sdk::google::cloud::bigquery::storage::v1::big_query_read_client::BigQueryReadClient;
 use gcloud_sdk::google::cloud::bigquery::storage::v1::{
-    read_session, CreateReadSessionRequest, DataFormat, ReadSession,
+    arrow_serialization_options, read_session, ArrowSerializationOptions, CreateReadSessionRequest,
+    DataFormat, ReadSession,
 };
-use gcloud_sdk::tonic::async_trait;
-use gcloud_sdk::*;
-use hyper::header::{HeaderValue, USER_AGENT};
-use hyper::HeaderMap;
+use gcloud_sdk::{GoogleApiClient, GoogleApiClientBuilder, GoogleAuthMiddleware};
 use polars_arrow::datatypes::ArrowSchemaRef;
 use polars_arrow::io::ipc::read::read_stream_metadata;
 use polars_arrow::record_batch::RecordBatch;
 use tower::ServiceExt;
-
-#[derive(Clone)]
-pub struct BigQueryReadClientBuilder {
-    max_decoding_message_size: usize,
-}
-
-#[async_trait]
-impl GoogleApiClientBuilder<BigQueryReadClient<GoogleAuthMiddleware>>
-    for BigQueryReadClientBuilder
-{
-    fn create_client(
-        &self,
-        channel: GoogleAuthMiddleware,
-    ) -> BigQueryReadClient<GoogleAuthMiddleware> {
-        BigQueryReadClient::new(channel).max_decoding_message_size(self.max_decoding_message_size)
-    }
-}
-
-pub struct PolarsBigQueryClientBuilder {
-    max_decoding_message_size: usize,
-    token_source_type: TokenSourceType,
-    scopes: Vec<String>,
-    user_agent: Option<String>,
-}
-
-impl Default for PolarsBigQueryClientBuilder {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl PolarsBigQueryClientBuilder {
-    pub fn new() -> Self {
-        Self {
-            max_decoding_message_size: 128 * 1024 * 1024, // 128MB default
-            token_source_type: TokenSourceType::Default,
-            scopes: vec!["https://www.googleapis.com/auth/cloud-platform".to_string()],
-            user_agent: None,
-        }
-    }
-
-    pub fn with_max_decoding_message_size(mut self, size: usize) -> Self {
-        self.max_decoding_message_size = size;
-        self
-    }
-
-    pub fn with_token_source(mut self, token_source: TokenSourceType) -> Self {
-        self.token_source_type = token_source;
-        self
-    }
-
-    pub fn with_scopes(mut self, scopes: Vec<String>) -> Self {
-        self.scopes = scopes;
-        self
-    }
-
-    pub fn with_user_agent(mut self, extension: String) -> Self {
-        self.user_agent = Some(extension);
-        self
-    }
-
-    pub async fn build(
-        self,
-    ) -> Result<
-        GoogleApiClient<BigQueryReadClientBuilder, BigQueryReadClient<GoogleAuthMiddleware>>,
-        Box<dyn std::error::Error>,
-    > {
-        init_crypto();
-        let builder = BigQueryReadClientBuilder {
-            max_decoding_message_size: self.max_decoding_message_size,
-        };
-
-        // Construct User-Agent header
-        let default_user_agent = format!("polars-bigquery/{}", env!("CARGO_PKG_VERSION"));
-        let user_agent = match self.user_agent {
-            Some(ext) => format!("{} {}", default_user_agent, ext),
-            None => default_user_agent,
-        };
-
-        let mut headers = HeaderMap::new();
-        headers.insert(USER_AGENT, HeaderValue::from_str(&user_agent)?);
-
-        let client = GoogleApiClient::with_token_source_and_headers(
-            builder,
-            "https://bigquerystorage.googleapis.com",
-            None,
-            self.token_source_type,
-            self.scopes,
-            headers,
-        )
-        .await?;
-
-        Ok(client)
-    }
-}
 
 /// A receiver that yields [`RecordBatch`]es read from BigQuery.
 ///
@@ -189,15 +94,6 @@ fn table_id_to_table_path(table_id: &str) -> Result<String, BigQueryError> {
     ))
 }
 
-static INIT_CRYPTO: std::sync::Once = std::sync::Once::new();
-
-pub fn init_crypto() {
-    INIT_CRYPTO.call_once(|| {
-        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
-        // ignore if another crate already set the default provider.
-    });
-}
-
 pub async fn read_bigquery_with_client<B>(
     read_client: GoogleApiClient<B, BigQueryReadClient<GoogleAuthMiddleware>>,
     table_id: &str,
@@ -207,11 +103,20 @@ pub async fn read_bigquery_with_client<B>(
 where
     B: GoogleApiClientBuilder<BigQueryReadClient<GoogleAuthMiddleware>> + Send + Sync + 'static,
 {
-    init_crypto();
-
+    let arrow_options = ArrowSerializationOptions {
+        buffer_compression: arrow_serialization_options::CompressionCodec::Lz4Frame.into(),
+        ..Default::default()
+    };
+    let read_options = read_session::TableReadOptions {
+        output_format_serialization_options : Some(
+            read_session::table_read_options::OutputFormatSerializationOptions::ArrowSerializationOptions(arrow_options)
+        ),
+        ..Default::default()
+    };
     let read_session = ReadSession {
         data_format: DataFormat::Arrow as i32,
         table: table_id_to_table_path(table_id)?,
+        read_options: Some(read_options),
         ..Default::default()
     };
 
@@ -231,7 +136,7 @@ where
         ..Default::default()
     };
 
-    let policy = bigquery_read_retry::create_read_session_policy();
+    let policy = bigquery_read_retry::RetryPolicy::create_read_session_policy();
     let service = tower::service_fn(|req: CreateReadSessionRequest| {
         let mut client = read_client.get();
         async move { client.create_read_session(req).await }

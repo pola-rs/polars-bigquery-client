@@ -1,4 +1,3 @@
-
 use gcloud_sdk::tonic;
 
 #[derive(Debug)]

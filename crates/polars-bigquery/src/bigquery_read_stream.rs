@@ -181,7 +181,7 @@ pub async fn read_stream<B>(
         schema,
         stream_name,
         tx,
-        bigquery_read_retry::stream_reconnect_policy(),
+        bigquery_read_retry::RetryPolicy::stream_reconnect_policy(),
     )
     .await;
 }
@@ -210,7 +210,7 @@ async fn connect_read_rows_stream<C: BigQueryReadClientTrait>(
         offset,
     };
 
-    let policy = bigquery_read_retry::read_rows_policy();
+    let policy = bigquery_read_retry::RetryPolicy::read_rows_policy();
     let service =
         tower::service_fn(
             |req: ReadRowsRequest| async move { read_client.read_rows_stream(req).await },
@@ -254,7 +254,7 @@ async fn consume_next_message<S: ReadRowsStreamTrait>(
         },
         Ok(None) => ReadStreamState::Terminated,
         Err(status) => {
-            if bigquery_read_retry::reconnect_stream_predicate(&status) {
+            if bigquery_read_retry::RetryPolicy::stream_reconnect_predicate(&status) {
                 ReadStreamState::BackingOff(status)
             } else {
                 let _ = tx.send(Err(BigQueryError::Grpc(status))).await;
@@ -514,15 +514,21 @@ mod tests {
 
     fn test_policy(
     ) -> bigquery_read_retry::RetryPolicy<fn(&Status) -> bool, tower::util::rng::HasherRng> {
+        let params = bigquery_read_retry::RetryParameters::builder()
+            .with_min_delay(std::time::Duration::from_millis(1))
+            .expect("hardcoded value guaranteed to be valid")
+            .with_max_delay(std::time::Duration::from_millis(1))
+            .expect("hardcoded value guaranteed to be valid")
+            .with_factor(1.3)
+            .with_jitter(0.0)
+            .with_max_times(3)
+            .build()
+            .expect("hardcoded value guaranteed to be valid");
         bigquery_read_retry::RetryPolicy::new(
-            std::time::Duration::from_millis(1),
-            std::time::Duration::from_millis(1),
-            1.3,
-            0.0,
+            params,
+            bigquery_read_retry::RetryPolicy::stream_reconnect_predicate,
             tower::util::rng::HasherRng::default(),
-            bigquery_read_retry::reconnect_stream_predicate as fn(&Status) -> bool,
         )
-        .with_max_times(3)
     }
 
     #[test]
