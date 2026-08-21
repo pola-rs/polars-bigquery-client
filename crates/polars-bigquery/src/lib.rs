@@ -10,7 +10,8 @@ pub use client_builder::*;
 pub use error::BigQueryError;
 use gcloud_sdk::google::cloud::bigquery::storage::v1::big_query_read_client::BigQueryReadClient;
 use gcloud_sdk::google::cloud::bigquery::storage::v1::{
-    read_session, CreateReadSessionRequest, DataFormat, ReadSession,
+    arrow_serialization_options, read_session, ArrowSerializationOptions, CreateReadSessionRequest,
+    DataFormat, ReadSession,
 };
 use gcloud_sdk::{GoogleApiClient, GoogleApiClientBuilder, GoogleAuthMiddleware};
 use polars_arrow::datatypes::ArrowSchemaRef;
@@ -102,9 +103,20 @@ pub async fn read_bigquery_with_client<B>(
 where
     B: GoogleApiClientBuilder<BigQueryReadClient<GoogleAuthMiddleware>> + Send + Sync + 'static,
 {
+    let arrow_options = ArrowSerializationOptions {
+        buffer_compression: arrow_serialization_options::CompressionCodec::Lz4Frame.into(),
+        ..Default::default()
+    };
+    let read_options = read_session::TableReadOptions {
+        output_format_serialization_options : Some(
+            read_session::table_read_options::OutputFormatSerializationOptions::ArrowSerializationOptions(arrow_options)
+        ),
+        ..Default::default()
+    };
     let read_session = ReadSession {
         data_format: DataFormat::Arrow as i32,
         table: table_id_to_table_path(table_id)?,
+        read_options: Some(read_options),
         ..Default::default()
     };
 
