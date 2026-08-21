@@ -7,15 +7,10 @@ JOB_CREATION_OPTIONAL parameter to improve latency in small query results.
 import polars as pl
 import requests
 
-import polars_bigquery.core.version
 import polars_bigquery.exceptions
 
 
 _BIGQUERY_ENDPOINT = "https://bigquery.googleapis.com/bigquery/v2"
-
-
-def _get_user_agent() -> str:
-    return f"polars-bigquery/{polars_bigquery.core.version.__version__}"
 
 
 def _get_jobs_insert_url(quota_project_id: str) -> str:
@@ -70,17 +65,14 @@ def run_query(
     quota_project_id: str,
     credentials_provider: pl.CredentialProviderGCP,
     *,
-    user_agent: str | None = None,
+    user_agent: str,
 ) -> str:
     """Run a query and return the destination table from the job resource."""
     token_data, _ = credentials_provider()
     token = token_data["bearer_token"]
-    ua = _get_user_agent()
-    if user_agent:
-        ua = f"{ua} {user_agent}"
     headers = {
         "Authorization": f"Bearer {token}",
-        "User-Agent": ua,
+        "User-Agent": user_agent,
         "Content-Type": "application/json",
         "x-goog-user-project": quota_project_id,
     }

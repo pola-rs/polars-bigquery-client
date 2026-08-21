@@ -42,7 +42,12 @@ def test_run_query_success():
 
         mock_get.side_effect = [m1, m_poll, m2]
 
-        result = run_query("SELECT 1", "quota-project", mock_cp)
+        result = run_query(
+            "SELECT 1",
+            "quota-project",
+            mock_cp,
+            user_agent="polars-bigquery/0.1.0",
+        )
 
         assert result == "p.d.t"
         mock_post.assert_called_once()
@@ -52,6 +57,7 @@ def test_run_query_success():
         called_headers = mock_post.call_args.kwargs["headers"]
         assert called_headers["Authorization"] == "Bearer fake-token"
         assert called_headers["x-goog-user-project"] == "quota-project"
+        assert called_headers["User-Agent"] == "polars-bigquery/0.1.0"
 
 
 def test_run_query_error():
@@ -77,7 +83,12 @@ def test_run_query_error():
         mock_get.return_value.raise_for_status = MagicMock()
 
         with pytest.raises(BigQueryError, match="Something went wrong"):
-            run_query("SELECT 1", "quota-project", mock_cp)
+            run_query(
+                "SELECT 1",
+                "quota-project",
+                mock_cp,
+                user_agent="polars-bigquery/0.1.0",
+            )
 
 
 def test_run_query_with_user_agent():
@@ -107,8 +118,21 @@ def test_run_query_with_user_agent():
             },
         }
 
-        run_query("SELECT 1", "quota-project", mock_cp, user_agent="custom-ua/1.0")
+        run_query(
+            "SELECT 1",
+            "quota-project",
+            mock_cp,
+            user_agent="polars-bigquery/0.1.0 custom-ua/1.0",
+        )
 
         called_headers = mock_post.call_args.kwargs["headers"]
-        assert "custom-ua/1.0" in called_headers["User-Agent"]
-        assert called_headers["User-Agent"].startswith("polars-bigquery/")
+        assert (
+            called_headers["User-Agent"]
+            == "polars-bigquery/0.1.0 custom-ua/1.0"
+        )
+
+
+def test_run_query_requires_user_agent():
+    mock_cp = MagicMock()
+    with pytest.raises(TypeError):
+        run_query("SELECT 1", "quota-project", mock_cp)

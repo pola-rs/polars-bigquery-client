@@ -261,15 +261,11 @@ pub fn read_bigquery_table(
     let rt = pyo3_async_runtimes::tokio::get_runtime();
 
     let result = rt.block_on(async {
-        let mut builder = polars_bigquery_lib::PolarsBigQueryClientBuilder::new()
-            .with_token_source(token_source_type)
-            .with_max_decoding_message_size(128 * 1024 * 1024);
+        use polars_bigquery_lib::BigQueryReadClientBuilder;
 
-        if let Some(ua) = user_agent {
-            builder = builder.with_user_agent(ua);
-        }
-
-        let client = builder
+        let client = polars_bigquery_lib::ServiceConfigBuilder::new()
+            .with_cred(token_source_type)
+            .with_user_agent(user_agent)
             .build()
             .await
             .map_err(|err| pyo3::exceptions::PyRuntimeError::new_err(err.to_string()))?;
@@ -387,7 +383,8 @@ fn polars_bigquery(m: &Bound<PyModule>) -> PyResult<()> {
         // ignore if another crate already set the default provider.
     });
 
-    m.add_wrapped(wrap_pyfunction!(read_bigquery_table)).unwrap();
+    m.add_wrapped(wrap_pyfunction!(read_bigquery_table))
+        .unwrap();
     m.add_wrapped(wrap_pyfunction!(_create_test_exporter))
         .unwrap();
     m.add_wrapped(wrap_pyfunction!(_test_create_exporter_with_drop_flag))
