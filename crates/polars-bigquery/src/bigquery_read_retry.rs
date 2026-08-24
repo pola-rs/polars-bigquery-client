@@ -16,9 +16,9 @@
 //! which ramps up more gently. `RetryPolicy` and `BackoffSession` support configurable multiplier factors while remaining
 //! 100% compatible with Tower's [`tower::retry::Policy`] trait.
 
-use core::time::Duration;
-use std::fmt::Debug;
-use std::time::Instant;
+use std::error::Error;
+use std::fmt::{Debug, Display};
+use std::time::{Duration, Instant};
 
 use gcloud_sdk::tonic;
 use tower::retry::Policy;
@@ -41,94 +41,118 @@ pub struct RetryParameters {
 
 impl RetryParameters {
     /// Creates a new [`RetryParametersBuilder`] to configure and validate retry parameters.
-    pub fn builder() -> RetryParametersBuilder {
-        RetryParametersBuilder::new()
+    pub fn builder(
+        min_delay: Duration,
+        max_delay: Duration,
+    ) -> Result<RetryParametersBuilder, RetryParametersBuilderError> {
+        RetryParametersBuilder::new(min_delay, max_delay)
     }
 }
 
+#[derive(Debug)]
+pub struct RetryParametersBuilderError {
+    pub message: String,
+}
+
+impl Display for RetryParametersBuilderError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "invalid RetryParametersBuilder: {}", self.message)
+    }
+}
+
+impl Error for RetryParametersBuilderError {}
+
 /// Builder for constructing and validating [`RetryParameters`].
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct RetryParametersBuilder {
-    min_delay: Option<Duration>,
-    max_delay: Option<Duration>,
-    factor: Option<f64>,
-    jitter: Option<f64>,
+    min_delay: Duration,
+    max_delay: Duration,
+    factor: f64,
+    jitter: f64,
     max_times: Option<u32>,
     max_total_delay: Option<Duration>,
 }
 
 impl RetryParametersBuilder {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    fn check_delay_bounds(&self) -> Result<(), String> {
-        let Some(min_delay) = self.min_delay else {
-            return Ok(());
-        };
-        let Some(max_delay) = self.max_delay else {
-            return Ok(());
-        };
-        if min_delay > max_delay {
-            return Err("min_delay must be <= max_delay".to_owned());
-        }
-        Ok(())
-    }
-
-    pub fn with_min_delay(mut self, min_delay: Duration) -> Result<Self, String> {
-        self.min_delay = Some(min_delay);
-        self.check_delay_bounds()?;
-        Ok(self)
-    }
-
-    pub fn with_max_delay(mut self, max_delay: Duration) -> Result<Self, String> {
-        if max_delay <= Duration::ZERO {
-            return Err("max_delay must be > 0".to_owned());
-        }
-        self.max_delay = Some(max_delay);
-        self.check_delay_bounds()?;
-        Ok(self)
-    }
-
-    pub fn with_factor(mut self, factor: f64) -> Self {
-        self.factor = Some(factor);
-        self
-    }
-
-    pub fn with_jitter(mut self, jitter: f64) -> Self {
-        self.jitter = Some(jitter);
-        self
-    }
-
-    pub fn with_max_times(mut self, max_times: u32) -> Self {
-        self.max_times = Some(max_times);
-        self
-    }
-
-    pub fn with_max_total_delay(mut self, max_total_delay: Duration) -> Self {
-        self.max_total_delay = Some(max_total_delay);
-        self
-    }
-
-    pub fn build(self) -> Result<RetryParameters, String> {
-        let min_delay = self.min_delay.ok_or("min_delay is required")?;
-        let max_delay = self.max_delay.ok_or("max_delay is required")?;
-        let factor = self.factor.ok_or("factor is required")?;
-        let jitter = self.jitter.ok_or("jitter is required")?;
-        if max_delay <= Duration::ZERO {
-            return Err("max_delay must be > 0".to_owned());
+    pub fn new(
+        min_delay: Duration,
+        max_delay: Duration,
+    ) -> Result<Self, RetryParametersBuilderError> {
+        // Note: negative durations aren't representable in the built-in
+        // Duration type.  Subtracting anything from Duration::ZERO results in
+        // an overflow error.
+        if max_delay == Duration::ZERO {
+            return Err(RetryParametersBuilderError {
+                message: "max_delay must by > Duration::ZERO".to_owned(),
+            });
         }
         if min_delay > max_delay {
-            return Err("min_delay must be <= max_delay".to_owned());
+            return Err(RetryParametersBuilderError {
+                message: "min_delay must be <= max_delay".to_owned(),
+            });
         }
-        Ok(RetryParameters {
+        Ok(RetryParametersBuilder {
             min_delay,
             max_delay,
-            factor,
-            jitter,
+            factor: 1.3,
+            jitter: 0.0,
+            max_times: None,
+            max_total_delay: None,
+        })
+    }
+
+    pub fn with_factor(mut self, factor: f64) -> Result<Self, RetryParametersBuilderError> {
+        if factor <= 0.0 {
+            return Err(RetryParametersBuilderError {
+                message: "factor must by > 0".to_owned(),
+            });
+        }
+        self.factor = factor;
+        Ok(self)
+    }
+
+    pub fn with_jitter(mut self, jitter: f64) -> Result<Self, RetryParametersBuilderError> {
+        if jitter < 0.0 {
+            return Err(RetryParametersBuilderError {
+                message: "jitter must by >= 0".to_owned(),
+            });
+        }
+        self.jitter = jitter;
+        Ok(self)
+    }
+
+    pub fn with_max_times(mut self, max_times: u32) -> Result<Self, RetryParametersBuilderError> {
+        if max_times == 0 {
+            return Err(RetryParametersBuilderError {
+                message: "max_times must be at least 1".to_owned(),
+            });
+        }
+        self.max_times = Some(max_times);
+        Ok(self)
+    }
+
+    pub fn with_max_total_delay(
+        mut self,
+        max_total_delay: Duration,
+    ) -> Result<Self, RetryParametersBuilderError> {
+        if max_total_delay < self.min_delay {
+            return Err(RetryParametersBuilderError {
+                message: "max_total_delay must be at least min_delay".to_owned(),
+            });
+        }
+        self.max_total_delay = Some(max_total_delay);
+        Ok(self)
+    }
+
+    pub fn build(self) -> RetryParameters {
+        RetryParameters {
+            min_delay: self.min_delay,
+            max_delay: self.max_delay,
+            factor: self.factor,
+            jitter: self.jitter,
             max_times: self.max_times,
             max_total_delay: self.max_total_delay,
-        })
+        }
     }
 }
 
@@ -247,16 +271,15 @@ impl RetryPolicy<fn(&tonic::Status) -> bool, HasherRng> {
     /// Inspired by the Python configuration at
     /// https://github.com/googleapis/google-cloud-python/blob/c43caeee34e7c0878766d2806f69016c319697e2/packages/google-cloud-bigquery-storage/google/cloud/bigquery_storage_v1/services/big_query_read/transports/base.py#L148-L162
     pub fn create_read_session_parameters() -> RetryParameters {
-        RetryParameters::builder()
-            .with_min_delay(Duration::from_millis(100))
-            .expect("hardcoded value guaranteed to be valid")
-            .with_max_delay(Duration::from_secs(60))
+        RetryParameters::builder(Duration::from_millis(100), Duration::from_secs(60))
             .expect("hardcoded value guaranteed to be valid")
             .with_factor(1.3)
-            .with_jitter(0.2)
-            .with_max_total_delay(Duration::from_secs(600))
-            .build()
             .expect("hardcoded value guaranteed to be valid")
+            .with_jitter(0.2)
+            .expect("hardcoded value guaranteed to be valid")
+            .with_max_total_delay(Duration::from_secs(600))
+            .expect("hardcoded value guaranteed to be valid")
+            .build()
     }
 
     /// Retry configuration policy for create_read_session.
@@ -289,16 +312,15 @@ impl RetryPolicy<fn(&tonic::Status) -> bool, HasherRng> {
     /// Inspired by the Python configuration at
     /// https://github.com/googleapis/google-cloud-python/blob/c43caeee34e7c0878766d2806f69016c319697e2/packages/google-cloud-bigquery-storage/google/cloud/bigquery_storage_v1/services/big_query_read/transports/base.py#L163-L176
     pub fn read_rows_parameters() -> RetryParameters {
-        RetryParameters::builder()
-            .with_min_delay(Duration::from_millis(100))
-            .expect("hardcoded value guaranteed to be valid")
-            .with_max_delay(Duration::from_secs(60))
+        RetryParameters::builder(Duration::from_millis(100), Duration::from_secs(60))
             .expect("hardcoded value guaranteed to be valid")
             .with_factor(1.3)
-            .with_jitter(0.2)
-            .with_max_total_delay(Duration::from_secs(900))
-            .build()
             .expect("hardcoded value guaranteed to be valid")
+            .with_jitter(0.2)
+            .expect("hardcoded value guaranteed to be valid")
+            .with_max_total_delay(Duration::from_secs(900))
+            .expect("hardcoded value guaranteed to be valid")
+            .build()
     }
 
     /// Retry configuration policy for initial read_rows requests.
@@ -328,16 +350,15 @@ impl RetryPolicy<fn(&tonic::Status) -> bool, HasherRng> {
     /// - `factor` (1.3): Multiplier scaling factor for exponential backoff (matching Python BigQuery Storage client standard).
     /// - `max_times` (10): Limits total consecutive failed reconnection attempts when no data progress is made.
     pub fn stream_reconnect_parameters() -> RetryParameters {
-        RetryParameters::builder()
-            .with_min_delay(Duration::from_millis(100))
-            .expect("hardcoded value guaranteed to be valid")
-            .with_max_delay(Duration::from_secs(60))
+        RetryParameters::builder(Duration::from_millis(100), Duration::from_secs(60))
             .expect("hardcoded value guaranteed to be valid")
             .with_factor(1.3)
-            .with_jitter(0.2)
-            .with_max_times(10)
-            .build()
             .expect("hardcoded value guaranteed to be valid")
+            .with_jitter(0.2)
+            .expect("hardcoded value guaranteed to be valid")
+            .with_max_times(10)
+            .expect("hardcoded value guaranteed to be valid")
+            .build()
     }
 
     /// Retry configuration policy for mid-stream read_rows reconnections.
@@ -503,16 +524,15 @@ mod tests {
 
     #[tokio::test]
     async fn test_retry_policy_max_times() {
-        let params = RetryParameters::builder()
-            .with_min_delay(Duration::from_millis(1))
-            .expect("hardcoded value guaranteed to be valid")
-            .with_max_delay(Duration::from_millis(1))
+        let params = RetryParameters::builder(Duration::from_millis(1), Duration::from_millis(1))
             .expect("hardcoded value guaranteed to be valid")
             .with_factor(1.3)
+            .expect("hardcoded value guaranteed to be valid")
             .with_jitter(0.0)
+            .expect("hardcoded value guaranteed to be valid")
             .with_max_times(2)
-            .build()
-            .expect("hardcoded value guaranteed to be valid");
+            .expect("hardcoded value guaranteed to be valid")
+            .build();
         let policy = RetryPolicy::new(params, |_: &Status| true, HasherRng::default());
 
         let mut session = policy.make_session();
@@ -523,15 +543,13 @@ mod tests {
 
     #[test]
     fn test_backoff_factor_growth() {
-        let params = RetryParameters::builder()
-            .with_min_delay(Duration::from_millis(100))
-            .expect("hardcoded value guaranteed to be valid")
-            .with_max_delay(Duration::from_secs(60))
+        let params = RetryParameters::builder(Duration::from_millis(100), Duration::from_secs(60))
             .expect("hardcoded value guaranteed to be valid")
             .with_factor(1.3)
+            .expect("hardcoded value guaranteed to be valid")
             .with_jitter(0.0) // no jitter for deterministic check
-            .build()
-            .expect("hardcoded value guaranteed to be valid");
+            .expect("hardcoded value guaranteed to be valid")
+            .build();
         let policy = RetryPolicy::new(params, |_: &Status| true, HasherRng::default());
         let mut session = policy.make_session();
         assert_eq!(session.compute_next_delay(), Duration::from_millis(100)); // 100 * 1.3^0
@@ -543,15 +561,13 @@ mod tests {
 
     #[test]
     fn test_backoff_overflow_safety() {
-        let params = RetryParameters::builder()
-            .with_min_delay(Duration::from_millis(100))
-            .expect("hardcoded value guaranteed to be valid")
-            .with_max_delay(Duration::from_secs(60))
+        let params = RetryParameters::builder(Duration::from_millis(100), Duration::from_secs(60))
             .expect("hardcoded value guaranteed to be valid")
             .with_factor(1.3)
+            .expect("hardcoded value guaranteed to be valid")
             .with_jitter(0.0)
-            .build()
-            .expect("hardcoded value guaranteed to be valid");
+            .expect("hardcoded value guaranteed to be valid")
+            .build();
         let policy = RetryPolicy::new(params, |_: &Status| true, HasherRng::default());
         let mut session = policy.make_session();
         session.attempts = 1000; // 1.3^1000 is infinity in f64
@@ -560,15 +576,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_retry_policy_session_reset_on_ok() {
-        let params = RetryParameters::builder()
-            .with_min_delay(Duration::from_millis(1))
-            .expect("hardcoded value guaranteed to be valid")
-            .with_max_delay(Duration::from_secs(60))
+        let params = RetryParameters::builder(Duration::from_millis(1), Duration::from_secs(60))
             .expect("hardcoded value guaranteed to be valid")
             .with_factor(1.3)
+            .expect("hardcoded value guaranteed to be valid")
             .with_jitter(0.0)
-            .build()
-            .expect("hardcoded value guaranteed to be valid");
+            .expect("hardcoded value guaranteed to be valid")
+            .build();
         let mut policy = RetryPolicy::new(params, |_: &Status| true, HasherRng::default());
 
         let mut req = ();
@@ -584,37 +598,25 @@ mod tests {
     #[test]
     fn test_retry_parameters_builder_validation() {
         // Zero or negative max_delay should fail
-        assert!(RetryParameters::builder()
-            .with_max_delay(Duration::ZERO)
-            .is_err());
+        assert!(RetryParameters::builder(Duration::ZERO, Duration::ZERO,).is_err());
 
         // min_delay > max_delay should fail at setter
-        assert!(RetryParameters::builder()
-            .with_max_delay(Duration::from_secs(5))
-            .unwrap()
-            .with_min_delay(Duration::from_secs(10))
-            .is_err());
-
-        // Missing required fields should fail on build
-        assert!(RetryParameters::builder()
-            .with_min_delay(Duration::from_millis(100))
-            .unwrap()
-            .build()
-            .is_err());
+        assert!(
+            RetryParameters::builder(Duration::from_secs(10), Duration::from_secs(5),).is_err()
+        );
 
         // Valid configuration succeeds
-        let params = RetryParameters::builder()
-            .with_min_delay(Duration::from_millis(100))
-            .unwrap()
-            .with_max_delay(Duration::from_secs(60))
+        let params = RetryParameters::builder(Duration::from_millis(100), Duration::from_secs(60))
             .unwrap()
             .with_factor(1.3)
+            .unwrap()
             .with_jitter(0.2)
+            .unwrap()
             .with_max_times(5)
+            .unwrap()
             .with_max_total_delay(Duration::from_secs(300))
+            .unwrap()
             .build();
-        assert!(params.is_ok());
-        let params = params.unwrap();
         assert_eq!(params.min_delay, Duration::from_millis(100));
         assert_eq!(params.max_delay, Duration::from_secs(60));
         assert_eq!(params.factor, 1.3);
