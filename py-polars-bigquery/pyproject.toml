@@ -59,6 +59,7 @@ before-all = "brew install openssl@3"
 environment = { PKG_CONFIG_PATH = "/opt/homebrew/opt/openssl@3/lib/pkgconfig:/usr/local/opt/openssl@3/lib/pkgconfig" }
 
 [tool.maturin]
+module-name = "polars_bigquery._native"
 profile = "release"
 # Allow cargo test without failing on linking to Python.
 # https://github.com/PyO3/pyo3/discussions/2271#discussioncomment-2497276
