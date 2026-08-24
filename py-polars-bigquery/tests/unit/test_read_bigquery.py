@@ -12,7 +12,7 @@ from polars_bigquery._read_bigquery import _get_user_agent, _parse_table_id
 
 @pytest.fixture
 def mock_rust_read():
-    with patch("polars_bigquery.polars_bigquery.read_bigquery_table") as mocked:
+    with patch("polars_bigquery._native.read_bigquery_table") as mocked:
         yield mocked
 
 
