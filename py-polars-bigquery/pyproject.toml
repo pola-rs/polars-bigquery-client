@@ -59,9 +59,10 @@ before-all = "brew install openssl@3"
 environment = { PKG_CONFIG_PATH = "/opt/homebrew/opt/openssl@3/lib/pkgconfig:/usr/local/opt/openssl@3/lib/pkgconfig" }
 
 [tool.maturin]
+profile = "release"
 # Allow cargo test without failing on linking to Python.
 # https://github.com/PyO3/pyo3/discussions/2271#discussioncomment-2497276
-cargo-extra-args = "--features extension-module"
+features = ["extension-module"]
 
 [tool.uv]
 # https://github.com/PyO3/maturin/issues/2314#issuecomment-2488542771
