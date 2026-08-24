@@ -1,6 +1,12 @@
+import threading
+import _thread
+import time
+
 from unittest.mock import patch, MagicMock, ANY
 import polars as pl
 import pytest
+
+from polars_bigquery import _native
 from polars_bigquery import (
     read_bigquery_table,
     read_bigquery_query,
@@ -223,12 +229,7 @@ def test_scan_bigquery_with_user_agent(mock_rust_read):
 
 
 def test_receiver_iterator_interrupt():
-    import threading
-    import _thread
-    import time
-    from polars_bigquery import polars_bigquery
-
-    exporter = polars_bigquery._create_test_exporter()
+    exporter = _native._create_test_exporter()
 
     interrupted = False
 

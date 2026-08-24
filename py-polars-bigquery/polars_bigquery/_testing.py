@@ -30,7 +30,7 @@ on the active outer frame's stack during polling.
 
 import gc
 import time
-from polars_bigquery import polars_bigquery
+from polars_bigquery import _native
 
 
 class TestState:
@@ -46,7 +46,7 @@ def run_exporter_drop_test():
     state = TestState()
 
     def phase_create():
-        res = polars_bigquery._test_create_exporter_with_drop_flag()
+        res = _native._test_create_exporter_with_drop_flag()
         state.exporter = res[0]
         state.drop_flag = res[1]
         assert not state.drop_flag.is_set()
@@ -75,7 +75,7 @@ def run_exporter_drop_after_stream_created_test():
     state = TestState()
 
     def phase_create_and_export():
-        res = polars_bigquery._test_create_exporter_with_drop_flag()
+        res = _native._test_create_exporter_with_drop_flag()
         state.exporter = res[0]
         state.drop_flag = res[1]
         assert not state.drop_flag.is_set()
