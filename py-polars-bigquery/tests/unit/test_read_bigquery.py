@@ -1,6 +1,12 @@
+import threading
+import _thread
+import time
+
 from unittest.mock import patch, MagicMock, ANY
 import polars as pl
 import pytest
+
+from polars_bigquery import _native
 from polars_bigquery import (
     read_bigquery_table,
     read_bigquery_query,
@@ -12,7 +18,7 @@ from polars_bigquery._read_bigquery import _get_user_agent, _parse_table_id
 
 @pytest.fixture
 def mock_rust_read():
-    with patch("polars_bigquery.polars_bigquery.read_bigquery_table") as mocked:
+    with patch("polars_bigquery._native.read_bigquery_table") as mocked:
         yield mocked
 
 
@@ -223,12 +229,7 @@ def test_scan_bigquery_with_user_agent(mock_rust_read):
 
 
 def test_receiver_iterator_interrupt():
-    import threading
-    import _thread
-    import time
-    from polars_bigquery import polars_bigquery
-
-    exporter = polars_bigquery._create_test_exporter()
+    exporter = _native._create_test_exporter()
 
     interrupted = False
 

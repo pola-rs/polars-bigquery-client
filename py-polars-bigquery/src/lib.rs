@@ -377,6 +377,7 @@ pub fn _test_create_exporter_with_drop_flag() -> (ArrowStreamExporter, DropFlag)
 }
 
 #[pymodule]
+#[pyo3(name = "_native")]
 fn polars_bigquery(m: &Bound<PyModule>) -> PyResult<()> {
     INIT_CRYPTO.call_once(|| {
         let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();

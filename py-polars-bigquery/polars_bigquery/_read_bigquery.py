@@ -5,7 +5,7 @@ from typing import Any, Dict
 import polars as pl
 
 import polars_bigquery.core.version
-import polars_bigquery.polars_bigquery
+import polars_bigquery._native
 from .core.run_query import run_query
 
 _DEFAULT_CREDENTIAL_PROVIDERS: Dict[str, pl.CredentialProviderGCP] = {}
@@ -66,7 +66,7 @@ def read_bigquery_table(
     user_agent = _get_user_agent(user_agent)
 
     table_ref = _parse_table_id(table)
-    res = polars_bigquery.polars_bigquery.read_bigquery_table(
+    res = polars_bigquery._native.read_bigquery_table(
         table_ref, quota_project_id, maintain_order, credentials_provider, user_agent
     )
     return pl.DataFrame(res)
@@ -92,7 +92,7 @@ def read_bigquery_query(
         user_agent=user_agent,
     )
     table_ref = _parse_table_id(table)
-    res = polars_bigquery.polars_bigquery.read_bigquery_table(
+    res = polars_bigquery._native.read_bigquery_table(
         table_ref, quota_project_id, maintain_order, credentials_provider, user_agent
     )
     return pl.DataFrame(res)
@@ -111,7 +111,7 @@ def scan_bigquery_table(
     user_agent = _get_user_agent(user_agent)
 
     table_ref = _parse_table_id(table)
-    res = polars_bigquery.polars_bigquery.read_bigquery_table(
+    res = polars_bigquery._native.read_bigquery_table(
         table_ref,
         quota_project_id,
         False,  # maintain_order
