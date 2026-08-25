@@ -7,7 +7,7 @@ on:
       - crates/**
       - docs/source/src/python/**
       - py-arrow-bigquery/**
-      - .github/workflows/test-python-unit.yml
+      - .github/workflows/test-py-arrow-unit.yml
   push:
     branches:
       - main
@@ -16,7 +16,7 @@ on:
       - crates/**
       - docs/source/src/python/**
       - py-arrow-bigquery/**
-      - .github/workflows/test-python-unit.yml
+      - .github/workflows/test-py-arrow-unit.yml
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}

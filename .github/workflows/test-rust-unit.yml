@@ -48,9 +48,9 @@ jobs:
 
       - name: Compile tests
         # Specify --lib and --bins to exclude the integration and doc tests.
-        run: cargo test --workspace --exclude py-polars-bigquery --lib --bins --all-features --no-run
+        run: cargo test --workspace --exclude py-arrow-bigquery --lib --bins --all-features --no-run
 
       - name: Run tests
         if: github.ref_name != 'main'
         run: >
-          cargo test --workspace --exclude py-polars-bigquery --lib --bins --all-features
+          cargo test --workspace --exclude py-arrow-bigquery --lib --bins --all-features

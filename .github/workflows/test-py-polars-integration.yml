@@ -7,7 +7,7 @@ on:
       - crates/**
       - docs/source/src/python/**
       - py-polars-bigquery/**
-      - .github/workflows/test-python-integration.yml
+      - .github/workflows/test-py-polars-integration.yml
   push:
     branches:
       - main
@@ -16,7 +16,7 @@ on:
       - crates/**
       - docs/source/src/python/**
       - py-polars-bigquery/**
-      - .github/workflows/test-python-integration.yml
+      - .github/workflows/test-py-polars-integration.yml
 
 permissions:
   contents: read
