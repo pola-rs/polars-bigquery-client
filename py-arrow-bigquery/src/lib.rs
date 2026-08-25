@@ -227,66 +227,99 @@ impl ArrowStreamExporter {
     }
 }
 
+/// A Python-exposed client that keeps the BigQuery Storage Read API gRPC channel
+/// open across multiple table read operations, caching the OAuth2 token in Rust.
+#[pyclass(name = "Client")]
+pub struct Client {
+    client: polars_bigquery_lib::Client,
+}
+
+#[pymethods]
+impl Client {
+    #[new]
+    #[pyo3(signature = (*, credentials_provider=None, user_agent=None))]
+    pub fn new(
+        credentials_provider: Option<Py<PyAny>>,
+        user_agent: Option<String>,
+    ) -> PyResult<Self> {
+        INIT_CRYPTO.call_once(|| {
+            let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+            // ignore if another crate already set the default provider.
+        });
+
+        let token_source_type = match credentials_provider {
+            Some(provider) => {
+                let is_none = Python::attach(|py| provider.is_none(py));
+                if is_none {
+                    gcloud_sdk::TokenSourceType::Default
+                } else {
+                    let token_source = PythonTokenSource {
+                        provider,
+                        cache: Mutex::new(None),
+                    };
+                    gcloud_sdk::TokenSourceType::ExternalSource(Box::new(token_source))
+                }
+            }
+            None => gcloud_sdk::TokenSourceType::Default,
+        };
+
+        let rt = pyo3_async_runtimes::tokio::get_runtime();
+        let client = rt.block_on(async {
+            use polars_bigquery_lib::BigQueryReadClientBuilder;
+
+            let builder = polars_bigquery_lib::ServiceConfigBuilder::new()
+                .with_cred(token_source_type)
+                .with_user_agent(user_agent);
+
+            polars_bigquery_lib::Client::from_builder(builder)
+                .await
+                .map_err(|err| pyo3::exceptions::PyRuntimeError::new_err(err.to_string()))
+        })?;
+
+        Ok(Self { client })
+    }
+
+    #[pyo3(signature = (table, quota_project_id, maintain_order=false, user_agent=None))]
+    pub fn read_bigquery_table(
+        &self,
+        table: &str,
+        quota_project_id: &str,
+        maintain_order: bool,
+        user_agent: Option<String>,
+    ) -> PyResult<ArrowStreamExporter> {
+        let _ = user_agent;
+        let rt = pyo3_async_runtimes::tokio::get_runtime();
+        let client = self.client.clone();
+        let result = rt.block_on(async move {
+            client
+                .read_table(table, quota_project_id, maintain_order)
+                .await
+                .map_err(|err| pyo3::exceptions::PyRuntimeError::new_err(err.to_string()))
+        });
+
+        match result {
+            Ok((schema, receiver)) => Ok(ArrowStreamExporter {
+                schema,
+                receiver: std::sync::Mutex::new(Some(receiver)),
+            }),
+            Err(err) => Err(err),
+        }
+    }
+}
+
 /// Reads a BigQuery table and returns an [`ArrowStreamExporter`] which can be
 /// consumed by Polars in Python.
-///
-/// This function initializes the connection, sets up the BigQuery Storage Read API session,
-/// spawns background tasks to read the streams, and returns the stream exporter.
-///
-/// # Arguments
-/// * `table` - The BigQuery table ID in the format `project.dataset.table`.
-/// * `quota_project_id` - The billing/quota project ID.
-/// * `maintain_order` - If true, restricts the read session to a single stream to preserve row order.
-/// * `credentials_provider` - A Python callable that returns Google OAuth2 credentials.
-/// * `user_agent` - An optional user agent extension to append to the client header.
 #[pyfunction]
+#[pyo3(signature = (table, quota_project_id, maintain_order=false, credentials_provider=None, user_agent=None))]
 pub fn read_bigquery_table(
     table: &str,
     quota_project_id: &str,
     maintain_order: bool,
-    credentials_provider: Py<PyAny>,
+    credentials_provider: Option<Py<PyAny>>,
     user_agent: Option<String>,
 ) -> pyo3::PyResult<ArrowStreamExporter> {
-    INIT_CRYPTO.call_once(|| {
-        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
-        // ignore if another crate already set the default provider.
-    });
-
-    let token_source = PythonTokenSource {
-        provider: credentials_provider,
-        cache: Mutex::new(None),
-    };
-    let token_source_type = gcloud_sdk::TokenSourceType::ExternalSource(Box::new(token_source));
-
-    let rt = pyo3_async_runtimes::tokio::get_runtime();
-
-    let result = rt.block_on(async {
-        use polars_bigquery_lib::BigQueryReadClientBuilder;
-
-        let client = polars_bigquery_lib::ServiceConfigBuilder::new()
-            .with_cred(token_source_type)
-            .with_user_agent(user_agent)
-            .build()
-            .await
-            .map_err(|err| pyo3::exceptions::PyRuntimeError::new_err(err.to_string()))?;
-
-        polars_bigquery_lib::read_bigquery_with_client(
-            client,
-            table,
-            quota_project_id,
-            maintain_order,
-        )
-        .await
-        .map_err(|err| pyo3::exceptions::PyRuntimeError::new_err(err.to_string()))
-    });
-
-    match result {
-        Ok((schema, receiver)) => Ok(ArrowStreamExporter {
-            schema,
-            receiver: std::sync::Mutex::new(Some(receiver)),
-        }),
-        Err(err) => Err(err),
-    }
+    let client = Client::new(credentials_provider, user_agent)?;
+    client.read_bigquery_table(table, quota_project_id, maintain_order, None)
 }
 
 #[pyfunction]
@@ -384,6 +417,7 @@ fn polars_bigquery(m: &Bound<PyModule>) -> PyResult<()> {
         // ignore if another crate already set the default provider.
     });
 
+    m.add_class::<Client>().unwrap();
     m.add_wrapped(wrap_pyfunction!(read_bigquery_table))
         .unwrap();
     m.add_wrapped(wrap_pyfunction!(_create_test_exporter))

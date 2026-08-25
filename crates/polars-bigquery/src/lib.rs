@@ -94,8 +94,71 @@ fn table_id_to_table_path(table_id: &str) -> Result<String, BigQueryError> {
     ))
 }
 
+pub type BigQueryClient =
+    GoogleApiClient<BQStorageGoogleApiClientBuilder, BigQueryReadClient<GoogleAuthMiddleware>>;
+
+/// A BigQuery client for reading tables using the Storage Read API.
+///
+/// Keeps the gRPC channel open across multiple read operations.
+#[derive(Clone)]
+pub struct Client {
+    client: Arc<BigQueryClient>,
+}
+
+impl Client {
+    pub fn new(client: BigQueryClient) -> Self {
+        Self {
+            client: Arc::new(client),
+        }
+    }
+
+    pub fn from_arc(client: Arc<BigQueryClient>) -> Self {
+        Self { client }
+    }
+
+    pub async fn from_builder(
+        builder: ServiceConfigBuilder,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        let client = builder.build().await?;
+        Ok(Self::new(client))
+    }
+
+    pub async fn read_table(
+        &self,
+        table_id: &str,
+        quota_project_id: &str,
+        maintain_order: bool,
+    ) -> Result<(ArrowSchemaRef, BigQueryRecordBatchReceiver), BigQueryError> {
+        read_bigquery_with_client_arc(
+            self.client.clone(),
+            table_id,
+            quota_project_id,
+            maintain_order,
+        )
+        .await
+    }
+}
+
 pub async fn read_bigquery_with_client<B>(
     read_client: GoogleApiClient<B, BigQueryReadClient<GoogleAuthMiddleware>>,
+    table_id: &str,
+    quota_project_id: &str,
+    maintain_order: bool,
+) -> Result<(ArrowSchemaRef, BigQueryRecordBatchReceiver), BigQueryError>
+where
+    B: GoogleApiClientBuilder<BigQueryReadClient<GoogleAuthMiddleware>> + Send + Sync + 'static,
+{
+    read_bigquery_with_client_arc(
+        Arc::new(read_client),
+        table_id,
+        quota_project_id,
+        maintain_order,
+    )
+    .await
+}
+
+pub async fn read_bigquery_with_client_arc<B>(
+    shared_client: Arc<GoogleApiClient<B, BigQueryReadClient<GoogleAuthMiddleware>>>,
     table_id: &str,
     quota_project_id: &str,
     maintain_order: bool,
@@ -108,7 +171,7 @@ where
         ..Default::default()
     };
     let read_options = read_session::TableReadOptions {
-        output_format_serialization_options : Some(
+        output_format_serialization_options: Some(
             read_session::table_read_options::OutputFormatSerializationOptions::ArrowSerializationOptions(arrow_options)
         ),
         ..Default::default()
@@ -137,8 +200,9 @@ where
     };
 
     let policy = bigquery_read_retry::RetryPolicy::create_read_session_policy();
-    let service = tower::service_fn(|req: CreateReadSessionRequest| {
-        let mut client = read_client.get();
+    let service_client = shared_client.clone();
+    let service = tower::service_fn(move |req: CreateReadSessionRequest| {
+        let mut client = service_client.get();
         async move { client.create_read_session(req).await }
     });
     let read_session = tower::retry::Retry::new(policy, service)
@@ -163,7 +227,6 @@ where
         Err(_) => 2,
     };
     let (tx, rx) = tokio::sync::mpsc::channel(channel_size);
-    let shared_client = Arc::new(read_client);
     let shared_schema = Arc::new(schema);
     let mut handles = Vec::new();
 

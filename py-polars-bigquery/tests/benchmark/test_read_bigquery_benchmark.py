@@ -11,13 +11,18 @@ TABLE_IDS = [
 ]
 
 
+@pytest.fixture(scope="session")
+def client():
+    return polars_bigquery.Client()
+
+
 @pytest.mark.benchmark(min_rounds=10, warmup=True)
 @pytest.mark.parametrize("table_id", TABLE_IDS)
-def test_read_bigquery_public_data(table_id, benchmark):
+def test_read_bigquery_public_data(client, table_id, benchmark):
     project = os.environ["GOOGLE_CLOUD_PROJECT"]
 
     df = benchmark(
-        polars_bigquery.read_bigquery_table,
+        client.read_bigquery_table,
         table=table_id,
         quota_project_id=project,
     )
