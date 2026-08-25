@@ -1,4 +1,4 @@
-name: Test Python (Unit)
+name: Test Python Arrow (Unit)
 
 on:
   pull_request:
@@ -92,13 +92,13 @@ jobs:
         run: |
           pip install uv
           if [ "$PYTHON_VERSION" = "3.10" ]; then
-            uv sync --resolution lowest --no-install-project --group test --no-dev
+            uv sync --active --resolution lowest --no-install-project --group test --no-dev
           else
             # Install typing-extensions separately whilst the `--extra-index-url` in `requirements-ci.txt`
             # doesn't have an up-to-date typing-extensions, see
             # https://github.com/astral-sh/uv/issues/6028#issuecomment-2287232150
             uv pip install -U typing-extensions
-            uv sync --upgrade --no-install-project --group test --no-dev
+            uv sync --active --upgrade --no-install-project --group test --no-dev
           fi
       - name: Set up Rust
         run: rustup show
@@ -109,7 +109,7 @@ jobs:
           workspaces: py-arrow-bigquery
           save-if: ${{ github.ref_name == 'main' }}
 
-      - name: Install Polars BigQuery
+      - name: Install Arrow BigQuery
         run: |
           pip install --no-deps -e .
 
