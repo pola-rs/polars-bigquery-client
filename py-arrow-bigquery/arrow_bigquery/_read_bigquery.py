@@ -1,14 +1,9 @@
 from __future__ import annotations
 
-from typing import Any, Dict
-
-import polars as pl
+from typing import Any
 
 import arrow_bigquery.core.version
 import arrow_bigquery._native
-from .core.run_query import run_query
-
-_DEFAULT_CREDENTIAL_PROVIDERS: Dict[str, pl.CredentialProviderGCP] = {}
 
 
 def _get_user_agent(user_agent: str | None) -> str:
@@ -18,14 +13,6 @@ def _get_user_agent(user_agent: str | None) -> str:
         return f"{ua} {user_agent}"
     else:
         return ua
-
-
-def _get_default_provider(quota_project_id: str) -> pl.CredentialProviderGCP:
-    if quota_project_id not in _DEFAULT_CREDENTIAL_PROVIDERS:
-        _DEFAULT_CREDENTIAL_PROVIDERS[quota_project_id] = pl.CredentialProviderGCP(
-            quota_project_id=quota_project_id
-        )
-    return _DEFAULT_CREDENTIAL_PROVIDERS[quota_project_id]
 
 
 def _parse_table_id(table_id: Any) -> str:
@@ -56,65 +43,12 @@ def read_bigquery_table(
     table: str,
     *,
     quota_project_id: str,
-    credentials_provider: pl.CredentialProviderGCP | None = None,
+    credentials_provider = None,
     maintain_order: bool = False,
     user_agent: str | None = None,
-) -> pl.DataFrame:
-    if not credentials_provider:
-        credentials_provider = _get_default_provider(quota_project_id)
-
+) -> arrow_bigquery._native.ArrowStreamExporter:
     user_agent = _get_user_agent(user_agent)
-
     table_ref = _parse_table_id(table)
     return arrow_bigquery._native.read_bigquery_table(
         table_ref, quota_project_id, maintain_order, credentials_provider, user_agent
     )
-
-
-def read_bigquery_query(
-    query: str,
-    *,
-    quota_project_id: str,
-    credentials_provider: pl.CredentialProviderGCP | None = None,
-    maintain_order: bool = False,
-    user_agent: str | None = None,
-) -> pl.DataFrame:
-    if not credentials_provider:
-        credentials_provider = _get_default_provider(quota_project_id)
-
-    user_agent = _get_user_agent(user_agent)
-
-    table = run_query(
-        query,
-        quota_project_id,
-        credentials_provider,
-        user_agent=user_agent,
-    )
-    table_ref = _parse_table_id(table)
-    res = arrow_bigquery._native.read_bigquery_table(
-        table_ref, quota_project_id, maintain_order, credentials_provider, user_agent
-    )
-    return pl.DataFrame(res)
-
-
-def scan_bigquery_table(
-    table: str,
-    *,
-    quota_project_id: str,
-    credentials_provider: pl.CredentialProviderGCP | None = None,
-    user_agent: str | None = None,
-) -> pl.LazyFrame:
-    if not credentials_provider:
-        credentials_provider = _get_default_provider(quota_project_id)
-
-    user_agent = _get_user_agent(user_agent)
-
-    table_ref = _parse_table_id(table)
-    res = arrow_bigquery._native.read_bigquery_table(
-        table_ref,
-        quota_project_id,
-        False,  # maintain_order
-        credentials_provider,
-        user_agent,
-    )
-    return pl.scan_arrow_c_stream(res)

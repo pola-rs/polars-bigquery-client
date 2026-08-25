@@ -5,7 +5,7 @@ from typing import Any, Dict
 import polars as pl
 
 import polars_bigquery.core.version
-import arrow_bigquery._native
+import arrow_bigquery
 from .core.run_query import run_query
 
 _DEFAULT_CREDENTIAL_PROVIDERS: Dict[str, pl.CredentialProviderGCP] = {}
@@ -66,10 +66,14 @@ def read_bigquery_table(
     user_agent = _get_user_agent(user_agent)
 
     table_ref = _parse_table_id(table)
-    res = arrow_bigquery._native.read_bigquery_table(
-        table_ref, quota_project_id, maintain_order, credentials_provider, user_agent
+    arrow_stream_exporter = arrow_bigquery.read_bigquery_table(
+        table_ref,
+        quota_project_id=quota_project_id,
+        maintain_order=maintain_order,
+        credentials_provider=credentials_provider,
+        user_agent=user_agent,
     )
-    return pl.DataFrame(res)
+    return pl.DataFrame(arrow_stream_exporter)
 
 
 def read_bigquery_query(
@@ -92,10 +96,14 @@ def read_bigquery_query(
         user_agent=user_agent,
     )
     table_ref = _parse_table_id(table)
-    res = arrow_bigquery._native.read_bigquery_table(
-        table_ref, quota_project_id, maintain_order, credentials_provider, user_agent
+    arrow_stream_exporter = arrow_bigquery.read_bigquery_table(
+        table_ref,
+        quota_project_id=quota_project_id,
+        maintain_order=maintain_order,
+        credentials_provider=credentials_provider,
+        user_agent=user_agent,
     )
-    return pl.DataFrame(res)
+    return pl.DataFrame(arrow_stream_exporter)
 
 
 def scan_bigquery_table(
@@ -111,11 +119,11 @@ def scan_bigquery_table(
     user_agent = _get_user_agent(user_agent)
 
     table_ref = _parse_table_id(table)
-    res = arrow_bigquery._native.read_bigquery_table(
+    arrow_stream_exporter = arrow_bigquery.read_bigquery_table(
         table_ref,
-        quota_project_id,
-        False,  # maintain_order
-        credentials_provider,
-        user_agent,
+        quota_project_id=quota_project_id,
+        maintain_order=False,
+        credentials_provider=credentials_provider,
+        user_agent=user_agent,
     )
-    return pl.scan_arrow_c_stream(res)
+    return pl.scan_arrow_c_stream(arrow_stream_exporter)

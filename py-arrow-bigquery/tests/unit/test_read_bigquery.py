@@ -1,17 +1,14 @@
-import threading
 import _thread
+import threading
 import time
+from unittest.mock import ANY, MagicMock, patch
 
-from unittest.mock import patch, MagicMock, ANY
-import polars as pl
+import nanoarrow
 import pytest
-
-from arrow_bigquery import _native
 from arrow_bigquery import (
-    read_bigquery_table,
-    read_bigquery_query,
-    scan_bigquery_table,
     __version__,
+    _native,
+    read_bigquery_table,
 )
 from arrow_bigquery._read_bigquery import _get_user_agent, _parse_table_id
 
@@ -69,11 +66,13 @@ def test_parse_table_id_invalid_type():
 
 def test_read_bigquery_calls_rust_with_parsed_id(mock_rust_read):
     # Prepare
-    mock_df = pl.DataFrame({"col1": [1, 2]})
-    mock_rust_read.return_value = mock_df
+    placeholder = object()
+    mock_rust_read.return_value = placeholder
 
     # Execute
-    result = read_bigquery_table(table="my-project.my_dataset.my_table", quota_project_id="q")
+    result = read_bigquery_table(
+        table="my-project.my_dataset.my_table", quota_project_id="q"
+    )
 
     # Assert
     mock_rust_read.assert_called_once_with(
@@ -83,56 +82,12 @@ def test_read_bigquery_calls_rust_with_parsed_id(mock_rust_read):
         ANY,
         f"arrow-bigquery/{__version__}",
     )
-    assert result.equals(mock_df)
-
-
-def test_read_bigquery_query(mock_rust_read):
-    # Prepare
-    mock_df = pl.DataFrame({"col1": [1, 2]})
-    mock_rust_read.return_value = mock_df
-
-    with patch("arrow_bigquery._read_bigquery.run_query") as mock_run_query:
-        mock_run_query.return_value = "project.dataset.temp_table"
-
-        # Execute
-        result = read_bigquery_query(query="SELECT 1", quota_project_id="q")
-
-        # Assert
-        expected_ua = f"arrow-bigquery/{__version__}"
-        mock_run_query.assert_called_once_with("SELECT 1", "q", ANY, user_agent=expected_ua)
-        mock_rust_read.assert_called_once_with(
-            "project.dataset.temp_table", "q", False, ANY, expected_ua
-        )
-        assert result.equals(mock_df)
-
-
-def test_read_bigquery_query_with_user_agent(mock_rust_read):
-    # Prepare
-    mock_df = pl.DataFrame({"col1": [1, 2]})
-    mock_rust_read.return_value = mock_df
-
-    with patch("arrow_bigquery._read_bigquery.run_query") as mock_run_query:
-        mock_run_query.return_value = "project.dataset.temp_table"
-
-        # Execute
-        result = read_bigquery_query(
-            query="SELECT 1", quota_project_id="q", user_agent="custom-ua/1.0"
-        )
-
-        # Assert
-        expected_ua = f"arrow-bigquery/{__version__} custom-ua/1.0"
-        mock_run_query.assert_called_once_with(
-            "SELECT 1", "q", ANY, user_agent=expected_ua
-        )
-        mock_rust_read.assert_called_once_with(
-            "project.dataset.temp_table", "q", False, ANY, expected_ua
-        )
-        assert result.equals(mock_df)
+    assert result is placeholder
 
 
 def test_read_bigquery_handles_bigquery_objects(mock_rust_read):
     # Prepare
-    mock_rust_read.return_value = pl.DataFrame()
+    mock_rust_read.return_value = MagicMock()
     mock_ref = MagicMock()
     mock_ref.project = "p"
     mock_ref.dataset_id = "d"
@@ -158,7 +113,7 @@ def test_read_bigquery_propagates_errors(mock_rust_read):
 
 def test_read_bigquery_with_user_agent(mock_rust_read):
     # Prepare
-    mock_rust_read.return_value = pl.DataFrame()
+    mock_rust_read.return_value = MagicMock()
 
     # Execute
     read_bigquery_table(
@@ -173,59 +128,6 @@ def test_read_bigquery_with_user_agent(mock_rust_read):
         ANY,
         f"arrow-bigquery/{__version__} custom-extension/1.0",
     )
-
-
-def test_scan_bigquery_calls_rust_with_parsed_id(mock_rust_read):
-    # Prepare
-    mock_stream = MagicMock()
-    mock_rust_read.return_value = mock_stream
-
-    with patch("polars.scan_arrow_c_stream") as mock_scan:
-        mock_lazy_df = pl.LazyFrame({"col1": [1, 2]})
-        mock_scan.return_value = mock_lazy_df
-
-        # Execute
-        result = scan_bigquery_table(
-            table="my-project.my_dataset.my_table", quota_project_id="q"
-        )
-
-        # Assert
-        mock_rust_read.assert_called_once_with(
-            "my-project.my_dataset.my_table",
-            "q",
-            False,
-            ANY,
-            f"arrow-bigquery/{__version__}",
-        )
-        mock_scan.assert_called_once_with(mock_stream)
-        assert result.collect().equals(mock_lazy_df.collect())
-
-
-def test_scan_bigquery_with_user_agent(mock_rust_read):
-    # Prepare
-    mock_stream = MagicMock()
-    mock_rust_read.return_value = mock_stream
-
-    with patch("polars.scan_arrow_c_stream") as mock_scan:
-        mock_lazy_df = pl.LazyFrame({"col1": [1, 2]})
-        mock_scan.return_value = mock_lazy_df
-
-        # Execute
-        result = scan_bigquery_table(
-            table="my-project.my_dataset.my_table",
-            quota_project_id="q",
-            user_agent="custom-extension/1.0",
-        )
-
-        # Assert
-        mock_rust_read.assert_called_once_with(
-            "my-project.my_dataset.my_table",
-            "q",
-            False,
-            ANY,
-            f"arrow-bigquery/{__version__} custom-extension/1.0",
-        )
-        mock_scan.assert_called_once_with(mock_stream)
 
 
 def test_receiver_iterator_interrupt():
@@ -243,18 +145,24 @@ def test_receiver_iterator_interrupt():
     thread.start()
 
     try:
-        # Constructing the DataFrame will consume the C-stream.
-        # Since the channel is empty and kept open, it will block.
+        # Consuming the stream will block because the channel is empty and kept open.
         # The interrupt should break it.
-        pl.DataFrame(exporter)
+        stream = nanoarrow.c_array_stream(exporter)
+        for _ in stream:
+            pass
     except BaseException as err:
-        # This catches KeyboardInterrupt, ComputeError, and PanicException (from Polars unwrap).
-        if isinstance(err, KeyboardInterrupt) or "Python interrupt" in str(err):
+        if (
+            isinstance(err, KeyboardInterrupt)
+            or isinstance(getattr(err, "__cause__", None), KeyboardInterrupt)
+            or isinstance(getattr(err, "__context__", None), KeyboardInterrupt)
+            or "Python interrupt" in str(err)
+        ):
             interrupted = True
         else:
             raise
+    finally:
+        thread.join()
 
-    thread.join()
     assert interrupted, "The C-stream consumption was not interrupted"
 
 
