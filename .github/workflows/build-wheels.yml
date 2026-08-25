@@ -52,7 +52,7 @@ jobs:
       - name: Build wheels
         uses: pypa/cibuildwheel@4726cd35bb13f7bde50cf2761f2499ac7b3aa32c #v4.1.1
         with:
-          package-dir: py-polars-bigquery
+          package-dir: py-arrow-bigquery
         env:
           CIBW_SKIP: pp* *i686 *-win32
           CIBW_ENVIRONMENT_LINUX: "PATH=/root/.cargo/bin:$PATH CARGO_BUILD_JOBS=2"
@@ -77,7 +77,7 @@ jobs:
           persist-credentials: false
 
       - name: Build sdist
-        run: pipx run build --sdist py-polars-bigquery --outdir dist
+        run: pipx run build --sdist py-arrow-bigquery --outdir dist
 
       - name: Upload artifacts
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a #v7.0.1

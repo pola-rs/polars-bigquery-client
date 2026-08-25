@@ -7,13 +7,13 @@ import polars as pl
 import pytest
 
 from arrow_bigquery import _native
-from polars_bigquery import (
+from arrow_bigquery import (
     read_bigquery_table,
     read_bigquery_query,
     scan_bigquery_table,
     __version__,
 )
-from polars_bigquery._read_bigquery import _get_user_agent, _parse_table_id
+from arrow_bigquery._read_bigquery import _get_user_agent, _parse_table_id
 
 
 @pytest.fixture
@@ -23,11 +23,11 @@ def mock_rust_read():
 
 
 def test_get_user_agent():
-    assert _get_user_agent(None) == f"polars-bigquery/{__version__}"
-    assert _get_user_agent("") == f"polars-bigquery/{__version__}"
+    assert _get_user_agent(None) == f"arrow-bigquery/{__version__}"
+    assert _get_user_agent("") == f"arrow-bigquery/{__version__}"
     assert (
         _get_user_agent("custom-extension/1.0")
-        == f"polars-bigquery/{__version__} custom-extension/1.0"
+        == f"arrow-bigquery/{__version__} custom-extension/1.0"
     )
 
 
@@ -81,7 +81,7 @@ def test_read_bigquery_calls_rust_with_parsed_id(mock_rust_read):
         "q",
         False,
         ANY,
-        f"polars-bigquery/{__version__}",
+        f"arrow-bigquery/{__version__}",
     )
     assert result.equals(mock_df)
 
@@ -91,14 +91,14 @@ def test_read_bigquery_query(mock_rust_read):
     mock_df = pl.DataFrame({"col1": [1, 2]})
     mock_rust_read.return_value = mock_df
 
-    with patch("polars_bigquery._read_bigquery.run_query") as mock_run_query:
+    with patch("arrow_bigquery._read_bigquery.run_query") as mock_run_query:
         mock_run_query.return_value = "project.dataset.temp_table"
 
         # Execute
         result = read_bigquery_query(query="SELECT 1", quota_project_id="q")
 
         # Assert
-        expected_ua = f"polars-bigquery/{__version__}"
+        expected_ua = f"arrow-bigquery/{__version__}"
         mock_run_query.assert_called_once_with("SELECT 1", "q", ANY, user_agent=expected_ua)
         mock_rust_read.assert_called_once_with(
             "project.dataset.temp_table", "q", False, ANY, expected_ua
@@ -111,7 +111,7 @@ def test_read_bigquery_query_with_user_agent(mock_rust_read):
     mock_df = pl.DataFrame({"col1": [1, 2]})
     mock_rust_read.return_value = mock_df
 
-    with patch("polars_bigquery._read_bigquery.run_query") as mock_run_query:
+    with patch("arrow_bigquery._read_bigquery.run_query") as mock_run_query:
         mock_run_query.return_value = "project.dataset.temp_table"
 
         # Execute
@@ -120,7 +120,7 @@ def test_read_bigquery_query_with_user_agent(mock_rust_read):
         )
 
         # Assert
-        expected_ua = f"polars-bigquery/{__version__} custom-ua/1.0"
+        expected_ua = f"arrow-bigquery/{__version__} custom-ua/1.0"
         mock_run_query.assert_called_once_with(
             "SELECT 1", "q", ANY, user_agent=expected_ua
         )
@@ -143,7 +143,7 @@ def test_read_bigquery_handles_bigquery_objects(mock_rust_read):
 
     # Assert
     mock_rust_read.assert_called_once_with(
-        "p.d.t", "q", False, ANY, f"polars-bigquery/{__version__}"
+        "p.d.t", "q", False, ANY, f"arrow-bigquery/{__version__}"
     )
 
 
@@ -171,7 +171,7 @@ def test_read_bigquery_with_user_agent(mock_rust_read):
         "q",
         False,
         ANY,
-        f"polars-bigquery/{__version__} custom-extension/1.0",
+        f"arrow-bigquery/{__version__} custom-extension/1.0",
     )
 
 
@@ -195,7 +195,7 @@ def test_scan_bigquery_calls_rust_with_parsed_id(mock_rust_read):
             "q",
             False,
             ANY,
-            f"polars-bigquery/{__version__}",
+            f"arrow-bigquery/{__version__}",
         )
         mock_scan.assert_called_once_with(mock_stream)
         assert result.collect().equals(mock_lazy_df.collect())
@@ -223,7 +223,7 @@ def test_scan_bigquery_with_user_agent(mock_rust_read):
             "q",
             False,
             ANY,
-            f"polars-bigquery/{__version__} custom-extension/1.0",
+            f"arrow-bigquery/{__version__} custom-extension/1.0",
         )
         mock_scan.assert_called_once_with(mock_stream)
 
@@ -256,3 +256,17 @@ def test_receiver_iterator_interrupt():
 
     thread.join()
     assert interrupted, "The C-stream consumption was not interrupted"
+
+
+def test_exporter_drop_direct():
+    from arrow_bigquery._testing import run_exporter_drop_test
+
+    assert run_exporter_drop_test(), "The background task was not aborted within 1s"
+
+
+def test_exporter_drop_after_stream_created():
+    from arrow_bigquery._testing import run_exporter_drop_after_stream_created_test
+
+    assert run_exporter_drop_after_stream_created_test(), (
+        "The background task was not aborted within 1s"
+    )

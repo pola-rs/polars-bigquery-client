@@ -1,10 +1,10 @@
 [package]
-name = "py-polars-bigquery"
+name = "py-arrow-bigquery"
 version = "0.1.0"
 edition = "2021"
 
 [lib]
-name = "polars_bigquery"
+name = "arrow_bigquery"
 crate-type= ["cdylib"]
 
 [dependencies]

@@ -1,9 +1,9 @@
 """
-Private testing helpers for the polars-bigquery client.
+Private testing helpers for the arrow-bigquery client.
 
 IMPORTANT: Rationale for this module's location
 -----------------------------------------------
-This module is placed inside the production package (`polars_bigquery`) rather than
+This module is placed inside the production package (`arrow_bigquery`) rather than
 the `tests/` directory to bypass pytest's automatic frame instrumentation.
 
 Pytest automatically rewrites assertions and instruments frames for all Python files
@@ -30,7 +30,7 @@ on the active outer frame's stack during polling.
 
 import gc
 import time
-from polars_bigquery import _native
+from arrow_bigquery import _native
 
 
 class TestState:

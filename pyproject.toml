@@ -1,0 +1,8 @@
+[project]
+name = "polars-bigquery-workspace"
+version = "0.1.0"
+description = "Root workspace"
+dependencies = []
+
+[tool.uv.workspace]
+members = ["py-arrow-bigquery", "py-polars-bigquery"]

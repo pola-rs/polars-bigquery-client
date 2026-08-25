@@ -1,4 +1,4 @@
-name: Test Python (Unit)
+name: Test Python Arrow (Unit)
 
 on:
   pull_request:
@@ -6,8 +6,8 @@ on:
       - Cargo.lock
       - crates/**
       - docs/source/src/python/**
-      - py-polars-bigquery/**
-      - .github/workflows/test-python-unit.yml
+      - py-arrow-bigquery/**
+      - .github/workflows/test-py-arrow-unit.yml
   push:
     branches:
       - main
@@ -15,8 +15,8 @@ on:
       - Cargo.lock
       - crates/**
       - docs/source/src/python/**
-      - py-polars-bigquery/**
-      - .github/workflows/test-python-unit.yml
+      - py-arrow-bigquery/**
+      - .github/workflows/test-py-arrow-unit.yml
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -29,7 +29,7 @@ env:
 
 defaults:
   run:
-    working-directory: py-polars-bigquery
+    working-directory: py-arrow-bigquery
     shell: bash
 
 permissions:
@@ -76,9 +76,9 @@ jobs:
           BIN: ${{ matrix.os == 'windows-latest' && 'Scripts' || 'bin' }}
         run: |
           python -m venv .venv
-          echo "$GITHUB_WORKSPACE/py-polars-bigquery/.venv/$BIN" >> "$GITHUB_PATH"
-          echo "VIRTUAL_ENV=$GITHUB_WORKSPACE/py-polars-bigquery/.venv" >> "$GITHUB_ENV"
-          echo "VENV=$GITHUB_WORKSPACE/py-polars-bigquery/.venv" >> "$GITHUB_ENV"
+          echo "$GITHUB_WORKSPACE/py-arrow-bigquery/.venv/$BIN" >> "$GITHUB_PATH"
+          echo "VIRTUAL_ENV=$GITHUB_WORKSPACE/py-arrow-bigquery/.venv" >> "$GITHUB_ENV"
+          echo "VENV=$GITHUB_WORKSPACE/py-arrow-bigquery/.venv" >> "$GITHUB_ENV"
 
       - name: Install maturin
         if: matrix.python-version == '3.14t'
@@ -92,13 +92,13 @@ jobs:
         run: |
           pip install uv
           if [ "$PYTHON_VERSION" = "3.10" ]; then
-            uv sync --resolution lowest --no-install-project --group test --no-dev
+            uv sync --active --resolution lowest --no-install-project --group test --no-dev
           else
             # Install typing-extensions separately whilst the `--extra-index-url` in `requirements-ci.txt`
             # doesn't have an up-to-date typing-extensions, see
             # https://github.com/astral-sh/uv/issues/6028#issuecomment-2287232150
             uv pip install -U typing-extensions
-            uv sync --upgrade --no-install-project --group test --no-dev
+            uv sync --active --upgrade --no-install-project --group test --no-dev
           fi
       - name: Set up Rust
         run: rustup show
@@ -106,10 +106,10 @@ jobs:
       - name: Cache Rust
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 #v2.9.1
         with:
-          workspaces: py-polars-bigquery
+          workspaces: py-arrow-bigquery
           save-if: ${{ github.ref_name == 'main' }}
 
-      - name: Install Polars BigQuery
+      - name: Install Arrow BigQuery
         run: |
           pip install --no-deps -e .
 

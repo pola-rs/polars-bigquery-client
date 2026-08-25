@@ -4,7 +4,7 @@ from typing import Any, Dict
 
 import polars as pl
 
-import polars_bigquery.core.version
+import arrow_bigquery.core.version
 import arrow_bigquery._native
 from .core.run_query import run_query
 
@@ -12,7 +12,7 @@ _DEFAULT_CREDENTIAL_PROVIDERS: Dict[str, pl.CredentialProviderGCP] = {}
 
 
 def _get_user_agent(user_agent: str | None) -> str:
-    ua = f"polars-bigquery/{polars_bigquery.core.version.__version__}"
+    ua = f"arrow-bigquery/{arrow_bigquery.core.version.__version__}"
 
     if user_agent:
         return f"{ua} {user_agent}"
@@ -66,10 +66,9 @@ def read_bigquery_table(
     user_agent = _get_user_agent(user_agent)
 
     table_ref = _parse_table_id(table)
-    res = arrow_bigquery._native.read_bigquery_table(
+    return arrow_bigquery._native.read_bigquery_table(
         table_ref, quota_project_id, maintain_order, credentials_provider, user_agent
     )
-    return pl.DataFrame(res)
 
 
 def read_bigquery_query(
