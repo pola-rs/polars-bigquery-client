@@ -613,7 +613,7 @@ wheels = [
 [[package]]
 name = "polars-bigquery"
 version = "0.1.0"
-source = { virtual = "py-polars-bigquery" }
+source = { editable = "py-polars-bigquery" }
 dependencies = [
     { name = "arrow-bigquery" },
     { name = "cachetools" },
@@ -624,9 +624,6 @@ dependencies = [
 
 [package.dev-dependencies]
 dev = [
-    { name = "maturin" },
-    { name = "maturin", extra = ["patchelf"], marker = "sys_platform == 'linux'" },
-    { name = "nodeenv" },
     { name = "pre-commit" },
     { name = "pyparsing" },
     { name = "pytest" },
@@ -651,9 +648,6 @@ requires-dist = [
 
 [package.metadata.requires-dev]
 dev = [
-    { name = "maturin", marker = "sys_platform != 'linux'", specifier = ">=1.13.1" },
-    { name = "maturin", extras = ["patchelf"], marker = "sys_platform == 'linux'", specifier = ">=1.13.1" },
-    { name = "nodeenv", specifier = ">=1.9.1" },
     { name = "pre-commit", specifier = ">=4.3.0" },
     { name = "pyparsing", specifier = ">=2.4.7" },
     { name = "pytest", specifier = ">=8.4.1" },
