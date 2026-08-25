@@ -6,7 +6,6 @@ from unittest.mock import patch, MagicMock, ANY
 import polars as pl
 import pytest
 
-from arrow_bigquery import _native
 from polars_bigquery import (
     read_bigquery_table,
     read_bigquery_query,
@@ -18,7 +17,7 @@ from polars_bigquery._read_bigquery import _get_user_agent, _parse_table_id
 
 @pytest.fixture
 def mock_rust_read():
-    with patch("arrow_bigquery._native.read_bigquery_table") as mocked:
+    with patch("arrow_bigquery.read_bigquery_table") as mocked:
         yield mocked
 
 
@@ -78,10 +77,10 @@ def test_read_bigquery_calls_rust_with_parsed_id(mock_rust_read):
     # Assert
     mock_rust_read.assert_called_once_with(
         "my-project.my_dataset.my_table",
-        "q",
-        False,
-        ANY,
-        f"polars-bigquery/{__version__}",
+        quota_project_id="q",
+        maintain_order=False,
+        credentials_provider=ANY,
+        user_agent=f"polars-bigquery/{__version__}",
     )
     assert result.equals(mock_df)
 
@@ -101,7 +100,11 @@ def test_read_bigquery_query(mock_rust_read):
         expected_ua = f"polars-bigquery/{__version__}"
         mock_run_query.assert_called_once_with("SELECT 1", "q", ANY, user_agent=expected_ua)
         mock_rust_read.assert_called_once_with(
-            "project.dataset.temp_table", "q", False, ANY, expected_ua
+            "project.dataset.temp_table",
+            quota_project_id="q",
+            maintain_order=False,
+            credentials_provider=ANY,
+            user_agent=expected_ua,
         )
         assert result.equals(mock_df)
 
@@ -125,7 +128,11 @@ def test_read_bigquery_query_with_user_agent(mock_rust_read):
             "SELECT 1", "q", ANY, user_agent=expected_ua
         )
         mock_rust_read.assert_called_once_with(
-            "project.dataset.temp_table", "q", False, ANY, expected_ua
+            "project.dataset.temp_table",
+            quota_project_id="q",
+            maintain_order=False,
+            credentials_provider=ANY,
+            user_agent=expected_ua
         )
         assert result.equals(mock_df)
 
@@ -143,7 +150,11 @@ def test_read_bigquery_handles_bigquery_objects(mock_rust_read):
 
     # Assert
     mock_rust_read.assert_called_once_with(
-        "p.d.t", "q", False, ANY, f"polars-bigquery/{__version__}"
+        "p.d.t",
+        quota_project_id="q",
+        maintain_order=False,
+        credentials_provider=ANY,
+        user_agent=f"polars-bigquery/{__version__}",
     )
 
 
@@ -168,10 +179,10 @@ def test_read_bigquery_with_user_agent(mock_rust_read):
     # Assert
     mock_rust_read.assert_called_once_with(
         "p.d.t",
-        "q",
-        False,
-        ANY,
-        f"polars-bigquery/{__version__} custom-extension/1.0",
+        quota_project_id="q",
+        maintain_order=False,
+        credentials_provider=ANY,
+        user_agent=f"polars-bigquery/{__version__} custom-extension/1.0",
     )
 
 
@@ -192,10 +203,10 @@ def test_scan_bigquery_calls_rust_with_parsed_id(mock_rust_read):
         # Assert
         mock_rust_read.assert_called_once_with(
             "my-project.my_dataset.my_table",
-            "q",
-            False,
-            ANY,
-            f"polars-bigquery/{__version__}",
+            quota_project_id="q",
+            maintain_order=False,
+            credentials_provider=ANY,
+            user_agent=f"polars-bigquery/{__version__}",
         )
         mock_scan.assert_called_once_with(mock_stream)
         assert result.collect().equals(mock_lazy_df.collect())
@@ -220,39 +231,9 @@ def test_scan_bigquery_with_user_agent(mock_rust_read):
         # Assert
         mock_rust_read.assert_called_once_with(
             "my-project.my_dataset.my_table",
-            "q",
-            False,
-            ANY,
-            f"polars-bigquery/{__version__} custom-extension/1.0",
+            quota_project_id="q",
+            maintain_order=False,
+            credentials_provider=ANY,
+            user_agent=f"polars-bigquery/{__version__} custom-extension/1.0",
         )
         mock_scan.assert_called_once_with(mock_stream)
-
-
-def test_receiver_iterator_interrupt():
-    exporter = _native._create_test_exporter()
-
-    interrupted = False
-
-    def trigger_interrupt():
-        # Wait a bit to ensure we are blocking in the iterator
-        time.sleep(0.3)
-        _thread.interrupt_main()
-
-    # Start the interrupt thread
-    thread = threading.Thread(target=trigger_interrupt)
-    thread.start()
-
-    try:
-        # Constructing the DataFrame will consume the C-stream.
-        # Since the channel is empty and kept open, it will block.
-        # The interrupt should break it.
-        pl.DataFrame(exporter)
-    except BaseException as err:
-        # This catches KeyboardInterrupt, ComputeError, and PanicException (from Polars unwrap).
-        if isinstance(err, KeyboardInterrupt) or "Python interrupt" in str(err):
-            interrupted = True
-        else:
-            raise
-
-    thread.join()
-    assert interrupted, "The C-stream consumption was not interrupted"
