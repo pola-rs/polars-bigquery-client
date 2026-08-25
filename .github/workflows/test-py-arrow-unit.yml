@@ -1,0 +1,117 @@
+name: Test Python (Unit)
+
+on:
+  pull_request:
+    paths:
+      - Cargo.lock
+      - crates/**
+      - docs/source/src/python/**
+      - py-arrow-bigquery/**
+      - .github/workflows/test-python-unit.yml
+  push:
+    branches:
+      - main
+    paths:
+      - Cargo.lock
+      - crates/**
+      - docs/source/src/python/**
+      - py-arrow-bigquery/**
+      - .github/workflows/test-python-unit.yml
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  RUSTFLAGS: -C debuginfo=0 # Do not produce debug symbols to keep memory usage down
+  RUST_BACKTRACE: 1
+  PYTHONUTF8: 1
+
+defaults:
+  run:
+    working-directory: py-arrow-bigquery
+    shell: bash
+
+permissions:
+  contents: read
+
+jobs:
+  test-python:
+    name: Test Python (Unit)
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest]
+        # Skip 3.14t for now, until we don't have to build quite as many
+        # dependencies from scratch.
+        python-version: ['3.10', '3.12', '3.13', '3.14']
+        include:
+          - os: windows-latest
+            python-version: '3.14'
+
+    steps:
+      - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
+        with:
+          persist-credentials: false
+
+      - name: Free some disk space (remove unused packages)
+        uses: endersonmenezes/free-disk-space@7901478139cff6e9d44df5972fd8ab8fcade4db1 #v3.2.2
+        if: ${{ matrix.os != 'windows-latest' }}
+
+      - name: Enable long paths on Windows
+        if: matrix.os == 'windows-latest'
+        shell:
+          powershell
+        run: |
+          Set-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\FileSystem' -Name 'LongPathsEnabled' -Value 1
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 #v7.0.0
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Create virtual environment
+        env:
+          BIN: ${{ matrix.os == 'windows-latest' && 'Scripts' || 'bin' }}
+        run: |
+          python -m venv .venv
+          echo "$GITHUB_WORKSPACE/py-arrow-bigquery/.venv/$BIN" >> "$GITHUB_PATH"
+          echo "VIRTUAL_ENV=$GITHUB_WORKSPACE/py-arrow-bigquery/.venv" >> "$GITHUB_ENV"
+          echo "VENV=$GITHUB_WORKSPACE/py-arrow-bigquery/.venv" >> "$GITHUB_ENV"
+
+      - name: Install maturin
+        if: matrix.python-version == '3.14t'
+        run: |
+          pip install uv
+          uv pip install maturin
+
+      - name: Install Python dependencies
+        env:
+          PYTHON_VERSION: ${{ matrix.python-version }}
+        run: |
+          pip install uv
+          if [ "$PYTHON_VERSION" = "3.10" ]; then
+            uv sync --resolution lowest --no-install-project --group test --no-dev
+          else
+            # Install typing-extensions separately whilst the `--extra-index-url` in `requirements-ci.txt`
+            # doesn't have an up-to-date typing-extensions, see
+            # https://github.com/astral-sh/uv/issues/6028#issuecomment-2287232150
+            uv pip install -U typing-extensions
+            uv sync --upgrade --no-install-project --group test --no-dev
+          fi
+      - name: Set up Rust
+        run: rustup show
+
+      - name: Cache Rust
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 #v2.9.1
+        with:
+          workspaces: py-arrow-bigquery
+          save-if: ${{ github.ref_name == 'main' }}
+
+      - name: Install Polars BigQuery
+        run: |
+          pip install --no-deps -e .
+
+      - name: Run tests
+        run: pytest -n auto tests/unit
