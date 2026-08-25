@@ -1,5 +1,5 @@
 [build-system]
-requires = ["maturin>=1.0,<2.0", "polars>=1.3.0"]
+requires = ["maturin>=1.0,<2.0"]
 build-backend = "maturin"
 
 [project]
@@ -15,13 +15,13 @@ dependencies = [
     "google-auth >= 2.40.3",
     "requests >= 2.33.0, < 3.0.0",
     "cachetools >= 5.0.0",
-    "polars",  # todo: remove
 ]
 
 [dependency-groups]
 dev = [
     "maturin>=1.13.1; platform_system != 'Linux'",
     "maturin[patchelf]>=1.13.1; platform_system == 'Linux'",
+    "nanoarrow>=0.9.0",
     "nodeenv>=1.9.1",
     "pre-commit>=4.3.0",
     "pyparsing>=2.4.7",
@@ -33,6 +33,7 @@ dev = [
 test = [
     "maturin>=1.13.1; platform_system != 'Linux'",
     "maturin[patchelf]>=1.13.1; platform_system == 'Linux'",
+    "nanoarrow>=0.9.0",
     "pytest>=8.4.1",
     "pytest-benchmark>=5.1.0",
     "pytest-xdist>=3.8.0",
