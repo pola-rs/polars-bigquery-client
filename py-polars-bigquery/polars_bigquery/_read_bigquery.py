@@ -67,7 +67,7 @@ class Client:
     def credentials_provider(self) -> pl.CredentialProviderGCP:
         return self._credentials_provider
 
-    def read_bigquery_table(
+    def read_table(
         self,
         table: Any,
         *,
@@ -77,7 +77,7 @@ class Client:
     ) -> pl.DataFrame:
         user_agent = _get_user_agent(user_agent or self._user_agent)
         table_ref = _parse_table_id(table)
-        arrow_stream_exporter = self._arrow_client.read_bigquery_table(
+        arrow_stream_exporter = self._arrow_client.read_table(
             table_ref,
             quota_project_id=quota_project_id,
             maintain_order=maintain_order,
@@ -85,9 +85,7 @@ class Client:
         )
         return pl.DataFrame(arrow_stream_exporter)
 
-    read_table = read_bigquery_table
-
-    def read_bigquery_query(
+    def read_query(
         self,
         query: str,
         *,
@@ -103,7 +101,7 @@ class Client:
             user_agent=user_agent,
         )
         table_ref = _parse_table_id(table)
-        arrow_stream_exporter = self._arrow_client.read_bigquery_table(
+        arrow_stream_exporter = self._arrow_client.read_table(
             table_ref,
             quota_project_id=quota_project_id,
             maintain_order=maintain_order,
@@ -111,9 +109,7 @@ class Client:
         )
         return pl.DataFrame(arrow_stream_exporter)
 
-    read_query = read_bigquery_query
-
-    def scan_bigquery_table(
+    def scan_table(
         self,
         table: Any,
         *,
@@ -122,61 +118,10 @@ class Client:
     ) -> pl.LazyFrame:
         user_agent = _get_user_agent(user_agent or self._user_agent)
         table_ref = _parse_table_id(table)
-        arrow_stream_exporter = self._arrow_client.read_bigquery_table(
+        arrow_stream_exporter = self._arrow_client.read_table(
             table_ref,
             quota_project_id=quota_project_id,
             maintain_order=False,
             user_agent=user_agent,
         )
         return pl.scan_arrow_c_stream(arrow_stream_exporter)
-
-    scan_table = scan_bigquery_table
-
-
-def read_bigquery_table(
-    table: Any,
-    *,
-    quota_project_id: str,
-    credentials_provider: pl.CredentialProviderGCP | None = None,
-    maintain_order: bool = False,
-    user_agent: str | None = None,
-) -> pl.DataFrame:
-    client = Client(credentials_provider=credentials_provider, user_agent=user_agent)
-    return client.read_bigquery_table(
-        table,
-        quota_project_id=quota_project_id,
-        maintain_order=maintain_order,
-        user_agent=user_agent,
-    )
-
-
-def read_bigquery_query(
-    query: str,
-    *,
-    quota_project_id: str,
-    credentials_provider: pl.CredentialProviderGCP | None = None,
-    maintain_order: bool = False,
-    user_agent: str | None = None,
-) -> pl.DataFrame:
-    client = Client(credentials_provider=credentials_provider, user_agent=user_agent)
-    return client.read_bigquery_query(
-        query,
-        quota_project_id=quota_project_id,
-        maintain_order=maintain_order,
-        user_agent=user_agent,
-    )
-
-
-def scan_bigquery_table(
-    table: Any,
-    *,
-    quota_project_id: str,
-    credentials_provider: pl.CredentialProviderGCP | None = None,
-    user_agent: str | None = None,
-) -> pl.LazyFrame:
-    client = Client(credentials_provider=credentials_provider, user_agent=user_agent)
-    return client.scan_bigquery_table(
-        table,
-        quota_project_id=quota_project_id,
-        user_agent=user_agent,
-    )

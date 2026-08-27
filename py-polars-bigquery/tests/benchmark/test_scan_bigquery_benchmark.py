@@ -16,7 +16,7 @@ def test_scan_bigquery_public_data(client, benchmark):
     project = os.environ["GOOGLE_CLOUD_PROJECT"]
 
     def scan_bigquery_and_collect():
-        ldf = client.scan_bigquery_table(
+        ldf = client.scan_table(
             table="bigquery-public-data.usa_names.usa_1910_2013",
             quota_project_id=project,
         )

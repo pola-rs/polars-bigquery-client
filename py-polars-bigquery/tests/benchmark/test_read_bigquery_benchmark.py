@@ -22,7 +22,7 @@ def test_read_bigquery_public_data(client, table_id, benchmark):
     project = os.environ["GOOGLE_CLOUD_PROJECT"]
 
     df = benchmark(
-        client.read_bigquery_table,
+        client.read_table,
         table=table_id,
         quota_project_id=project,
     )

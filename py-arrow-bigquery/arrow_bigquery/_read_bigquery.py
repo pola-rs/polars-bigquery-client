@@ -59,7 +59,7 @@ class Client:
             user_agent=full_user_agent,
         )
 
-    def read_bigquery_table(
+    def read_table(
         self,
         table: Any,
         *,
@@ -69,31 +69,9 @@ class Client:
     ) -> arrow_bigquery._native.ArrowStreamExporter:
         user_agent = _get_user_agent(user_agent or self._user_agent)
         table_ref = _parse_table_id(table)
-        return self._client.read_bigquery_table(
+        return self._client.read_table(
             table_ref,
             quota_project_id,
             maintain_order,
             user_agent,
         )
-
-    read_table = read_bigquery_table
-
-
-def read_bigquery_table(
-    table: Any,
-    *,
-    quota_project_id: str,
-    credentials_provider: Any = None,
-    maintain_order: bool = False,
-    user_agent: str | None = None,
-) -> arrow_bigquery._native.ArrowStreamExporter:
-    client = Client(
-        credentials_provider=credentials_provider,
-        user_agent=user_agent,
-    )
-    return client.read_bigquery_table(
-        table,
-        quota_project_id=quota_project_id,
-        maintain_order=maintain_order,
-        user_agent=user_agent,
-    )

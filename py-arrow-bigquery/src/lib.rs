@@ -279,8 +279,10 @@ impl Client {
         Ok(Self { client })
     }
 
+    /// Reads a BigQuery table and returns an [`ArrowStreamExporter`] which can be
+    /// consumed by Polars in Python.
     #[pyo3(signature = (table, quota_project_id, maintain_order=false, user_agent=None))]
-    pub fn read_bigquery_table(
+    pub fn read_table(
         &self,
         table: &str,
         quota_project_id: &str,
@@ -305,21 +307,6 @@ impl Client {
             Err(err) => Err(err),
         }
     }
-}
-
-/// Reads a BigQuery table and returns an [`ArrowStreamExporter`] which can be
-/// consumed by Polars in Python.
-#[pyfunction]
-#[pyo3(signature = (table, quota_project_id, maintain_order=false, credentials_provider=None, user_agent=None))]
-pub fn read_bigquery_table(
-    table: &str,
-    quota_project_id: &str,
-    maintain_order: bool,
-    credentials_provider: Option<Py<PyAny>>,
-    user_agent: Option<String>,
-) -> pyo3::PyResult<ArrowStreamExporter> {
-    let client = Client::new(credentials_provider, user_agent)?;
-    client.read_bigquery_table(table, quota_project_id, maintain_order, None)
 }
 
 #[pyfunction]
@@ -418,8 +405,6 @@ fn polars_bigquery(m: &Bound<PyModule>) -> PyResult<()> {
     });
 
     m.add_class::<Client>().unwrap();
-    m.add_wrapped(wrap_pyfunction!(read_bigquery_table))
-        .unwrap();
     m.add_wrapped(wrap_pyfunction!(_create_test_exporter))
         .unwrap();
     m.add_wrapped(wrap_pyfunction!(_test_create_exporter_with_drop_flag))
