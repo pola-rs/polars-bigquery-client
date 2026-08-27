@@ -13,7 +13,7 @@ use gcloud_sdk::google::cloud::bigquery::storage::v1::{
     arrow_serialization_options, read_session, ArrowSerializationOptions, CreateReadSessionRequest,
     DataFormat, ReadSession,
 };
-use gcloud_sdk::{GoogleApiClient, GoogleApiClientBuilder, GoogleAuthMiddleware};
+use gcloud_sdk::{GoogleApiClient, GoogleAuthMiddleware};
 use polars_arrow::datatypes::ArrowSchemaRef;
 use polars_arrow::io::ipc::read::read_stream_metadata;
 use polars_arrow::record_batch::RecordBatch;

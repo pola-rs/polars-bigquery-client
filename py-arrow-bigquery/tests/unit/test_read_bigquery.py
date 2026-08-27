@@ -1,21 +1,16 @@
 import _thread
 import threading
 import time
-from unittest.mock import ANY, MagicMock, patch
+from unittest.mock import MagicMock, patch
 
 import nanoarrow
 import pytest
 from arrow_bigquery import (
+    Client,
     __version__,
     _native,
 )
 from arrow_bigquery._read_bigquery import _get_user_agent, _parse_table_id
-
-
-@pytest.fixture
-def mock_rust_read():
-    with patch("arrow_bigquery._native.read_table") as mocked:
-        yield mocked
 
 
 @pytest.fixture
@@ -74,7 +69,6 @@ def test_parse_table_id_invalid_type():
 def test_client_init_passes_credentials_provider():
     mock_cp = MagicMock()
     with patch("arrow_bigquery._native.Client") as mock_native_cls:
-        from arrow_bigquery import Client
         Client(credentials_provider=mock_cp)
         mock_native_cls.assert_called_once_with(
             credentials_provider=mock_cp,
@@ -83,8 +77,6 @@ def test_client_init_passes_credentials_provider():
 
 
 def test_client_read_bigquery_calls_rust_with_parsed_id(mock_rust_client):
-    from arrow_bigquery import Client
-
     placeholder = object()
     mock_rust_client.read_table.return_value = placeholder
 
@@ -103,8 +95,6 @@ def test_client_read_bigquery_calls_rust_with_parsed_id(mock_rust_client):
 
 
 def test_client_read_bigquery_handles_bigquery_objects(mock_rust_client):
-    from arrow_bigquery import Client
-
     mock_rust_client.read_table.return_value = MagicMock()
     mock_ref = MagicMock()
     mock_ref.project = "p"
@@ -120,8 +110,6 @@ def test_client_read_bigquery_handles_bigquery_objects(mock_rust_client):
 
 
 def test_client_read_bigquery_propagates_errors(mock_rust_client):
-    from arrow_bigquery import Client
-
     mock_rust_client.read_table.side_effect = Exception("Rust error")
 
     client = Client()
@@ -130,8 +118,6 @@ def test_client_read_bigquery_propagates_errors(mock_rust_client):
 
 
 def test_client_read_bigquery_with_user_agent(mock_rust_client):
-    from arrow_bigquery import Client
-
     mock_rust_client.read_table.return_value = MagicMock()
 
     client = Client()
@@ -139,59 +125,6 @@ def test_client_read_bigquery_with_user_agent(mock_rust_client):
         table="p.d.t", quota_project_id="q", user_agent="custom-extension/1.0"
     )
 
-    mock_rust_client.read_table.assert_called_once_with(
-        "p.d.t",
-        "q",
-        False,
-        f"arrow-bigquery/{__version__} custom-extension/1.0",
-    )
-
-
-def test_read_bigquery_calls_rust_with_parsed_id(mock_rust_client):
-    # Prepare
-    placeholder = object()
-    mock_rust_client.read_table.return_value = placeholder
-
-    # Execute
-    result = read_table(
-        table="my-project.my_dataset.my_table", quota_project_id="q"
-    )
-
-    # Assert
-    assert result is placeholder
-
-
-def test_read_bigquery_handles_bigquery_objects(mock_rust_client):
-    # Prepare
-    mock_rust_client.read_table.return_value = MagicMock()
-    mock_ref = MagicMock()
-    mock_ref.project = "p"
-    mock_ref.dataset_id = "d"
-    mock_ref.table_id = "t"
-
-    # Execute
-    read_table(table=mock_ref, quota_project_id="q")
-
-
-def test_read_bigquery_propagates_errors(mock_rust_client):
-    # Prepare
-    mock_rust_client.read_table.side_effect = Exception("Rust error")
-
-    # Execute & Assert
-    with pytest.raises(Exception, match="Rust error"):
-        read_table(table="p.d.t", quota_project_id="q")
-
-
-def test_read_bigquery_with_user_agent(mock_rust_client):
-    # Prepare
-    mock_rust_client.read_table.return_value = MagicMock()
-
-    # Execute
-    read_table(
-        table="p.d.t", quota_project_id="q", user_agent="custom-extension/1.0"
-    )
-
-    # Assert
     mock_rust_client.read_table.assert_called_once_with(
         "p.d.t",
         "q",
