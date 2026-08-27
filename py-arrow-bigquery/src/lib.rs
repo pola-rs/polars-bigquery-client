@@ -109,7 +109,7 @@ pub struct ArrowStreamExporter {
     schema: ArrowSchemaRef,
     /// The underlying BigQuery record batch receiver, wrapped in a mutex.
     /// It is an `Option` because the stream can only be consumed once.
-    receiver: std::sync::Mutex<Option<polars_bigquery_lib::BigQueryRecordBatchReceiver>>,
+    receiver: std::sync::Mutex<Option<arrow_bigquery_lib::BigQueryRecordBatchReceiver>>,
 }
 
 /// An iterator that adapts the asynchronous [`BigQueryRecordBatchReceiver`] into
@@ -119,7 +119,7 @@ pub struct ArrowStreamExporter {
 /// Each iteration blocks on the Tokio runtime to receive the next batch.
 struct ReceiverIterator {
     /// The receiver yielding record batches from the BigQuery Storage Read API.
-    rx: polars_bigquery_lib::BigQueryRecordBatchReceiver,
+    rx: arrow_bigquery_lib::BigQueryRecordBatchReceiver,
     /// The Arrow datatype (specifically a `Struct` type) matching the schema of the batches.
     dtype: polars_arrow::datatypes::ArrowDataType,
 }
@@ -231,7 +231,7 @@ impl ArrowStreamExporter {
 /// open across multiple table read operations, caching the OAuth2 token in Rust.
 #[pyclass(name = "Client")]
 pub struct Client {
-    client: polars_bigquery_lib::Client,
+    client: arrow_bigquery_lib::Client,
 }
 
 #[pymethods]
@@ -265,13 +265,13 @@ impl Client {
 
         let rt = pyo3_async_runtimes::tokio::get_runtime();
         let client = rt.block_on(async {
-            use polars_bigquery_lib::BigQueryReadClientBuilder;
+            use arrow_bigquery_lib::BigQueryReadClientBuilder;
 
-            let builder = polars_bigquery_lib::ServiceConfigBuilder::new()
+            let builder = arrow_bigquery_lib::ServiceConfigBuilder::new()
                 .with_cred(token_source_type)
                 .with_user_agent(user_agent);
 
-            polars_bigquery_lib::Client::from_builder(builder)
+            arrow_bigquery_lib::Client::from_builder(builder)
                 .await
                 .map_err(|err| pyo3::exceptions::PyRuntimeError::new_err(err.to_string()))
         })?;
@@ -342,7 +342,7 @@ pub fn _create_test_exporter() -> ArrowStreamExporter {
     let schema = polars_arrow::datatypes::ArrowSchema::from_iter(vec![field]);
     let schema_ref = std::sync::Arc::new(schema);
     let receiver =
-        polars_bigquery_lib::BigQueryRecordBatchReceiver::new_for_testing(rx, Vec::new());
+        arrow_bigquery_lib::BigQueryRecordBatchReceiver::new_for_testing(rx, Vec::new());
 
     ArrowStreamExporter {
         schema: schema_ref,
@@ -397,7 +397,7 @@ pub fn _test_create_exporter_with_drop_flag() -> (ArrowStreamExporter, DropFlag)
     let schema_ref = std::sync::Arc::new(schema);
 
     let receiver =
-        polars_bigquery_lib::BigQueryRecordBatchReceiver::new_for_testing(rx, vec![handle]);
+        arrow_bigquery_lib::BigQueryRecordBatchReceiver::new_for_testing(rx, vec![handle]);
 
     let exporter = ArrowStreamExporter {
         schema: schema_ref,

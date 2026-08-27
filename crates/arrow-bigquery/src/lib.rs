@@ -129,125 +129,89 @@ impl Client {
         quota_project_id: &str,
         maintain_order: bool,
     ) -> Result<(ArrowSchemaRef, BigQueryRecordBatchReceiver), BigQueryError> {
-        read_bigquery_with_client_arc(
-            self.client.clone(),
-            table_id,
-            quota_project_id,
-            maintain_order,
-        )
-        .await
+        let arrow_options = ArrowSerializationOptions {
+            buffer_compression: arrow_serialization_options::CompressionCodec::Lz4Frame.into(),
+            ..Default::default()
+        };
+        let read_options = read_session::TableReadOptions {
+            output_format_serialization_options: Some(
+                read_session::table_read_options::OutputFormatSerializationOptions::ArrowSerializationOptions(arrow_options)
+            ),
+            ..Default::default()
+        };
+        let read_session = ReadSession {
+            data_format: DataFormat::Arrow as i32,
+            table: table_id_to_table_path(table_id)?,
+            read_options: Some(read_options),
+            ..Default::default()
+        };
+
+        let request = CreateReadSessionRequest {
+            parent: format!("projects/{quota_project_id}"),
+            // If you are reading from a query results table where order matters,
+            // limit this to a single stream.
+            max_stream_count: if maintain_order {
+                1
+            } else {
+                match std::thread::available_parallelism() {
+                    Ok(value) => value.get() as i32,
+                    Err(_) => 1,
+                }
+            },
+            read_session: Some(read_session),
+            ..Default::default()
+        };
+
+        let policy = bigquery_read_retry::RetryPolicy::create_read_session_policy();
+        let service_client = self.client.clone();
+        let service = tower::service_fn(move |req: CreateReadSessionRequest| {
+            let mut client = service_client.get();
+            async move { client.create_read_session(req).await }
+        });
+        let read_session = tower::retry::Retry::new(policy, service)
+            .oneshot(request)
+            .await?
+            .into_inner();
+        let schema = match read_session.schema {
+            Some(read_session::Schema::ArrowSchema(value)) => value.serialized_schema,
+            _ => {
+                return Err(BigQueryError::Protocol(
+                    "Unexpectedly got schema type other than arrow".into(),
+                ))
+            },
+        };
+
+        let mut schema_cursor = Cursor::new(schema.clone());
+        let metadata = read_stream_metadata(&mut schema_cursor)?;
+        let schema_ref = Arc::new(metadata.schema);
+
+        let channel_size = match std::thread::available_parallelism() {
+            Ok(value) => value.get() * 2,
+            Err(_) => 2,
+        };
+        let (tx, rx) = tokio::sync::mpsc::channel(channel_size);
+        let shared_schema = Arc::new(schema);
+        let mut handles = Vec::new();
+
+        for stream in read_session.streams {
+            let stream_name = stream.name;
+            let handle = tokio::task::spawn(bigquery_read_stream::read_stream(
+                self.client.clone(),
+                shared_schema.clone(),
+                stream_name,
+                tx.clone(),
+            ));
+            handles.push(handle);
+        }
+
+        Ok((
+            schema_ref,
+            BigQueryRecordBatchReceiver {
+                rx,
+                _handles: handles,
+            },
+        ))
     }
-}
-
-pub async fn read_bigquery_with_client<B>(
-    read_client: GoogleApiClient<B, BigQueryReadClient<GoogleAuthMiddleware>>,
-    table_id: &str,
-    quota_project_id: &str,
-    maintain_order: bool,
-) -> Result<(ArrowSchemaRef, BigQueryRecordBatchReceiver), BigQueryError>
-where
-    B: GoogleApiClientBuilder<BigQueryReadClient<GoogleAuthMiddleware>> + Send + Sync + 'static,
-{
-    read_bigquery_with_client_arc(
-        Arc::new(read_client),
-        table_id,
-        quota_project_id,
-        maintain_order,
-    )
-    .await
-}
-
-pub async fn read_bigquery_with_client_arc<B>(
-    shared_client: Arc<GoogleApiClient<B, BigQueryReadClient<GoogleAuthMiddleware>>>,
-    table_id: &str,
-    quota_project_id: &str,
-    maintain_order: bool,
-) -> Result<(ArrowSchemaRef, BigQueryRecordBatchReceiver), BigQueryError>
-where
-    B: GoogleApiClientBuilder<BigQueryReadClient<GoogleAuthMiddleware>> + Send + Sync + 'static,
-{
-    let arrow_options = ArrowSerializationOptions {
-        buffer_compression: arrow_serialization_options::CompressionCodec::Lz4Frame.into(),
-        ..Default::default()
-    };
-    let read_options = read_session::TableReadOptions {
-        output_format_serialization_options: Some(
-            read_session::table_read_options::OutputFormatSerializationOptions::ArrowSerializationOptions(arrow_options)
-        ),
-        ..Default::default()
-    };
-    let read_session = ReadSession {
-        data_format: DataFormat::Arrow as i32,
-        table: table_id_to_table_path(table_id)?,
-        read_options: Some(read_options),
-        ..Default::default()
-    };
-
-    let request = CreateReadSessionRequest {
-        parent: format!("projects/{quota_project_id}"),
-        // If you are reading from a query results table where order matters,
-        // limit this to a single stream.
-        max_stream_count: if maintain_order {
-            1
-        } else {
-            match std::thread::available_parallelism() {
-                Ok(value) => value.get() as i32,
-                Err(_) => 1,
-            }
-        },
-        read_session: Some(read_session),
-        ..Default::default()
-    };
-
-    let policy = bigquery_read_retry::RetryPolicy::create_read_session_policy();
-    let service_client = shared_client.clone();
-    let service = tower::service_fn(move |req: CreateReadSessionRequest| {
-        let mut client = service_client.get();
-        async move { client.create_read_session(req).await }
-    });
-    let read_session = tower::retry::Retry::new(policy, service)
-        .oneshot(request)
-        .await?
-        .into_inner();
-    let schema = match read_session.schema {
-        Some(read_session::Schema::ArrowSchema(value)) => value.serialized_schema,
-        _ => {
-            return Err(BigQueryError::Protocol(
-                "Unexpectedly got schema type other than arrow".into(),
-            ))
-        },
-    };
-
-    let mut schema_cursor = Cursor::new(schema.clone());
-    let metadata = read_stream_metadata(&mut schema_cursor)?;
-    let schema_ref = Arc::new(metadata.schema);
-
-    let channel_size = match std::thread::available_parallelism() {
-        Ok(value) => value.get() * 2,
-        Err(_) => 2,
-    };
-    let (tx, rx) = tokio::sync::mpsc::channel(channel_size);
-    let shared_schema = Arc::new(schema);
-    let mut handles = Vec::new();
-
-    for stream in read_session.streams {
-        let stream_name = stream.name;
-        let handle = tokio::task::spawn(bigquery_read_stream::read_stream(
-            shared_client.clone(),
-            shared_schema.clone(),
-            stream_name,
-            tx.clone(),
-        ));
-        handles.push(handle);
-    }
-
-    Ok((
-        schema_ref,
-        BigQueryRecordBatchReceiver {
-            rx,
-            _handles: handles,
-        },
-    ))
 }
 
 #[cfg(test)]
