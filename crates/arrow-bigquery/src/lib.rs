@@ -5,6 +5,7 @@ mod error;
 
 use std::io::Cursor;
 use std::sync::Arc;
+use std::time::SystemTime;
 
 pub use client_builder::*;
 pub use error::BigQueryError;
@@ -13,11 +14,68 @@ use gcloud_sdk::google::cloud::bigquery::storage::v1::{
     arrow_serialization_options, read_session, ArrowSerializationOptions, CreateReadSessionRequest,
     DataFormat, ReadSession,
 };
+use gcloud_sdk::prost_types::Timestamp;
 use gcloud_sdk::{GoogleApiClient, GoogleAuthMiddleware};
 use polars_arrow::datatypes::ArrowSchemaRef;
 use polars_arrow::io::ipc::read::read_stream_metadata;
 use polars_arrow::record_batch::RecordBatch;
 use tower::ServiceExt;
+
+pub struct ReadOptions {
+    maintain_order: bool,
+    snapshot_time: Option<Timestamp>,
+    selected_fields: Vec<String>,
+    row_restriction: String,
+    arrow_serialization_options: Option<ArrowSerializationOptions>,
+    sample_percentage: Option<f64>,
+}
+
+impl ReadOptions {
+    fn build<F>(self, table_id: &str, max_streams: F, quota_project_id: &str) -> CreateReadSessionRequest
+    where F: Fn() -> i32
+    {
+        let arrow_options = match self.arrow_serialization_options {
+            Some(options) => options,
+            None => {
+                ArrowSerializationOptions {
+                    buffer_compression: arrow_serialization_options::CompressionCodec::Lz4Frame.into(),
+                    ..Default::default()
+                }
+            },
+        };
+        let table_modifiers = read_session::TableModifiers {
+            snapshot_time: self.snapshot_time,
+        }
+        let read_options = read_session::TableReadOptions {
+            output_format_serialization_options: Some(
+                read_session::table_read_options::OutputFormatSerializationOptions::ArrowSerializationOptions(arrow_options)
+            ),
+            selected_fields: self.selected_fields,
+            row_restriction: self.row_restriction,
+            sample_percentage: self.sample_percentage,
+            ..Default::default()
+        };
+        let read_session = ReadSession {
+            data_format: DataFormat::Arrow as i32,
+            table: table_id_to_table_path(table_id)?,
+            read_options: Some(read_options),
+            ..Default::default()
+        };
+
+        CreateReadSessionRequest {
+            parent: format!("projects/{}", quota_project_id),
+            // If you are reading from a query results table where order matters,
+            // limit this to a single stream.
+            max_stream_count: if self.maintain_order {
+                1
+            } else {
+                max_streams()
+            },
+            read_session: Some(read_session),
+            ..Default::default()
+        }
+    }
+}
 
 /// A receiver that yields [`RecordBatch`]es read from BigQuery.
 ///
@@ -139,41 +197,18 @@ impl Client {
     pub async fn read_table(
         &self,
         table_id: &str,
-        maintain_order: bool,
+        options: ReadOptions,
     ) -> Result<(ArrowSchemaRef, BigQueryRecordBatchReceiver), BigQueryError> {
-        let arrow_options = ArrowSerializationOptions {
-            buffer_compression: arrow_serialization_options::CompressionCodec::Lz4Frame.into(),
-            ..Default::default()
-        };
-        let read_options = read_session::TableReadOptions {
-            output_format_serialization_options: Some(
-                read_session::table_read_options::OutputFormatSerializationOptions::ArrowSerializationOptions(arrow_options)
-            ),
-            ..Default::default()
-        };
-        let read_session = ReadSession {
-            data_format: DataFormat::Arrow as i32,
-            table: table_id_to_table_path(table_id)?,
-            read_options: Some(read_options),
-            ..Default::default()
-        };
-
-        let request = CreateReadSessionRequest {
-            parent: format!("projects/{}", self.quota_project_id),
-            // If you are reading from a query results table where order matters,
-            // limit this to a single stream.
-            max_stream_count: if maintain_order {
-                1
-            } else {
+        let request = options.build(
+            table_id,
+            || {
                 match std::thread::available_parallelism() {
                     Ok(value) => value.get() as i32,
                     Err(_) => 1,
                 }
             },
-            read_session: Some(read_session),
-            ..Default::default()
-        };
-
+            &self.quota_project_id,
+        );
         let policy = bigquery_read_retry::RetryPolicy::create_read_session_policy();
         let service_client = self.client.clone();
         let service = tower::service_fn(move |req: CreateReadSessionRequest| {
