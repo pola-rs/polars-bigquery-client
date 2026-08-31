@@ -1,6 +1,7 @@
 from unittest.mock import MagicMock, patch
 
 import pytest
+
 from polars_bigquery.core.run_query import run_query
 from polars_bigquery.exceptions import BigQueryError
 

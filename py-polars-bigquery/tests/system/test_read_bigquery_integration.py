@@ -1,8 +1,9 @@
 import os
 
 import polars
-import polars_bigquery
 import pytest
+
+import polars_bigquery
 
 
 @pytest.fixture(scope="module")

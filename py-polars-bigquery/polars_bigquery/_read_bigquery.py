@@ -57,7 +57,9 @@ class Client:
         user_agent: str | None = None,
     ) -> None:
         if credentials_provider is None:
-            credentials_provider = pl.CredentialProviderGCP()
+            credentials_provider = pl.CredentialProviderGCP(
+                quota_project_id=quota_project_id
+            )
         self._credentials_provider = credentials_provider
         self._user_agent = _get_user_agent(user_agent)
         self._quota_project_id = quota_project_id
