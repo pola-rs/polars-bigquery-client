@@ -237,8 +237,9 @@ pub struct Client {
 #[pymethods]
 impl Client {
     #[new]
-    #[pyo3(signature = (*, credentials_provider=None, user_agent=None))]
+    #[pyo3(signature = (*, quota_project_id, credentials_provider=None, user_agent=None))]
     pub fn new(
+        quota_project_id: String,
         credentials_provider: Option<Py<PyAny>>,
         user_agent: Option<String>,
     ) -> PyResult<Self> {
@@ -259,7 +260,7 @@ impl Client {
                     };
                     gcloud_sdk::TokenSourceType::ExternalSource(Box::new(token_source))
                 }
-            }
+            },
             None => gcloud_sdk::TokenSourceType::Default,
         };
 
@@ -269,7 +270,8 @@ impl Client {
 
             let builder = arrow_bigquery_lib::ServiceConfigBuilder::new()
                 .with_cred(token_source_type)
-                .with_user_agent(user_agent);
+                .with_user_agent(user_agent)
+                .with_quota_project_id(Some(quota_project_id));
 
             arrow_bigquery_lib::Client::from_builder(builder)
                 .await
@@ -281,18 +283,13 @@ impl Client {
 
     /// Reads a BigQuery table and returns an [`ArrowStreamExporter`] which can be
     /// consumed by Polars in Python.
-    #[pyo3(signature = (table, quota_project_id, maintain_order=false))]
-    pub fn read_table(
-        &self,
-        table: &str,
-        quota_project_id: &str,
-        maintain_order: bool,
-    ) -> PyResult<ArrowStreamExporter> {
+    #[pyo3(signature = (table, maintain_order=false))]
+    pub fn read_table(&self, table: &str, maintain_order: bool) -> PyResult<ArrowStreamExporter> {
         let rt = pyo3_async_runtimes::tokio::get_runtime();
         let client = self.client.clone();
         let result = rt.block_on(async move {
             client
-                .read_table(table, quota_project_id, maintain_order)
+                .read_table(table, maintain_order)
                 .await
                 .map_err(|err| pyo3::exceptions::PyRuntimeError::new_err(err.to_string()))
         });
@@ -326,8 +323,7 @@ pub fn _create_test_exporter() -> ArrowStreamExporter {
     );
     let schema = polars_arrow::datatypes::ArrowSchema::from_iter(vec![field]);
     let schema_ref = std::sync::Arc::new(schema);
-    let receiver =
-        arrow_bigquery_lib::BigQueryRecordBatchReceiver::new_for_testing(rx, Vec::new());
+    let receiver = arrow_bigquery_lib::BigQueryRecordBatchReceiver::new_for_testing(rx, Vec::new());
 
     ArrowStreamExporter {
         schema: schema_ref,

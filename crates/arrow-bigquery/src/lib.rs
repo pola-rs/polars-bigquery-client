@@ -103,30 +103,42 @@ pub type BigQueryClient =
 #[derive(Clone)]
 pub struct Client {
     client: Arc<BigQueryClient>,
+    quota_project_id: String,
 }
 
 impl Client {
-    pub fn new(client: BigQueryClient) -> Self {
+    pub fn new(client: BigQueryClient, quota_project_id: String) -> Self {
         Self {
             client: Arc::new(client),
+            quota_project_id,
         }
     }
 
-    pub fn from_arc(client: Arc<BigQueryClient>) -> Self {
-        Self { client }
+    pub fn from_arc(client: Arc<BigQueryClient>, quota_project_id: String) -> Self {
+        Self {
+            client,
+            quota_project_id,
+        }
+    }
+
+    pub fn quota_project_id(&self) -> &str {
+        &self.quota_project_id
     }
 
     pub async fn from_builder(
         builder: ServiceConfigBuilder,
     ) -> Result<Self, Box<dyn std::error::Error>> {
+        let quota_project_id = builder
+            .quota_project_id
+            .clone()
+            .ok_or_else(|| "quota_project_id is required".to_string())?;
         let client = builder.build().await?;
-        Ok(Self::new(client))
+        Ok(Self::new(client, quota_project_id))
     }
 
     pub async fn read_table(
         &self,
         table_id: &str,
-        quota_project_id: &str,
         maintain_order: bool,
     ) -> Result<(ArrowSchemaRef, BigQueryRecordBatchReceiver), BigQueryError> {
         let arrow_options = ArrowSerializationOptions {
@@ -147,7 +159,7 @@ impl Client {
         };
 
         let request = CreateReadSessionRequest {
-            parent: format!("projects/{quota_project_id}"),
+            parent: format!("projects/{}", self.quota_project_id),
             // If you are reading from a query results table where order matters,
             // limit this to a single stream.
             max_stream_count: if maintain_order {

@@ -69,26 +69,32 @@ def test_parse_table_id_invalid_type():
 def test_client_init_passes_credentials_provider():
     mock_cp = MagicMock()
     with patch("arrow_bigquery._native.Client") as mock_native_cls:
-        Client(credentials_provider=mock_cp)
+        client = Client(quota_project_id="test-proj", credentials_provider=mock_cp)
+        assert client.quota_project_id == "test-proj"
         mock_native_cls.assert_called_once_with(
+            quota_project_id="test-proj",
             credentials_provider=mock_cp,
             user_agent=f"arrow-bigquery/{__version__}",
         )
+
+
+def test_client_init_requires_quota_project_id():
+    with pytest.raises(
+        TypeError, match="missing 1 required keyword-only argument: 'quota_project_id'"
+    ):
+        Client()
 
 
 def test_client_read_bigquery_calls_rust_with_parsed_id(mock_rust_client):
     placeholder = object()
     mock_rust_client.read_table.return_value = placeholder
 
-    client = Client()
-    result = client.read_table(
-        table="my-project.my_dataset.my_table", quota_project_id="q"
-    )
+    client = Client(quota_project_id="q")
+    result = client.read_table(table="my-project.my_dataset.my_table")
 
     mock_rust_client.read_table.assert_called_once_with(
         "my-project.my_dataset.my_table",
-        "q",
-        False,
+        maintain_order=False,
     )
     assert result is placeholder
 
@@ -100,20 +106,18 @@ def test_client_read_bigquery_handles_bigquery_objects(mock_rust_client):
     mock_ref.dataset_id = "d"
     mock_ref.table_id = "t"
 
-    client = Client()
-    client.read_table(table=mock_ref, quota_project_id="q")
+    client = Client(quota_project_id="q")
+    client.read_table(table=mock_ref)
 
-    mock_rust_client.read_table.assert_called_once_with(
-        "p.d.t", "q", False
-    )
+    mock_rust_client.read_table.assert_called_once_with("p.d.t", maintain_order=False)
 
 
 def test_client_read_bigquery_propagates_errors(mock_rust_client):
     mock_rust_client.read_table.side_effect = Exception("Rust error")
 
-    client = Client()
+    client = Client(quota_project_id="q")
     with pytest.raises(Exception, match="Rust error"):
-        client.read_table(table="p.d.t", quota_project_id="q")
+        client.read_table(table="p.d.t")
 
 
 def test_receiver_iterator_interrupt():

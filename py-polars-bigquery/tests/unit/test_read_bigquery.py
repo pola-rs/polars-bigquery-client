@@ -1,9 +1,7 @@
-
 from unittest.mock import MagicMock, patch
 
 import polars as pl
 import pytest
-
 from polars_bigquery import (
     Client,
     __version__,
@@ -67,12 +65,21 @@ def test_parse_table_id_invalid_type():
 def test_client_custom_credentials_provider():
     custom_creds = MagicMock()
     with patch("arrow_bigquery.Client") as mock_arrow_cls:
-        client = Client(credentials_provider=custom_creds)
+        client = Client(quota_project_id="test-proj", credentials_provider=custom_creds)
         assert client.credentials_provider is custom_creds
+        assert client.quota_project_id == "test-proj"
         mock_arrow_cls.assert_called_once_with(
+            quota_project_id="test-proj",
             credentials_provider=custom_creds,
             user_agent=f"polars-bigquery/{__version__}",
         )
+
+
+def test_client_init_requires_quota_project_id():
+    with pytest.raises(
+        TypeError, match="missing 1 required keyword-only argument: 'quota_project_id'"
+    ):
+        Client()
 
 
 def test_client_read_bigquery_calls_arrow_with_parsed_id(mock_arrow_client):
@@ -83,12 +90,11 @@ def test_client_read_bigquery_calls_arrow_with_parsed_id(mock_arrow_client):
         mock_df = MagicMock()
         mock_df_cls.return_value = mock_df
 
-        client = Client()
-        result = client.read_table(table="my-project.my_dataset.my_table", quota_project_id="q")
+        client = Client(quota_project_id="q")
+        result = client.read_table(table="my-project.my_dataset.my_table")
 
         mock_arrow_client.read_table.assert_called_once_with(
             "my-project.my_dataset.my_table",
-            quota_project_id="q",
             maintain_order=False,
         )
         mock_df_cls.assert_called_once_with(mock_exporter)
@@ -99,20 +105,23 @@ def test_client_read_query(mock_arrow_client):
     mock_exporter = MagicMock()
     mock_arrow_client.read_table.return_value = mock_exporter
 
-    with patch("polars_bigquery._read_bigquery.run_query") as mock_run_query, \
-         patch("polars.DataFrame") as mock_df_cls:
+    with (
+        patch("polars_bigquery._read_bigquery.run_query") as mock_run_query,
+        patch("polars.DataFrame") as mock_df_cls,
+    ):
         mock_run_query.return_value = "project.dataset.temp_table"
         mock_df = MagicMock()
         mock_df_cls.return_value = mock_df
 
-        client = Client()
-        result = client.read_query(query="SELECT 1", quota_project_id="q")
+        client = Client(quota_project_id="q")
+        result = client.read_query(query="SELECT 1")
 
         expected_ua = f"polars-bigquery/{__version__}"
-        mock_run_query.assert_called_once_with("SELECT 1", "q", client.credentials_provider, user_agent=expected_ua)
+        mock_run_query.assert_called_once_with(
+            "SELECT 1", "q", client.credentials_provider, user_agent=expected_ua
+        )
         mock_arrow_client.read_table.assert_called_once_with(
             "project.dataset.temp_table",
-            quota_project_id="q",
             maintain_order=False,
         )
         assert result is mock_df
@@ -122,16 +131,16 @@ def test_client_read_query_with_user_agent(mock_arrow_client):
     mock_exporter = MagicMock()
     mock_arrow_client.read_table.return_value = mock_exporter
 
-    with patch("polars_bigquery._read_bigquery.run_query") as mock_run_query, \
-         patch("polars.DataFrame") as mock_df_cls:
+    with (
+        patch("polars_bigquery._read_bigquery.run_query") as mock_run_query,
+        patch("polars.DataFrame") as mock_df_cls,
+    ):
         mock_run_query.return_value = "project.dataset.temp_table"
         mock_df = MagicMock()
         mock_df_cls.return_value = mock_df
 
-        client = Client(user_agent="custom-ua/1.0")
-        result = client.read_query(
-            query="SELECT 1", quota_project_id="q",
-        )
+        client = Client(user_agent="custom-ua/1.0", quota_project_id="q")
+        result = client.read_query(query="SELECT 1")
 
         assert result is not None
         expected_ua = f"polars-bigquery/{__version__} custom-ua/1.0"
@@ -149,12 +158,11 @@ def test_client_read_bigquery_handles_bigquery_objects(mock_arrow_client):
     mock_ref.table_id = "t"
 
     with patch("polars.DataFrame"):
-        client = Client()
-        client.read_table(table=mock_ref, quota_project_id="q")
+        client = Client(quota_project_id="q")
+        client.read_table(table=mock_ref)
 
         mock_arrow_client.read_table.assert_called_once_with(
             "p.d.t",
-            quota_project_id="q",
             maintain_order=False,
         )
 
@@ -162,9 +170,9 @@ def test_client_read_bigquery_handles_bigquery_objects(mock_arrow_client):
 def test_client_read_bigquery_propagates_errors(mock_arrow_client):
     mock_arrow_client.read_table.side_effect = Exception("Rust error")
 
-    client = Client()
+    client = Client(quota_project_id="q")
     with pytest.raises(Exception, match="Rust error"):
-        client.read_table(table="p.d.t", quota_project_id="q")
+        client.read_table(table="p.d.t")
 
 
 def test_client_scan_bigquery_calls_arrow_with_parsed_id(mock_arrow_client):
@@ -175,14 +183,11 @@ def test_client_scan_bigquery_calls_arrow_with_parsed_id(mock_arrow_client):
         mock_lazy_df = pl.LazyFrame({"col1": [1, 2]})
         mock_scan.return_value = mock_lazy_df
 
-        client = Client()
-        result = client.scan_table(
-            table="my-project.my_dataset.my_table", quota_project_id="q"
-        )
+        client = Client(quota_project_id="q")
+        result = client.scan_table(table="my-project.my_dataset.my_table")
 
         mock_arrow_client.read_table.assert_called_once_with(
             "my-project.my_dataset.my_table",
-            quota_project_id="q",
             maintain_order=False,
         )
         mock_scan.assert_called_once_with(mock_stream)

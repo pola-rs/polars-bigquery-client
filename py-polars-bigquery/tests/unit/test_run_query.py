@@ -1,7 +1,6 @@
 from unittest.mock import MagicMock, patch
 
 import pytest
-
 from polars_bigquery.core.run_query import run_query
 from polars_bigquery.exceptions import BigQueryError
 
@@ -128,10 +127,7 @@ def test_run_query_with_user_agent():
         )
 
         called_headers = mock_post.call_args.kwargs["headers"]
-        assert (
-            called_headers["User-Agent"]
-            == "polars-bigquery/0.1.0 custom-ua/1.0"
-        )
+        assert called_headers["User-Agent"] == "polars-bigquery/0.1.0 custom-ua/1.0"
 
 
 def test_run_query_requires_user_agent():

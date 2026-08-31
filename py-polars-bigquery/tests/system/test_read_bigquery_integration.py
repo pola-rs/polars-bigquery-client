@@ -1,19 +1,17 @@
 import os
 
 import polars
-import pytest
-
 import polars_bigquery
+import pytest
 
 
 @pytest.fixture(scope="module")
 def client():
-    return polars_bigquery.Client()
+    project = os.environ["GOOGLE_CLOUD_PROJECT"]
+    return polars_bigquery.Client(quota_project_id=project)
 
 
 def test_read_bigquery_public_data_ordered(client):
-    project = os.environ["GOOGLE_CLOUD_PROJECT"]
-
     # Use a query so that the test can run using BigQuery sandbox quota.
     df = client.read_query(
         query="""
@@ -24,7 +22,6 @@ def test_read_bigquery_public_data_ordered(client):
         ORDER BY total_born DESC
         LIMIT 100
         """,
-        quota_project_id=project,
         maintain_order=True,
     )
     assert isinstance(df, polars.DataFrame)
@@ -35,14 +32,11 @@ def test_read_bigquery_public_data_ordered(client):
 
 
 def test_read_bigquery_public_data_unordered(client):
-    project = os.environ["GOOGLE_CLOUD_PROJECT"]
-
     # Use a query so that the test can run using BigQuery sandbox quota.
     df = client.read_query(
         query="""
         SELECT * FROM `bigquery-public-data.utility_us.country_code_iso`
         """,
-        quota_project_id=project,
         maintain_order=False,
     )
     assert isinstance(df, polars.DataFrame)

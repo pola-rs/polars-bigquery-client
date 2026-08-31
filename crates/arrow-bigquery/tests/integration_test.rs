@@ -10,18 +10,16 @@ async fn test_read_small_public_table() {
     let client = Client::from_builder(
         ServiceConfigBuilder::new()
             .with_cred(gcloud_sdk::TokenSourceType::Default)
-            .with_user_agent(Some("integration-test/1.0".to_string())),
+            .with_user_agent(Some("integration-test/1.0".to_string()))
+            .with_quota_project_id(Some(quota_project_id)),
     )
     .await
     .expect("should build client");
 
-    let (_, mut receiver) = client.read_table(
-        "bigquery-public-data.usa_names.usa_1910_2013",
-        &quota_project_id,
-        false,
-    )
-    .await
-    .expect("public table read should work with default credentials");
+    let (_, mut receiver) = client
+        .read_table("bigquery-public-data.usa_names.usa_1910_2013", false)
+        .await
+        .expect("public table read should work with default credentials");
 
     let mut total_rows = 0;
     while let Some(batch) = receiver.recv().await {
