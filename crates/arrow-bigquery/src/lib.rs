@@ -5,7 +5,6 @@ mod error;
 
 use std::io::Cursor;
 use std::sync::Arc;
-use std::time::SystemTime;
 
 pub use client_builder::*;
 pub use error::BigQueryError;
@@ -21,17 +20,18 @@ use polars_arrow::io::ipc::read::read_stream_metadata;
 use polars_arrow::record_batch::RecordBatch;
 use tower::ServiceExt;
 
+#[derive(Default)]
 pub struct ReadOptions {
-    maintain_order: bool,
-    snapshot_time: Option<Timestamp>,
-    selected_fields: Vec<String>,
-    row_restriction: String,
-    arrow_serialization_options: Option<ArrowSerializationOptions>,
-    sample_percentage: Option<f64>,
+    pub maintain_order: bool,
+    pub snapshot_time: Option<Timestamp>,
+    pub selected_fields: Vec<String>,
+    pub row_restriction: String,
+    pub arrow_serialization_options: Option<ArrowSerializationOptions>,
+    pub sample_percentage: Option<f64>,
 }
 
 impl ReadOptions {
-    fn build<F>(self, table_id: &str, max_streams: F, quota_project_id: &str) -> CreateReadSessionRequest
+    fn build<F>(self, table_path: String, max_streams: F, quota_project_id: &str) -> CreateReadSessionRequest
     where F: Fn() -> i32
     {
         let arrow_options = match self.arrow_serialization_options {
@@ -45,7 +45,7 @@ impl ReadOptions {
         };
         let table_modifiers = read_session::TableModifiers {
             snapshot_time: self.snapshot_time,
-        }
+        };
         let read_options = read_session::TableReadOptions {
             output_format_serialization_options: Some(
                 read_session::table_read_options::OutputFormatSerializationOptions::ArrowSerializationOptions(arrow_options)
@@ -57,7 +57,8 @@ impl ReadOptions {
         };
         let read_session = ReadSession {
             data_format: DataFormat::Arrow as i32,
-            table: table_id_to_table_path(table_id)?,
+            table: table_path,
+            table_modifiers: Some(table_modifiers),
             read_options: Some(read_options),
             ..Default::default()
         };
@@ -200,7 +201,7 @@ impl Client {
         options: ReadOptions,
     ) -> Result<(ArrowSchemaRef, BigQueryRecordBatchReceiver), BigQueryError> {
         let request = options.build(
-            table_id,
+            table_id_to_table_path(table_id)?,
             || {
                 match std::thread::available_parallelism() {
                     Ok(value) => value.get() as i32,
