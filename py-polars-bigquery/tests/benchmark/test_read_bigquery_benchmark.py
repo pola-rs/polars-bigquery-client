@@ -5,7 +5,6 @@ import pytest
 
 import polars_bigquery
 
-
 TABLE_IDS = [
     "bigquery-public-data.usa_names.usa_1910_2013",
 ]

@@ -281,15 +281,13 @@ impl Client {
 
     /// Reads a BigQuery table and returns an [`ArrowStreamExporter`] which can be
     /// consumed by Polars in Python.
-    #[pyo3(signature = (table, quota_project_id, maintain_order=false, user_agent=None))]
+    #[pyo3(signature = (table, quota_project_id, maintain_order=false))]
     pub fn read_table(
         &self,
         table: &str,
         quota_project_id: &str,
         maintain_order: bool,
-        user_agent: Option<String>,
     ) -> PyResult<ArrowStreamExporter> {
-        let _ = user_agent;
         let rt = pyo3_async_runtimes::tokio::get_runtime();
         let client = self.client.clone();
         let result = rt.block_on(async move {

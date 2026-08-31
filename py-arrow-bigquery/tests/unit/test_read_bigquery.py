@@ -89,7 +89,6 @@ def test_client_read_bigquery_calls_rust_with_parsed_id(mock_rust_client):
         "my-project.my_dataset.my_table",
         "q",
         False,
-        f"arrow-bigquery/{__version__}",
     )
     assert result is placeholder
 
@@ -105,7 +104,7 @@ def test_client_read_bigquery_handles_bigquery_objects(mock_rust_client):
     client.read_table(table=mock_ref, quota_project_id="q")
 
     mock_rust_client.read_table.assert_called_once_with(
-        "p.d.t", "q", False, f"arrow-bigquery/{__version__}"
+        "p.d.t", "q", False
     )
 
 
@@ -115,22 +114,6 @@ def test_client_read_bigquery_propagates_errors(mock_rust_client):
     client = Client()
     with pytest.raises(Exception, match="Rust error"):
         client.read_table(table="p.d.t", quota_project_id="q")
-
-
-def test_client_read_bigquery_with_user_agent(mock_rust_client):
-    mock_rust_client.read_table.return_value = MagicMock()
-
-    client = Client()
-    client.read_table(
-        table="p.d.t", quota_project_id="q", user_agent="custom-extension/1.0"
-    )
-
-    mock_rust_client.read_table.assert_called_once_with(
-        "p.d.t",
-        "q",
-        False,
-        f"arrow-bigquery/{__version__} custom-extension/1.0",
-    )
 
 
 def test_receiver_iterator_interrupt():

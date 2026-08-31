@@ -65,13 +65,10 @@ class Client:
         *,
         quota_project_id: str,
         maintain_order: bool = False,
-        user_agent: str | None = None,
     ) -> arrow_bigquery._native.ArrowStreamExporter:
-        user_agent = _get_user_agent(user_agent or self._user_agent)
         table_ref = _parse_table_id(table)
         return self._client.read_table(
             table_ref,
             quota_project_id,
             maintain_order,
-            user_agent,
         )

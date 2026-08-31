@@ -1,11 +1,12 @@
 from __future__ import annotations
 
-from typing import Any, Dict
+from typing import Any
 
+import arrow_bigquery
 import polars as pl
 
 import polars_bigquery.core.version
-import arrow_bigquery
+
 from .core.run_query import run_query
 
 
@@ -57,10 +58,10 @@ class Client:
         if credentials_provider is None:
             credentials_provider = pl.CredentialProviderGCP()
         self._credentials_provider = credentials_provider
-        self._user_agent = user_agent
+        self._user_agent = _get_user_agent(user_agent)
         self._arrow_client = arrow_bigquery.Client(
             credentials_provider=credentials_provider,
-            user_agent=_get_user_agent(user_agent),
+            user_agent=self._user_agent,
         )
 
     @property
@@ -73,15 +74,12 @@ class Client:
         *,
         quota_project_id: str,
         maintain_order: bool = False,
-        user_agent: str | None = None,
     ) -> pl.DataFrame:
-        user_agent = _get_user_agent(user_agent or self._user_agent)
         table_ref = _parse_table_id(table)
         arrow_stream_exporter = self._arrow_client.read_table(
             table_ref,
             quota_project_id=quota_project_id,
             maintain_order=maintain_order,
-            user_agent=user_agent,
         )
         return pl.DataFrame(arrow_stream_exporter)
 
@@ -91,21 +89,18 @@ class Client:
         *,
         quota_project_id: str,
         maintain_order: bool = False,
-        user_agent: str | None = None,
     ) -> pl.DataFrame:
-        user_agent = _get_user_agent(user_agent or self._user_agent)
         table = run_query(
             query,
             quota_project_id,
             self._credentials_provider,
-            user_agent=user_agent,
+            user_agent=self._user_agent,
         )
         table_ref = _parse_table_id(table)
         arrow_stream_exporter = self._arrow_client.read_table(
             table_ref,
             quota_project_id=quota_project_id,
             maintain_order=maintain_order,
-            user_agent=user_agent,
         )
         return pl.DataFrame(arrow_stream_exporter)
 
@@ -114,14 +109,11 @@ class Client:
         table: Any,
         *,
         quota_project_id: str,
-        user_agent: str | None = None,
     ) -> pl.LazyFrame:
-        user_agent = _get_user_agent(user_agent or self._user_agent)
         table_ref = _parse_table_id(table)
         arrow_stream_exporter = self._arrow_client.read_table(
             table_ref,
             quota_project_id=quota_project_id,
             maintain_order=False,
-            user_agent=user_agent,
         )
         return pl.scan_arrow_c_stream(arrow_stream_exporter)

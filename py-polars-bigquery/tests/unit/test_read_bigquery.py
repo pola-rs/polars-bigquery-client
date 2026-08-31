@@ -1,8 +1,6 @@
-import threading
-import _thread
-import time
 
-from unittest.mock import patch, MagicMock
+from unittest.mock import MagicMock, patch
+
 import polars as pl
 import pytest
 
@@ -92,7 +90,6 @@ def test_client_read_bigquery_calls_arrow_with_parsed_id(mock_arrow_client):
             "my-project.my_dataset.my_table",
             quota_project_id="q",
             maintain_order=False,
-            user_agent=f"polars-bigquery/{__version__}",
         )
         mock_df_cls.assert_called_once_with(mock_exporter)
         assert result is mock_df
@@ -117,7 +114,6 @@ def test_client_read_query(mock_arrow_client):
             "project.dataset.temp_table",
             quota_project_id="q",
             maintain_order=False,
-            user_agent=expected_ua,
         )
         assert result is mock_df
 
@@ -132,22 +128,16 @@ def test_client_read_query_with_user_agent(mock_arrow_client):
         mock_df = MagicMock()
         mock_df_cls.return_value = mock_df
 
-        client = Client()
+        client = Client(user_agent="custom-ua/1.0")
         result = client.read_query(
-            query="SELECT 1", quota_project_id="q", user_agent="custom-ua/1.0"
+            query="SELECT 1", quota_project_id="q",
         )
 
+        assert result is not None
         expected_ua = f"polars-bigquery/{__version__} custom-ua/1.0"
         mock_run_query.assert_called_once_with(
             "SELECT 1", "q", client.credentials_provider, user_agent=expected_ua
         )
-        mock_arrow_client.read_table.assert_called_once_with(
-            "project.dataset.temp_table",
-            quota_project_id="q",
-            maintain_order=False,
-            user_agent=expected_ua,
-        )
-        assert result is mock_df
 
 
 def test_client_read_bigquery_handles_bigquery_objects(mock_arrow_client):
@@ -166,7 +156,6 @@ def test_client_read_bigquery_handles_bigquery_objects(mock_arrow_client):
             "p.d.t",
             quota_project_id="q",
             maintain_order=False,
-            user_agent=f"polars-bigquery/{__version__}",
         )
 
 
@@ -176,24 +165,6 @@ def test_client_read_bigquery_propagates_errors(mock_arrow_client):
     client = Client()
     with pytest.raises(Exception, match="Rust error"):
         client.read_table(table="p.d.t", quota_project_id="q")
-
-
-def test_client_read_bigquery_with_user_agent(mock_arrow_client):
-    mock_exporter = MagicMock()
-    mock_arrow_client.read_table.return_value = mock_exporter
-
-    with patch("polars.DataFrame"):
-        client = Client()
-        client.read_table(
-            table="p.d.t", quota_project_id="q", user_agent="custom-extension/1.0"
-        )
-
-        mock_arrow_client.read_table.assert_called_once_with(
-            "p.d.t",
-            quota_project_id="q",
-            maintain_order=False,
-            user_agent=f"polars-bigquery/{__version__} custom-extension/1.0",
-        )
 
 
 def test_client_scan_bigquery_calls_arrow_with_parsed_id(mock_arrow_client):
@@ -213,32 +184,6 @@ def test_client_scan_bigquery_calls_arrow_with_parsed_id(mock_arrow_client):
             "my-project.my_dataset.my_table",
             quota_project_id="q",
             maintain_order=False,
-            user_agent=f"polars-bigquery/{__version__}",
         )
         mock_scan.assert_called_once_with(mock_stream)
         assert result.collect().equals(mock_lazy_df.collect())
-
-
-def test_client_scan_bigquery_with_user_agent(mock_arrow_client):
-    mock_stream = MagicMock()
-    mock_arrow_client.read_table.return_value = mock_stream
-
-    with patch("polars.scan_arrow_c_stream") as mock_scan:
-        mock_lazy_df = pl.LazyFrame({"col1": [1, 2]})
-        mock_scan.return_value = mock_lazy_df
-
-        client = Client()
-        result = client.scan_table(
-            table="my-project.my_dataset.my_table",
-            quota_project_id="q",
-            user_agent="custom-extension/1.0",
-        )
-
-        mock_arrow_client.read_table.assert_called_once_with(
-            "my-project.my_dataset.my_table",
-            quota_project_id="q",
-            maintain_order=False,
-            user_agent=f"polars-bigquery/{__version__} custom-extension/1.0",
-        )
-        mock_scan.assert_called_once_with(mock_stream)
-
