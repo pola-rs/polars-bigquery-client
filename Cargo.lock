@@ -76,6 +76,25 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d3fb67a6e08acf24fdeccbac2cb6ac4305825bd1f117462e0e6f2f193345ad56"
 
 [[package]]
+name = "arrow-bigquery"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "gcloud-sdk",
+ "hyper",
+ "polars-arrow",
+ "polars-error",
+ "rand 0.10.2",
+ "regex",
+ "rustls",
+ "secret-vault-value",
+ "tokio",
+ "tower",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "async-channel"
 version = "2.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1856,25 +1875,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "polars-bigquery"
-version = "0.1.0"
-dependencies = [
- "chrono",
- "gcloud-sdk",
- "hyper",
- "polars-arrow",
- "polars-error",
- "rand 0.10.2",
- "regex",
- "rustls",
- "secret-vault-value",
- "tokio",
- "tower",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
 name = "polars-buffer"
 version = "0.53.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2431,11 +2431,11 @@ dependencies = [
 name = "py-arrow-bigquery"
 version = "0.1.0"
 dependencies = [
+ "arrow-bigquery",
  "async-trait",
  "chrono",
  "gcloud-sdk",
  "polars-arrow",
- "polars-bigquery",
  "pyo3",
  "pyo3-async-runtimes",
  "pyo3-polars",

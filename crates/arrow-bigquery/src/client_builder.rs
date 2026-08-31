@@ -6,7 +6,7 @@
 use gcloud_sdk::google::cloud::bigquery::storage::v1::big_query_read_client::BigQueryReadClient;
 use gcloud_sdk::tonic::async_trait;
 use gcloud_sdk::{GoogleApiClient, GoogleApiClientBuilder, GoogleAuthMiddleware, TokenSourceType};
-use hyper::header::{HeaderValue, USER_AGENT};
+use hyper::header::{HeaderName, HeaderValue, USER_AGENT};
 use hyper::HeaderMap;
 
 static INIT_CRYPTO: std::sync::Once = std::sync::Once::new();
@@ -25,6 +25,7 @@ pub struct ServiceConfigBuilder {
     cred_scopes: Vec<String>,
     endpoint: String,
     user_agent: Option<String>,
+    pub(crate) quota_project_id: Option<String>,
 }
 
 impl ServiceConfigBuilder {
@@ -47,6 +48,15 @@ impl ServiceConfigBuilder {
         self.user_agent = user_agent;
         self
     }
+
+    pub fn with_quota_project_id(mut self, quota_project_id: Option<String>) -> Self {
+        self.quota_project_id = quota_project_id;
+        self
+    }
+
+    pub fn quota_project_id(&self) -> Option<&str> {
+        self.quota_project_id.as_deref()
+    }
 }
 
 #[async_trait]
@@ -68,6 +78,7 @@ impl BigQueryReadClientBuilder for ServiceConfigBuilder {
             cred_scopes: vec![DEFAULT_GCP_SCOPE.to_owned()],
             endpoint: DEFAULT_BQSTORAGE_ENDPOINT.to_owned(),
             user_agent: None,
+            quota_project_id: None,
         }
     }
 
@@ -83,6 +94,12 @@ impl BigQueryReadClientBuilder for ServiceConfigBuilder {
         let mut headers = HeaderMap::new();
         if let Some(user_agent) = self.user_agent {
             headers.insert(USER_AGENT, HeaderValue::from_str(&user_agent)?);
+        }
+        if let Some(quota_project_id) = self.quota_project_id {
+            headers.insert(
+                HeaderName::from_static("x-goog-user-project"),
+                HeaderValue::from_str(&quota_project_id)?,
+            );
         }
 
         let client = GoogleApiClient::with_token_source_and_headers(
@@ -129,6 +146,7 @@ mod tests {
             vec!["https://www.googleapis.com/auth/cloud-platform"]
         );
         assert!(builder.user_agent.is_none());
+        assert!(builder.quota_project_id.is_none());
     }
 
     #[test]
@@ -136,10 +154,12 @@ mod tests {
         let builder = ServiceConfigBuilder::new()
             .with_endpoint("https://custom.endpoint.com".to_string())
             .with_cred_scopes(vec!["scope1".to_string(), "scope2".to_string()])
-            .with_user_agent(Some("custom-agent/1.0".to_string()));
+            .with_user_agent(Some("custom-agent/1.0".to_string()))
+            .with_quota_project_id(Some("custom-project".to_string()));
 
         assert_eq!(builder.endpoint, "https://custom.endpoint.com");
         assert_eq!(builder.cred_scopes, vec!["scope1", "scope2"]);
         assert_eq!(builder.user_agent, Some("custom-agent/1.0".to_string()));
+        assert_eq!(builder.quota_project_id, Some("custom-project".to_string()));
     }
 }

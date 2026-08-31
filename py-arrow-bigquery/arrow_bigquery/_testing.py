@@ -30,6 +30,7 @@ on the active outer frame's stack during polling.
 
 import gc
 import time
+
 from arrow_bigquery import _native
 
 

@@ -9,7 +9,6 @@ import requests
 
 import polars_bigquery.exceptions
 
-
 _BIGQUERY_ENDPOINT = "https://bigquery.googleapis.com/bigquery/v2"
 
 

@@ -1,14 +1,13 @@
 from __future__ import annotations
 
-from typing import Any, Dict
+from typing import Any
 
+import arrow_bigquery
 import polars as pl
 
 import polars_bigquery.core.version
-import arrow_bigquery
-from .core.run_query import run_query
 
-_DEFAULT_CREDENTIAL_PROVIDERS: Dict[str, pl.CredentialProviderGCP] = {}
+from .core.run_query import run_query
 
 
 def _get_user_agent(user_agent: str | None) -> str:
@@ -18,14 +17,6 @@ def _get_user_agent(user_agent: str | None) -> str:
         return f"{ua} {user_agent}"
     else:
         return ua
-
-
-def _get_default_provider(quota_project_id: str) -> pl.CredentialProviderGCP:
-    if quota_project_id not in _DEFAULT_CREDENTIAL_PROVIDERS:
-        _DEFAULT_CREDENTIAL_PROVIDERS[quota_project_id] = pl.CredentialProviderGCP(
-            quota_project_id=quota_project_id
-        )
-    return _DEFAULT_CREDENTIAL_PROVIDERS[quota_project_id]
 
 
 def _parse_table_id(table_id: Any) -> str:
@@ -52,78 +43,79 @@ def _parse_table_id(table_id: Any) -> str:
     raise ValueError("Invalid table ID")
 
 
-def read_bigquery_table(
-    table: str,
-    *,
-    quota_project_id: str,
-    credentials_provider: pl.CredentialProviderGCP | None = None,
-    maintain_order: bool = False,
-    user_agent: str | None = None,
-) -> pl.DataFrame:
-    if not credentials_provider:
-        credentials_provider = _get_default_provider(quota_project_id)
+class Client:
+    """Client for reading data from BigQuery into Polars.
 
-    user_agent = _get_user_agent(user_agent)
+    Wraps an arrow_bigquery Client to keep connections open and reuse credentials across operations.
+    """
 
-    table_ref = _parse_table_id(table)
-    arrow_stream_exporter = arrow_bigquery.read_bigquery_table(
-        table_ref,
-        quota_project_id=quota_project_id,
-        maintain_order=maintain_order,
-        credentials_provider=credentials_provider,
-        user_agent=user_agent,
-    )
-    return pl.DataFrame(arrow_stream_exporter)
+    def __init__(
+        self,
+        *,
+        quota_project_id: str,
+        credentials_provider: pl.CredentialProviderGCP | None = None,
+        user_agent: str | None = None,
+    ) -> None:
+        if credentials_provider is None:
+            credentials_provider = pl.CredentialProviderGCP(
+                quota_project_id=quota_project_id
+            )
+        self._credentials_provider = credentials_provider
+        self._user_agent = _get_user_agent(user_agent)
+        self._quota_project_id = quota_project_id
+        self._arrow_client = arrow_bigquery.Client(
+            quota_project_id=quota_project_id,
+            credentials_provider=credentials_provider,
+            user_agent=self._user_agent,
+        )
 
+    @property
+    def credentials_provider(self) -> pl.CredentialProviderGCP:
+        return self._credentials_provider
 
-def read_bigquery_query(
-    query: str,
-    *,
-    quota_project_id: str,
-    credentials_provider: pl.CredentialProviderGCP | None = None,
-    maintain_order: bool = False,
-    user_agent: str | None = None,
-) -> pl.DataFrame:
-    if not credentials_provider:
-        credentials_provider = _get_default_provider(quota_project_id)
+    @property
+    def quota_project_id(self) -> str:
+        return self._quota_project_id
 
-    user_agent = _get_user_agent(user_agent)
+    def read_table(
+        self,
+        table: Any,
+        *,
+        maintain_order: bool = False,
+    ) -> pl.DataFrame:
+        table_ref = _parse_table_id(table)
+        arrow_stream_exporter = self._arrow_client.read_table(
+            table_ref,
+            maintain_order=maintain_order,
+        )
+        return pl.DataFrame(arrow_stream_exporter)
 
-    table = run_query(
-        query,
-        quota_project_id,
-        credentials_provider,
-        user_agent=user_agent,
-    )
-    table_ref = _parse_table_id(table)
-    arrow_stream_exporter = arrow_bigquery.read_bigquery_table(
-        table_ref,
-        quota_project_id=quota_project_id,
-        maintain_order=maintain_order,
-        credentials_provider=credentials_provider,
-        user_agent=user_agent,
-    )
-    return pl.DataFrame(arrow_stream_exporter)
+    def read_query(
+        self,
+        query: str,
+        *,
+        maintain_order: bool = False,
+    ) -> pl.DataFrame:
+        table = run_query(
+            query,
+            self._quota_project_id,
+            self._credentials_provider,
+            user_agent=self._user_agent,
+        )
+        table_ref = _parse_table_id(table)
+        arrow_stream_exporter = self._arrow_client.read_table(
+            table_ref,
+            maintain_order=maintain_order,
+        )
+        return pl.DataFrame(arrow_stream_exporter)
 
-
-def scan_bigquery_table(
-    table: str,
-    *,
-    quota_project_id: str,
-    credentials_provider: pl.CredentialProviderGCP | None = None,
-    user_agent: str | None = None,
-) -> pl.LazyFrame:
-    if not credentials_provider:
-        credentials_provider = _get_default_provider(quota_project_id)
-
-    user_agent = _get_user_agent(user_agent)
-
-    table_ref = _parse_table_id(table)
-    arrow_stream_exporter = arrow_bigquery.read_bigquery_table(
-        table_ref,
-        quota_project_id=quota_project_id,
-        maintain_order=False,
-        credentials_provider=credentials_provider,
-        user_agent=user_agent,
-    )
-    return pl.scan_arrow_c_stream(arrow_stream_exporter)
+    def scan_table(
+        self,
+        table: Any,
+    ) -> pl.LazyFrame:
+        table_ref = _parse_table_id(table)
+        arrow_stream_exporter = self._arrow_client.read_table(
+            table_ref,
+            maintain_order=False,
+        )
+        return pl.scan_arrow_c_stream(arrow_stream_exporter)

@@ -1,22 +1,25 @@
 import _thread
 import threading
 import time
-from unittest.mock import ANY, MagicMock, patch
+from unittest.mock import MagicMock, patch
 
 import nanoarrow
 import pytest
+
 from arrow_bigquery import (
+    Client,
     __version__,
     _native,
-    read_bigquery_table,
 )
 from arrow_bigquery._read_bigquery import _get_user_agent, _parse_table_id
 
 
 @pytest.fixture
-def mock_rust_read():
-    with patch("arrow_bigquery._native.read_bigquery_table") as mocked:
-        yield mocked
+def mock_rust_client():
+    with patch("arrow_bigquery._native.Client") as mocked_cls:
+        mock_instance = MagicMock()
+        mocked_cls.return_value = mock_instance
+        yield mock_instance
 
 
 def test_get_user_agent():
@@ -64,70 +67,58 @@ def test_parse_table_id_invalid_type():
         _parse_table_id(123)
 
 
-def test_read_bigquery_calls_rust_with_parsed_id(mock_rust_read):
-    # Prepare
+def test_client_init_passes_credentials_provider():
+    mock_cp = MagicMock()
+    with patch("arrow_bigquery._native.Client") as mock_native_cls:
+        client = Client(quota_project_id="test-proj", credentials_provider=mock_cp)
+        assert client.quota_project_id == "test-proj"
+        mock_native_cls.assert_called_once_with(
+            quota_project_id="test-proj",
+            credentials_provider=mock_cp,
+            user_agent=f"arrow-bigquery/{__version__}",
+        )
+
+
+def test_client_init_requires_quota_project_id():
+    with pytest.raises(
+        TypeError, match="missing 1 required keyword-only argument: 'quota_project_id'"
+    ):
+        Client()
+
+
+def test_client_read_bigquery_calls_rust_with_parsed_id(mock_rust_client):
     placeholder = object()
-    mock_rust_read.return_value = placeholder
+    mock_rust_client.read_table.return_value = placeholder
 
-    # Execute
-    result = read_bigquery_table(
-        table="my-project.my_dataset.my_table", quota_project_id="q"
-    )
+    client = Client(quota_project_id="q")
+    result = client.read_table(table="my-project.my_dataset.my_table")
 
-    # Assert
-    mock_rust_read.assert_called_once_with(
+    mock_rust_client.read_table.assert_called_once_with(
         "my-project.my_dataset.my_table",
-        "q",
-        False,
-        ANY,
-        f"arrow-bigquery/{__version__}",
+        maintain_order=False,
     )
     assert result is placeholder
 
 
-def test_read_bigquery_handles_bigquery_objects(mock_rust_read):
-    # Prepare
-    mock_rust_read.return_value = MagicMock()
+def test_client_read_bigquery_handles_bigquery_objects(mock_rust_client):
+    mock_rust_client.read_table.return_value = MagicMock()
     mock_ref = MagicMock()
     mock_ref.project = "p"
     mock_ref.dataset_id = "d"
     mock_ref.table_id = "t"
 
-    # Execute
-    read_bigquery_table(table=mock_ref, quota_project_id="q")
+    client = Client(quota_project_id="q")
+    client.read_table(table=mock_ref)
 
-    # Assert
-    mock_rust_read.assert_called_once_with(
-        "p.d.t", "q", False, ANY, f"arrow-bigquery/{__version__}"
-    )
+    mock_rust_client.read_table.assert_called_once_with("p.d.t", maintain_order=False)
 
 
-def test_read_bigquery_propagates_errors(mock_rust_read):
-    # Prepare
-    mock_rust_read.side_effect = Exception("Rust error")
+def test_client_read_bigquery_propagates_errors(mock_rust_client):
+    mock_rust_client.read_table.side_effect = Exception("Rust error")
 
-    # Execute & Assert
+    client = Client(quota_project_id="q")
     with pytest.raises(Exception, match="Rust error"):
-        read_bigquery_table(table="p.d.t", quota_project_id="q")
-
-
-def test_read_bigquery_with_user_agent(mock_rust_read):
-    # Prepare
-    mock_rust_read.return_value = MagicMock()
-
-    # Execute
-    read_bigquery_table(
-        table="p.d.t", quota_project_id="q", user_agent="custom-extension/1.0"
-    )
-
-    # Assert
-    mock_rust_read.assert_called_once_with(
-        "p.d.t",
-        "q",
-        False,
-        ANY,
-        f"arrow-bigquery/{__version__} custom-extension/1.0",
-    )
+        client.read_table(table="p.d.t")
 
 
 def test_receiver_iterator_interrupt():

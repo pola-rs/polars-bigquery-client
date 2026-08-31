@@ -1,15 +1,20 @@
 import os
 
 import polars
+import pytest
 
 import polars_bigquery
 
 
-def test_read_bigquery_public_data_ordered():
+@pytest.fixture(scope="module")
+def client():
     project = os.environ["GOOGLE_CLOUD_PROJECT"]
+    return polars_bigquery.Client(quota_project_id=project)
 
+
+def test_read_bigquery_public_data_ordered(client):
     # Use a query so that the test can run using BigQuery sandbox quota.
-    df = polars_bigquery.read_bigquery_query(
+    df = client.read_query(
         query="""
         SELECT SUM(number) AS total_born,
         name
@@ -18,7 +23,6 @@ def test_read_bigquery_public_data_ordered():
         ORDER BY total_born DESC
         LIMIT 100
         """,
-        quota_project_id=project,
         maintain_order=True,
     )
     assert isinstance(df, polars.DataFrame)
@@ -28,15 +32,12 @@ def test_read_bigquery_public_data_ordered():
     assert df["total_born"].is_sorted(descending=True)
 
 
-def test_read_bigquery_public_data_unordered():
-    project = os.environ["GOOGLE_CLOUD_PROJECT"]
-
+def test_read_bigquery_public_data_unordered(client):
     # Use a query so that the test can run using BigQuery sandbox quota.
-    df = polars_bigquery.read_bigquery_query(
+    df = client.read_query(
         query="""
         SELECT * FROM `bigquery-public-data.utility_us.country_code_iso`
         """,
-        quota_project_id=project,
         maintain_order=False,
     )
     assert isinstance(df, polars.DataFrame)
