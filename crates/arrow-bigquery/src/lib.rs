@@ -21,7 +21,8 @@ use polars_arrow::io::ipc::read::read_stream_metadata;
 use polars_arrow::record_batch::RecordBatch;
 use tower::ServiceExt;
 
-const DEFAULT_COMPRESSION: arrow_serialization_options::CompressionCodec = arrow_serialization_options::CompressionCodec::Lz4Frame;
+const DEFAULT_COMPRESSION: arrow_serialization_options::CompressionCodec =
+    arrow_serialization_options::CompressionCodec::Lz4Frame;
 
 #[derive(Default)]
 pub struct ReadOptions {
@@ -34,8 +35,14 @@ pub struct ReadOptions {
 }
 
 impl ReadOptions {
-    fn build<F>(self, table_path: String, max_streams: F, quota_project_id: &str) -> CreateReadSessionRequest
-    where F: Fn() -> i32
+    fn build<F>(
+        self,
+        table_path: String,
+        max_streams: F,
+        quota_project_id: &str,
+    ) -> CreateReadSessionRequest
+    where
+        F: Fn() -> i32,
     {
         let arrow_options = ArrowSerializationOptions {
             buffer_compression: match self.arrow_buffer_compression {
@@ -45,10 +52,9 @@ impl ReadOptions {
             ..Default::default()
         };
         let table_modifiers = read_session::TableModifiers {
-            snapshot_time: match self.snapshot_time {
-                Some(snapshot_time) => Some(Timestamp::from(SystemTime::from(snapshot_time))),
-                None => None,
-            },
+            snapshot_time: self
+                .snapshot_time
+                .map(|snapshot_time| Timestamp::from(SystemTime::from(snapshot_time))),
         };
         let read_options = read_session::TableReadOptions {
             output_format_serialization_options: Some(
@@ -206,11 +212,9 @@ impl Client {
     ) -> Result<(ArrowSchemaRef, BigQueryRecordBatchReceiver), BigQueryError> {
         let request = options.build(
             table_id_to_table_path(table_id)?,
-            || {
-                match std::thread::available_parallelism() {
-                    Ok(value) => value.get() as i32,
-                    Err(_) => 1,
-                }
+            || match std::thread::available_parallelism() {
+                Ok(value) => value.get() as i32,
+                Err(_) => 1,
             },
             &self.quota_project_id,
         );
@@ -288,5 +292,169 @@ mod tests {
             "projects/google.com:my-project/datasets/my_dataset/tables/my_table"
         );
         Ok(())
+    }
+
+    #[test]
+    fn test_read_options_defaults() {
+        let options = ReadOptions::default();
+        let request = options.build(
+            "projects/test-project/datasets/test_dataset/tables/test_table".to_string(),
+            || 4,
+            "quota-project-123",
+        );
+
+        assert_eq!(request.parent, "projects/quota-project-123");
+        assert_eq!(request.max_stream_count, 4);
+
+        let session = request
+            .read_session
+            .expect("read_session should be present");
+        assert_eq!(session.data_format, DataFormat::Arrow as i32);
+        assert_eq!(
+            session.table,
+            "projects/test-project/datasets/test_dataset/tables/test_table"
+        );
+
+        let table_modifiers = session
+            .table_modifiers
+            .expect("table_modifiers should be present");
+        assert_eq!(table_modifiers.snapshot_time, None);
+
+        let read_options = session
+            .read_options
+            .expect("read_options should be present");
+        assert!(read_options.selected_fields.is_empty());
+        assert_eq!(read_options.row_restriction, "");
+        assert_eq!(read_options.sample_percentage, None);
+
+        match read_options.output_format_serialization_options {
+            Some(
+                read_session::table_read_options::OutputFormatSerializationOptions::ArrowSerializationOptions(
+                    arrow_opts,
+                ),
+            ) => {
+                assert_eq!(
+                    arrow_opts.buffer_compression,
+                    arrow_serialization_options::CompressionCodec::Lz4Frame as i32
+                );
+            },
+            other => panic!("expected ArrowSerializationOptions, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_read_options_all_fields_plumbed() {
+        let snapshot_dt =
+            chrono::DateTime::from_timestamp(1_700_000_000, 500_000_000).expect("valid timestamp");
+        let expected_timestamp = Timestamp::from(SystemTime::from(snapshot_dt));
+
+        let options = ReadOptions {
+            maintain_order: true,
+            snapshot_time: Some(snapshot_dt),
+            selected_fields: vec!["col1".to_string(), "col2".to_string()],
+            row_restriction: "col1 > 100".to_string(),
+            arrow_buffer_compression: Some(arrow_serialization_options::CompressionCodec::Zstd),
+            sample_percentage: Some(42.5),
+        };
+
+        let request = options.build(
+            "projects/p/datasets/d/tables/t".to_string(),
+            || 8,
+            "custom-quota",
+        );
+
+        assert_eq!(request.parent, "projects/custom-quota");
+        assert_eq!(request.max_stream_count, 1);
+
+        let session = request
+            .read_session
+            .expect("read_session should be present");
+        assert_eq!(session.data_format, DataFormat::Arrow as i32);
+        assert_eq!(session.table, "projects/p/datasets/d/tables/t");
+
+        let table_modifiers = session
+            .table_modifiers
+            .expect("table_modifiers should be present");
+        assert_eq!(table_modifiers.snapshot_time, Some(expected_timestamp));
+
+        let read_options = session
+            .read_options
+            .expect("read_options should be present");
+        assert_eq!(read_options.selected_fields, vec!["col1", "col2"]);
+        assert_eq!(read_options.row_restriction, "col1 > 100");
+        assert_eq!(read_options.sample_percentage, Some(42.5));
+
+        match read_options.output_format_serialization_options {
+            Some(
+                read_session::table_read_options::OutputFormatSerializationOptions::ArrowSerializationOptions(
+                    arrow_opts,
+                ),
+            ) => {
+                assert_eq!(
+                    arrow_opts.buffer_compression,
+                    arrow_serialization_options::CompressionCodec::Zstd as i32
+                );
+            },
+            other => panic!("expected ArrowSerializationOptions, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_read_options_maintain_order_controls_max_stream_count() {
+        let options_ordered = ReadOptions {
+            maintain_order: true,
+            ..Default::default()
+        };
+        let request_ordered = options_ordered.build("table".to_string(), || 16, "quota");
+        assert_eq!(request_ordered.max_stream_count, 1);
+
+        let options_unordered = ReadOptions {
+            maintain_order: false,
+            ..Default::default()
+        };
+        let request_unordered = options_unordered.build("table".to_string(), || 16, "quota");
+        assert_eq!(request_unordered.max_stream_count, 16);
+    }
+
+    #[test]
+    fn test_read_options_compression_codecs() {
+        let codecs = [
+            (
+                None,
+                arrow_serialization_options::CompressionCodec::Lz4Frame as i32,
+            ),
+            (
+                Some(arrow_serialization_options::CompressionCodec::Lz4Frame),
+                arrow_serialization_options::CompressionCodec::Lz4Frame as i32,
+            ),
+            (
+                Some(arrow_serialization_options::CompressionCodec::Zstd),
+                arrow_serialization_options::CompressionCodec::Zstd as i32,
+            ),
+            (
+                Some(arrow_serialization_options::CompressionCodec::CompressionUnspecified),
+                arrow_serialization_options::CompressionCodec::CompressionUnspecified as i32,
+            ),
+        ];
+
+        for (codec, expected_val) in codecs {
+            let options = ReadOptions {
+                arrow_buffer_compression: codec,
+                ..Default::default()
+            };
+            let request = options.build("table".to_string(), || 1, "quota");
+            let session = request.read_session.unwrap();
+            let read_options = session.read_options.unwrap();
+            match read_options.output_format_serialization_options {
+                Some(
+                    read_session::table_read_options::OutputFormatSerializationOptions::ArrowSerializationOptions(
+                        arrow_opts,
+                    ),
+                ) => {
+                    assert_eq!(arrow_opts.buffer_compression, expected_val);
+                },
+                other => panic!("expected ArrowSerializationOptions, got {:?}", other),
+            }
+        }
     }
 }
