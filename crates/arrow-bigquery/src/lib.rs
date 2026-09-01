@@ -5,6 +5,7 @@ mod error;
 
 use std::io::Cursor;
 use std::sync::Arc;
+use std::time::SystemTime;
 
 pub use client_builder::*;
 pub use error::BigQueryError;
@@ -20,13 +21,15 @@ use polars_arrow::io::ipc::read::read_stream_metadata;
 use polars_arrow::record_batch::RecordBatch;
 use tower::ServiceExt;
 
+const DEFAULT_COMPRESSION: arrow_serialization_options::CompressionCodec = arrow_serialization_options::CompressionCodec::Lz4Frame;
+
 #[derive(Default)]
 pub struct ReadOptions {
     pub maintain_order: bool,
-    pub snapshot_time: Option<Timestamp>,
+    pub snapshot_time: Option<chrono::DateTime<chrono::Utc>>,
     pub selected_fields: Vec<String>,
     pub row_restriction: String,
-    pub arrow_serialization_options: Option<ArrowSerializationOptions>,
+    pub arrow_buffer_compression: Option<arrow_serialization_options::CompressionCodec>,
     pub sample_percentage: Option<f64>,
 }
 
@@ -34,17 +37,18 @@ impl ReadOptions {
     fn build<F>(self, table_path: String, max_streams: F, quota_project_id: &str) -> CreateReadSessionRequest
     where F: Fn() -> i32
     {
-        let arrow_options = match self.arrow_serialization_options {
-            Some(options) => options,
-            None => {
-                ArrowSerializationOptions {
-                    buffer_compression: arrow_serialization_options::CompressionCodec::Lz4Frame.into(),
-                    ..Default::default()
-                }
+        let arrow_options = ArrowSerializationOptions {
+            buffer_compression: match self.arrow_buffer_compression {
+                Some(buffer_compression) => buffer_compression.into(),
+                None => DEFAULT_COMPRESSION.into(),
             },
+            ..Default::default()
         };
         let table_modifiers = read_session::TableModifiers {
-            snapshot_time: self.snapshot_time,
+            snapshot_time: match self.snapshot_time {
+                Some(snapshot_time) => Some(Timestamp::from(SystemTime::from(snapshot_time))),
+                None => None,
+            },
         };
         let read_options = read_session::TableReadOptions {
             output_format_serialization_options: Some(
