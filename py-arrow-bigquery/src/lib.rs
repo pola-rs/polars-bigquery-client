@@ -2,9 +2,12 @@ use std::sync::{Mutex, Once};
 
 use async_trait::async_trait;
 use chrono::Utc;
+use gcloud_sdk::google::cloud::bigquery::storage::v1::arrow_serialization_options::CompressionCodec;
 use polars_arrow::datatypes::ArrowSchemaRef;
+use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::pyfunction;
+use pyo3::types::*;
 
 static INIT_CRYPTO: Once = Once::new();
 
@@ -283,13 +286,46 @@ impl Client {
 
     /// Reads a BigQuery table and returns an [`ArrowStreamExporter`] which can be
     /// consumed by Polars in Python.
-    #[pyo3(signature = (table, maintain_order=false))]
-    pub fn read_table(&self, table: &str, maintain_order: bool) -> PyResult<ArrowStreamExporter> {
+    #[pyo3(signature = (table, maintain_order=false, snapshot_time=None, selected_fields=None, row_restriction="", arrow_buffer_compression="lz4frame", sample_percentage=None))]
+    pub fn read_table<'py>(
+        &self,
+        table: &str,
+        maintain_order: bool,
+        snapshot_time: Option<Py<PyDateTime>>,
+        selected_fields: Option<Vec<String>>,
+        row_restriction: &str,
+        arrow_buffer_compression: &str,
+        sample_percentage: Option<f64>,
+    ) -> PyResult<ArrowStreamExporter> {
         let rt = pyo3_async_runtimes::tokio::get_runtime();
         let client = self.client.clone();
+        let snapshot_time: Option<chrono::DateTime<chrono::Utc>> = match snapshot_time {
+            Some(dt) => Some(Python::attach(|py| {
+                dt.extract::<chrono::DateTime<chrono::Utc>>(py)
+                    .or_else(|_| Err(PyValueError::new_err("failed to extract snapshot_time")))
+            })?),
+            None => None,
+        };
+        let arrow_buffer_compression = Some(match arrow_buffer_compression {
+            "unspecified" => CompressionCodec::CompressionUnspecified,
+            "lz4frame" => CompressionCodec::Lz4Frame,
+            "zstd" => CompressionCodec::Zstd,
+            _ => Err(PyValueError::new_err(format!(
+                "got unexpected compression codec {arrow_buffer_compression}"
+            )))?,
+        });
+        let read_options = arrow_bigquery_lib::ReadOptions {
+            maintain_order,
+            snapshot_time,
+            selected_fields: selected_fields.unwrap_or_else(|| vec![]),
+            row_restriction: row_restriction.to_owned(),
+            arrow_buffer_compression,
+            sample_percentage,
+            ..Default::default()
+        };
         let result = rt.block_on(async move {
             client
-                .read_table(table, maintain_order)
+                .read_table(table, read_options)
                 .await
                 .map_err(|err| pyo3::exceptions::PyRuntimeError::new_err(err.to_string()))
         });
