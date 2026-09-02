@@ -297,32 +297,16 @@ impl Client {
         arrow_buffer_compression: &str,
         sample_percentage: Option<f64>,
     ) -> PyResult<ArrowStreamExporter> {
-        let rt = pyo3_async_runtimes::tokio::get_runtime();
-        let client = self.client.clone();
-        let snapshot_time: Option<chrono::DateTime<chrono::Utc>> = match snapshot_time {
-            Some(dt) => Some(Python::attach(|py| {
-                dt.extract::<chrono::DateTime<chrono::Utc>>(py)
-                    .or_else(|_| Err(PyValueError::new_err("failed to extract snapshot_time")))
-            })?),
-            None => None,
-        };
-        let arrow_buffer_compression = Some(match arrow_buffer_compression {
-            "unspecified" => CompressionCodec::CompressionUnspecified,
-            "lz4frame" => CompressionCodec::Lz4Frame,
-            "zstd" => CompressionCodec::Zstd,
-            _ => Err(PyValueError::new_err(format!(
-                "got unexpected compression codec {arrow_buffer_compression}"
-            )))?,
-        });
-        let read_options = arrow_bigquery_lib::ReadOptions {
+        let read_options = parse_read_options(
             maintain_order,
             snapshot_time,
-            selected_fields: selected_fields.unwrap_or_else(|| vec![]),
-            row_restriction: row_restriction.to_owned(),
+            selected_fields,
+            row_restriction,
             arrow_buffer_compression,
             sample_percentage,
-            ..Default::default()
-        };
+        )?;
+        let rt = pyo3_async_runtimes::tokio::get_runtime();
+        let client = self.client.clone();
         let result = rt.block_on(async move {
             client
                 .read_table(table, read_options)
@@ -338,6 +322,40 @@ impl Client {
             Err(err) => Err(err),
         }
     }
+}
+
+fn parse_read_options(
+    maintain_order: bool,
+    snapshot_time: Option<Py<PyDateTime>>,
+    selected_fields: Option<Vec<String>>,
+    row_restriction: &str,
+    arrow_buffer_compression: &str,
+    sample_percentage: Option<f64>,
+) -> PyResult<arrow_bigquery_lib::ReadOptions> {
+    let snapshot_time: Option<chrono::DateTime<chrono::Utc>> = match snapshot_time {
+        Some(dt) => Some(Python::attach(|py| {
+            dt.extract::<chrono::DateTime<chrono::Utc>>(py)
+                .or_else(|_| Err(PyValueError::new_err("failed to extract snapshot_time")))
+        })?),
+        None => None,
+    };
+    let arrow_buffer_compression = Some(match arrow_buffer_compression {
+        "unspecified" => CompressionCodec::CompressionUnspecified,
+        "lz4frame" => CompressionCodec::Lz4Frame,
+        "zstd" => CompressionCodec::Zstd,
+        _ => Err(PyValueError::new_err(format!(
+            "got unexpected compression codec {arrow_buffer_compression}"
+        )))?,
+    });
+    Ok(arrow_bigquery_lib::ReadOptions {
+        maintain_order,
+        snapshot_time,
+        selected_fields: selected_fields.unwrap_or_else(|| vec![]),
+        row_restriction: row_restriction.to_owned(),
+        arrow_buffer_compression,
+        sample_percentage,
+        ..Default::default()
+    })
 }
 
 #[pyfunction]
@@ -442,4 +460,173 @@ fn polars_bigquery(m: &Bound<PyModule>) -> PyResult<()> {
     m.add_class::<DropFlag>().unwrap();
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_read_options_defaults() {
+        Python::initialize();
+        let options = parse_read_options(false, None, None, "", "lz4frame", None).unwrap();
+        assert!(!options.maintain_order);
+        assert_eq!(options.snapshot_time, None);
+        assert!(options.selected_fields.is_empty());
+        assert_eq!(options.row_restriction, "");
+        assert_eq!(
+            options.arrow_buffer_compression,
+            Some(CompressionCodec::Lz4Frame)
+        );
+        assert_eq!(options.sample_percentage, None);
+    }
+
+    #[test]
+    fn test_parse_read_options_all_fields() {
+        Python::initialize();
+        let (dt_py, expected_dt) = Python::attach(|py| {
+            let datetime_mod = py.import("datetime").unwrap();
+            let timezone = datetime_mod
+                .getattr("timezone")
+                .unwrap()
+                .getattr("utc")
+                .unwrap();
+            let dt = datetime_mod
+                .getattr("datetime")
+                .unwrap()
+                .call1((2023, 11, 14, 22, 13, 20, 500_000, timezone))
+                .unwrap();
+            let py_dt: Py<PyDateTime> = dt.extract().unwrap();
+            let expected = chrono::DateTime::from_timestamp(1_700_000_000, 500_000_000).unwrap();
+            (py_dt, expected)
+        });
+
+        let options = parse_read_options(
+            true,
+            Some(dt_py),
+            Some(vec!["col1".to_string(), "col2".to_string()]),
+            "col1 > 100",
+            "zstd",
+            Some(42.5),
+        )
+        .unwrap();
+
+        assert!(options.maintain_order);
+        assert_eq!(options.snapshot_time, Some(expected_dt));
+        assert_eq!(options.selected_fields, vec!["col1", "col2"]);
+        assert_eq!(options.row_restriction, "col1 > 100");
+        assert_eq!(
+            options.arrow_buffer_compression,
+            Some(CompressionCodec::Zstd)
+        );
+        assert_eq!(options.sample_percentage, Some(42.5));
+    }
+
+    #[test]
+    fn test_parse_read_options_compression_codecs() {
+        Python::initialize();
+
+        let valid_codecs = [
+            ("unspecified", CompressionCodec::CompressionUnspecified),
+            ("lz4frame", CompressionCodec::Lz4Frame),
+            ("zstd", CompressionCodec::Zstd),
+        ];
+
+        for (codec_str, expected) in valid_codecs {
+            let options = parse_read_options(false, None, None, "", codec_str, None).unwrap();
+            assert_eq!(options.arrow_buffer_compression, Some(expected));
+        }
+
+        let err = match parse_read_options(false, None, None, "", "invalid_codec", None) {
+            Err(e) => e,
+            Ok(_) => panic!("expected Err for invalid compression codec"),
+        };
+        Python::attach(|py| {
+            assert!(err.is_instance_of::<PyValueError>(py));
+            assert!(err
+                .to_string()
+                .contains("got unexpected compression codec invalid_codec"));
+        });
+    }
+
+    #[test]
+    fn test_parse_read_options_snapshot_time_naive_error() {
+        Python::initialize();
+        let dt_py = Python::attach(|py| {
+            let datetime_mod = py.import("datetime").unwrap();
+            let dt = datetime_mod
+                .getattr("datetime")
+                .unwrap()
+                .call1((2023, 11, 14, 22, 13, 20))
+                .unwrap();
+            let py_dt: Py<PyDateTime> = dt.extract().unwrap();
+            py_dt
+        });
+
+        let err = match parse_read_options(false, Some(dt_py), None, "", "lz4frame", None) {
+            Err(e) => e,
+            Ok(_) => panic!("expected Err for naive datetime"),
+        };
+        Python::attach(|py| {
+            assert!(err.is_instance_of::<PyValueError>(py));
+            assert!(err.to_string().contains("failed to extract snapshot_time"));
+        });
+    }
+
+    #[test]
+    fn test_client_read_table_invalid_compression() {
+        Python::initialize();
+        let client = Client::new("test-project".to_string(), None, None).unwrap();
+        let err = match client.read_table(
+            "projects/p/datasets/d/tables/t",
+            false,
+            None,
+            None,
+            "",
+            "invalid_codec",
+            None,
+        ) {
+            Err(e) => e,
+            Ok(_) => panic!("expected Err for invalid compression codec"),
+        };
+        Python::attach(|py| {
+            assert!(err.is_instance_of::<PyValueError>(py));
+            assert!(err
+                .to_string()
+                .contains("got unexpected compression codec invalid_codec"));
+        });
+    }
+
+    #[test]
+    fn test_client_read_table_naive_snapshot_time() {
+        Python::initialize();
+        let dt_py = Python::attach(|py| {
+            let datetime_mod = py.import("datetime").unwrap();
+            let dt = datetime_mod
+                .getattr("datetime")
+                .unwrap()
+                .call1((2023, 11, 14, 22, 13, 20))
+                .unwrap();
+            let py_dt: Py<PyDateTime> = dt.extract().unwrap();
+            py_dt
+        });
+
+        let client = Client::new("test-project".to_string(), None, None).unwrap();
+        let err = match client.read_table(
+            "projects/p/datasets/d/tables/t",
+            false,
+            Some(dt_py),
+            None,
+            "",
+            "lz4frame",
+            None,
+        ) {
+            Err(e) => e,
+            Ok(_) => panic!("expected Err for naive datetime"),
+        };
+        Python::attach(|py| {
+            assert!(err.is_instance_of::<PyValueError>(py));
+            assert!(err.to_string().contains("failed to extract snapshot_time"));
+        });
+    }
 }
