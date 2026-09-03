@@ -286,8 +286,9 @@ impl Client {
 
     /// Reads a BigQuery table and returns an [`ArrowStreamExporter`] which can be
     /// consumed by Polars in Python.
+    #[allow(clippy::too_many_arguments)]
     #[pyo3(signature = (table, maintain_order=false, snapshot_time=None, selected_fields=None, row_restriction="", arrow_buffer_compression="lz4frame", sample_percentage=None))]
-    pub fn read_table<'py>(
+    pub fn read_table(
         &self,
         table: &str,
         maintain_order: bool,
@@ -335,7 +336,7 @@ fn parse_read_options(
     let snapshot_time: Option<chrono::DateTime<chrono::Utc>> = match snapshot_time {
         Some(dt) => Some(Python::attach(|py| {
             dt.extract::<chrono::DateTime<chrono::Utc>>(py)
-                .or_else(|_| Err(PyValueError::new_err("failed to extract snapshot_time")))
+                .map_err(|_| PyValueError::new_err("failed to extract snapshot_time"))
         })?),
         None => None,
     };
@@ -350,7 +351,7 @@ fn parse_read_options(
     Ok(arrow_bigquery_lib::ReadOptions {
         maintain_order,
         snapshot_time,
-        selected_fields: selected_fields.unwrap_or_else(|| vec![]),
+        selected_fields: selected_fields.unwrap_or_default(),
         row_restriction: row_restriction.to_owned(),
         arrow_buffer_compression,
         sample_percentage,
