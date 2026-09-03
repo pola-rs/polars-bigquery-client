@@ -36,8 +36,7 @@ pub struct ReadOptions {
 }
 
 impl ReadOptions {
-    fn to_request(self, table_path: String, quota_project_id: &str) -> CreateReadSessionRequest
-    {
+    fn to_request(self, table_path: String, quota_project_id: &str) -> CreateReadSessionRequest {
         let arrow_options = ArrowSerializationOptions {
             buffer_compression: match self.arrow_buffer_compression {
                 Some(buffer_compression) => buffer_compression.into(),
@@ -209,10 +208,7 @@ impl Client {
         table_id: &str,
         options: ReadOptions,
     ) -> Result<(ArrowSchemaRef, BigQueryRecordBatchReceiver), BigQueryError> {
-        let request = options.to_request(
-            table_id_to_table_path(table_id)?,
-            &self.quota_project_id,
-        );
+        let request = options.to_request(table_id_to_table_path(table_id)?, &self.quota_project_id);
         let policy = bigquery_read_retry::RetryPolicy::create_read_session_policy();
         let service_client = self.client.clone();
         let service = tower::service_fn(move |req: CreateReadSessionRequest| {
@@ -269,7 +265,7 @@ impl Client {
 mod tests {
     use std::num::NonZero;
 
-use super::*;
+    use super::*;
 
     #[test]
     fn table_id_to_table_path_success() -> Result<(), Box<dyn std::error::Error>> {
@@ -298,7 +294,9 @@ use super::*;
             "projects/test-project/datasets/test_dataset/tables/test_table".to_string(),
             "quota-project-123",
         );
-        let available_parallelism = std::thread::available_parallelism().unwrap_or(NonZero::new(1).expect("hardcoded")).get() as i32;
+        let available_parallelism = std::thread::available_parallelism()
+            .unwrap_or(NonZero::new(1).expect("hardcoded"))
+            .get() as i32;
 
         assert_eq!(request.parent, "projects/quota-project-123");
         assert_eq!(request.max_stream_count, available_parallelism);
@@ -355,10 +353,8 @@ use super::*;
             max_stream_count: Some(12),
         };
 
-        let request = options.to_request(
-            "projects/p/datasets/d/tables/t".to_string(),
-            "custom-quota",
-        );
+        let request =
+            options.to_request("projects/p/datasets/d/tables/t".to_string(), "custom-quota");
 
         assert_eq!(request.parent, "projects/custom-quota");
         assert_eq!(request.max_stream_count, 12);
