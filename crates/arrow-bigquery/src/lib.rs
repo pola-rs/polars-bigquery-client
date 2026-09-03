@@ -32,17 +32,11 @@ pub struct ReadOptions {
     pub row_restriction: String,
     pub arrow_buffer_compression: Option<arrow_serialization_options::CompressionCodec>,
     pub sample_percentage: Option<f64>,
+    pub max_stream_count: Option<i32>,
 }
 
 impl ReadOptions {
-    fn build<F>(
-        self,
-        table_path: String,
-        max_streams: F,
-        quota_project_id: &str,
-    ) -> CreateReadSessionRequest
-    where
-        F: Fn() -> i32,
+    fn to_request(self, table_path: String, quota_project_id: &str) -> CreateReadSessionRequest
     {
         let arrow_options = ArrowSerializationOptions {
             buffer_compression: match self.arrow_buffer_compression {
@@ -72,16 +66,21 @@ impl ReadOptions {
             read_options: Some(read_options),
             ..Default::default()
         };
+        let max_stream_count = if self.maintain_order {
+            // If you are reading from a query results table where order matters,
+            // limit this to a single stream.
+            1
+        } else {
+            self.max_stream_count
+                .unwrap_or_else(|| match std::thread::available_parallelism() {
+                    Ok(value) => value.get() as i32,
+                    Err(_) => 1,
+                })
+        };
 
         CreateReadSessionRequest {
             parent: format!("projects/{}", quota_project_id),
-            // If you are reading from a query results table where order matters,
-            // limit this to a single stream.
-            max_stream_count: if self.maintain_order {
-                1
-            } else {
-                max_streams()
-            },
+            max_stream_count,
             read_session: Some(read_session),
             ..Default::default()
         }
@@ -210,12 +209,8 @@ impl Client {
         table_id: &str,
         options: ReadOptions,
     ) -> Result<(ArrowSchemaRef, BigQueryRecordBatchReceiver), BigQueryError> {
-        let request = options.build(
+        let request = options.to_request(
             table_id_to_table_path(table_id)?,
-            || match std::thread::available_parallelism() {
-                Ok(value) => value.get() as i32,
-                Err(_) => 1,
-            },
             &self.quota_project_id,
         );
         let policy = bigquery_read_retry::RetryPolicy::create_read_session_policy();
@@ -272,7 +267,9 @@ impl Client {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use std::num::NonZero;
+
+use super::*;
 
     #[test]
     fn table_id_to_table_path_success() -> Result<(), Box<dyn std::error::Error>> {
@@ -297,14 +294,14 @@ mod tests {
     #[test]
     fn test_read_options_defaults() {
         let options = ReadOptions::default();
-        let request = options.build(
+        let request = options.to_request(
             "projects/test-project/datasets/test_dataset/tables/test_table".to_string(),
-            || 4,
             "quota-project-123",
         );
+        let available_parallelism = std::thread::available_parallelism().unwrap_or(NonZero::new(1).expect("hardcoded")).get() as i32;
 
         assert_eq!(request.parent, "projects/quota-project-123");
-        assert_eq!(request.max_stream_count, 4);
+        assert_eq!(request.max_stream_count, available_parallelism);
 
         let session = request
             .read_session
@@ -349,22 +346,22 @@ mod tests {
         let expected_timestamp = Timestamp::from(SystemTime::from(snapshot_dt));
 
         let options = ReadOptions {
-            maintain_order: true,
+            maintain_order: false,
             snapshot_time: Some(snapshot_dt),
             selected_fields: vec!["col1".to_string(), "col2".to_string()],
             row_restriction: "col1 > 100".to_string(),
             arrow_buffer_compression: Some(arrow_serialization_options::CompressionCodec::Zstd),
             sample_percentage: Some(42.5),
+            max_stream_count: Some(12),
         };
 
-        let request = options.build(
+        let request = options.to_request(
             "projects/p/datasets/d/tables/t".to_string(),
-            || 8,
             "custom-quota",
         );
 
         assert_eq!(request.parent, "projects/custom-quota");
-        assert_eq!(request.max_stream_count, 1);
+        assert_eq!(request.max_stream_count, 12);
 
         let session = request
             .read_session
@@ -405,14 +402,15 @@ mod tests {
             maintain_order: true,
             ..Default::default()
         };
-        let request_ordered = options_ordered.build("table".to_string(), || 16, "quota");
+        let request_ordered = options_ordered.to_request("table".to_string(), "quota");
         assert_eq!(request_ordered.max_stream_count, 1);
 
         let options_unordered = ReadOptions {
             maintain_order: false,
+            max_stream_count: Some(16),
             ..Default::default()
         };
-        let request_unordered = options_unordered.build("table".to_string(), || 16, "quota");
+        let request_unordered = options_unordered.to_request("table".to_string(), "quota");
         assert_eq!(request_unordered.max_stream_count, 16);
     }
 
@@ -442,7 +440,7 @@ mod tests {
                 arrow_buffer_compression: codec,
                 ..Default::default()
             };
-            let request = options.build("table".to_string(), || 1, "quota");
+            let request = options.to_request("table".to_string(), "quota");
             let session = request.read_session.unwrap();
             let read_options = session.read_options.unwrap();
             match read_options.output_format_serialization_options {
