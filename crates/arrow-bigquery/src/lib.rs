@@ -36,7 +36,7 @@ pub struct ReadOptions {
 }
 
 impl ReadOptions {
-    fn to_request(self, table_path: String, quota_project_id: &str) -> CreateReadSessionRequest {
+    fn build_request(self, table_path: String, quota_project_id: &str) -> CreateReadSessionRequest {
         let arrow_options = ArrowSerializationOptions {
             buffer_compression: match self.arrow_buffer_compression {
                 Some(buffer_compression) => buffer_compression.into(),
@@ -208,7 +208,8 @@ impl Client {
         table_id: &str,
         options: ReadOptions,
     ) -> Result<(ArrowSchemaRef, BigQueryRecordBatchReceiver), BigQueryError> {
-        let request = options.to_request(table_id_to_table_path(table_id)?, &self.quota_project_id);
+        let request =
+            options.build_request(table_id_to_table_path(table_id)?, &self.quota_project_id);
         let policy = bigquery_read_retry::RetryPolicy::create_read_session_policy();
         let service_client = self.client.clone();
         let service = tower::service_fn(move |req: CreateReadSessionRequest| {
@@ -290,7 +291,7 @@ mod tests {
     #[test]
     fn test_read_options_defaults() {
         let options = ReadOptions::default();
-        let request = options.to_request(
+        let request = options.build_request(
             "projects/test-project/datasets/test_dataset/tables/test_table".to_string(),
             "quota-project-123",
         );
@@ -354,7 +355,7 @@ mod tests {
         };
 
         let request =
-            options.to_request("projects/p/datasets/d/tables/t".to_string(), "custom-quota");
+            options.build_request("projects/p/datasets/d/tables/t".to_string(), "custom-quota");
 
         assert_eq!(request.parent, "projects/custom-quota");
         assert_eq!(request.max_stream_count, 12);
@@ -398,7 +399,7 @@ mod tests {
             maintain_order: true,
             ..Default::default()
         };
-        let request_ordered = options_ordered.to_request("table".to_string(), "quota");
+        let request_ordered = options_ordered.build_request("table".to_string(), "quota");
         assert_eq!(request_ordered.max_stream_count, 1);
 
         let options_unordered = ReadOptions {
@@ -406,7 +407,7 @@ mod tests {
             max_stream_count: Some(16),
             ..Default::default()
         };
-        let request_unordered = options_unordered.to_request("table".to_string(), "quota");
+        let request_unordered = options_unordered.build_request("table".to_string(), "quota");
         assert_eq!(request_unordered.max_stream_count, 16);
     }
 
@@ -436,7 +437,7 @@ mod tests {
                 arrow_buffer_compression: codec,
                 ..Default::default()
             };
-            let request = options.to_request("table".to_string(), "quota");
+            let request = options.build_request("table".to_string(), "quota");
             let session = request.read_session.unwrap();
             let read_options = session.read_options.unwrap();
             match read_options.output_format_serialization_options {
