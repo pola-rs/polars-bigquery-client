@@ -12,7 +12,7 @@ chrono = "0.4"
 # easily for musl targets.
 gcloud-sdk = { version = "0.30.0", default-features = false, features = ["google-cloud-bigquery-storage-v1", "tls-webpki-roots"] }
 hyper = "1.0"
-polars-arrow = { version = "0.53.0", default-features = false, features = ["io_ipc"] }
+polars-arrow = { version = "0.53.0", default-features = false, features = ["io_ipc", "io_ipc_compression"] }
 polars-error = "0.53.0"
 rand = { version = "0.10.0", features = [] }
 regex = "1.12.3"

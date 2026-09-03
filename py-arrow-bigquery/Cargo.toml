@@ -16,7 +16,7 @@ chrono = "0.4"
 # easily for musl targets.
 gcloud-sdk = { version = "0.30.0", default-features = false, features = ["google-cloud-bigquery-storage-v1", "tls-webpki-roots"] }
 arrow-bigquery-lib = { package = "arrow-bigquery", path = "../crates/arrow-bigquery" }
-pyo3 = { version = "0.27", features = ["abi3-py310"] }
+pyo3 = { version = "0.27", features = ["abi3-py310", "chrono"] }
 pyo3-async-runtimes = { version = "0.27", features = ["attributes", "tokio-runtime"] }
 pyo3-polars = { version = "0.26.0", features = ["derive", "lazy"] }
 polars-arrow = { version = "0.53.0", default-features = false }

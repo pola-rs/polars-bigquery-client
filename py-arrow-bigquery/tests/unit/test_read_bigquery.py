@@ -5,7 +5,6 @@ from unittest.mock import MagicMock, patch
 
 import nanoarrow
 import pytest
-
 from arrow_bigquery import (
     Client,
     __version__,

@@ -2,7 +2,6 @@ from unittest.mock import MagicMock, patch
 
 import polars as pl
 import pytest
-
 from polars_bigquery import (
     Client,
     __version__,
