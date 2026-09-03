@@ -287,24 +287,36 @@ impl Client {
     /// Reads a BigQuery table and returns an [`ArrowStreamExporter`] which can be
     /// consumed by Polars in Python.
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (table, maintain_order=false, snapshot_time=None, selected_fields=None, row_restriction="", arrow_buffer_compression="lz4frame", sample_percentage=None))]
+    #[pyo3(signature = (
+        table,
+        *,
+        arrow_buffer_compression="lz4frame",
+        maintain_order=false,
+        max_stream_count=None,
+        row_restriction="",
+        sample_percentage=None,
+        selected_fields=None,
+        snapshot_time=None
+    ))]
     pub fn read_table(
         &self,
         table: &str,
-        maintain_order: bool,
-        snapshot_time: Option<Py<PyDateTime>>,
-        selected_fields: Option<Vec<String>>,
-        row_restriction: &str,
         arrow_buffer_compression: &str,
+        maintain_order: bool,
+        max_stream_count: Option<i32>,
+        row_restriction: &str,
         sample_percentage: Option<f64>,
+        selected_fields: Option<Vec<String>>,
+        snapshot_time: Option<Py<PyDateTime>>,
     ) -> PyResult<ArrowStreamExporter> {
         let read_options = parse_read_options(
-            maintain_order,
-            snapshot_time,
-            selected_fields,
-            row_restriction,
             arrow_buffer_compression,
+            maintain_order,
+            max_stream_count,
+            row_restriction,
             sample_percentage,
+            selected_fields,
+            snapshot_time,
         )?;
         let rt = pyo3_async_runtimes::tokio::get_runtime();
         let client = self.client.clone();
@@ -326,12 +338,13 @@ impl Client {
 }
 
 fn parse_read_options(
-    maintain_order: bool,
-    snapshot_time: Option<Py<PyDateTime>>,
-    selected_fields: Option<Vec<String>>,
-    row_restriction: &str,
     arrow_buffer_compression: &str,
+    maintain_order: bool,
+    max_stream_count: Option<i32>,
+    row_restriction: &str,
     sample_percentage: Option<f64>,
+    selected_fields: Option<Vec<String>>,
+    snapshot_time: Option<Py<PyDateTime>>,
 ) -> PyResult<arrow_bigquery_lib::ReadOptions> {
     let snapshot_time: Option<chrono::DateTime<chrono::Utc>> = match snapshot_time {
         Some(dt) => Some(Python::attach(|py| {
@@ -349,12 +362,13 @@ fn parse_read_options(
         )))?,
     });
     Ok(arrow_bigquery_lib::ReadOptions {
-        maintain_order,
-        snapshot_time,
-        selected_fields: selected_fields.unwrap_or_default(),
-        row_restriction: row_restriction.to_owned(),
         arrow_buffer_compression,
+        maintain_order,
+        max_stream_count,
+        row_restriction: row_restriction.to_owned(),
         sample_percentage,
+        selected_fields: selected_fields.unwrap_or_default(),
+        snapshot_time,
         ..Default::default()
     })
 }
@@ -470,7 +484,7 @@ mod tests {
     #[test]
     fn test_parse_read_options_defaults() {
         Python::initialize();
-        let options = parse_read_options(false, None, None, "", "lz4frame", None).unwrap();
+        let options = parse_read_options("lz4frame", false, None, "", None, None, None).unwrap();
         assert!(!options.maintain_order);
         assert_eq!(options.snapshot_time, None);
         assert!(options.selected_fields.is_empty());
@@ -503,16 +517,18 @@ mod tests {
         });
 
         let options = parse_read_options(
-            true,
-            Some(dt_py),
-            Some(vec!["col1".to_string(), "col2".to_string()]),
-            "col1 > 100",
             "zstd",
+            true,
+            Some(16),
+            "col1 > 100",
             Some(42.5),
+            Some(vec!["col1".to_string(), "col2".to_string()]),
+            Some(dt_py),
         )
         .unwrap();
 
-        assert!(options.maintain_order);
+        assert_eq!(options.maintain_order, true);
+        assert_eq!(options.max_stream_count, Some(16));
         assert_eq!(options.snapshot_time, Some(expected_dt));
         assert_eq!(options.selected_fields, vec!["col1", "col2"]);
         assert_eq!(options.row_restriction, "col1 > 100");
@@ -534,11 +550,11 @@ mod tests {
         ];
 
         for (codec_str, expected) in valid_codecs {
-            let options = parse_read_options(false, None, None, "", codec_str, None).unwrap();
+            let options = parse_read_options(codec_str, false, None, "", None, None, None).unwrap();
             assert_eq!(options.arrow_buffer_compression, Some(expected));
         }
 
-        let err = match parse_read_options(false, None, None, "", "invalid_codec", None) {
+        let err = match parse_read_options("invalid_codec", false, None, "", None, None, None) {
             Err(e) => e,
             Ok(_) => panic!("expected Err for invalid compression codec"),
         };
@@ -564,7 +580,7 @@ mod tests {
             py_dt
         });
 
-        let err = match parse_read_options(false, Some(dt_py), None, "", "lz4frame", None) {
+        let err = match parse_read_options("lz4frame", false, None, "", None, None, Some(dt_py)) {
             Err(e) => e,
             Ok(_) => panic!("expected Err for naive datetime"),
         };
@@ -580,11 +596,12 @@ mod tests {
         let client = Client::new("test-project".to_string(), None, None).unwrap();
         let err = match client.read_table(
             "projects/p/datasets/d/tables/t",
+            "invalid_codec",
             false,
             None,
-            None,
             "",
-            "invalid_codec",
+            None,
+            None,
             None,
         ) {
             Err(e) => e,
@@ -615,12 +632,13 @@ mod tests {
         let client = Client::new("test-project".to_string(), None, None).unwrap();
         let err = match client.read_table(
             "projects/p/datasets/d/tables/t",
+            "lz4frame",
             false,
-            Some(dt_py),
             None,
             "",
-            "lz4frame",
             None,
+            None,
+            Some(dt_py),
         ) {
             Err(e) => e,
             Ok(_) => panic!("expected Err for naive datetime"),
