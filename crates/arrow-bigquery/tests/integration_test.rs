@@ -17,7 +17,13 @@ async fn test_read_small_public_table() {
     .expect("should build client");
 
     let (_, mut receiver) = client
-        .read_table("bigquery-public-data.usa_names.usa_1910_2013", false)
+        .read_table(
+            "bigquery-public-data.usa_names.usa_1910_2013",
+            ReadOptions {
+                maintain_order: false,
+                ..Default::default()
+            },
+        )
         .await
         .expect("public table read should work with default credentials");
 

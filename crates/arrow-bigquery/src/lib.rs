@@ -5,6 +5,7 @@ mod error;
 
 use std::io::Cursor;
 use std::sync::Arc;
+use std::time::SystemTime;
 
 pub use client_builder::*;
 pub use error::BigQueryError;
@@ -13,11 +14,77 @@ use gcloud_sdk::google::cloud::bigquery::storage::v1::{
     arrow_serialization_options, read_session, ArrowSerializationOptions, CreateReadSessionRequest,
     DataFormat, ReadSession,
 };
+use gcloud_sdk::prost_types::Timestamp;
 use gcloud_sdk::{GoogleApiClient, GoogleAuthMiddleware};
 use polars_arrow::datatypes::ArrowSchemaRef;
 use polars_arrow::io::ipc::read::read_stream_metadata;
 use polars_arrow::record_batch::RecordBatch;
 use tower::ServiceExt;
+
+const DEFAULT_COMPRESSION: arrow_serialization_options::CompressionCodec =
+    arrow_serialization_options::CompressionCodec::Lz4Frame;
+
+#[derive(Default)]
+pub struct ReadOptions {
+    pub maintain_order: bool,
+    pub snapshot_time: Option<chrono::DateTime<chrono::Utc>>,
+    pub selected_fields: Vec<String>,
+    pub row_restriction: String,
+    pub arrow_buffer_compression: Option<arrow_serialization_options::CompressionCodec>,
+    pub sample_percentage: Option<f64>,
+    pub max_stream_count: Option<i32>,
+}
+
+impl ReadOptions {
+    fn build_request(self, table_path: String, quota_project_id: &str) -> CreateReadSessionRequest {
+        let arrow_options = ArrowSerializationOptions {
+            buffer_compression: match self.arrow_buffer_compression {
+                Some(buffer_compression) => buffer_compression.into(),
+                None => DEFAULT_COMPRESSION.into(),
+            },
+            ..Default::default()
+        };
+        let table_modifiers = read_session::TableModifiers {
+            snapshot_time: self
+                .snapshot_time
+                .map(|snapshot_time| Timestamp::from(SystemTime::from(snapshot_time))),
+        };
+        let read_options = read_session::TableReadOptions {
+            output_format_serialization_options: Some(
+                read_session::table_read_options::OutputFormatSerializationOptions::ArrowSerializationOptions(arrow_options)
+            ),
+            selected_fields: self.selected_fields,
+            row_restriction: self.row_restriction,
+            sample_percentage: self.sample_percentage,
+            ..Default::default()
+        };
+        let read_session = ReadSession {
+            data_format: DataFormat::Arrow as i32,
+            table: table_path,
+            table_modifiers: Some(table_modifiers),
+            read_options: Some(read_options),
+            ..Default::default()
+        };
+        let max_stream_count = if self.maintain_order {
+            // If you are reading from a query results table where order matters,
+            // limit this to a single stream.
+            1
+        } else {
+            self.max_stream_count
+                .unwrap_or_else(|| match std::thread::available_parallelism() {
+                    Ok(value) => value.get() as i32,
+                    Err(_) => 1,
+                })
+        };
+
+        CreateReadSessionRequest {
+            parent: format!("projects/{}", quota_project_id),
+            max_stream_count,
+            read_session: Some(read_session),
+            ..Default::default()
+        }
+    }
+}
 
 /// A receiver that yields [`RecordBatch`]es read from BigQuery.
 ///
@@ -139,41 +206,10 @@ impl Client {
     pub async fn read_table(
         &self,
         table_id: &str,
-        maintain_order: bool,
+        options: ReadOptions,
     ) -> Result<(ArrowSchemaRef, BigQueryRecordBatchReceiver), BigQueryError> {
-        let arrow_options = ArrowSerializationOptions {
-            buffer_compression: arrow_serialization_options::CompressionCodec::Lz4Frame.into(),
-            ..Default::default()
-        };
-        let read_options = read_session::TableReadOptions {
-            output_format_serialization_options: Some(
-                read_session::table_read_options::OutputFormatSerializationOptions::ArrowSerializationOptions(arrow_options)
-            ),
-            ..Default::default()
-        };
-        let read_session = ReadSession {
-            data_format: DataFormat::Arrow as i32,
-            table: table_id_to_table_path(table_id)?,
-            read_options: Some(read_options),
-            ..Default::default()
-        };
-
-        let request = CreateReadSessionRequest {
-            parent: format!("projects/{}", self.quota_project_id),
-            // If you are reading from a query results table where order matters,
-            // limit this to a single stream.
-            max_stream_count: if maintain_order {
-                1
-            } else {
-                match std::thread::available_parallelism() {
-                    Ok(value) => value.get() as i32,
-                    Err(_) => 1,
-                }
-            },
-            read_session: Some(read_session),
-            ..Default::default()
-        };
-
+        let request =
+            options.build_request(table_id_to_table_path(table_id)?, &self.quota_project_id);
         let policy = bigquery_read_retry::RetryPolicy::create_read_session_policy();
         let service_client = self.client.clone();
         let service = tower::service_fn(move |req: CreateReadSessionRequest| {
@@ -228,6 +264,8 @@ impl Client {
 
 #[cfg(test)]
 mod tests {
+    use std::num::NonZero;
+
     use super::*;
 
     #[test]
@@ -248,5 +286,170 @@ mod tests {
             "projects/google.com:my-project/datasets/my_dataset/tables/my_table"
         );
         Ok(())
+    }
+
+    #[test]
+    fn test_read_options_defaults() {
+        let options = ReadOptions::default();
+        let request = options.build_request(
+            "projects/test-project/datasets/test_dataset/tables/test_table".to_string(),
+            "quota-project-123",
+        );
+        let available_parallelism = std::thread::available_parallelism()
+            .unwrap_or(NonZero::new(1).expect("hardcoded"))
+            .get() as i32;
+
+        assert_eq!(request.parent, "projects/quota-project-123");
+        assert_eq!(request.max_stream_count, available_parallelism);
+
+        let session = request
+            .read_session
+            .expect("read_session should be present");
+        assert_eq!(session.data_format, DataFormat::Arrow as i32);
+        assert_eq!(
+            session.table,
+            "projects/test-project/datasets/test_dataset/tables/test_table"
+        );
+
+        let table_modifiers = session
+            .table_modifiers
+            .expect("table_modifiers should be present");
+        assert_eq!(table_modifiers.snapshot_time, None);
+
+        let read_options = session
+            .read_options
+            .expect("read_options should be present");
+        assert!(read_options.selected_fields.is_empty());
+        assert_eq!(read_options.row_restriction, "");
+        assert_eq!(read_options.sample_percentage, None);
+
+        match read_options.output_format_serialization_options {
+            Some(
+                read_session::table_read_options::OutputFormatSerializationOptions::ArrowSerializationOptions(
+                    arrow_opts,
+                ),
+            ) => {
+                assert_eq!(
+                    arrow_opts.buffer_compression,
+                    arrow_serialization_options::CompressionCodec::Lz4Frame as i32
+                );
+            },
+            other => panic!("expected ArrowSerializationOptions, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_read_options_all_fields_plumbed() {
+        let snapshot_dt =
+            chrono::DateTime::from_timestamp(1_700_000_000, 500_000_000).expect("valid timestamp");
+        let expected_timestamp = Timestamp::from(SystemTime::from(snapshot_dt));
+
+        let options = ReadOptions {
+            maintain_order: false,
+            snapshot_time: Some(snapshot_dt),
+            selected_fields: vec!["col1".to_string(), "col2".to_string()],
+            row_restriction: "col1 > 100".to_string(),
+            arrow_buffer_compression: Some(arrow_serialization_options::CompressionCodec::Zstd),
+            sample_percentage: Some(42.5),
+            max_stream_count: Some(12),
+        };
+
+        let request =
+            options.build_request("projects/p/datasets/d/tables/t".to_string(), "custom-quota");
+
+        assert_eq!(request.parent, "projects/custom-quota");
+        assert_eq!(request.max_stream_count, 12);
+
+        let session = request
+            .read_session
+            .expect("read_session should be present");
+        assert_eq!(session.data_format, DataFormat::Arrow as i32);
+        assert_eq!(session.table, "projects/p/datasets/d/tables/t");
+
+        let table_modifiers = session
+            .table_modifiers
+            .expect("table_modifiers should be present");
+        assert_eq!(table_modifiers.snapshot_time, Some(expected_timestamp));
+
+        let read_options = session
+            .read_options
+            .expect("read_options should be present");
+        assert_eq!(read_options.selected_fields, vec!["col1", "col2"]);
+        assert_eq!(read_options.row_restriction, "col1 > 100");
+        assert_eq!(read_options.sample_percentage, Some(42.5));
+
+        match read_options.output_format_serialization_options {
+            Some(
+                read_session::table_read_options::OutputFormatSerializationOptions::ArrowSerializationOptions(
+                    arrow_opts,
+                ),
+            ) => {
+                assert_eq!(
+                    arrow_opts.buffer_compression,
+                    arrow_serialization_options::CompressionCodec::Zstd as i32
+                );
+            },
+            other => panic!("expected ArrowSerializationOptions, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_read_options_maintain_order_controls_max_stream_count() {
+        let options_ordered = ReadOptions {
+            maintain_order: true,
+            ..Default::default()
+        };
+        let request_ordered = options_ordered.build_request("table".to_string(), "quota");
+        assert_eq!(request_ordered.max_stream_count, 1);
+
+        let options_unordered = ReadOptions {
+            maintain_order: false,
+            max_stream_count: Some(16),
+            ..Default::default()
+        };
+        let request_unordered = options_unordered.build_request("table".to_string(), "quota");
+        assert_eq!(request_unordered.max_stream_count, 16);
+    }
+
+    #[test]
+    fn test_read_options_compression_codecs() {
+        let codecs = [
+            (
+                None,
+                arrow_serialization_options::CompressionCodec::Lz4Frame as i32,
+            ),
+            (
+                Some(arrow_serialization_options::CompressionCodec::Lz4Frame),
+                arrow_serialization_options::CompressionCodec::Lz4Frame as i32,
+            ),
+            (
+                Some(arrow_serialization_options::CompressionCodec::Zstd),
+                arrow_serialization_options::CompressionCodec::Zstd as i32,
+            ),
+            (
+                Some(arrow_serialization_options::CompressionCodec::CompressionUnspecified),
+                arrow_serialization_options::CompressionCodec::CompressionUnspecified as i32,
+            ),
+        ];
+
+        for (codec, expected_val) in codecs {
+            let options = ReadOptions {
+                arrow_buffer_compression: codec,
+                ..Default::default()
+            };
+            let request = options.build_request("table".to_string(), "quota");
+            let session = request.read_session.unwrap();
+            let read_options = session.read_options.unwrap();
+            match read_options.output_format_serialization_options {
+                Some(
+                    read_session::table_read_options::OutputFormatSerializationOptions::ArrowSerializationOptions(
+                        arrow_opts,
+                    ),
+                ) => {
+                    assert_eq!(arrow_opts.buffer_compression, expected_val);
+                },
+                other => panic!("expected ArrowSerializationOptions, got {:?}", other),
+            }
+        }
     }
 }
