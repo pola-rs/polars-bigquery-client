@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import datetime
 from typing import Any
 
 import arrow_bigquery._native
@@ -70,10 +71,22 @@ class Client:
         self,
         table: Any,
         *,
+        arrow_buffer_compression: str = "lz4frame",
         maintain_order: bool = False,
+        max_stream_count: int | None = None,
+        row_restriction: str = "",
+        sample_percentage: float | None = None,
+        selected_fields: list[str] | None = None,
+        snapshot_time: datetime.datetime | None = None,
     ) -> arrow_bigquery._native.ArrowStreamExporter:
         table_ref = _parse_table_id(table)
         return self._client.read_table(
             table_ref,
+            arrow_buffer_compression=arrow_buffer_compression,
             maintain_order=maintain_order,
+            max_stream_count=max_stream_count,
+            row_restriction=row_restriction,
+            sample_percentage=sample_percentage,
+            selected_fields=selected_fields,
+            snapshot_time=snapshot_time,
         )

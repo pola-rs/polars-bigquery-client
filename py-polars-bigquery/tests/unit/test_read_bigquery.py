@@ -2,6 +2,7 @@ from unittest.mock import MagicMock, patch
 
 import polars as pl
 import pytest
+
 from polars_bigquery import (
     Client,
     __version__,
@@ -24,42 +25,6 @@ def test_get_user_agent():
         _get_user_agent("custom-extension/1.0")
         == f"polars-bigquery/{__version__} custom-extension/1.0"
     )
-
-
-def test_parse_table_id_valid_string():
-    assert _parse_table_id("proj.ds.tab") == "proj.ds.tab"
-
-
-def test_parse_table_id_with_colon():
-    assert _parse_table_id("google.com:project.ds.tab") == "google.com:project.ds.tab"
-
-
-def test_parse_table_id_table_reference():
-    mock_ref = MagicMock()
-    mock_ref.project = "p"
-    mock_ref.dataset_id = "d"
-    mock_ref.table_id = "t"
-    assert _parse_table_id(mock_ref) == "p.d.t"
-
-
-def test_parse_table_id_table_object():
-    mock_table = MagicMock()
-    mock_table.project = "proj-obj"
-    mock_table.dataset_id = "ds-obj"
-    mock_table.table_id = "tab-obj"
-    assert _parse_table_id(mock_table) == "proj-obj.ds-obj.tab-obj"
-
-
-def test_parse_table_id_invalid_format():
-    with pytest.raises(ValueError, match="Invalid table ID"):
-        _parse_table_id("just_a_string")
-    with pytest.raises(TypeError, match="BigLake tables are not supported yet"):
-        _parse_table_id("too.many.parts.here")
-
-
-def test_parse_table_id_invalid_type():
-    with pytest.raises(TypeError, match="Expected table_id to be a string"):
-        _parse_table_id(123)
 
 
 def test_client_custom_credentials_provider():

@@ -1,10 +1,12 @@
 import _thread
+import datetime
 import threading
 import time
 from unittest.mock import MagicMock, patch
 
 import nanoarrow
 import pytest
+
 from arrow_bigquery import (
     Client,
     __version__,
@@ -94,7 +96,13 @@ def test_client_read_bigquery_calls_rust_with_parsed_id(mock_rust_client):
 
     mock_rust_client.read_table.assert_called_once_with(
         "my-project.my_dataset.my_table",
+        arrow_buffer_compression="lz4frame",
         maintain_order=False,
+        max_stream_count=None,
+        row_restriction="",
+        sample_percentage=None,
+        selected_fields=None,
+        snapshot_time=None,
     )
     assert result is placeholder
 
@@ -109,7 +117,46 @@ def test_client_read_bigquery_handles_bigquery_objects(mock_rust_client):
     client = Client(quota_project_id="q")
     client.read_table(table=mock_ref)
 
-    mock_rust_client.read_table.assert_called_once_with("p.d.t", maintain_order=False)
+    mock_rust_client.read_table.assert_called_once_with(
+        "p.d.t",
+        arrow_buffer_compression="lz4frame",
+        maintain_order=False,
+        max_stream_count=None,
+        row_restriction="",
+        sample_percentage=None,
+        selected_fields=None,
+        snapshot_time=None,
+    )
+
+
+def test_client_read_bigquery_passes_additional_parameters(mock_rust_client):
+    placeholder = object()
+    mock_rust_client.read_table.return_value = placeholder
+
+    snapshot_dt = datetime.datetime(2026, 1, 1, 12, 0, 0, tzinfo=datetime.timezone.utc)
+    client = Client(quota_project_id="q")
+    result = client.read_table(
+        table="my-project.my_dataset.my_table",
+        arrow_buffer_compression="zstd",
+        maintain_order=True,
+        max_stream_count=4,
+        row_restriction="foo > 1",
+        sample_percentage=10.0,
+        selected_fields=["foo", "bar"],
+        snapshot_time=snapshot_dt,
+    )
+
+    mock_rust_client.read_table.assert_called_once_with(
+        "my-project.my_dataset.my_table",
+        arrow_buffer_compression="zstd",
+        maintain_order=True,
+        max_stream_count=4,
+        row_restriction="foo > 1",
+        sample_percentage=10.0,
+        selected_fields=["foo", "bar"],
+        snapshot_time=snapshot_dt,
+    )
+    assert result is placeholder
 
 
 def test_client_read_bigquery_propagates_errors(mock_rust_client):
