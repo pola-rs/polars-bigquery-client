@@ -6,7 +6,7 @@ from polars_bigquery import (
     Client,
     __version__,
 )
-from polars_bigquery._read_bigquery import _get_user_agent, _parse_table_id
+from polars_bigquery._read_bigquery import _get_user_agent
 
 
 @pytest.fixture
@@ -132,7 +132,7 @@ def test_client_read_query_with_user_agent(mock_arrow_client):
     mock_arrow_client.read_table.return_value = mock_exporter
 
     with (
-        patch("polars_bigquery._read_bigquery.run_query") as mock_run_query,
+        patch("polars_bigquery.core.bigquery_rest.run_query") as mock_run_query,
         patch("polars.DataFrame") as mock_df_cls,
     ):
         mock_run_query.return_value = "project.dataset.temp_table"
