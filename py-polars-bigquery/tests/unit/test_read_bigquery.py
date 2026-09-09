@@ -84,7 +84,10 @@ def test_client_read_query(mock_arrow_client):
 
         expected_ua = f"polars-bigquery/{__version__}"
         mock_run_query.assert_called_once_with(
-            "SELECT 1", "q", client.credentials_provider, user_agent=expected_ua
+            "SELECT 1",
+            quota_project_id="q",
+            credentials_provider=client.credentials_provider,
+            user_agent=expected_ua,
         )
         mock_arrow_client.read_table.assert_called_once_with(
             "project.dataset.temp_table",
@@ -111,7 +114,10 @@ def test_client_read_query_with_user_agent(mock_arrow_client):
         assert result is not None
         expected_ua = f"polars-bigquery/{__version__} custom-ua/1.0"
         mock_run_query.assert_called_once_with(
-            "SELECT 1", "q", client.credentials_provider, user_agent=expected_ua
+            "SELECT 1",
+            quota_project_id="q",
+            credentials_provider=client.credentials_provider,
+            user_agent=expected_ua,
         )
 
 

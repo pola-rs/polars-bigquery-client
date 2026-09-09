@@ -46,8 +46,8 @@ def test_run_query_success():
 
         result = run_query(
             "SELECT 1",
-            "quota-project",
-            mock_cp,
+            quota_project_id="quota-project",
+            credentials_provider=mock_cp,
             user_agent="polars-bigquery/0.1.0",
         )
 
@@ -87,8 +87,8 @@ def test_run_query_error():
         with pytest.raises(BigQueryError, match="Something went wrong"):
             run_query(
                 "SELECT 1",
-                "quota-project",
-                mock_cp,
+                quota_project_id="quota-project",
+                credentials_provider=mock_cp,
                 user_agent="polars-bigquery/0.1.0",
             )
 
@@ -122,8 +122,8 @@ def test_run_query_with_user_agent():
 
         run_query(
             "SELECT 1",
-            "quota-project",
-            mock_cp,
+            quota_project_id="quota-project",
+            credentials_provider=mock_cp,
             user_agent="polars-bigquery/0.1.0 custom-ua/1.0",
         )
 
@@ -134,4 +134,8 @@ def test_run_query_with_user_agent():
 def test_run_query_requires_user_agent():
     mock_cp = MagicMock()
     with pytest.raises(TypeError):
-        run_query("SELECT 1", "quota-project", mock_cp)
+        run_query(
+            "SELECT 1",
+            quota_project_id="quota-project",
+            credentials_provider=mock_cp,
+        )
