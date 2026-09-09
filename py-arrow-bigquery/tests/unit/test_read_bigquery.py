@@ -56,6 +56,14 @@ def test_parse_table_id_table_object():
     assert _parse_table_id(mock_table) == "proj-obj.ds-obj.tab-obj"
 
 
+def test_parse_table_id_project_id_attribute():
+    mock_table = MagicMock(spec=["project_id", "dataset_id", "table_id"])
+    mock_table.project_id = "proj-id"
+    mock_table.dataset_id = "ds-id"
+    mock_table.table_id = "tab-id"
+    assert _parse_table_id(mock_table) == "proj-id.ds-id.tab-id"
+
+
 def test_parse_table_id_invalid_format():
     with pytest.raises(ValueError, match="Invalid table ID"):
         _parse_table_id("just_a_string")

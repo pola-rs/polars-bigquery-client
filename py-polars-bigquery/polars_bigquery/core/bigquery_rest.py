@@ -69,7 +69,7 @@ def _get_headers(
     quota_project_id: str,
     credentials_provider: pl.CredentialProviderGCP,
     user_agent: str,
-) -> dict :
+) -> dict:
     token_data, _ = credentials_provider()
     token = token_data["bearer_token"]
     return {
@@ -88,7 +88,11 @@ def run_query(
     user_agent: str,
 ) -> str:
     """Run a query and return the destination table from the job resource."""
-    headers = _get_headers(quota_project_id=quota_project_id, credentials_provider=credentials_provider, user_agent=user_agent)
+    headers = _get_headers(
+        quota_project_id=quota_project_id,
+        credentials_provider=credentials_provider,
+        user_agent=user_agent,
+    )
 
     # 1. Insert the job
     insert_url = _get_jobs_insert_url(quota_project_id)
@@ -113,7 +117,11 @@ def get_table_metadata(
     credentials_provider: pl.CredentialProviderGCP,
     user_agent: str,
 ) -> dict:
-    headers = _get_headers(quota_project_id=quota_project_id, credentials_provider=credentials_provider, user_agent=user_agent)
+    headers = _get_headers(
+        quota_project_id=quota_project_id,
+        credentials_provider=credentials_provider,
+        user_agent=user_agent,
+    )
     table_metadata_url = _get_table_metadata_url(table_ref=table_ref)
     response = requests.get(table_metadata_url, headers=headers)
     response.raise_for_status()

@@ -1,9 +1,10 @@
 from __future__ import annotations
 
-import polars._reexport as pl
+import polars as pl
 from polars.datatypes import (
     Binary,
     Boolean,
+    DataType,
     Date,
     Datetime,
     Decimal,
@@ -15,7 +16,6 @@ from polars.datatypes import (
     Struct,
     Time,
 )
-from polars.datatypes import DataType
 
 
 def _extract_data_type(field: dict) -> DataType:
@@ -66,7 +66,8 @@ def _extract_data_type(field: dict) -> DataType:
         return Decimal(precision=38, scale=9)
     if type_ in ("record", "struct"):
         polars_fields = [
-            Field(field.name, _extract_data_type(field)) for field in field.get("fields", [])
+            Field(subfield.get("name", ""), _extract_data_type(subfield))
+            for subfield in field.get("fields", [])
         ]
         return Struct(polars_fields)
     if type_ == "string":
@@ -94,7 +95,7 @@ def extract_polars_schema(table_metadata: dict) -> pl.Schema:
     # https://cloud.google.com/bigquery/docs/partitioned-tables#ingestion_time
     if (
         time_partitioning := table_metadata.get("timePartitioning")
-    ) is not None and time_partitioning.field is None:
+    ) is not None and time_partitioning.get("field") is None:
         pl_schema["_PARTITIONDATE"] = Date()
 
     return pl.Schema(pl_schema)

@@ -18,12 +18,15 @@ def _get_user_agent(user_agent: str | None) -> str:
 
 def _parse_table_id(table_id: Any) -> str:
     if not isinstance(table_id, str):
+        project = getattr(table_id, "project", None) or getattr(
+            table_id, "project_id", None
+        )
         if (
-            hasattr(table_id, "project")
+            project is not None
             and hasattr(table_id, "dataset_id")
             and hasattr(table_id, "table_id")
         ):
-            return f"{table_id.project}.{table_id.dataset_id}.{table_id.table_id}"
+            return f"{project}.{table_id.dataset_id}.{table_id.table_id}"
         raise TypeError(f"Expected table_id to be a string, got {type(table_id)}")
 
     parts = table_id.split(".")

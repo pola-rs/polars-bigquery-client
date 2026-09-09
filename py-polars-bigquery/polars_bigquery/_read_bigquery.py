@@ -1,15 +1,15 @@
 from __future__ import annotations
 
-from typing import Any, Iterator
+from collections.abc import Iterator
+from typing import Any
 
 import arrow_bigquery
 import polars as pl
 import polars.io.plugins
 
-import polars_bigquery.core.version
-from polars_bigquery.core import bigquery_rest
-from polars_bigquery.core import resource_references
 import polars_bigquery.core.schema
+import polars_bigquery.core.version
+from polars_bigquery.core import bigquery_rest, resource_references
 
 
 def _get_user_agent(user_agent: str | None) -> str:
@@ -57,7 +57,7 @@ class Client:
 
     def read_table(
         self,
-        table: str,
+        table: Any,
         *,
         maintain_order: bool = False,
     ) -> pl.DataFrame:
@@ -106,7 +106,7 @@ class Client:
             batch_size: int | None,
         ) -> Iterator[pl.DataFrame]:
             arrow_stream_exporter = self._arrow_client.read_table(
-                table_ref,
+                f"{table_ref.project_id}.{table_ref.dataset_id}.{table_ref.table_id}",
                 maintain_order=False,
             )
             lazyframe = pl.scan_arrow_c_stream(arrow_stream_exporter)

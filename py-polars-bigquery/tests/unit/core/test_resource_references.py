@@ -61,3 +61,26 @@ def test_parse_table_id_invalid_format():
 def test_parse_table_id_invalid_type():
     with pytest.raises(TypeError, match="Expected table_id to be a string"):
         parse_table_id(123)
+
+
+def test_bigquery_table_id_str_and_properties():
+    table_id = BigQueryTableId(project_id="proj", dataset_id="ds", table_id="tab")
+    assert str(table_id) == "proj.ds.tab"
+    assert table_id.project == "proj"
+
+
+def test_parse_table_id_idempotent():
+    table_id = BigQueryTableId(project_id="proj", dataset_id="ds", table_id="tab")
+    assert parse_table_id(table_id) == table_id
+
+
+def test_parse_table_id_with_project_id_attribute():
+    mock_table = MagicMock(spec=["project_id", "dataset_id", "table_id"])
+    mock_table.project_id = "proj"
+    mock_table.dataset_id = "ds"
+    mock_table.table_id = "tab"
+    assert parse_table_id(mock_table) == BigQueryTableId(
+        project_id="proj",
+        dataset_id="ds",
+        table_id="tab",
+    )

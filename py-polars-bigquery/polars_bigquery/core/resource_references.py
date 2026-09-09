@@ -28,6 +28,13 @@ class BigQueryTableId:
     dataset_id: str
     table_id: str
 
+    @property
+    def project(self) -> str:
+        return self.project_id
+
+    def __str__(self) -> str:
+        return f"{self.project_id}.{self.dataset_id}.{self.table_id}"
+
 
 def parse_table_id(table_id: Any) -> BigQueryTableId:
     """Turn a string or BigQuery table object into a BigQueryTableId.
@@ -36,13 +43,19 @@ def parse_table_id(table_id: Any) -> BigQueryTableId:
         ValueError: If the table ID is invalid.
         TypeError: If the table ID is not a string or BigQuery table object.
     """
+    if isinstance(table_id, BigQueryTableId):
+        return table_id
+
     if (
-        hasattr(table_id, "project")
+        (hasattr(table_id, "project") or hasattr(table_id, "project_id"))
         and hasattr(table_id, "dataset_id")
         and hasattr(table_id, "table_id")
     ):
+        project = getattr(table_id, "project", None) or getattr(
+            table_id, "project_id", None
+        )
         return BigQueryTableId(
-            project_id=table_id.project,
+            project_id=project,
             dataset_id=table_id.dataset_id,
             table_id=table_id.table_id,
         )
