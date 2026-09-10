@@ -4,12 +4,17 @@ TODO(tswast): Implement this in Rust using jobs.query and the
 JOB_CREATION_OPTIONAL parameter to improve latency in small query results.
 """
 
+import arrow_bigquery.api.resources
 import polars as pl
 import requests
 
 import polars_bigquery.exceptions
 
 _BIGQUERY_ENDPOINT = "https://bigquery.googleapis.com/bigquery/v2"
+
+
+def _get_table_metadata_url(*, table_ref: arrow_bigquery.api.resources.BigQueryTableId):
+    return f"{_BIGQUERY_ENDPOINT}/projects/{table_ref.project_id}/datasets/{table_ref.dataset_id}/tables/{table_ref.table_id}"
 
 
 def _get_jobs_insert_url(quota_project_id: str) -> str:
@@ -59,22 +64,35 @@ def _wait_for_job(job_id: str, quota_project_id: str, headers: dict) -> dict:
         ).json()
 
 
-def run_query(
-    query: str,
+def _get_headers(
+    *,
     quota_project_id: str,
     credentials_provider: pl.CredentialProviderGCP,
-    *,
     user_agent: str,
-) -> str:
-    """Run a query and return the destination table from the job resource."""
+) -> dict:
     token_data, _ = credentials_provider()
     token = token_data["bearer_token"]
-    headers = {
+    return {
         "Authorization": f"Bearer {token}",
         "User-Agent": user_agent,
         "Content-Type": "application/json",
         "x-goog-user-project": quota_project_id,
     }
+
+
+def run_query(
+    query: str,
+    *,
+    quota_project_id: str,
+    credentials_provider: pl.CredentialProviderGCP,
+    user_agent: str,
+) -> str:
+    """Run a query and return the destination table from the job resource."""
+    headers = _get_headers(
+        quota_project_id=quota_project_id,
+        credentials_provider=credentials_provider,
+        user_agent=user_agent,
+    )
 
     # 1. Insert the job
     insert_url = _get_jobs_insert_url(quota_project_id)
@@ -90,3 +108,21 @@ def run_query(
     # 3. Return the destination table ID
     dest = job["configuration"]["query"]["destinationTable"]
     return f"{dest['projectId']}.{dest['datasetId']}.{dest['tableId']}"
+
+
+def get_table_metadata(
+    table_ref: arrow_bigquery.api.resources.BigQueryTableId,
+    *,
+    quota_project_id: str,
+    credentials_provider: pl.CredentialProviderGCP,
+    user_agent: str,
+) -> dict:
+    headers = _get_headers(
+        quota_project_id=quota_project_id,
+        credentials_provider=credentials_provider,
+        user_agent=user_agent,
+    )
+    table_metadata_url = _get_table_metadata_url(table_ref=table_ref)
+    response = requests.get(table_metadata_url, headers=headers)
+    response.raise_for_status()
+    return response.json()
