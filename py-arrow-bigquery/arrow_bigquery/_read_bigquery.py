@@ -1,9 +1,13 @@
 from __future__ import annotations
 
+import datetime
 from typing import Any
 
 import arrow_bigquery._native
 import arrow_bigquery.core.version
+from arrow_bigquery.api.resources import parse_table_id
+
+_parse_table_id = parse_table_id
 
 
 def _get_user_agent(user_agent: str | None) -> str:
@@ -13,30 +17,6 @@ def _get_user_agent(user_agent: str | None) -> str:
         return f"{ua} {user_agent}"
     else:
         return ua
-
-
-def _parse_table_id(table_id: Any) -> str:
-    if not isinstance(table_id, str):
-        if (
-            hasattr(table_id, "project")
-            and hasattr(table_id, "dataset_id")
-            and hasattr(table_id, "table_id")
-        ):
-            return f"{table_id.project}.{table_id.dataset_id}.{table_id.table_id}"
-        raise TypeError(f"Expected table_id to be a string, got {type(table_id)}")
-
-    parts = table_id.split(".")
-    if len(parts) < 3:
-        raise ValueError("Invalid table ID")
-    if len(parts) > 3 and not any(":" in part for part in parts[:-2]):
-        raise TypeError("BigLake tables are not supported yet")
-
-    # Let's just follow the rust regex logic:
-    # it must have at least two dots, and the last two parts must not have dots.
-    if len(parts) >= 3:
-        return table_id
-
-    raise ValueError("Invalid table ID")
 
 
 class Client:
@@ -68,12 +48,24 @@ class Client:
 
     def read_table(
         self,
-        table: Any,
+        table: arrow_bigquery._native.BigQueryTableId | str | Any,
         *,
+        arrow_buffer_compression: str = "lz4frame",
         maintain_order: bool = False,
+        max_stream_count: int | None = None,
+        row_restriction: str = "",
+        sample_percentage: float | None = None,
+        selected_fields: list[str] | None = None,
+        snapshot_time: datetime.datetime | None = None,
     ) -> arrow_bigquery._native.ArrowStreamExporter:
-        table_ref = _parse_table_id(table)
+        table_id = _parse_table_id(table)
         return self._client.read_table(
-            table_ref,
+            table_id,
+            arrow_buffer_compression=arrow_buffer_compression,
             maintain_order=maintain_order,
+            max_stream_count=max_stream_count,
+            row_restriction=row_restriction,
+            sample_percentage=sample_percentage,
+            selected_fields=selected_fields,
+            snapshot_time=snapshot_time,
         )

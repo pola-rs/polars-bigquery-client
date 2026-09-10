@@ -1,4 +1,5 @@
 import _thread
+import datetime
 import threading
 import time
 from unittest.mock import MagicMock, patch
@@ -6,11 +7,12 @@ from unittest.mock import MagicMock, patch
 import nanoarrow
 import pytest
 from arrow_bigquery import (
+    BigQueryTableId,
     Client,
     __version__,
     _native,
 )
-from arrow_bigquery._read_bigquery import _get_user_agent, _parse_table_id
+from arrow_bigquery._read_bigquery import _get_user_agent
 
 
 @pytest.fixture
@@ -30,40 +32,33 @@ def test_get_user_agent():
     )
 
 
-def test_parse_table_id_valid_string():
-    assert _parse_table_id("proj.ds.tab") == "proj.ds.tab"
+def test_bigquery_table_id_str_and_properties():
+    table_id = BigQueryTableId("proj", "ds", "tab")
+    assert str(table_id) == "proj.ds.tab"
+    assert table_id.project == "proj"
+    assert table_id.project_id == "proj"
+    assert table_id.dataset_id == "ds"
+    assert table_id.table_id == "tab"
 
 
-def test_parse_table_id_with_colon():
-    assert _parse_table_id("google.com:project.ds.tab") == "google.com:project.ds.tab"
+def test_bigquery_table_id_from_string():
+    id1 = BigQueryTableId.from_string("proj.ds.tab")
+    assert id1 == BigQueryTableId("proj", "ds", "tab")
 
+    id2 = BigQueryTableId.from_str("google.com:proj.ds.tab")
+    assert id2 == BigQueryTableId("google.com:proj", "ds", "tab")
 
-def test_parse_table_id_table_reference():
-    mock_ref = MagicMock()
-    mock_ref.project = "p"
-    mock_ref.dataset_id = "d"
-    mock_ref.table_id = "t"
-    assert _parse_table_id(mock_ref) == "p.d.t"
+    id3 = BigQueryTableId.from_string("too.many.parts.here")
+    assert id3 == BigQueryTableId("too", "many.parts", "here")
 
-
-def test_parse_table_id_table_object():
-    mock_table = MagicMock()
-    mock_table.project = "proj-obj"
-    mock_table.dataset_id = "ds-obj"
-    mock_table.table_id = "tab-obj"
-    assert _parse_table_id(mock_table) == "proj-obj.ds-obj.tab-obj"
-
-
-def test_parse_table_id_invalid_format():
     with pytest.raises(ValueError, match="Invalid table ID"):
-        _parse_table_id("just_a_string")
-    with pytest.raises(TypeError, match="BigLake tables are not supported yet"):
-        _parse_table_id("too.many.parts.here")
+        BigQueryTableId.from_string("just_a_string")
 
+    with pytest.raises(ValueError, match="Invalid table ID"):
+        BigQueryTableId.from_string("`proj.ds.tab`")
 
-def test_parse_table_id_invalid_type():
-    with pytest.raises(TypeError, match="Expected table_id to be a string"):
-        _parse_table_id(123)
+    with pytest.raises(ValueError, match="Invalid table ID"):
+        BigQueryTableId.from_string("proj..tab")
 
 
 def test_client_init_passes_credentials_provider():
@@ -85,7 +80,59 @@ def test_client_init_requires_quota_project_id():
         Client()
 
 
-def test_client_read_bigquery_calls_rust_with_parsed_id(mock_rust_client):
+def test_client_read_bigquery_calls_rust(mock_rust_client):
+    placeholder = object()
+    mock_rust_client.read_table.return_value = placeholder
+
+    table = BigQueryTableId("my-project", "my_dataset", "my_table")
+    client = Client(quota_project_id="q")
+    result = client.read_table(table=table)
+
+    mock_rust_client.read_table.assert_called_once_with(
+        table,
+        arrow_buffer_compression="lz4frame",
+        maintain_order=False,
+        max_stream_count=None,
+        row_restriction="",
+        sample_percentage=None,
+        selected_fields=None,
+        snapshot_time=None,
+    )
+    assert result is placeholder
+
+
+def test_client_read_bigquery_passes_additional_parameters(mock_rust_client):
+    placeholder = object()
+    mock_rust_client.read_table.return_value = placeholder
+
+    table = BigQueryTableId("my-project", "my_dataset", "my_table")
+    snapshot_dt = datetime.datetime(2026, 1, 1, 12, 0, 0, tzinfo=datetime.timezone.utc)
+    client = Client(quota_project_id="q")
+    result = client.read_table(
+        table=table,
+        arrow_buffer_compression="zstd",
+        maintain_order=True,
+        max_stream_count=4,
+        row_restriction="foo > 1",
+        sample_percentage=10.0,
+        selected_fields=["foo", "bar"],
+        snapshot_time=snapshot_dt,
+    )
+
+    mock_rust_client.read_table.assert_called_once_with(
+        table,
+        arrow_buffer_compression="zstd",
+        maintain_order=True,
+        max_stream_count=4,
+        row_restriction="foo > 1",
+        sample_percentage=10.0,
+        selected_fields=["foo", "bar"],
+        snapshot_time=snapshot_dt,
+    )
+    assert result is placeholder
+
+
+def test_client_read_bigquery_with_str_table(mock_rust_client):
     placeholder = object()
     mock_rust_client.read_table.return_value = placeholder
 
@@ -93,23 +140,53 @@ def test_client_read_bigquery_calls_rust_with_parsed_id(mock_rust_client):
     result = client.read_table(table="my-project.my_dataset.my_table")
 
     mock_rust_client.read_table.assert_called_once_with(
-        "my-project.my_dataset.my_table",
+        BigQueryTableId("my-project", "my_dataset", "my_table"),
+        arrow_buffer_compression="lz4frame",
         maintain_order=False,
+        max_stream_count=None,
+        row_restriction="",
+        sample_percentage=None,
+        selected_fields=None,
+        snapshot_time=None,
     )
     assert result is placeholder
 
 
-def test_client_read_bigquery_handles_bigquery_objects(mock_rust_client):
-    mock_rust_client.read_table.return_value = MagicMock()
+def test_client_read_bigquery_with_table_object(mock_rust_client):
+    placeholder = object()
+    mock_rust_client.read_table.return_value = placeholder
+
     mock_ref = MagicMock()
     mock_ref.project = "p"
     mock_ref.dataset_id = "d"
     mock_ref.table_id = "t"
 
     client = Client(quota_project_id="q")
-    client.read_table(table=mock_ref)
+    result = client.read_table(table=mock_ref)
 
-    mock_rust_client.read_table.assert_called_once_with("p.d.t", maintain_order=False)
+    mock_rust_client.read_table.assert_called_once_with(
+        BigQueryTableId("p", "d", "t"),
+        arrow_buffer_compression="lz4frame",
+        maintain_order=False,
+        max_stream_count=None,
+        row_restriction="",
+        sample_percentage=None,
+        selected_fields=None,
+        snapshot_time=None,
+    )
+    assert result is placeholder
+
+
+def test_client_read_bigquery_invalid_table_type(mock_rust_client):
+    client = Client(quota_project_id="q")
+    with pytest.raises(TypeError, match="Expected table_id to be a string"):
+        client.read_table(table=123)
+
+
+def test_client_read_bigquery_invalid_table_str(mock_rust_client):
+    client = Client(quota_project_id="q")
+    with pytest.raises(ValueError, match="Invalid table ID"):
+        client.read_table(table="just_a_string")
 
 
 def test_client_read_bigquery_propagates_errors(mock_rust_client):
@@ -117,7 +194,7 @@ def test_client_read_bigquery_propagates_errors(mock_rust_client):
 
     client = Client(quota_project_id="q")
     with pytest.raises(Exception, match="Rust error"):
-        client.read_table(table="p.d.t")
+        client.read_table(table=BigQueryTableId("p", "d", "t"))
 
 
 def test_receiver_iterator_interrupt():
