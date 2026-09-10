@@ -74,8 +74,9 @@ def parse_table_id(table_id: Any) -> BigQueryTableId:
     if any(part == "" for part in inner_parts):
         raise ValueError(f"Invalid table ID: {table_id}")
 
+    legacy_domain = regex_match.group("legacy_project_domain") or ""
     return BigQueryTableId(
-        project_id=regex_match.group("project"),
+        project_id=f"{legacy_domain}{regex_match.group('project')}",
         dataset_id=".".join(inner_parts),
         table_id=regex_match.group("table"),
     )

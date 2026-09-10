@@ -20,9 +20,108 @@ use polars_arrow::datatypes::ArrowSchemaRef;
 use polars_arrow::io::ipc::read::read_stream_metadata;
 use polars_arrow::record_batch::RecordBatch;
 use tower::ServiceExt;
+use winnow::combinator::{eof, opt, separated, terminated};
+use winnow::token::take_while;
+use winnow::Parser;
 
 const DEFAULT_COMPRESSION: arrow_serialization_options::CompressionCodec =
     arrow_serialization_options::CompressionCodec::Lz4Frame;
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct BigQueryTableId {
+    pub project_id: String,
+    pub dataset_id: String,
+    pub table_id: String,
+}
+
+impl BigQueryTableId {
+    pub fn new(
+        project_id: impl Into<String>,
+        dataset_id: impl Into<String>,
+        table_id: impl Into<String>,
+    ) -> Self {
+        Self {
+            project_id: project_id.into(),
+            dataset_id: dataset_id.into(),
+            table_id: table_id.into(),
+        }
+    }
+
+    pub fn to_table_path(&self) -> String {
+        format!(
+            "projects/{}/datasets/{}/tables/{}",
+            self.project_id, self.dataset_id, self.table_id
+        )
+    }
+}
+
+impl std::fmt::Display for BigQueryTableId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{}.{}.{}",
+            self.project_id, self.dataset_id, self.table_id
+        )
+    }
+}
+
+fn parse_table_id<'s>(input: &mut &'s str) -> winnow::Result<BigQueryTableId> {
+    // In the past, organizations could prefix their project IDs with a domain
+    // name. Such projects still exist, especially at Google.
+    let domain: Option<&'s str> =
+        opt(terminated(take_while(1.., |c| c != ':'), ':')).parse_next(input)?;
+
+    // Project ID cannot contain '.' or ':'
+    let project: &'s str = take_while(1.., |c| c != '.' && c != ':').parse_next(input)?;
+
+    // Separator between project and dataset
+    let _ = '.'.parse_next(input)?;
+
+    // Match dataset or catalog + namespace.
+    // Namespace could be arbitrarily deeply nested in Iceberg/BigLake.
+    // Separated into at least 2 non-empty parts: inner parts (dataset) and table.
+    let mut parts: Vec<&'s str> =
+        separated(2.., take_while(1.., |c| c != '.'), '.').parse_next(input)?;
+
+    let _ = eof.parse_next(input)?;
+
+    let table_id = parts
+        .pop()
+        .expect("parts is guaranteed to have at least 2 elements")
+        .to_string();
+    let dataset_id = parts.join(".");
+    let project_id = match domain {
+        Some(d) => format!("{d}:{project}"),
+        None => project.to_string(),
+    };
+
+    Ok(BigQueryTableId {
+        project_id,
+        dataset_id,
+        table_id,
+    })
+}
+
+impl std::str::FromStr for BigQueryTableId {
+    type Err = BigQueryError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        if s.contains('`') {
+            return Err(InvalidTableId.into());
+        }
+
+        let mut input = s;
+        parse_table_id(&mut input).map_err(|_| InvalidTableId.into())
+    }
+}
+
+impl TryFrom<&str> for BigQueryTableId {
+    type Error = BigQueryError;
+
+    fn try_from(s: &str) -> Result<Self, Self::Error> {
+        s.parse()
+    }
+}
 
 #[derive(Default)]
 pub struct ReadOptions {
@@ -142,24 +241,6 @@ impl From<InvalidTableId> for BigQueryError {
     }
 }
 
-impl From<regex::Error> for BigQueryError {
-    fn from(e: regex::Error) -> Self {
-        Self::Other(Box::new(e))
-    }
-}
-
-fn table_id_to_table_path(table_id: &str) -> Result<String, BigQueryError> {
-    static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
-    let re = RE.get_or_init(|| {
-        regex::Regex::new(r"(?<project>.+)\.(?<dataset>[^.]+)\.(?<table>[^.]+)")
-            .expect("valid regex pattern")
-    });
-    let caps = re.captures(table_id).ok_or(InvalidTableId)?;
-    Ok(format!(
-        "projects/{}/datasets/{}/tables/{}",
-        &caps["project"], &caps["dataset"], &caps["table"]
-    ))
-}
 
 pub type BigQueryClient =
     GoogleApiClient<BQStorageGoogleApiClientBuilder, BigQueryReadClient<GoogleAuthMiddleware>>;
@@ -205,11 +286,10 @@ impl Client {
 
     pub async fn read_table(
         &self,
-        table_id: &str,
+        table: &BigQueryTableId,
         options: ReadOptions,
     ) -> Result<(ArrowSchemaRef, BigQueryRecordBatchReceiver), BigQueryError> {
-        let request =
-            options.build_request(table_id_to_table_path(table_id)?, &self.quota_project_id);
+        let request = options.build_request(table.to_table_path(), &self.quota_project_id);
         let policy = bigquery_read_retry::RetryPolicy::create_read_session_policy();
         let service_client = self.client.clone();
         let service = tower::service_fn(move |req: CreateReadSessionRequest| {
@@ -270,7 +350,8 @@ mod tests {
 
     #[test]
     fn table_id_to_table_path_success() -> Result<(), Box<dyn std::error::Error>> {
-        let result = table_id_to_table_path("my-project.my_dataset.my_table")?;
+        let id: BigQueryTableId = "my-project.my_dataset.my_table".parse().expect("valid table id");
+        let result = id.to_table_path();
         assert_eq!(
             result,
             "projects/my-project/datasets/my_dataset/tables/my_table"
@@ -280,12 +361,104 @@ mod tests {
 
     #[test]
     fn table_id_to_table_path_success_legacy_project() -> Result<(), Box<dyn std::error::Error>> {
-        let result = table_id_to_table_path("google.com:my-project.my_dataset.my_table")?;
+        let id: BigQueryTableId = "google.com:my-project.my_dataset.my_table".parse().expect("valid table id");
+        let result = id.to_table_path();
         assert_eq!(
             result,
             "projects/google.com:my-project/datasets/my_dataset/tables/my_table"
         );
         Ok(())
+    }
+
+    #[test]
+    fn test_from_str_valid_string() {
+        let id: BigQueryTableId = "proj.ds.tab".parse().expect("valid table id");
+        assert_eq!(
+            id,
+            BigQueryTableId {
+                project_id: "proj".to_string(),
+                dataset_id: "ds".to_string(),
+                table_id: "tab".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn test_from_str_with_colon() {
+        let id: BigQueryTableId = "google.com:project.ds.tab"
+            .parse()
+            .expect("valid table id with legacy domain");
+        assert_eq!(
+            id,
+            BigQueryTableId {
+                project_id: "google.com:project".to_string(),
+                dataset_id: "ds".to_string(),
+                table_id: "tab".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn test_from_str_multipart() {
+        let id: BigQueryTableId = "too.many.parts.here"
+            .parse()
+            .expect("valid multipart table id");
+        assert_eq!(
+            id,
+            BigQueryTableId {
+                project_id: "too".to_string(),
+                dataset_id: "many.parts".to_string(),
+                table_id: "here".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn test_from_str_invalid_format() {
+        assert!("just_a_string".parse::<BigQueryTableId>().is_err());
+        assert!("proj.tab".parse::<BigQueryTableId>().is_err());
+    }
+
+    #[test]
+    fn test_from_str_backtick() {
+        assert!("`proj.ds.tab`".parse::<BigQueryTableId>().is_err());
+        assert!("proj.`ds`.tab".parse::<BigQueryTableId>().is_err());
+    }
+
+    #[test]
+    fn test_from_str_consecutive_dots() {
+        assert!("proj..tab".parse::<BigQueryTableId>().is_err());
+        assert!("proj.a..b.tab".parse::<BigQueryTableId>().is_err());
+    }
+
+    #[test]
+    fn test_from_str_empty_string() {
+        assert!("".parse::<BigQueryTableId>().is_err());
+    }
+
+    #[test]
+    fn test_from_str_trailing_and_leading_dots() {
+        assert!(".proj.ds.tab".parse::<BigQueryTableId>().is_err());
+        assert!("proj.ds.tab.".parse::<BigQueryTableId>().is_err());
+        assert!("proj.ds.".parse::<BigQueryTableId>().is_err());
+        assert!(".ds.tab".parse::<BigQueryTableId>().is_err());
+        assert!(".".parse::<BigQueryTableId>().is_err());
+        assert!("..".parse::<BigQueryTableId>().is_err());
+        assert!("...".parse::<BigQueryTableId>().is_err());
+    }
+
+    #[test]
+    fn test_from_str_invalid_legacy_domain() {
+        assert!(":proj.ds.tab".parse::<BigQueryTableId>().is_err());
+        assert!("google.com:".parse::<BigQueryTableId>().is_err());
+        assert!("google.com:.ds.tab".parse::<BigQueryTableId>().is_err());
+        assert!("google.com:proj.tab".parse::<BigQueryTableId>().is_err());
+        assert!("google.com:proj.ds.tab."
+            .parse::<BigQueryTableId>()
+            .is_err());
+        assert!("google.com:proj:extra.ds.tab"
+            .parse::<BigQueryTableId>()
+            .is_err());
     }
 
     #[test]
@@ -438,8 +611,12 @@ mod tests {
                 ..Default::default()
             };
             let request = options.build_request("table".to_string(), "quota");
-            let session = request.read_session.unwrap();
-            let read_options = session.read_options.unwrap();
+            let session = request
+                .read_session
+                .expect("read_session should be present");
+            let read_options = session
+                .read_options
+                .expect("read_options should be present");
             match read_options.output_format_serialization_options {
                 Some(
                     read_session::table_read_options::OutputFormatSerializationOptions::ArrowSerializationOptions(

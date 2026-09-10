@@ -1,7 +1,6 @@
 from unittest.mock import MagicMock
 
 import pytest
-
 from polars_bigquery.core.resource_references import BigQueryTableId, parse_table_id
 
 
@@ -15,7 +14,7 @@ def test_parse_table_id_valid_string():
 
 def test_parse_table_id_with_colon():
     assert parse_table_id("google.com:project.ds.tab") == BigQueryTableId(
-        project_id="project",
+        project_id="google.com:project",
         dataset_id="ds",
         table_id="tab",
     )

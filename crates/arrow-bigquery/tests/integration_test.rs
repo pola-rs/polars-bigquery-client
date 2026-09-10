@@ -16,9 +16,15 @@ async fn test_read_small_public_table() {
     .await
     .expect("should build client");
 
+    let table = BigQueryTableId {
+        project_id: "bigquery-public-data".to_string(),
+        dataset_id: "usa_names".to_string(),
+        table_id: "usa_1910_2013".to_string(),
+    };
+
     let (_, mut receiver) = client
         .read_table(
-            "bigquery-public-data.usa_names.usa_1910_2013",
+            &table,
             ReadOptions {
                 maintain_order: false,
                 ..Default::default()

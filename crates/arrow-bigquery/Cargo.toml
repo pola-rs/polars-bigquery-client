@@ -15,12 +15,12 @@ hyper = "1.0"
 polars-arrow = { version = "0.53.0", default-features = false, features = ["io_ipc", "io_ipc_compression"] }
 polars-error = "0.53.0"
 rand = { version = "0.10.0", features = [] }
-regex = "1.12.3"
 rustls = { version = "0.23.37", features = ["aws_lc_rs"] }
 secret-vault-value = "1.0"
 tokio = "1.51.0"
 tracing = "0.1"
 tracing-subscriber = { version ="0.3", features = ["env-filter"] }
+winnow = "1.0.4"
 
 [dev-dependencies]
 tokio = { version = "1.51.0", features = ["rt-multi-thread", "macros"] }
