@@ -10,6 +10,7 @@ import polars.io.plugins
 
 import polars_bigquery.core.schema
 import polars_bigquery.core.version
+from polars_bigquery.core import predicates
 from polars_bigquery.core import bigquery_rest
 
 
@@ -111,6 +112,7 @@ class Client:
                 table_ref,
                 maintain_order=False,
                 selected_fields=with_columns if with_columns is not None else [],
+                row_restriction=predicates.predicate_to_row_restriction(predicate=predicate) if predicate is not None else "",
             )
             lazyframe = pl.scan_arrow_c_stream(arrow_stream_exporter)
 
@@ -130,4 +132,5 @@ class Client:
         return polars.io.plugins.register_io_source(
             io_source=source_generator,
             schema=schema,
+            explain_name=f"BIGQUERY[{table_ref.project_id}.{table_ref.dataset_id}.{table_ref.table_id}]",
         )
