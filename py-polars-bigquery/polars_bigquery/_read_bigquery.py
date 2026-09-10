@@ -64,7 +64,7 @@ class Client:
     ) -> pl.DataFrame:
         table_ref = arrow_bigquery.api.resources.parse_table_id(table)
         arrow_stream_exporter = self._arrow_client.read_table(
-            f"{table_ref.project_id}.{table_ref.dataset_id}.{table_ref.table_id}",
+            table_ref,
             maintain_order=maintain_order,
         )
         return pl.DataFrame(arrow_stream_exporter)
@@ -83,7 +83,7 @@ class Client:
         )
         table_ref = arrow_bigquery.api.resources.parse_table_id(table)
         arrow_stream_exporter = self._arrow_client.read_table(
-            table,
+            table_ref,
             maintain_order=maintain_order,
         )
         return pl.DataFrame(arrow_stream_exporter)
@@ -108,7 +108,7 @@ class Client:
             batch_size: int | None,
         ) -> Iterator[pl.DataFrame]:
             arrow_stream_exporter = self._arrow_client.read_table(
-                f"{table_ref.project_id}.{table_ref.dataset_id}.{table_ref.table_id}",
+                table_ref,
                 maintain_order=False,
                 selected_fields=with_columns if with_columns is not None else [],
             )

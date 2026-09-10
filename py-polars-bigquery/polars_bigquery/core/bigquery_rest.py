@@ -4,11 +4,11 @@ TODO(tswast): Implement this in Rust using jobs.query and the
 JOB_CREATION_OPTIONAL parameter to improve latency in small query results.
 """
 
+import arrow_bigquery.api.resources
 import polars as pl
 import requests
 
 import polars_bigquery.exceptions
-import arrow_bigquery.api.resources
 
 _BIGQUERY_ENDPOINT = "https://bigquery.googleapis.com/bigquery/v2"
 
