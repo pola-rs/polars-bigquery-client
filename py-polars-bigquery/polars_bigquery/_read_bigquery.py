@@ -1,15 +1,13 @@
 from __future__ import annotations
 
-from collections.abc import Iterator
 from typing import Any
 
 import arrow_bigquery
 import polars as pl
-import polars.io.plugins
 
-import polars_bigquery.core.schema
 import polars_bigquery.core.version
-from polars_bigquery.core import bigquery_rest, resource_references
+
+from .core.run_query import run_query
 
 
 def _get_user_agent(user_agent: str | None) -> str:
@@ -19,6 +17,30 @@ def _get_user_agent(user_agent: str | None) -> str:
         return f"{ua} {user_agent}"
     else:
         return ua
+
+
+def _parse_table_id(table_id: Any) -> str:
+    if not isinstance(table_id, str):
+        if (
+            hasattr(table_id, "project")
+            and hasattr(table_id, "dataset_id")
+            and hasattr(table_id, "table_id")
+        ):
+            return f"{table_id.project}.{table_id.dataset_id}.{table_id.table_id}"
+        raise TypeError(f"Expected table_id to be a string, got {type(table_id)}")
+
+    parts = table_id.split(".")
+    if len(parts) < 3:
+        raise ValueError("Invalid table ID")
+    if len(parts) > 3 and not any(":" in part for part in parts[:-2]):
+        raise TypeError("BigLake tables are not supported yet")
+
+    # Let's just follow the rust regex logic:
+    # it must have at least two dots, and the last two parts must not have dots.
+    if len(parts) >= 3:
+        return table_id
+
+    raise ValueError("Invalid table ID")
 
 
 class Client:
@@ -61,9 +83,9 @@ class Client:
         *,
         maintain_order: bool = False,
     ) -> pl.DataFrame:
-        table_ref = resource_references.parse_table_id(table)
+        table_ref = _parse_table_id(table)
         arrow_stream_exporter = self._arrow_client.read_table(
-            f"{table_ref.project_id}.{table_ref.dataset_id}.{table_ref.table_id}",
+            table_ref,
             maintain_order=maintain_order,
         )
         return pl.DataFrame(arrow_stream_exporter)
@@ -74,14 +96,15 @@ class Client:
         *,
         maintain_order: bool = False,
     ) -> pl.DataFrame:
-        table = bigquery_rest.run_query(
+        table = run_query(
             query,
-            quota_project_id=self._quota_project_id,
-            credentials_provider=self._credentials_provider,
+            self._quota_project_id,
+            self._credentials_provider,
             user_agent=self._user_agent,
         )
+        table_ref = _parse_table_id(table)
         arrow_stream_exporter = self._arrow_client.read_table(
-            table,
+            table_ref,
             maintain_order=maintain_order,
         )
         return pl.DataFrame(arrow_stream_exporter)
@@ -90,41 +113,9 @@ class Client:
         self,
         table: Any,
     ) -> pl.LazyFrame:
-        table_ref = resource_references.parse_table_id(table)
-        table_metadata = bigquery_rest.get_table_metadata(
+        table_ref = _parse_table_id(table)
+        arrow_stream_exporter = self._arrow_client.read_table(
             table_ref,
-            quota_project_id=self._quota_project_id,
-            credentials_provider=self._credentials_provider,
-            user_agent=self._user_agent,
+            maintain_order=False,
         )
-        schema = polars_bigquery.core.schema.extract_polars_schema(table_metadata)
-
-        def source_generator(
-            with_columns: list[str] | None,
-            predicate: pl.Expr | None,
-            n_rows: int | None,
-            batch_size: int | None,
-        ) -> Iterator[pl.DataFrame]:
-            arrow_stream_exporter = self._arrow_client.read_table(
-                f"{table_ref.project_id}.{table_ref.dataset_id}.{table_ref.table_id}",
-                maintain_order=False,
-            )
-            lazyframe = pl.scan_arrow_c_stream(arrow_stream_exporter)
-
-            # Since the BQ Storage Read API may return more rows than we need,
-            # apply the filters client-side as well.
-            if with_columns is not None:
-                lazyframe = lazyframe.select(with_columns)
-
-            if predicate is not None:
-                lazyframe = lazyframe.filter(predicate)
-
-            if n_rows is not None:
-                lazyframe = lazyframe.limit(n_rows)
-
-            return lazyframe.collect_batches(chunk_size=batch_size)
-
-        return polars.io.plugins.register_io_source(
-            io_source=source_generator,
-            schema=schema,
-        )
+        return pl.scan_arrow_c_stream(arrow_stream_exporter)
