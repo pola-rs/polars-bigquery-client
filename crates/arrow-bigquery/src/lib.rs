@@ -241,7 +241,6 @@ impl From<InvalidTableId> for BigQueryError {
     }
 }
 
-
 pub type BigQueryClient =
     GoogleApiClient<BQStorageGoogleApiClientBuilder, BigQueryReadClient<GoogleAuthMiddleware>>;
 
@@ -350,7 +349,9 @@ mod tests {
 
     #[test]
     fn table_id_to_table_path_success() -> Result<(), Box<dyn std::error::Error>> {
-        let id: BigQueryTableId = "my-project.my_dataset.my_table".parse().expect("valid table id");
+        let id: BigQueryTableId = "my-project.my_dataset.my_table"
+            .parse()
+            .expect("valid table id");
         let result = id.to_table_path();
         assert_eq!(
             result,
@@ -361,7 +362,9 @@ mod tests {
 
     #[test]
     fn table_id_to_table_path_success_legacy_project() -> Result<(), Box<dyn std::error::Error>> {
-        let id: BigQueryTableId = "google.com:my-project.my_dataset.my_table".parse().expect("valid table id");
+        let id: BigQueryTableId = "google.com:my-project.my_dataset.my_table"
+            .parse()
+            .expect("valid table id");
         let result = id.to_table_path();
         assert_eq!(
             result,

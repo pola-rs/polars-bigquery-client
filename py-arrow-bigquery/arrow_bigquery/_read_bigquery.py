@@ -5,6 +5,9 @@ from typing import Any
 
 import arrow_bigquery._native
 import arrow_bigquery.core.version
+from arrow_bigquery.api.resources import parse_table_id
+
+_parse_table_id = parse_table_id
 
 
 def _get_user_agent(user_agent: str | None) -> str:
@@ -45,7 +48,7 @@ class Client:
 
     def read_table(
         self,
-        table: arrow_bigquery._native.BigQueryTableId,
+        table: arrow_bigquery._native.BigQueryTableId | str | Any,
         *,
         arrow_buffer_compression: str = "lz4frame",
         maintain_order: bool = False,
@@ -55,8 +58,9 @@ class Client:
         selected_fields: list[str] | None = None,
         snapshot_time: datetime.datetime | None = None,
     ) -> arrow_bigquery._native.ArrowStreamExporter:
+        table_id = _parse_table_id(table)
         return self._client.read_table(
-            table,
+            table_id,
             arrow_buffer_compression=arrow_buffer_compression,
             maintain_order=maintain_order,
             max_stream_count=max_stream_count,

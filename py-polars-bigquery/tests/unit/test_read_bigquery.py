@@ -1,12 +1,13 @@
 from unittest.mock import MagicMock, patch
 
+import arrow_bigquery
 import polars as pl
 import pytest
 from polars_bigquery import (
     Client,
     __version__,
 )
-from polars_bigquery._read_bigquery import _get_user_agent, _parse_table_id
+from polars_bigquery._read_bigquery import _get_user_agent
 
 
 @pytest.fixture
@@ -24,42 +25,6 @@ def test_get_user_agent():
         _get_user_agent("custom-extension/1.0")
         == f"polars-bigquery/{__version__} custom-extension/1.0"
     )
-
-
-def test_parse_table_id_valid_string():
-    assert _parse_table_id("proj.ds.tab") == "proj.ds.tab"
-
-
-def test_parse_table_id_with_colon():
-    assert _parse_table_id("google.com:project.ds.tab") == "google.com:project.ds.tab"
-
-
-def test_parse_table_id_table_reference():
-    mock_ref = MagicMock()
-    mock_ref.project = "p"
-    mock_ref.dataset_id = "d"
-    mock_ref.table_id = "t"
-    assert _parse_table_id(mock_ref) == "p.d.t"
-
-
-def test_parse_table_id_table_object():
-    mock_table = MagicMock()
-    mock_table.project = "proj-obj"
-    mock_table.dataset_id = "ds-obj"
-    mock_table.table_id = "tab-obj"
-    assert _parse_table_id(mock_table) == "proj-obj.ds-obj.tab-obj"
-
-
-def test_parse_table_id_invalid_format():
-    with pytest.raises(ValueError, match="Invalid table ID"):
-        _parse_table_id("just_a_string")
-    with pytest.raises(TypeError, match="BigLake tables are not supported yet"):
-        _parse_table_id("too.many.parts.here")
-
-
-def test_parse_table_id_invalid_type():
-    with pytest.raises(TypeError, match="Expected table_id to be a string"):
-        _parse_table_id(123)
 
 
 def test_client_custom_credentials_provider():
@@ -94,7 +59,7 @@ def test_client_read_bigquery_calls_arrow_with_parsed_id(mock_arrow_client):
         result = client.read_table(table="my-project.my_dataset.my_table")
 
         mock_arrow_client.read_table.assert_called_once_with(
-            "my-project.my_dataset.my_table",
+            arrow_bigquery.BigQueryTableId("my-project", "my_dataset", "my_table"),
             maintain_order=False,
         )
         mock_df_cls.assert_called_once_with(mock_exporter)
@@ -121,7 +86,7 @@ def test_client_read_query(mock_arrow_client):
             "SELECT 1", "q", client.credentials_provider, user_agent=expected_ua
         )
         mock_arrow_client.read_table.assert_called_once_with(
-            "project.dataset.temp_table",
+            arrow_bigquery.BigQueryTableId("project", "dataset", "temp_table"),
             maintain_order=False,
         )
         assert result is mock_df
@@ -162,7 +127,7 @@ def test_client_read_bigquery_handles_bigquery_objects(mock_arrow_client):
         client.read_table(table=mock_ref)
 
         mock_arrow_client.read_table.assert_called_once_with(
-            "p.d.t",
+            arrow_bigquery.BigQueryTableId("p", "d", "t"),
             maintain_order=False,
         )
 
@@ -187,7 +152,7 @@ def test_client_scan_bigquery_calls_arrow_with_parsed_id(mock_arrow_client):
         result = client.scan_table(table="my-project.my_dataset.my_table")
 
         mock_arrow_client.read_table.assert_called_once_with(
-            "my-project.my_dataset.my_table",
+            arrow_bigquery.BigQueryTableId("my-project", "my_dataset", "my_table"),
             maintain_order=False,
         )
         mock_scan.assert_called_once_with(mock_stream)

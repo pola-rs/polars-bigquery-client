@@ -265,6 +265,49 @@ impl BigQueryTableId {
         Self::from_string(s)
     }
 
+    /// Parse a table ID from a string, a BigQueryTableId instance, or an object
+    /// with table reference attributes (`project`/`project_id`, `dataset_id`, `table_id`).
+    #[staticmethod]
+    pub fn parse(table_id: &Bound<'_, PyAny>) -> PyResult<Self> {
+        if let Ok(existing) = table_id.cast::<BigQueryTableId>() {
+            return Ok(existing.borrow().clone());
+        }
+
+        if let Ok(s) = table_id.extract::<&str>() {
+            return Self::from_string(s);
+        }
+
+        let project = table_id
+            .getattr("project")
+            .ok()
+            .and_then(|p| p.extract::<String>().ok())
+            .or_else(|| {
+                table_id
+                    .getattr("project_id")
+                    .ok()
+                    .and_then(|p| p.extract::<String>().ok())
+            });
+
+        let dataset = table_id
+            .getattr("dataset_id")
+            .ok()
+            .and_then(|d| d.extract::<String>().ok());
+
+        let table = table_id
+            .getattr("table_id")
+            .ok()
+            .and_then(|t| t.extract::<String>().ok());
+
+        if let (Some(project), Some(dataset), Some(table)) = (project, dataset, table) {
+            return Ok(Self::new(project, dataset, table));
+        }
+
+        Err(pyo3::exceptions::PyTypeError::new_err(format!(
+            "Expected table_id to be a string or BigQuery table object, got {}",
+            table_id.get_type()
+        )))
+    }
+
     #[getter]
     pub fn project_id(&self) -> &str {
         &self.inner.project_id

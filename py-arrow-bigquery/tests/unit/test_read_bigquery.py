@@ -132,6 +132,63 @@ def test_client_read_bigquery_passes_additional_parameters(mock_rust_client):
     assert result is placeholder
 
 
+def test_client_read_bigquery_with_str_table(mock_rust_client):
+    placeholder = object()
+    mock_rust_client.read_table.return_value = placeholder
+
+    client = Client(quota_project_id="q")
+    result = client.read_table(table="my-project.my_dataset.my_table")
+
+    mock_rust_client.read_table.assert_called_once_with(
+        BigQueryTableId("my-project", "my_dataset", "my_table"),
+        arrow_buffer_compression="lz4frame",
+        maintain_order=False,
+        max_stream_count=None,
+        row_restriction="",
+        sample_percentage=None,
+        selected_fields=None,
+        snapshot_time=None,
+    )
+    assert result is placeholder
+
+
+def test_client_read_bigquery_with_table_object(mock_rust_client):
+    placeholder = object()
+    mock_rust_client.read_table.return_value = placeholder
+
+    mock_ref = MagicMock()
+    mock_ref.project = "p"
+    mock_ref.dataset_id = "d"
+    mock_ref.table_id = "t"
+
+    client = Client(quota_project_id="q")
+    result = client.read_table(table=mock_ref)
+
+    mock_rust_client.read_table.assert_called_once_with(
+        BigQueryTableId("p", "d", "t"),
+        arrow_buffer_compression="lz4frame",
+        maintain_order=False,
+        max_stream_count=None,
+        row_restriction="",
+        sample_percentage=None,
+        selected_fields=None,
+        snapshot_time=None,
+    )
+    assert result is placeholder
+
+
+def test_client_read_bigquery_invalid_table_type(mock_rust_client):
+    client = Client(quota_project_id="q")
+    with pytest.raises(TypeError, match="Expected table_id to be a string"):
+        client.read_table(table=123)
+
+
+def test_client_read_bigquery_invalid_table_str(mock_rust_client):
+    client = Client(quota_project_id="q")
+    with pytest.raises(ValueError, match="Invalid table ID"):
+        client.read_table(table="just_a_string")
+
+
 def test_client_read_bigquery_propagates_errors(mock_rust_client):
     mock_rust_client.read_table.side_effect = Exception("Rust error")
 
