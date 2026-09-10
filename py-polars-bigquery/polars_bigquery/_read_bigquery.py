@@ -135,5 +135,4 @@ class Client:
         return polars.io.plugins.register_io_source(
             io_source=source_generator,
             schema=schema,
-            explain_name=f"BIGQUERY[{table_ref.project_id}.{table_ref.dataset_id}.{table_ref.table_id}]",
         )
