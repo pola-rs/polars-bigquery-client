@@ -110,6 +110,7 @@ class Client:
             arrow_stream_exporter = self._arrow_client.read_table(
                 f"{table_ref.project_id}.{table_ref.dataset_id}.{table_ref.table_id}",
                 maintain_order=False,
+                selected_fields=with_columns if with_columns is not None else [],
             )
             lazyframe = pl.scan_arrow_c_stream(arrow_stream_exporter)
 
