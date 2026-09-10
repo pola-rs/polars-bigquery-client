@@ -181,6 +181,7 @@ def test_client_scan_bigquery_calls_arrow_with_parsed_id(mock_arrow_client):
             arrow_bigquery.BigQueryTableId("my-project", "my_dataset", "my_table"),
             maintain_order=False,
             selected_fields=[],
+            row_restriction="",
         )
         mock_scan.assert_called_once_with(mock_stream)
         assert df.equals(mock_lazy_df.collect())
@@ -214,5 +215,6 @@ def test_client_scan_bigquery_handles_bigquery_objects(mock_arrow_client):
             arrow_bigquery.BigQueryTableId("p", "d", "t"),
             maintain_order=False,
             selected_fields=[],
+            row_restriction="",
         )
         assert df.equals(mock_lazy_df.collect())

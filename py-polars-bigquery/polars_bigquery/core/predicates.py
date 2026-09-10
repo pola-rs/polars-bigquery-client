@@ -51,22 +51,56 @@ def _json_literal_to_sql(literal_json: dict[str, Any]) -> str | None:
 
 def _json_function_to_sql(function_json: dict[str, Any]) -> str | None:
     """Converts a polars function call into the equivalent BigQuery syntax."""
-    # So far, only boolean output functions are supported.
-    boolean_function_name = function_json.get("function", {}).get("Boolean", None)
-    if boolean_function_name is None:
+    function_details = function_json.get("function")
+    if not isinstance(function_details, dict):
         return None
 
+    inputs = function_json.get("input", [])
+
+    # So far, only boolean output functions are supported.
+    boolean_function_name = function_details.get("Boolean", None)
     if boolean_function_name == "IsNull":
-        input_ = _json_expr_to_row_restriction(function_json["input"][0])
+        if not inputs:
+            return None
+        input_ = _json_expr_to_row_restriction(inputs[0])
         if input_ is None:
             return None
         return f"({input_} IS NULL)"
 
     if boolean_function_name == "IsNotNull":
-        input_ = _json_expr_to_row_restriction(function_json["input"][0])
+        if not inputs:
+            return None
+        input_ = _json_expr_to_row_restriction(inputs[0])
         if input_ is None:
             return None
         return f"({input_} IS NOT NULL)"
+
+    if boolean_function_name == "Not":
+        if not inputs:
+            return None
+        input_ = _json_expr_to_row_restriction(inputs[0])
+        if input_ is None:
+            return None
+        return f"(NOT {input_})"
+
+    string_function_name = function_details.get("StringExpr", None)
+    if string_function_name == "StartsWith":
+        if len(inputs) != 2:
+            return None
+        value = _json_expr_to_row_restriction(inputs[0])
+        prefix = _json_expr_to_row_restriction(inputs[1])
+        if value is None or prefix is None:
+            return None
+        return f"STARTS_WITH({value}, {prefix})"
+
+    if string_function_name == "EndsWith":
+        if len(inputs) != 2:
+            return None
+        value = _json_expr_to_row_restriction(inputs[0])
+        suffix = _json_expr_to_row_restriction(inputs[1])
+        if value is None or suffix is None:
+            return None
+        return f"ENDS_WITH({value}, {suffix})"
 
     return None
 
@@ -130,6 +164,5 @@ def predicate_to_row_restriction(predicate: pl.Expr) -> str:
     predicate.meta.serialize(predicate_json_file, format="json")
     predicate_json_file.seek(0)
     predicate_json = json.load(predicate_json_file)
-    row_restriction =  _json_expr_to_row_restriction(predicate_json)
+    row_restriction = _json_expr_to_row_restriction(predicate_json)
     return row_restriction if row_restriction is not None else ""
-

@@ -10,8 +10,7 @@ import polars.io.plugins
 
 import polars_bigquery.core.schema
 import polars_bigquery.core.version
-from polars_bigquery.core import predicates
-from polars_bigquery.core import bigquery_rest
+from polars_bigquery.core import bigquery_rest, predicates
 
 
 def _get_user_agent(user_agent: str | None) -> str:
@@ -112,7 +111,11 @@ class Client:
                 table_ref,
                 maintain_order=False,
                 selected_fields=with_columns if with_columns is not None else [],
-                row_restriction=predicates.predicate_to_row_restriction(predicate=predicate) if predicate is not None else "",
+                row_restriction=predicates.predicate_to_row_restriction(
+                    predicate=predicate
+                )
+                if predicate is not None
+                else "",
             )
             lazyframe = pl.scan_arrow_c_stream(arrow_stream_exporter)
 
