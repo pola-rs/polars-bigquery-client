@@ -79,6 +79,25 @@ def test_extract_polars_schema_ingestion_time_partitioning():
     schema = extract_polars_schema(metadata)
     assert schema["val"] == pl.Int64()
     assert schema["_PARTITIONDATE"] == pl.Date()
+    assert schema["_PARTITIONTIME"] == pl.Datetime(time_unit="us", time_zone="utc")
+
+
+def test_extract_polars_schema_extended_types():
+    metadata = {
+        "schema": {
+            "fields": [
+                {"name": "bignumeric_col", "type": "BIGNUMERIC"},
+                {"name": "bigdecimal_col", "type": "BIGDECIMAL"},
+                {"name": "json_col", "type": "JSON"},
+                {"name": "interval_col", "type": "INTERVAL"},
+            ]
+        }
+    }
+    schema = extract_polars_schema(metadata)
+    assert schema["bignumeric_col"] == pl.Decimal(precision=76, scale=38)
+    assert schema["bigdecimal_col"] == pl.Decimal(precision=76, scale=38)
+    assert schema["json_col"] == pl.String()
+    assert schema["interval_col"] == pl.Duration(time_unit="us")
 
 
 def test_extract_polars_schema_column_partitioning():

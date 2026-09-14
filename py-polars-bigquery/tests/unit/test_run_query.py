@@ -1,7 +1,16 @@
 from unittest.mock import MagicMock, patch
 
+import arrow_bigquery.api.resources
 import pytest
-from polars_bigquery.core.bigquery_rest import run_query
+import requests
+from polars_bigquery.core.bigquery_rest import (
+    BigQueryRestClient,
+    _raise_for_bigquery_error,
+    _wait_for_job,
+    create_resilient_session,
+    get_table_metadata,
+    run_query,
+)
 from polars_bigquery.exceptions import BigQueryError
 
 
@@ -138,3 +147,151 @@ def test_run_query_requires_user_agent():
             quota_project_id="quota-project",
             credentials_provider=mock_cp,
         )
+
+
+def test_run_query_refreshes_token_during_polling_and_generates_job_id():
+    tokens = iter([
+        ({"bearer_token": "initial-token"}, 12345),
+        ({"bearer_token": "refreshed-token-1"}, 12346),
+        ({"bearer_token": "refreshed-token-2"}, 12347),
+    ])
+    mock_cp = MagicMock(side_effect=lambda: next(tokens))
+
+    with (
+        patch("requests.post") as mock_post,
+        patch("requests.get") as mock_get,
+    ):
+        mock_post.return_value.json.return_value = {
+            "jobReference": {"jobId": "job-123"}
+        }
+        mock_post.return_value.raise_for_status = MagicMock()
+
+        m1 = MagicMock()
+        m1.json.return_value = {"status": {"state": "RUNNING"}}
+        m1.raise_for_status = MagicMock()
+
+        m_poll = MagicMock()
+        m_poll.json.return_value = {}
+        m_poll.raise_for_status = MagicMock()
+
+        m2 = MagicMock()
+        m2.json.return_value = {
+            "status": {"state": "DONE"},
+            "configuration": {
+                "query": {
+                    "destinationTable": {
+                        "projectId": "p",
+                        "datasetId": "d",
+                        "tableId": "t",
+                    }
+                }
+            },
+        }
+        m2.raise_for_status = MagicMock()
+
+        mock_get.side_effect = [m1, m_poll, m2]
+
+        result = run_query(
+            "SELECT 1",
+            quota_project_id="quota-project",
+            credentials_provider=mock_cp,
+            user_agent="polars-bigquery/0.1.0",
+        )
+        assert result == "p.d.t"
+
+        # Verify client-side idempotent jobId was generated in jobs.insert body
+        insert_body = mock_post.call_args.kwargs["json"]
+        assert insert_body["jobReference"]["jobId"].startswith("polars_bq_")
+        assert insert_body["jobReference"]["projectId"] == "quota-project"
+
+        # Verify credentials_provider was called on insert and on each poll cycle
+        assert mock_cp.call_count == 3
+
+
+def test_create_resilient_session_configures_retries_and_pooling():
+    session = create_resilient_session()
+    adapter = session.get_adapter("https://bigquery.googleapis.com")
+    assert adapter.max_retries.total == 5
+    assert adapter.max_retries.backoff_factor == 0.5
+    assert set(adapter.max_retries.status_forcelist) == {429, 500, 502, 503, 504}
+    assert adapter.max_retries.respect_retry_after_header is True
+
+
+def test_raise_for_bigquery_error_extracts_structured_json_message():
+    resp = MagicMock()
+    resp.raise_for_status.side_effect = requests.exceptions.HTTPError("400 Bad Request")
+    resp.json.return_value = {"error": {"message": "Table not found: my_dataset.my_table"}}
+
+    with pytest.raises(BigQueryError, match="Table not found: my_dataset.my_table"):
+        _raise_for_bigquery_error(resp)
+
+
+def test_raise_for_bigquery_error_falls_back_when_json_invalid():
+    resp = MagicMock()
+    resp.raise_for_status.side_effect = requests.exceptions.HTTPError("502 Bad Gateway")
+    resp.json.side_effect = ValueError("No JSON object could be decoded")
+
+    with pytest.raises(BigQueryError, match="502 Bad Gateway"):
+        _raise_for_bigquery_error(resp)
+
+
+def test_wait_for_job_timeout_raises_bigquery_error():
+    mock_cp = MagicMock(return_value=({"bearer_token": "tok"}, 123))
+    with (
+        patch("time.monotonic", side_effect=[0.0, 100.0]),
+        pytest.raises(
+            BigQueryError, match="Timed out waiting for BigQuery job job-123 after 50.0s"
+        ),
+    ):
+        _wait_for_job(
+            "job-123",
+            "quota-project",
+            mock_cp,
+            "polars-bigquery/0.1.0",
+            max_poll_seconds=50.0,
+        )
+
+
+def test_get_table_metadata_uses_field_mask_and_session():
+    mock_cp = MagicMock(return_value=({"bearer_token": "tok"}, 123))
+    mock_session = MagicMock()
+    mock_session.get.return_value.json.return_value = {"schema": {"fields": []}}
+
+    table_ref = arrow_bigquery.api.resources.BigQueryTableId("p", "d", "t")
+    metadata = get_table_metadata(
+        table_ref,
+        quota_project_id="quota-project",
+        credentials_provider=mock_cp,
+        user_agent="polars-bigquery/0.1.0",
+        session=mock_session,
+    )
+
+    assert metadata == {"schema": {"fields": []}}
+    called_url = mock_session.get.call_args.args[0]
+    assert called_url.endswith(
+        "/projects/p/datasets/d/tables/t?fields=schema,timePartitioning"
+    )
+
+
+def test_bigquery_rest_client_caches_metadata_and_runs_queries():
+    mock_cp = MagicMock(return_value=({"bearer_token": "tok"}, 123))
+    mock_session = MagicMock()
+    mock_session.get.return_value.json.return_value = {
+        "schema": {"fields": [{"name": "c", "type": "INTEGER"}]}
+    }
+
+    client = BigQueryRestClient(
+        quota_project_id="quota-project",
+        credentials_provider=mock_cp,
+        user_agent="polars-bigquery/0.1.0",
+        session=mock_session,
+    )
+    assert client.session is mock_session
+
+    table_ref = arrow_bigquery.api.resources.BigQueryTableId("p", "d", "t")
+    meta1 = client.get_table_metadata(table_ref)
+    meta2 = client.get_table_metadata(table_ref)
+
+    assert meta1 == meta2
+    # Verify HTTP GET was called only once due to per-client caching
+    mock_session.get.assert_called_once()

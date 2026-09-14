@@ -42,6 +42,11 @@ class Client:
         self._credentials_provider = credentials_provider
         self._user_agent = _get_user_agent(user_agent)
         self._quota_project_id = quota_project_id
+        self._rest_client = bigquery_rest.BigQueryRestClient(
+            quota_project_id=quota_project_id,
+            credentials_provider=credentials_provider,
+            user_agent=self._user_agent,
+        )
         self._arrow_client = arrow_bigquery.Client(
             quota_project_id=quota_project_id,
             credentials_provider=credentials_provider,
@@ -75,12 +80,7 @@ class Client:
         *,
         maintain_order: bool = False,
     ) -> pl.DataFrame:
-        table = bigquery_rest.run_query(
-            query,
-            quota_project_id=self._quota_project_id,
-            credentials_provider=self._credentials_provider,
-            user_agent=self._user_agent,
-        )
+        table = self._rest_client.run_query(query)
         table_ref = arrow_bigquery.api.resources.parse_table_id(table)
         arrow_stream_exporter = self._arrow_client.read_table(
             table_ref,
@@ -93,12 +93,7 @@ class Client:
         table: Any,
     ) -> pl.LazyFrame:
         table_ref = arrow_bigquery.api.resources.parse_table_id(table)
-        table_metadata = bigquery_rest.get_table_metadata(
-            table_ref,
-            quota_project_id=self._quota_project_id,
-            credentials_provider=self._credentials_provider,
-            user_agent=self._user_agent,
-        )
+        table_metadata = self._rest_client.get_table_metadata(table_ref)
         schema = polars_bigquery.core.schema.extract_polars_schema(table_metadata)
 
         def source_generator(
@@ -107,10 +102,18 @@ class Client:
             n_rows: int | None,
             batch_size: int | None,
         ) -> Iterator[pl.DataFrame]:
+            if with_columns is not None:
+                predicate_cols = (
+                    predicate.meta.root_names() if predicate is not None else []
+                )
+                selected_fields = list(dict.fromkeys([*with_columns, *predicate_cols]))
+            else:
+                selected_fields = []
+
             arrow_stream_exporter = self._arrow_client.read_table(
                 table_ref,
                 maintain_order=False,
-                selected_fields=with_columns if with_columns is not None else [],
+                selected_fields=selected_fields,
                 row_restriction=predicates.predicate_to_row_restriction(
                     predicate=predicate
                 )
@@ -119,13 +122,13 @@ class Client:
             )
             lazyframe = pl.scan_arrow_c_stream(arrow_stream_exporter)
 
-            # Since the BQ Storage Read API may return more rows than we need,
-            # apply the filters client-side as well.
-            if with_columns is not None:
-                lazyframe = lazyframe.select(with_columns)
-
+            # Apply filter BEFORE column projection so predicates referencing
+            # non-projected columns are evaluated before being dropped.
             if predicate is not None:
                 lazyframe = lazyframe.filter(predicate)
+
+            if with_columns is not None:
+                lazyframe = lazyframe.select(with_columns)
 
             if n_rows is not None:
                 lazyframe = lazyframe.limit(n_rows)

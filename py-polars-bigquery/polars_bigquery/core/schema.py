@@ -8,6 +8,7 @@ from polars.datatypes import (
     Date,
     Datetime,
     Decimal,
+    Duration,
     Field,
     Float64,
     Int64,
@@ -64,6 +65,13 @@ def _extract_data_type(field: dict) -> DataType:
         # BigQuery NUMERIC type has precision 38 and scale 9.
         # https://cloud.google.com/bigquery/docs/reference/standard-sql/data-types#decimal_types
         return Decimal(precision=38, scale=9)
+    if type_ in ("bignumeric", "bigdecimal"):
+        # BigQuery BIGNUMERIC type has precision 76 and scale 38.
+        return Decimal(precision=76, scale=38)
+    if type_ == "json":
+        return String()
+    if type_ == "interval":
+        return Duration(time_unit="us")
     if type_ in ("record", "struct"):
         polars_fields = [
             Field(subfield.get("name", ""), _extract_data_type(subfield))
@@ -90,12 +98,13 @@ def extract_polars_schema(table_metadata: dict) -> pl.Schema:
     for field in table_metadata.get("schema", {}).get("fields", []):
         pl_schema[field.get("name", "")] = _extract_data_type(field)
 
-    # If table is ingestion time partitioned, add pseudocolumn for _PARTITIONDATE
-    # to allow for partition filters. See:
+    # If table is ingestion time partitioned, add pseudocolumns for _PARTITIONDATE
+    # and _PARTITIONTIME to allow for partition filters. See:
     # https://cloud.google.com/bigquery/docs/partitioned-tables#ingestion_time
     if (
         time_partitioning := table_metadata.get("timePartitioning")
     ) is not None and time_partitioning.get("field") is None:
         pl_schema["_PARTITIONDATE"] = Date()
+        pl_schema["_PARTITIONTIME"] = Datetime(time_unit="us", time_zone="utc")
 
     return pl.Schema(pl_schema)

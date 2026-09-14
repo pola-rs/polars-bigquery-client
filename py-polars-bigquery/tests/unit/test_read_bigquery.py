@@ -87,6 +87,7 @@ def test_client_read_query(mock_arrow_client):
             quota_project_id="q",
             credentials_provider=client.credentials_provider,
             user_agent=expected_ua,
+            session=client._rest_client.session,
         )
         mock_arrow_client.read_table.assert_called_once_with(
             arrow_bigquery.BigQueryTableId("project", "dataset", "temp_table"),
@@ -117,6 +118,7 @@ def test_client_read_query_with_user_agent(mock_arrow_client):
             quota_project_id="q",
             credentials_provider=client.credentials_provider,
             user_agent=expected_ua,
+            session=client._rest_client.session,
         )
 
 
@@ -170,6 +172,7 @@ def test_client_scan_bigquery_calls_arrow_with_parsed_id(mock_arrow_client):
             quota_project_id="q",
             credentials_provider=client.credentials_provider,
             user_agent=f"polars-bigquery/{__version__}",
+            session=client._rest_client.session,
         )
 
         mock_arrow_client.read_table.assert_not_called()
@@ -218,3 +221,46 @@ def test_client_scan_bigquery_handles_bigquery_objects(mock_arrow_client):
             row_restriction="",
         )
         assert df.equals(mock_lazy_df.collect())
+
+
+def test_client_scan_bigquery_caches_metadata_and_projects_filter_cols(
+    mock_arrow_client,
+):
+    mock_stream = MagicMock()
+    mock_arrow_client.read_table.return_value = mock_stream
+
+    with (
+        patch(
+            "polars_bigquery.core.bigquery_rest.get_table_metadata"
+        ) as mock_get_metadata,
+        patch("polars.scan_arrow_c_stream") as mock_scan,
+    ):
+        mock_get_metadata.return_value = {
+            "schema": {
+                "fields": [
+                    {"name": "visible", "type": "STRING"},
+                    {"name": "hidden", "type": "INTEGER"},
+                    {"name": "unused", "type": "STRING"},
+                ]
+            }
+        }
+        mock_scan.return_value = pl.LazyFrame(
+            {"visible": ["a", "b"], "hidden": [5, 15]}
+        )
+
+        client = Client(quota_project_id="q")
+        # Call scan_table twice on the same table to verify metadata caching
+        _ = client.scan_table(table="my-project.my_dataset.my_table")
+        lf = client.scan_table(table="my-project.my_dataset.my_table")
+        mock_get_metadata.assert_called_once()
+
+        # Filter on 'hidden' (not in select projection) and project 'visible'
+        df = lf.filter(pl.col("hidden") > 10).select(["visible"]).collect()
+
+        mock_arrow_client.read_table.assert_called_once_with(
+            arrow_bigquery.BigQueryTableId("my-project", "my_dataset", "my_table"),
+            maintain_order=False,
+            selected_fields=["visible", "hidden"],
+            row_restriction="(`hidden` > 10)",
+        )
+        assert df.equals(pl.DataFrame({"visible": ["b"]}))
