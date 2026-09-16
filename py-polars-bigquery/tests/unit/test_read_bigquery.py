@@ -1,3 +1,4 @@
+from datetime import date
 from unittest.mock import MagicMock, patch
 
 import arrow_bigquery
@@ -71,7 +72,7 @@ def test_client_read_query(mock_arrow_client):
     mock_arrow_client.read_table.return_value = mock_exporter
 
     with (
-        patch("polars_bigquery._read_bigquery.run_query") as mock_run_query,
+        patch("polars_bigquery.core.bigquery_rest.run_query") as mock_run_query,
         patch("polars.DataFrame") as mock_df_cls,
     ):
         mock_run_query.return_value = "project.dataset.temp_table"
@@ -83,7 +84,11 @@ def test_client_read_query(mock_arrow_client):
 
         expected_ua = f"polars-bigquery/{__version__}"
         mock_run_query.assert_called_once_with(
-            "SELECT 1", "q", client.credentials_provider, user_agent=expected_ua
+            "SELECT 1",
+            quota_project_id="q",
+            credentials_provider=client.credentials_provider,
+            user_agent=expected_ua,
+            session=client._rest_client.session,
         )
         mock_arrow_client.read_table.assert_called_once_with(
             arrow_bigquery.BigQueryTableId("project", "dataset", "temp_table"),
@@ -97,7 +102,7 @@ def test_client_read_query_with_user_agent(mock_arrow_client):
     mock_arrow_client.read_table.return_value = mock_exporter
 
     with (
-        patch("polars_bigquery._read_bigquery.run_query") as mock_run_query,
+        patch("polars_bigquery.core.bigquery_rest.run_query") as mock_run_query,
         patch("polars.DataFrame") as mock_df_cls,
     ):
         mock_run_query.return_value = "project.dataset.temp_table"
@@ -110,7 +115,11 @@ def test_client_read_query_with_user_agent(mock_arrow_client):
         assert result is not None
         expected_ua = f"polars-bigquery/{__version__} custom-ua/1.0"
         mock_run_query.assert_called_once_with(
-            "SELECT 1", "q", client.credentials_provider, user_agent=expected_ua
+            "SELECT 1",
+            quota_project_id="q",
+            credentials_provider=client.credentials_provider,
+            user_agent=expected_ua,
+            session=client._rest_client.session,
         )
 
 
@@ -144,16 +153,162 @@ def test_client_scan_bigquery_calls_arrow_with_parsed_id(mock_arrow_client):
     mock_stream = MagicMock()
     mock_arrow_client.read_table.return_value = mock_stream
 
-    with patch("polars.scan_arrow_c_stream") as mock_scan:
+    with (
+        patch(
+            "polars_bigquery.core.bigquery_rest.get_table_metadata"
+        ) as mock_get_metadata,
+        patch("polars.scan_arrow_c_stream") as mock_scan,
+    ):
+        mock_get_metadata.return_value = {
+            "schema": {"fields": [{"name": "col1", "type": "INTEGER"}]}
+        }
         mock_lazy_df = pl.LazyFrame({"col1": [1, 2]})
         mock_scan.return_value = mock_lazy_df
 
         client = Client(quota_project_id="q")
         result = client.scan_table(table="my-project.my_dataset.my_table")
 
+        mock_get_metadata.assert_called_once_with(
+            arrow_bigquery.BigQueryTableId("my-project", "my_dataset", "my_table"),
+            quota_project_id="q",
+            credentials_provider=client.credentials_provider,
+            user_agent=f"polars-bigquery/{__version__}",
+            session=client._rest_client.session,
+        )
+
+        mock_arrow_client.read_table.assert_not_called()
+        mock_scan.assert_not_called()
+
+        df = result.collect()
+
         mock_arrow_client.read_table.assert_called_once_with(
             arrow_bigquery.BigQueryTableId("my-project", "my_dataset", "my_table"),
             maintain_order=False,
+            selected_fields=[],
+            row_restriction="",
         )
         mock_scan.assert_called_once_with(mock_stream)
-        assert result.collect().equals(mock_lazy_df.collect())
+        assert df.equals(mock_lazy_df.collect())
+
+
+def test_client_scan_bigquery_handles_bigquery_objects(mock_arrow_client):
+    mock_stream = MagicMock()
+    mock_arrow_client.read_table.return_value = mock_stream
+    mock_ref = MagicMock()
+    mock_ref.project = "p"
+    mock_ref.dataset_id = "d"
+    mock_ref.table_id = "t"
+
+    with (
+        patch(
+            "polars_bigquery.core.bigquery_rest.get_table_metadata"
+        ) as mock_get_metadata,
+        patch("polars.scan_arrow_c_stream") as mock_scan,
+    ):
+        mock_get_metadata.return_value = {
+            "schema": {"fields": [{"name": "col1", "type": "INTEGER"}]}
+        }
+        mock_lazy_df = pl.LazyFrame({"col1": [1, 2]})
+        mock_scan.return_value = mock_lazy_df
+
+        client = Client(quota_project_id="q")
+        result = client.scan_table(table=mock_ref)
+        df = result.collect()
+
+        mock_arrow_client.read_table.assert_called_once_with(
+            arrow_bigquery.BigQueryTableId("p", "d", "t"),
+            maintain_order=False,
+            selected_fields=[],
+            row_restriction="",
+        )
+        assert df.equals(mock_lazy_df.collect())
+
+
+def test_client_scan_bigquery_projects_filter_cols(
+    mock_arrow_client,
+):
+    mock_stream = MagicMock()
+    mock_arrow_client.read_table.return_value = mock_stream
+
+    with (
+        patch(
+            "polars_bigquery.core.bigquery_rest.get_table_metadata"
+        ) as mock_get_metadata,
+        patch("polars.scan_arrow_c_stream") as mock_scan,
+    ):
+        mock_get_metadata.return_value = {
+            "schema": {
+                "fields": [
+                    {"name": "visible", "type": "STRING"},
+                    {"name": "hidden", "type": "INTEGER"},
+                    {"name": "unused", "type": "STRING"},
+                ]
+            }
+        }
+        mock_scan.return_value = pl.LazyFrame(
+            {"visible": ["a", "b"], "hidden": [5, 15]}
+        )
+
+        client = Client(quota_project_id="q")
+        lf = client.scan_table(table="my-project.my_dataset.my_table")
+        mock_get_metadata.assert_called_once()
+
+        # Filter on 'hidden' (not in select projection) and project 'visible'
+        df = lf.filter(pl.col("hidden") > 10).select(["visible"]).collect()
+
+        mock_arrow_client.read_table.assert_called_once_with(
+            arrow_bigquery.BigQueryTableId("my-project", "my_dataset", "my_table"),
+            maintain_order=False,
+            selected_fields=["visible", "hidden"],
+            row_restriction="(`hidden` > 10)",
+        )
+        assert df.equals(pl.DataFrame({"visible": ["b"]}))
+
+
+def test_client_scan_ingestion_time_partitioned_table(mock_arrow_client):
+    mock_stream = MagicMock()
+    mock_arrow_client.read_table.return_value = mock_stream
+
+    with (
+        patch(
+            "polars_bigquery.core.bigquery_rest.get_table_metadata"
+        ) as mock_get_metadata,
+        patch("polars.scan_arrow_c_stream") as mock_scan,
+        patch(
+            "polars.io.plugins.register_io_source",
+            wraps=pl.io.plugins.register_io_source,
+        ) as mock_register,
+    ):
+        mock_get_metadata.return_value = {
+            "schema": {"fields": [{"name": "val", "type": "INTEGER"}]},
+            "timePartitioning": {"type": "DAY"},
+        }
+        mock_scan.return_value = pl.LazyFrame({"val": [10, 20]})
+
+        client = Client(quota_project_id="q")
+        lf = client.scan_table(table="my-project.my_dataset.my_table")
+
+        # Verify the underlying io_source yields batches with deterministic schema column order
+        io_source = mock_register.call_args.kwargs["io_source"]
+        raw_df = next(io_source(None, None, None, None))
+        assert raw_df.columns == ["val", "_PARTITIONDATE", "_PARTITIONTIME"]
+
+        # 1. Verify unfiltered collect synthesizes pseudo-columns without crashing
+        df_all = lf.collect()
+        assert df_all.columns == ["val", "_PARTITIONDATE", "_PARTITIONTIME"]
+        assert df_all["_PARTITIONDATE"].to_list() == [None, None]
+
+        # 2. Verify filter on _PARTITIONDATE strips pseudo-column from selected_fields
+        df_filtered = (
+            lf.filter(pl.col("_PARTITIONDATE") == date(2024, 1, 1))
+            .select("val")
+            .collect()
+        )
+        mock_arrow_client.read_table.assert_called_with(
+            arrow_bigquery.BigQueryTableId("my-project", "my_dataset", "my_table"),
+            maintain_order=False,
+            selected_fields=["val"],
+            row_restriction="(`_PARTITIONDATE` = DATE(TIMESTAMP_SECONDS(19723 * 86400)))",
+        )
+        assert df_filtered.columns == ["val"]
+        assert df_filtered["val"].to_list() == [10, 20]

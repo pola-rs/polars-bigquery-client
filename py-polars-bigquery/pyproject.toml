@@ -40,3 +40,7 @@ test = [
     "pytest-benchmark>=5.1.0",
     "pytest-xdist>=3.8.0",
 ]
+
+[tool.pytest.ini_options]
+testpaths = ["tests/unit"]
+norecursedirs = ["tests/benchmark", "tests/system"]
