@@ -257,7 +257,6 @@ class BigQueryRestClient:
         self._credentials_provider = credentials_provider
         self._user_agent = user_agent
         self._session = session if session is not None else create_resilient_session()
-        self._metadata_cache: dict[tuple[str, str, str], dict[str, Any]] = {}
 
     @property
     def session(self) -> requests.Session:
@@ -276,13 +275,10 @@ class BigQueryRestClient:
         self,
         table_ref: arrow_bigquery.api.resources.BigQueryTableId,
     ) -> dict[str, Any]:
-        cache_key = (table_ref.project_id, table_ref.dataset_id, table_ref.table_id)
-        if cache_key not in self._metadata_cache:
-            self._metadata_cache[cache_key] = get_table_metadata(
-                table_ref,
-                quota_project_id=self._quota_project_id,
-                credentials_provider=self._credentials_provider,
-                user_agent=self._user_agent,
-                session=self._session,
-            )
-        return self._metadata_cache[cache_key]
+        return get_table_metadata(
+            table_ref,
+            quota_project_id=self._quota_project_id,
+            credentials_provider=self._credentials_provider,
+            user_agent=self._user_agent,
+            session=self._session,
+        )

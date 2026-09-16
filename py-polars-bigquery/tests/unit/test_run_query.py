@@ -273,30 +273,6 @@ def test_get_table_metadata_uses_field_mask_and_session():
     )
 
 
-def test_bigquery_rest_client_caches_metadata_and_runs_queries():
-    mock_cp = MagicMock(return_value=({"bearer_token": "tok"}, 123))
-    mock_session = MagicMock()
-    mock_session.get.return_value.json.return_value = {
-        "schema": {"fields": [{"name": "c", "type": "INTEGER"}]}
-    }
-
-    client = BigQueryRestClient(
-        quota_project_id="quota-project",
-        credentials_provider=mock_cp,
-        user_agent="polars-bigquery/0.1.0",
-        session=mock_session,
-    )
-    assert client.session is mock_session
-
-    table_ref = arrow_bigquery.api.resources.BigQueryTableId("p", "d", "t")
-    meta1 = client.get_table_metadata(table_ref)
-    meta2 = client.get_table_metadata(table_ref)
-
-    assert meta1 == meta2
-    # Verify HTTP GET was called only once due to per-client caching
-    mock_session.get.assert_called_once()
-
-
 def test_run_query_propagates_regional_location():
     mock_cp = MagicMock(return_value=({"bearer_token": "tok"}, 123))
     mock_session = MagicMock()

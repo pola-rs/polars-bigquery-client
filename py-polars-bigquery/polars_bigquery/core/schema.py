@@ -55,7 +55,8 @@ def _extract_data_type(field: dict) -> DataType:
         # https://stackoverflow.com/a/47724366/101923
         return Datetime(time_unit="us")
     if type_ == "geography":
-        # TODO: support geopolars data types, if available
+        # TODO(https://github.com/pola-rs/polars-bigquery-client/issues/40):
+        # Support GeoPolars data types, only if the package is installed.
         return String()
     if type_ in ("float", "float64"):
         return Float64()

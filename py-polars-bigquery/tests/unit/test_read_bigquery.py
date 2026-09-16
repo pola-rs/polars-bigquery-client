@@ -224,7 +224,7 @@ def test_client_scan_bigquery_handles_bigquery_objects(mock_arrow_client):
         assert df.equals(mock_lazy_df.collect())
 
 
-def test_client_scan_bigquery_caches_metadata_and_projects_filter_cols(
+def test_client_scan_bigquery_projects_filter_cols(
     mock_arrow_client,
 ):
     mock_stream = MagicMock()
@@ -250,8 +250,6 @@ def test_client_scan_bigquery_caches_metadata_and_projects_filter_cols(
         )
 
         client = Client(quota_project_id="q")
-        # Call scan_table twice on the same table to verify metadata caching
-        _ = client.scan_table(table="my-project.my_dataset.my_table")
         lf = client.scan_table(table="my-project.my_dataset.my_table")
         mock_get_metadata.assert_called_once()
 
