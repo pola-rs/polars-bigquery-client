@@ -20,7 +20,11 @@ from urllib3.util.retry import Retry
 import polars_bigquery.exceptions
 
 _BIGQUERY_ENDPOINT = "https://bigquery.googleapis.com/bigquery/v2"
-DEFAULT_TIMEOUT: tuple[float, float] = (10.0, 60.0)
+# Keep timeout at least as long as the server-side timeout defined at
+# https://github.com/googleapis/googleapis/blob/4bcbf04e688ffddb8ec1a20a2349df32b9fcbd9c/google/cloud/bigquery/v2/bigquery_grpc_service_config.json#L170-L181
+_CONNECT_TIMEOUT = 60.0
+_READ_TIMEOUT = 250.0
+DEFAULT_TIMEOUT: tuple[float, float] = (_CONNECT_TIMEOUT, _READ_TIMEOUT)
 MAX_POLL_SECONDS: float = 21600.0
 
 
