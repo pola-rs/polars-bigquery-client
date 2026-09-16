@@ -12,7 +12,7 @@ import polars_bigquery.core.schema
 import polars_bigquery.core.version
 from polars_bigquery.core import bigquery_rest, predicates
 
-_PSEUDO_COLUMNS = frozenset({"_PARTITIONDATE", "_PARTITIONTIME"})
+_PSEUDO_COLUMNS = ("_PARTITIONDATE", "_PARTITIONTIME")
 
 
 def _get_user_agent(user_agent: str | None) -> str:
@@ -134,7 +134,7 @@ class Client:
             # Pseudo-columns are already filtered by BigQuery server-side via row_restriction.
             if predicate is not None:
                 pred_cols = set(predicate.meta.root_names())
-                if not (pred_cols & _PSEUDO_COLUMNS):
+                if pred_cols.isdisjoint(_PSEUDO_COLUMNS):
                     lazyframe = lazyframe.filter(predicate)
 
             # Synthesize missing pseudo-columns as null to fulfill registered schema contracts.

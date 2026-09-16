@@ -77,6 +77,7 @@ def test_extract_polars_schema_ingestion_time_partitioning():
         "timePartitioning": {"type": "DAY"},
     }
     schema = extract_polars_schema(metadata)
+    assert schema.names() == ["val", "_PARTITIONDATE", "_PARTITIONTIME"]
     assert schema["val"] == pl.Int64()
     assert schema["_PARTITIONDATE"] == pl.Date()
     assert schema["_PARTITIONTIME"] == pl.Datetime(time_unit="us", time_zone="utc")

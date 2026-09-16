@@ -274,6 +274,10 @@ def test_client_scan_ingestion_time_partitioned_table(mock_arrow_client):
             "polars_bigquery.core.bigquery_rest.get_table_metadata"
         ) as mock_get_metadata,
         patch("polars.scan_arrow_c_stream") as mock_scan,
+        patch(
+            "polars.io.plugins.register_io_source",
+            wraps=pl.io.plugins.register_io_source,
+        ) as mock_register,
     ):
         mock_get_metadata.return_value = {
             "schema": {"fields": [{"name": "val", "type": "INTEGER"}]},
@@ -283,6 +287,11 @@ def test_client_scan_ingestion_time_partitioned_table(mock_arrow_client):
 
         client = Client(quota_project_id="q")
         lf = client.scan_table(table="my-project.my_dataset.my_table")
+
+        # Verify the underlying io_source yields batches with deterministic schema column order
+        io_source = mock_register.call_args.kwargs["io_source"]
+        raw_df = next(io_source(None, None, None, None))
+        assert raw_df.columns == ["val", "_PARTITIONDATE", "_PARTITIONTIME"]
 
         # 1. Verify unfiltered collect synthesizes pseudo-columns without crashing
         df_all = lf.collect()
