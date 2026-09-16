@@ -88,13 +88,26 @@ def _get_jobs_insert_body(query: str, quota_project_id: str) -> dict:
     }
 
 
-def _get_jobs_get_url(job_id: str, quota_project_id: str) -> str:
-    return f"{_BIGQUERY_ENDPOINT}/projects/{quota_project_id}/jobs/{job_id}"
+def _get_jobs_get_url(
+    job_id: str, quota_project_id: str, location: str | None = None
+) -> str:
+    url = f"{_BIGQUERY_ENDPOINT}/projects/{quota_project_id}/jobs/{job_id}"
+    if location:
+        url += f"?location={location}"
+    return url
 
 
-def _get_query_results_url(job_id: str, quota_project_id: str) -> str:
-    # Set maxResults=0 to only use this endpoint to wait for job to finish.
-    return f"{_BIGQUERY_ENDPOINT}/projects/{quota_project_id}/queries/{job_id}/results?maxResults=0"
+def _get_query_results_url(
+    job_id: str, quota_project_id: str, location: str | None = None
+) -> str:
+    # Set maxResults=0 and timeoutMs=10000 to use this endpoint to wait for job completion.
+    url = (
+        f"{_BIGQUERY_ENDPOINT}/projects/{quota_project_id}/queries/{job_id}/results"
+        "?maxResults=0&timeoutMs=10000"
+    )
+    if location:
+        url += f"&location={location}"
+    return url
 
 
 def _wait_for_job(
@@ -103,6 +116,7 @@ def _wait_for_job(
     credentials_provider: pl.CredentialProviderGCP,
     user_agent: str,
     *,
+    location: str | None = None,
     session: requests.Session | None = None,
     timeout: tuple[float, float] = DEFAULT_TIMEOUT,
     max_poll_seconds: float = MAX_POLL_SECONDS,
@@ -120,7 +134,7 @@ def _wait_for_job(
             user_agent=user_agent,
         )
         response = http.get(
-            _get_jobs_get_url(job_id, quota_project_id),
+            _get_jobs_get_url(job_id, quota_project_id, location=location),
             headers=headers,
             timeout=timeout,
         )
@@ -135,12 +149,17 @@ def _wait_for_job(
             return job
 
         # jobs.getQueryResults waits about 10s or until the query finishes.
+        poll_start = time.monotonic()
         poll_response = http.get(
-            _get_query_results_url(job_id, quota_project_id),
+            _get_query_results_url(job_id, quota_project_id, location=location),
             headers=headers,
             timeout=timeout,
         )
         _raise_for_bigquery_error(poll_response)
+        # Avoid busy-spinning if the polling endpoint returns without blocking
+        elapsed = time.monotonic() - poll_start
+        if elapsed < 1.0:
+            time.sleep(1.0 - elapsed)
 
 
 def _get_headers(
@@ -182,7 +201,9 @@ def run_query(
     response = http.post(insert_url, headers=headers, json=body, timeout=timeout)
     _raise_for_bigquery_error(response)
     job_resource = response.json()
-    job_id = job_resource["jobReference"]["jobId"]
+    job_ref = job_resource.get("jobReference", {})
+    job_id = job_ref["jobId"]
+    location = job_ref.get("location")
 
     # 2. Wait for the job to complete (refreshing credentials on each poll)
     job = _wait_for_job(
@@ -190,6 +211,7 @@ def run_query(
         quota_project_id,
         credentials_provider,
         user_agent,
+        location=location,
         session=session,
         timeout=timeout,
     )

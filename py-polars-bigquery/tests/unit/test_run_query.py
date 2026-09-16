@@ -295,3 +295,40 @@ def test_bigquery_rest_client_caches_metadata_and_runs_queries():
     assert meta1 == meta2
     # Verify HTTP GET was called only once due to per-client caching
     mock_session.get.assert_called_once()
+
+
+def test_run_query_propagates_regional_location():
+    mock_cp = MagicMock(return_value=({"bearer_token": "tok"}, 123))
+    mock_session = MagicMock()
+
+    # Mock insert response containing regional location
+    mock_insert_resp = MagicMock()
+    mock_insert_resp.json.return_value = {
+        "jobReference": {"jobId": "job-reg", "location": "europe-west1"}
+    }
+    mock_session.post.return_value = mock_insert_resp
+
+    # Mock poll response
+    mock_poll_resp = MagicMock()
+    mock_poll_resp.json.return_value = {
+        "status": {"state": "DONE"},
+        "configuration": {
+            "query": {
+                "destinationTable": {"projectId": "p", "datasetId": "d", "tableId": "t"}
+            }
+        },
+    }
+    mock_session.get.return_value = mock_poll_resp
+
+    dest = run_query(
+        "SELECT 1",
+        quota_project_id="q",
+        credentials_provider=mock_cp,
+        user_agent="ua",
+        session=mock_session,
+    )
+    assert dest == "p.d.t"
+
+    # Verify location query parameter was appended to jobs.get URL
+    called_get_url = mock_session.get.call_args_list[0].args[0]
+    assert "location=europe-west1" in called_get_url

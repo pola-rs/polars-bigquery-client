@@ -12,6 +12,8 @@ import polars_bigquery.core.schema
 import polars_bigquery.core.version
 from polars_bigquery.core import bigquery_rest, predicates
 
+_PSEUDO_COLUMNS = frozenset({"_PARTITIONDATE", "_PARTITIONTIME"})
+
 
 def _get_user_agent(user_agent: str | None) -> str:
     ua = f"polars-bigquery/{polars_bigquery.core.version.__version__}"
@@ -110,10 +112,16 @@ class Client:
             else:
                 selected_fields = []
 
+            # Pseudo-columns (_PARTITIONDATE, _PARTITIONTIME) cannot be requested in
+            # selected_fields for the Storage Read API, but are handled via row_restriction.
+            api_selected_fields = [
+                col for col in selected_fields if col not in _PSEUDO_COLUMNS
+            ]
+
             arrow_stream_exporter = self._arrow_client.read_table(
                 table_ref,
                 maintain_order=False,
-                selected_fields=selected_fields,
+                selected_fields=api_selected_fields,
                 row_restriction=predicates.predicate_to_row_restriction(
                     predicate=predicate
                 )
@@ -122,10 +130,21 @@ class Client:
             )
             lazyframe = pl.scan_arrow_c_stream(arrow_stream_exporter)
 
-            # Apply filter BEFORE column projection so predicates referencing
-            # non-projected columns are evaluated before being dropped.
+            # Apply in-memory filter only if all columns exist in the physical stream.
+            # Pseudo-columns are already filtered by BigQuery server-side via row_restriction.
             if predicate is not None:
-                lazyframe = lazyframe.filter(predicate)
+                pred_cols = set(predicate.meta.root_names())
+                if not (pred_cols & _PSEUDO_COLUMNS):
+                    lazyframe = lazyframe.filter(predicate)
+
+            # Synthesize missing pseudo-columns as null to fulfill registered schema contracts.
+            for pseudo_col in _PSEUDO_COLUMNS:
+                if pseudo_col in schema and (
+                    with_columns is None or pseudo_col in with_columns
+                ):
+                    lazyframe = lazyframe.with_columns(
+                        pl.lit(None, dtype=schema[pseudo_col]).alias(pseudo_col)
+                    )
 
             if with_columns is not None:
                 lazyframe = lazyframe.select(with_columns)

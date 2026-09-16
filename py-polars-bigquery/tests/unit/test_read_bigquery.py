@@ -1,3 +1,4 @@
+from datetime import date
 from unittest.mock import MagicMock, patch
 
 import arrow_bigquery
@@ -264,3 +265,43 @@ def test_client_scan_bigquery_caches_metadata_and_projects_filter_cols(
             row_restriction="(`hidden` > 10)",
         )
         assert df.equals(pl.DataFrame({"visible": ["b"]}))
+
+
+def test_client_scan_ingestion_time_partitioned_table(mock_arrow_client):
+    mock_stream = MagicMock()
+    mock_arrow_client.read_table.return_value = mock_stream
+
+    with (
+        patch(
+            "polars_bigquery.core.bigquery_rest.get_table_metadata"
+        ) as mock_get_metadata,
+        patch("polars.scan_arrow_c_stream") as mock_scan,
+    ):
+        mock_get_metadata.return_value = {
+            "schema": {"fields": [{"name": "val", "type": "INTEGER"}]},
+            "timePartitioning": {"type": "DAY"},
+        }
+        mock_scan.return_value = pl.LazyFrame({"val": [10, 20]})
+
+        client = Client(quota_project_id="q")
+        lf = client.scan_table(table="my-project.my_dataset.my_table")
+
+        # 1. Verify unfiltered collect synthesizes pseudo-columns without crashing
+        df_all = lf.collect()
+        assert df_all.columns == ["val", "_PARTITIONDATE", "_PARTITIONTIME"]
+        assert df_all["_PARTITIONDATE"].to_list() == [None, None]
+
+        # 2. Verify filter on _PARTITIONDATE strips pseudo-column from selected_fields
+        df_filtered = (
+            lf.filter(pl.col("_PARTITIONDATE") == date(2024, 1, 1))
+            .select("val")
+            .collect()
+        )
+        mock_arrow_client.read_table.assert_called_with(
+            arrow_bigquery.BigQueryTableId("my-project", "my_dataset", "my_table"),
+            maintain_order=False,
+            selected_fields=["val"],
+            row_restriction="(`_PARTITIONDATE` = DATE(TIMESTAMP_SECONDS(19723 * 86400)))",
+        )
+        assert df_filtered.columns == ["val"]
+        assert df_filtered["val"].to_list() == [10, 20]
