@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterator
+from dataclasses import dataclass
 from typing import Any
 
 import arrow_bigquery
@@ -22,6 +23,53 @@ def _get_user_agent(user_agent: str | None) -> str:
         return f"{ua} {user_agent}"
     else:
         return ua
+
+
+@dataclass(frozen=True)
+class ScanPlan:
+    """Pure execution plan for a BigQuery table scan."""
+
+    api_selected_fields: list[str]
+    row_restriction: str
+    residual_predicate: pl.Expr | None
+    synthesize_pseudo_columns: list[tuple[str, pl.DataType]]
+
+
+def plan_table_scan(
+    *,
+    schema: dict[str, pl.DataType],
+    with_columns: list[str] | None,
+    predicate: pl.Expr | None,
+) -> ScanPlan:
+    """Compute column projection, server-side row restriction, and client-side residual filter."""
+    compiled = (
+        predicates.compile_predicate(predicate, pseudo_columns=_PSEUDO_COLUMNS)
+        if predicate is not None
+        else None
+    )
+
+    if with_columns is not None:
+        predicate_cols = compiled.referenced_columns if compiled is not None else ()
+        selected_fields = list(dict.fromkeys([*with_columns, *predicate_cols]))
+    else:
+        selected_fields = []
+
+    api_selected_fields = [col for col in selected_fields if col not in _PSEUDO_COLUMNS]
+
+    synthesize_pseudo_columns = [
+        (pseudo_col, schema[pseudo_col])
+        for pseudo_col in _PSEUDO_COLUMNS
+        if pseudo_col in schema and (with_columns is None or pseudo_col in with_columns)
+    ]
+
+    return ScanPlan(
+        api_selected_fields=api_selected_fields,
+        row_restriction=compiled.row_restriction if compiled is not None else "",
+        residual_predicate=compiled.residual_predicate
+        if compiled is not None
+        else None,
+        synthesize_pseudo_columns=synthesize_pseudo_columns,
+    )
 
 
 class Client:
@@ -54,6 +102,16 @@ class Client:
             credentials_provider=credentials_provider,
             user_agent=self._user_agent,
         )
+
+    def close(self) -> None:
+        """Close underlying REST session resources."""
+        self._rest_client.close()
+
+    def __enter__(self) -> Client:  # noqa: PYI034
+        return self
+
+    def __exit__(self, *exc_info: object) -> None:
+        self.close()
 
     @property
     def credentials_provider(self) -> pl.CredentialProviderGCP:
@@ -104,47 +162,27 @@ class Client:
             n_rows: int | None,
             batch_size: int | None,
         ) -> Iterator[pl.DataFrame]:
-            if with_columns is not None:
-                predicate_cols = (
-                    predicate.meta.root_names() if predicate is not None else []
-                )
-                selected_fields = list(dict.fromkeys([*with_columns, *predicate_cols]))
-            else:
-                selected_fields = []
-
-            # Pseudo-columns (_PARTITIONDATE, _PARTITIONTIME) cannot be requested in
-            # selected_fields for the Storage Read API, but are handled via row_restriction.
-            api_selected_fields = [
-                col for col in selected_fields if col not in _PSEUDO_COLUMNS
-            ]
+            plan = plan_table_scan(
+                schema=schema,
+                with_columns=with_columns,
+                predicate=predicate,
+            )
 
             arrow_stream_exporter = self._arrow_client.read_table(
                 table_ref,
                 maintain_order=False,
-                selected_fields=api_selected_fields,
-                row_restriction=predicates.predicate_to_row_restriction(
-                    predicate=predicate
-                )
-                if predicate is not None
-                else "",
+                selected_fields=plan.api_selected_fields,
+                row_restriction=plan.row_restriction,
             )
             lazyframe = pl.scan_arrow_c_stream(arrow_stream_exporter)
 
-            # Apply in-memory filter only if all columns exist in the physical stream.
-            # Pseudo-columns are already filtered by BigQuery server-side via row_restriction.
-            if predicate is not None:
-                pred_cols = set(predicate.meta.root_names())
-                if pred_cols.isdisjoint(_PSEUDO_COLUMNS):
-                    lazyframe = lazyframe.filter(predicate)
+            if plan.residual_predicate is not None:
+                lazyframe = lazyframe.filter(plan.residual_predicate)
 
-            # Synthesize missing pseudo-columns as null to fulfill registered schema contracts.
-            for pseudo_col in _PSEUDO_COLUMNS:
-                if pseudo_col in schema and (
-                    with_columns is None or pseudo_col in with_columns
-                ):
-                    lazyframe = lazyframe.with_columns(
-                        pl.lit(None, dtype=schema[pseudo_col]).alias(pseudo_col)
-                    )
+            for pseudo_col, dtype in plan.synthesize_pseudo_columns:
+                lazyframe = lazyframe.with_columns(
+                    pl.lit(None, dtype=dtype).alias(pseudo_col)
+                )
 
             if with_columns is not None:
                 lazyframe = lazyframe.select(with_columns)

@@ -312,3 +312,22 @@ def test_client_scan_ingestion_time_partitioned_table(mock_arrow_client):
         )
         assert df_filtered.columns == ["val"]
         assert df_filtered["val"].to_list() == [10, 20]
+
+        # 3. Verify compound filter with _PARTITIONDATE and physical column applies residual filter
+        df_compound = (
+            lf.filter(
+                (pl.col("_PARTITIONDATE") == date(2024, 1, 1)) & (pl.col("val") > 15)
+            )
+            .select("val")
+            .collect()
+        )
+        assert df_compound["val"].to_list() == [20]
+
+
+def test_client_context_manager_closes_rest_session(mock_arrow_client):
+    with patch.object(
+        Client, "close", wraps=Client(quota_project_id="q").close
+    ) as mock_close:
+        with Client(quota_project_id="q") as client:
+            assert client.quota_project_id == "q"
+        mock_close.assert_called_once()

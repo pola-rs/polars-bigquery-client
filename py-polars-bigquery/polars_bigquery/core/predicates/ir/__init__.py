@@ -167,9 +167,13 @@ def json_to_ir(expr_json: Any) -> Expr:
             if not isinstance(binary_expr, dict):
                 records.append(("Leaf", Unsupported(), ()))
                 continue
+            polars_op = binary_expr.get("op")
+            binary_cls = (
+                _BINARY_OPS.get(polars_op) if isinstance(polars_op, str) else None
+            )
             left_json = binary_expr.get("left")
             right_json = binary_expr.get("right")
-            if left_json is None or right_json is None:
+            if binary_cls is None or left_json is None or right_json is None:
                 records.append(("Leaf", Unsupported(), ()))
                 continue
 
@@ -181,14 +185,7 @@ def json_to_ir(expr_json: Any) -> Expr:
             raw_nodes.append(right_json)
             queue.append(right_idx)
 
-            polars_op = binary_expr.get("op")
-            binary_cls = (
-                _BINARY_OPS.get(polars_op) if isinstance(polars_op, str) else None
-            )
-            if binary_cls is not None:
-                records.append(("Binary", binary_cls, (left_idx, right_idx)))
-            else:
-                records.append(("Unsupported", None, (left_idx, right_idx)))
+            records.append(("Binary", binary_cls, (left_idx, right_idx)))
             continue
 
         if "Function" in curr:
@@ -201,26 +198,22 @@ def json_to_ir(expr_json: Any) -> Expr:
                 records.append(("Leaf", Unsupported(), ()))
                 continue
 
-            child_indices: list[int] = []
-            for child_json in inputs:
-                child_idx = len(raw_nodes)
-                raw_nodes.append(child_json)
-                queue.append(child_idx)
-                child_indices.append(child_idx)
-
             function_details = function_json.get("function")
             if isinstance(function_details, dict):
                 boolean_name = function_details.get("Boolean")
                 if (
                     isinstance(boolean_name, str)
                     and boolean_name in _BOOLEAN_FUNCTIONS
-                    and len(child_indices) >= 1
+                    and len(inputs) >= 1
                 ):
+                    child_idx = len(raw_nodes)
+                    raw_nodes.append(inputs[0])
+                    queue.append(child_idx)
                     records.append(
                         (
                             "Unary",
                             _BOOLEAN_FUNCTIONS[boolean_name],
-                            (child_indices[0],),
+                            (child_idx,),
                         )
                     )
                     continue
@@ -229,18 +222,24 @@ def json_to_ir(expr_json: Any) -> Expr:
                 if (
                     isinstance(string_name, str)
                     and string_name in STRING_BINARY_FUNCTIONS
-                    and len(child_indices) == 2
+                    and len(inputs) == 2
                 ):
+                    left_idx = len(raw_nodes)
+                    raw_nodes.append(inputs[0])
+                    queue.append(left_idx)
+                    right_idx = len(raw_nodes)
+                    raw_nodes.append(inputs[1])
+                    queue.append(right_idx)
                     records.append(
                         (
                             "Binary",
                             STRING_BINARY_FUNCTIONS[string_name],
-                            (child_indices[0], child_indices[1]),
+                            (left_idx, right_idx),
                         )
                     )
                     continue
 
-            records.append(("Unsupported", None, tuple(child_indices)))
+            records.append(("Leaf", Unsupported(), ()))
             continue
 
         if "Column" in curr:

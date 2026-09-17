@@ -3,10 +3,11 @@ from __future__ import annotations
 import math
 import unicodedata
 from collections import deque
-from typing import Any
+from collections.abc import Callable
 
 from polars_bigquery.core.predicates.ir import (
     And,
+    BinaryExpr,
     BoolLiteral,
     Column,
     DateLiteral,
@@ -34,8 +35,8 @@ from polars_bigquery.core.predicates.ir import (
     StringLiteral,
     TimestampLiteral,
     TimestampUnit,
+    UnaryExpr,
     Unsupported,
-    _json_literal_to_ir,
 )
 
 _ALLOWED_FLEXIBLE_SPECIAL_CHARS = frozenset(
@@ -73,6 +74,8 @@ def _escape_sql_string(val: str) -> str:
         .replace("'", "\\'")
         .replace("\n", "\\n")
         .replace("\r", "\\r")
+        .replace("\t", "\\t")
+        .replace("\0", "\\x00")
     )
     return f"'{escaped}'"
 
@@ -162,12 +165,27 @@ def _literal_ir_to_sql(node: Literal) -> str:
     raise TypeError(msg)
 
 
-def _json_literal_to_sql(literal_json: dict[str, Any]) -> str | None:
-    """Convert a literal from a Polars expression JSON into SQL-like."""
-    ir_node = _json_literal_to_ir(literal_json)
-    if isinstance(ir_node, Literal):
-        return _literal_ir_to_sql(ir_node)
-    return None
+_BINARY_SQL_FORMATTERS: dict[type[BinaryExpr], Callable[[str, str], str]] = {
+    Or: lambda l, r: f"({l} OR {r})",
+    Eq: lambda l, r: f"({l} = {r})",
+    NotEq: lambda l, r: f"({l} != {r})",
+    Gt: lambda l, r: f"({l} > {r})",
+    GtEq: lambda l, r: f"({l} >= {r})",
+    Lt: lambda l, r: f"({l} < {r})",
+    LtEq: lambda l, r: f"({l} <= {r})",
+    StartsWith: lambda l, r: f"STARTS_WITH({l}, {r})",
+    EndsWith: lambda l, r: f"ENDS_WITH({l}, {r})",
+}
+
+_UNARY_SQL_FORMATTERS: dict[type[UnaryExpr], Callable[[str], str]] = {
+    Not: lambda x: f"(NOT {x})",
+    IsNull: lambda x: f"({x} IS NULL)",
+    IsNotNull: lambda x: f"({x} IS NOT NULL)",
+    IsNan: lambda x: f"IS_NAN({x})",
+    IsNotNan: lambda x: f"(NOT IS_NAN({x}))",
+    IsInfinite: lambda x: f"IS_INF({x})",
+    IsFinite: lambda x: f"(NOT IS_INF({x}) AND NOT IS_NAN({x}))",
+}
 
 
 def _emit_node_sql(node: Expr, child_sqls: list[str | None]) -> str | None:
@@ -191,43 +209,13 @@ def _emit_node_sql(node: Expr, child_sqls: list[str | None]) -> str | None:
     if any(s is None for s in child_sqls):
         return None
 
-    # Logical / Comparison binary operators
-    if isinstance(node, Or):
-        return f"({child_sqls[0]} OR {child_sqls[1]})"
-    if isinstance(node, Eq):
-        return f"({child_sqls[0]} = {child_sqls[1]})"
-    if isinstance(node, NotEq):
-        return f"({child_sqls[0]} != {child_sqls[1]})"
-    if isinstance(node, Gt):
-        return f"({child_sqls[0]} > {child_sqls[1]})"
-    if isinstance(node, GtEq):
-        return f"({child_sqls[0]} >= {child_sqls[1]})"
-    if isinstance(node, Lt):
-        return f"({child_sqls[0]} < {child_sqls[1]})"
-    if isinstance(node, LtEq):
-        return f"({child_sqls[0]} <= {child_sqls[1]})"
+    binary_formatter = _BINARY_SQL_FORMATTERS.get(type(node))
+    if binary_formatter is not None:
+        return binary_formatter(child_sqls[0], child_sqls[1])  # type: ignore[arg-type]
 
-    # Unary boolean / numeric functions
-    if isinstance(node, Not):
-        return f"(NOT {child_sqls[0]})"
-    if isinstance(node, IsNull):
-        return f"({child_sqls[0]} IS NULL)"
-    if isinstance(node, IsNotNull):
-        return f"({child_sqls[0]} IS NOT NULL)"
-    if isinstance(node, IsNan):
-        return f"IS_NAN({child_sqls[0]})"
-    if isinstance(node, IsNotNan):
-        return f"(NOT IS_NAN({child_sqls[0]}))"
-    if isinstance(node, IsInfinite):
-        return f"IS_INF({child_sqls[0]})"
-    if isinstance(node, IsFinite):
-        return f"(NOT IS_INF({child_sqls[0]}) AND NOT IS_NAN({child_sqls[0]}))"
-
-    # String binary functions
-    if isinstance(node, StartsWith):
-        return f"STARTS_WITH({child_sqls[0]}, {child_sqls[1]})"
-    if isinstance(node, EndsWith):
-        return f"ENDS_WITH({child_sqls[0]}, {child_sqls[1]})"
+    unary_formatter = _UNARY_SQL_FORMATTERS.get(type(node))
+    if unary_formatter is not None:
+        return unary_formatter(child_sqls[0])  # type: ignore[arg-type]
 
     return None
 

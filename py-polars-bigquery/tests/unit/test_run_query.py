@@ -150,11 +150,13 @@ def test_run_query_requires_user_agent():
 
 
 def test_run_query_refreshes_token_during_polling_and_generates_job_id():
-    tokens = iter([
-        ({"bearer_token": "initial-token"}, 12345),
-        ({"bearer_token": "refreshed-token-1"}, 12346),
-        ({"bearer_token": "refreshed-token-2"}, 12347),
-    ])
+    tokens = iter(
+        [
+            ({"bearer_token": "initial-token"}, 12345),
+            ({"bearer_token": "refreshed-token-1"}, 12346),
+            ({"bearer_token": "refreshed-token-2"}, 12347),
+        ]
+    )
     mock_cp = MagicMock(side_effect=lambda: next(tokens))
 
     with (
@@ -220,7 +222,9 @@ def test_create_resilient_session_configures_retries_and_pooling():
 def test_raise_for_bigquery_error_extracts_structured_json_message():
     resp = MagicMock()
     resp.raise_for_status.side_effect = requests.exceptions.HTTPError("400 Bad Request")
-    resp.json.return_value = {"error": {"message": "Table not found: my_dataset.my_table"}}
+    resp.json.return_value = {
+        "error": {"message": "Table not found: my_dataset.my_table"}
+    }
 
     with pytest.raises(BigQueryError, match="Table not found: my_dataset.my_table"):
         _raise_for_bigquery_error(resp)
@@ -240,7 +244,8 @@ def test_wait_for_job_timeout_raises_bigquery_error():
     with (
         patch("time.monotonic", side_effect=[0.0, 100.0]),
         pytest.raises(
-            BigQueryError, match="Timed out waiting for BigQuery job job-123 after 50.0s"
+            BigQueryError,
+            match="Timed out waiting for BigQuery job job-123 after 50.0s",
         ),
     ):
         _wait_for_job(
@@ -308,3 +313,68 @@ def test_run_query_propagates_regional_location():
     # Verify location query parameter was appended to jobs.get URL
     called_get_url = mock_session.get.call_args_list[0].args[0]
     assert "location=europe-west1" in called_get_url
+
+
+def test_request_with_retry_retries_http_403_rate_limit_exceeded():
+    from polars_bigquery.core.bigquery_rest import _request_with_retry
+
+    resp_403 = MagicMock()
+    resp_403.status_code = 403
+    resp_403.json.return_value = {
+        "error": {
+            "code": 403,
+            "errors": [{"reason": "rateLimitExceeded"}],
+            "message": "Rate limit exceeded",
+        }
+    }
+
+    resp_200 = MagicMock()
+    resp_200.status_code = 200
+
+    mock_fn = MagicMock(side_effect=[resp_403, resp_200])
+
+    with patch("time.sleep") as mock_sleep:
+        result = _request_with_retry(mock_fn, "https://example.com")
+        assert result is resp_200
+        assert mock_fn.call_count == 2
+        mock_sleep.assert_called_once()
+
+
+def test_run_query_skips_wait_when_insert_returns_done():
+    mock_cp = MagicMock(return_value=({"bearer_token": "tok"}, 123))
+    mock_session = MagicMock()
+
+    mock_insert_resp = MagicMock()
+    mock_insert_resp.json.return_value = {
+        "jobReference": {"jobId": "job-fast"},
+        "status": {"state": "DONE"},
+        "configuration": {
+            "query": {
+                "destinationTable": {"projectId": "p", "datasetId": "d", "tableId": "t"}
+            }
+        },
+    }
+    mock_session.post.return_value = mock_insert_resp
+
+    dest = run_query(
+        "SELECT 1",
+        quota_project_id="q",
+        credentials_provider=mock_cp,
+        user_agent="ua",
+        session=mock_session,
+    )
+    assert dest == "p.d.t"
+    mock_session.get.assert_not_called()
+
+
+def test_bigquery_rest_client_context_manager_closes_session():
+    mock_cp = MagicMock(return_value=({"bearer_token": "tok"}, 123))
+    client = BigQueryRestClient(
+        quota_project_id="q",
+        credentials_provider=mock_cp,
+        user_agent="ua",
+    )
+    with patch.object(client.session, "close") as mock_close:
+        with client:
+            pass
+        mock_close.assert_called_once()

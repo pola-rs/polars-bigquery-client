@@ -430,3 +430,54 @@ def test_predicate_to_row_restriction_root_recursion_error_fallback(
 
     monkeypatch.setattr(predicates, "_json_expr_to_row_restriction", raise_recursion)
     assert predicates.predicate_to_row_restriction(pl.col("a") == 1) == ""
+
+
+def test_escape_sql_string_tabs_and_null_bytes() -> None:
+    assert predicates._escape_sql_string("a\tb\0c") == "'a\\tb\\x00c'"
+
+
+def test_json_to_ir_prunes_unsupported_subtrees() -> None:
+    unsupported_json = {
+        "BinaryExpr": {
+            "left": {"Column": "a"},
+            "op": "Plus",
+            "right": {"Column": "b"},
+        }
+    }
+    ir_node = predicates.json_to_ir(unsupported_json)
+    assert isinstance(ir_node, predicates.ir.Unsupported)
+    assert ir_node.children() == ()
+
+
+def test_compile_predicate_compound_pseudo_column_and_physical_column() -> None:
+    from datetime import date
+
+    expr = (pl.col("_PARTITIONDATE") == date(2024, 1, 1)) & (pl.col("val").sin() > 0.5)
+    compiled = predicates.compile_predicate(
+        expr, pseudo_columns=("_PARTITIONDATE", "_PARTITIONTIME")
+    )
+    assert (
+        compiled.row_restriction
+        == "(`_PARTITIONDATE` = DATE(TIMESTAMP_SECONDS(19723 * 86400)))"
+    )
+    assert compiled.residual_predicate is not None
+    df = pl.DataFrame({"val": [0.0, 1.0]})
+    filtered = df.filter(compiled.residual_predicate)
+    assert filtered["val"].to_list() == [1.0]
+
+
+def test_compile_predicate_unpushable_pseudo_column_raises_bigquery_error() -> None:
+    from datetime import date
+
+    import polars_bigquery.exceptions
+
+    expr_or = (pl.col("_PARTITIONDATE") == date(2024, 1, 1)) | (
+        pl.col("val").sin() > 0.5
+    )
+    with pytest.raises(
+        polars_bigquery.exceptions.BigQueryError,
+        match="Predicate referencing BigQuery pseudo-column",
+    ):
+        predicates.compile_predicate(
+            expr_or, pseudo_columns=("_PARTITIONDATE", "_PARTITIONTIME")
+        )
