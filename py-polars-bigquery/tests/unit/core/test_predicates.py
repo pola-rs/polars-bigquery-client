@@ -116,13 +116,24 @@ def test_japanese_and_multilingual_column_names() -> None:
     )
 
     # Test individual identifiers across Japanese and other languages with diacritics/marks
-    assert predicates._column_to_sql_identifier("ユーザー名") == "`ユーザー名`"  # Katakana + Kanji
+    assert (
+        predicates._column_to_sql_identifier("ユーザー名") == "`ユーザー名`"
+    )  # Katakana + Kanji
     assert predicates._column_to_sql_identifier("なまえ") == "`なまえ`"  # Hiragana
-    assert predicates._column_to_sql_identifier("顧客コード_テスト#1") == "`顧客コード_テスト#1`"
+    assert (
+        predicates._column_to_sql_identifier("顧客コード_テスト#1")
+        == "`顧客コード_テスト#1`"
+    )
     assert predicates._column_to_sql_identifier("注文-番号:2026") == "`注文-番号:2026`"
-    assert predicates._column_to_sql_identifier("café_au_lait") == "`café_au_lait`"  # French (\p{M})
-    assert predicates._column_to_sql_identifier("Größe_in_cm") == "`Größe_in_cm`"  # German (\p{M})
-    assert predicates._column_to_sql_identifier("año_fiscal") == "`año_fiscal`"  # Spanish (\p{M})
+    assert (
+        predicates._column_to_sql_identifier("café_au_lait") == "`café_au_lait`"
+    )  # French (\p{M})
+    assert (
+        predicates._column_to_sql_identifier("Größe_in_cm") == "`Größe_in_cm`"
+    )  # German (\p{M})
+    assert (
+        predicates._column_to_sql_identifier("año_fiscal") == "`año_fiscal`"
+    )  # Spanish (\p{M})
 
 
 def test_unsupported_column_names_raise_value_error() -> None:
@@ -148,12 +159,10 @@ def test_nan_and_inf_floats_cast_to_float64() -> None:
 
     # When JSON literals contain nan, inf, and -inf, they are correctly cast to FLOAT64
     assert (
-        predicates._json_literal_to_sql({"Float64": "nan"})
-        == "CAST('nan' AS FLOAT64)"
+        predicates._json_literal_to_sql({"Float64": "nan"}) == "CAST('nan' AS FLOAT64)"
     )
     assert (
-        predicates._json_literal_to_sql({"Float64": "inf"})
-        == "CAST('inf' AS FLOAT64)"
+        predicates._json_literal_to_sql({"Float64": "inf"}) == "CAST('inf' AS FLOAT64)"
     )
     assert (
         predicates._json_literal_to_sql({"Float64": "-inf"})
@@ -208,7 +217,9 @@ def test_escape_sql_and_column_identifier_helpers() -> None:
     assert not predicates._is_valid_column_character("\n")
 
     assert predicates._column_to_sql_identifier("valid_col_1") == "`valid_col_1`"
-    assert predicates._column_to_sql_identifier("café & tea: 100%") == "`café & tea: 100%`"
+    assert (
+        predicates._column_to_sql_identifier("café & tea: 100%") == "`café & tea: 100%`"
+    )
     with pytest.raises(ValueError, match="Invalid BigQuery column name"):
         predicates._column_to_sql_identifier("bad`col")
     with pytest.raises(ValueError, match="Invalid BigQuery column name"):
@@ -318,39 +329,208 @@ def test_json_literal_to_sql_all_scalar_types_and_immutability() -> None:
     assert predicates._json_literal_to_sql({"DateTime": [5555, "Nanoseconds"]}) is None
     assert predicates._json_literal_to_sql({"DateTime": [10, "Seconds"]}) is None
 
-
     # Malformed literal values catch ValueError/TypeError locally and return None
     assert predicates._json_literal_to_sql({"Int64": "not-an-int"}) is None
     assert predicates._json_literal_to_sql({"Float64": "not-a-float"}) is None
-    assert predicates._json_literal_to_sql({"DateTime": ["not-an-int", "Microseconds"]}) is None
+    assert (
+        predicates._json_literal_to_sql({"DateTime": ["not-an-int", "Microseconds"]})
+        is None
+    )
     assert predicates._json_literal_to_sql({"DateTime": []}) is None
     assert predicates._json_literal_to_sql({"Date": "not-a-date"}) is None
 
 
-def test_and_expression_preserves_valid_branch_on_recursion_error(monkeypatch) -> None:
-    orig_fn = predicates._json_expr_to_row_restriction
-
-    def selective_recursion(expr_json):
-        if (
-            isinstance(expr_json, dict)
-            and expr_json.get("BinaryExpr", {}).get("left", {}).get("Column")
-            == "deep_col"
-        ):
-            raise RecursionError("Deep branch exceeded recursion limit")
-        return orig_fn(expr_json)
-
-    monkeypatch.setattr(
-        predicates, "_json_expr_to_row_restriction", selective_recursion
-    )
-    expr = (pl.col("keep_col") == 1) & (pl.col("deep_col") == 2)
+def test_and_expression_preserves_valid_branch_with_unsupported_branch() -> None:
+    expr = (pl.col("keep_col") == 1) & (pl.col("other_col").sin() > 0.5)
     assert predicates.predicate_to_row_restriction(expr) == "(`keep_col` = 1)"
 
 
-def test_predicate_to_row_restriction_root_recursion_error_fallback(monkeypatch) -> None:
+def test_deep_expression_avoids_stack_overflow() -> None:
+    # Build a deeply nested JSON expression tree (depth > 2500, well above Python's default
+    # recursion limit of 1000) to verify that json_to_ir and ir_to_sql walk trees
+    # breadth-first using a queue without hitting RecursionError.
+    leaf: dict[str, object] = {
+        "BinaryExpr": {
+            "left": {"Column": "x"},
+            "op": "Eq",
+            "right": {"Literal": {"Int64": 0}},
+        }
+    }
+    curr = leaf
+    depth = 2500
+    for i in range(1, depth):
+        right_leaf = {
+            "BinaryExpr": {
+                "left": {"Column": "x"},
+                "op": "Eq",
+                "right": {"Literal": {"Int64": i}},
+            }
+        }
+        curr = {
+            "BinaryExpr": {
+                "left": curr,
+                "op": "And",
+                "right": right_leaf,
+            }
+        }
+
+    ir_tree = predicates.json_to_ir(curr)
+    assert isinstance(ir_tree, predicates.ir.And)
+
+    sql_result = predicates.ir_to_sql(ir_tree)
+    assert sql_result is not None
+    assert sql_result.startswith("(" * depth + "`x` = 0)")
+    assert sql_result.endswith(f"AND (`x` = {depth - 1}))")
+
+
+def test_ir_frozen_dataclasses_and_submodules() -> None:
+    from dataclasses import FrozenInstanceError
+
+    col_a = predicates.ir.base.Column("a")
+    lit_10 = predicates.ir.numeric.IntLiteral(10)
+    eq_node = predicates.ir.comparison.Eq(left=col_a, right=lit_10)
+
+    # Verify frozen dataclass immutability
+    with pytest.raises(FrozenInstanceError):
+        col_a.name = "b"  # type: ignore[misc]
+    with pytest.raises(FrozenInstanceError):
+        eq_node.left = col_a  # type: ignore[misc]
+
+    # Verify submodule organization and direct IR -> SQL compilation
+    str_starts = predicates.ir.string.StartsWith(
+        left=predicates.ir.base.Column("name"),
+        right=predicates.ir.string.StringLiteral("pre"),
+    )
+    assert str_starts.expr == predicates.ir.base.Column("name")
+    assert str_starts.prefix == predicates.ir.string.StringLiteral("pre")
+
+    date_cmp = predicates.ir.comparison.GtEq(
+        left=predicates.ir.base.Column("dt"),
+        right=predicates.ir.temporal.DateLiteral(days=10),
+    )
+    not_nan = predicates.ir.numeric.IsNotNan(expr=predicates.ir.base.Column("score"))
+
+    combined = predicates.ir.boolean.And(
+        left=predicates.ir.boolean.Or(left=eq_node, right=str_starts),
+        right=predicates.ir.boolean.And(left=date_cmp, right=not_nan),
+    )
+
+    expected_sql = (
+        "(((`a` = 10) OR STARTS_WITH(`name`, 'pre')) AND "
+        "((`dt` >= DATE(TIMESTAMP_SECONDS(10 * 86400))) AND (NOT IS_NAN(`score`))))"
+    )
+    assert predicates.ir_to_sql(combined) == expected_sql
+
+
+def test_predicate_to_row_restriction_root_recursion_error_fallback(
+    monkeypatch,
+) -> None:
     def raise_recursion(_expr_json):
         raise RecursionError("Maximum recursion depth exceeded")
 
-    monkeypatch.setattr(
-        predicates, "_json_expr_to_row_restriction", raise_recursion
-    )
+    monkeypatch.setattr(predicates, "_json_expr_to_row_restriction", raise_recursion)
     assert predicates.predicate_to_row_restriction(pl.col("a") == 1) == ""
+
+
+def test_escape_sql_string_tabs_and_null_bytes() -> None:
+    assert predicates._escape_sql_string("a\tb\0c") == "'a\\tb\\x00c'"
+
+
+def test_json_to_ir_prunes_unsupported_subtrees() -> None:
+    unsupported_json = {
+        "BinaryExpr": {
+            "left": {"Column": "a"},
+            "op": "Plus",
+            "right": {"Column": "b"},
+        }
+    }
+    ir_node = predicates.json_to_ir(unsupported_json)
+    assert isinstance(ir_node, predicates.ir.Unsupported)
+    assert ir_node.children() == ()
+
+
+def test_compile_predicate_compound_pseudo_column_and_physical_column() -> None:
+    from datetime import date
+
+    expr = (pl.col("_PARTITIONDATE") == date(2024, 1, 1)) & (pl.col("val").sin() > 0.5)
+    compiled = predicates.compile_predicate(
+        expr, pseudo_columns=("_PARTITIONDATE", "_PARTITIONTIME")
+    )
+    assert (
+        compiled.row_restriction
+        == "(`_PARTITIONDATE` = DATE(TIMESTAMP_SECONDS(19723 * 86400)))"
+    )
+    assert compiled.residual_predicate is not None
+    df = pl.DataFrame({"val": [0.0, 1.0]})
+    filtered = df.filter(compiled.residual_predicate)
+    assert filtered["val"].to_list() == [1.0]
+
+
+def test_compile_predicate_unpushable_pseudo_column_raises_bigquery_error() -> None:
+    from datetime import date
+
+    import polars_bigquery.exceptions
+
+    expr_or = (pl.col("_PARTITIONDATE") == date(2024, 1, 1)) | (
+        pl.col("val").sin() > 0.5
+    )
+    with pytest.raises(
+        polars_bigquery.exceptions.BigQueryError,
+        match="Predicate referencing BigQuery pseudo-column",
+    ):
+        predicates.compile_predicate(
+            expr_or, pseudo_columns=("_PARTITIONDATE", "_PARTITIONTIME")
+        )
+
+
+def test_negation_over_partial_and_does_not_drop_data() -> None:
+    # ~((a == 1) & (sin(b) > 0.5)) must NOT relax to NOT (a = 1), which would
+    # drop rows where a == 1 and sin(b) <= 0.5.
+    expr = ~((pl.col("a") == 1) & (pl.col("b").sin() > 0.5))
+    assert predicates.predicate_to_row_restriction(expr) == ""
+
+    # Negation over 100% exact AND is safe to push down
+    exact_expr = ~((pl.col("a") == 1) & (pl.col("b") == 2))
+    assert (
+        predicates.predicate_to_row_restriction(exact_expr)
+        == "(NOT ((`a` = 1) AND (`b` = 2)))"
+    )
+
+    # Positive monotone OR over partial AND safely relaxes to superset ((a = 1) OR (c = 3))
+    or_expr = ((pl.col("a") == 1) & (pl.col("b").sin() > 0.5)) | (pl.col("c") == 3)
+    assert (
+        predicates.predicate_to_row_restriction(or_expr) == "((`a` = 1) OR (`c` = 3))"
+    )
+
+    # Negation over that OR must NOT push down because its child is a relaxed superset
+    neg_or_expr = ~or_expr
+    assert predicates.predicate_to_row_restriction(neg_or_expr) == ""
+
+
+def test_bare_null_literal_comparison_not_pushed_down() -> None:
+    expr = pl.col("a") == pl.lit(None)
+    assert predicates.predicate_to_row_restriction(expr) == ""
+
+
+def test_datetime_naive_vs_timezone_aware_pushdown() -> None:
+    from datetime import datetime, timezone
+
+    # Timezone-aware datetime -> BigQuery TIMESTAMP
+    ts_expr = pl.col("_PARTITIONTIME") == datetime(
+        2024, 1, 1, 12, 0, tzinfo=timezone.utc
+    )
+    compiled_ts = predicates.compile_predicate(
+        ts_expr, pseudo_columns=("_PARTITIONDATE", "_PARTITIONTIME")
+    )
+    assert (
+        compiled_ts.row_restriction
+        == "(`_PARTITIONTIME` = TIMESTAMP_MICROS(1704110400000000))"
+    )
+    assert compiled_ts.referenced_columns == ()
+
+    # Timezone-naive datetime -> BigQuery DATETIME
+    dt_expr = pl.col("created_dt") == datetime(2024, 1, 1, 12, 0)  # noqa: DTZ001
+    assert (
+        predicates.predicate_to_row_restriction(dt_expr)
+        == "(`created_dt` = DATETIME(TIMESTAMP_MICROS(1704110400000000)))"
+    )

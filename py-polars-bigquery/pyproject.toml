@@ -16,12 +16,11 @@ dependencies = [
     "google-auth >= 2.40.3",
     "polars >= 1.43.0, < 3.0.0",
     "requests >= 2.33.0, < 3.0.0",
-    "cachetools >= 5.0.0",
 ]
 
 [tool.setuptools.packages.find]
 where = ["./"]
-include = ["polars_bigquery"]
+include = ["polars_bigquery*"]
 
 [tool.uv.sources]
 arrow-bigquery = { workspace = true }

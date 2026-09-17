@@ -677,7 +677,6 @@ version = "0.1.0"
 source = { editable = "py-polars-bigquery" }
 dependencies = [
     { name = "arrow-bigquery" },
-    { name = "cachetools" },
     { name = "google-auth" },
     { name = "polars" },
     { name = "requests" },
@@ -701,7 +700,6 @@ test = [
 [package.metadata]
 requires-dist = [
     { name = "arrow-bigquery", editable = "py-arrow-bigquery" },
-    { name = "cachetools", specifier = ">=5.0.0" },
     { name = "google-auth", specifier = ">=2.40.3" },
     { name = "polars", specifier = ">=1.43.0,<3.0.0" },
     { name = "requests", specifier = ">=2.33.0,<3.0.0" },
