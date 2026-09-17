@@ -481,3 +481,56 @@ def test_compile_predicate_unpushable_pseudo_column_raises_bigquery_error() -> N
         predicates.compile_predicate(
             expr_or, pseudo_columns=("_PARTITIONDATE", "_PARTITIONTIME")
         )
+
+
+def test_negation_over_partial_and_does_not_drop_data() -> None:
+    # ~((a == 1) & (sin(b) > 0.5)) must NOT relax to NOT (a = 1), which would
+    # drop rows where a == 1 and sin(b) <= 0.5.
+    expr = ~((pl.col("a") == 1) & (pl.col("b").sin() > 0.5))
+    assert predicates.predicate_to_row_restriction(expr) == ""
+
+    # Negation over 100% exact AND is safe to push down
+    exact_expr = ~((pl.col("a") == 1) & (pl.col("b") == 2))
+    assert (
+        predicates.predicate_to_row_restriction(exact_expr)
+        == "(NOT ((`a` = 1) AND (`b` = 2)))"
+    )
+
+    # Positive monotone OR over partial AND safely relaxes to superset ((a = 1) OR (c = 3))
+    or_expr = ((pl.col("a") == 1) & (pl.col("b").sin() > 0.5)) | (pl.col("c") == 3)
+    assert (
+        predicates.predicate_to_row_restriction(or_expr) == "((`a` = 1) OR (`c` = 3))"
+    )
+
+    # Negation over that OR must NOT push down because its child is a relaxed superset
+    neg_or_expr = ~or_expr
+    assert predicates.predicate_to_row_restriction(neg_or_expr) == ""
+
+
+def test_bare_null_literal_comparison_not_pushed_down() -> None:
+    expr = pl.col("a") == pl.lit(None)
+    assert predicates.predicate_to_row_restriction(expr) == ""
+
+
+def test_datetime_naive_vs_timezone_aware_pushdown() -> None:
+    from datetime import datetime, timezone
+
+    # Timezone-aware datetime -> BigQuery TIMESTAMP
+    ts_expr = pl.col("_PARTITIONTIME") == datetime(
+        2024, 1, 1, 12, 0, tzinfo=timezone.utc
+    )
+    compiled_ts = predicates.compile_predicate(
+        ts_expr, pseudo_columns=("_PARTITIONDATE", "_PARTITIONTIME")
+    )
+    assert (
+        compiled_ts.row_restriction
+        == "(`_PARTITIONTIME` = TIMESTAMP_MICROS(1704110400000000))"
+    )
+    assert compiled_ts.referenced_columns == ()
+
+    # Timezone-naive datetime -> BigQuery DATETIME
+    dt_expr = pl.col("created_dt") == datetime(2024, 1, 1, 12, 0)  # noqa: DTZ001
+    assert (
+        predicates.predicate_to_row_restriction(dt_expr)
+        == "(`created_dt` = DATETIME(TIMESTAMP_MICROS(1704110400000000)))"
+    )

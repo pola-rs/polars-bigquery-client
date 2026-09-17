@@ -96,6 +96,22 @@ def _split_and_conjuncts_json(expr_json: dict[str, Any]) -> list[dict[str, Any]]
     return conjuncts
 
 
+def _extract_json_columns(expr_json: Any) -> set[str]:
+    """Extract all column names referenced in a Polars serialized expression JSON dict."""
+    cols: set[str] = set()
+    stack = [expr_json]
+    while stack:
+        curr = stack.pop()
+        if isinstance(curr, dict):
+            if "Column" in curr and isinstance(curr["Column"], str):
+                cols.add(curr["Column"])
+            else:
+                stack.extend(curr.values())
+        elif isinstance(curr, list):
+            stack.extend(curr)
+    return cols
+
+
 def _json_expr_to_row_restriction(expr_json: dict[str, Any]) -> str | None:
     """Compile a Polars expression JSON dict into a BigQuery SQL row restriction.
 
@@ -155,18 +171,15 @@ def compile_predicate(
     conjunct_jsons = _split_and_conjuncts_json(predicate_json)
     sql_conjuncts: list[str] = []
     residual_exprs: list[pl.Expr] = []
+    residual_cols: set[str] = set()
 
     for c_json in conjunct_jsons:
-        c_expr = pl.Expr.deserialize(
-            io.BytesIO(json.dumps(c_json).encode()), format="json"
-        )
-        c_cols = set(c_expr.meta.root_names())
+        c_cols = _extract_json_columns(c_json)
         c_ir = json_to_ir(c_json)
-        c_sql = ir_to_sql(c_ir)
-        is_exact = _is_ir_exact(c_ir) and c_sql is not None
+        c_sql, is_exact = sql._compile_ir_to_sql(c_ir)
 
         if not c_cols.isdisjoint(pseudo_columns):
-            if not is_exact:
+            if not is_exact or c_sql is None:
                 bad_cols = sorted(c_cols.intersection(pseudo_columns))
                 msg = (
                     f"Predicate referencing BigQuery pseudo-column(s) {bad_cols} "
@@ -175,12 +188,15 @@ def compile_predicate(
                     "synthesized as NULL."
                 )
                 raise polars_bigquery.exceptions.BigQueryError(msg)
-            if c_sql is not None:
-                sql_conjuncts.append(c_sql)
+            sql_conjuncts.append(c_sql)
         else:
             if c_sql is not None:
                 sql_conjuncts.append(c_sql)
+            c_expr = pl.Expr.deserialize(
+                io.BytesIO(json.dumps(c_json).encode()), format="json"
+            )
             residual_exprs.append(c_expr)
+            residual_cols.update(c_cols)
 
     if not sql_conjuncts:
         row_restriction = ""
@@ -194,9 +210,10 @@ def compile_predicate(
     residual_predicate = (
         functools.reduce(operator.and_, residual_exprs) if residual_exprs else None
     )
+    referenced_columns = tuple(col for col in root_names if col in residual_cols)
 
     return CompiledPredicate(
         row_restriction=row_restriction,
         residual_predicate=residual_predicate,
-        referenced_columns=root_names,
+        referenced_columns=referenced_columns,
     )

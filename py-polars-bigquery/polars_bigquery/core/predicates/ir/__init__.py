@@ -125,7 +125,7 @@ def _json_literal_to_ir(literal_json: Any) -> Expr:
 
     polars_type, value = next(iter(curr.items()))
 
-    if polars_type == "DateTime":
+    if polars_type in ("Datetime", "DateTime"):
         return parse_datetime_literal(value)
     if polars_type == "Date":
         return parse_date_literal(value)

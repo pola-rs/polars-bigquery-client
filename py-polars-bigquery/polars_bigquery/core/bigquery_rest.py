@@ -57,7 +57,11 @@ def create_resilient_session() -> requests.Session:
 def _is_rate_limit_error(response: requests.Response) -> bool:
     """Check if an HTTP error response represents a retryable BigQuery rate limit."""
     if response.status_code == 429:
-        return True
+        raw = getattr(response, "raw", None)
+        retries = getattr(raw, "retries", None)
+        history = getattr(retries, "history", None)
+        # If urllib3 already exhausted its retry budget for this 429 response, do not retry again.
+        return not (isinstance(history, (tuple, list)) and len(history) > 0)
     if response.status_code == 403:
         with contextlib.suppress(ValueError, KeyError, TypeError):
             err_json = response.json()
@@ -85,7 +89,10 @@ def _request_with_retry(
     """Execute an HTTP request with exponential backoff and jitter for BigQuery rate limits."""
     attempt = 0
     while True:
-        response = request_fn(*args, **kwargs)
+        try:
+            response = request_fn(*args, **kwargs)
+        except requests.exceptions.RequestException as exc:
+            raise polars_bigquery.exceptions.BigQueryError(str(exc)) from exc
         if not _is_rate_limit_error(response) or attempt >= max_retries:
             return response
         attempt += 1
@@ -106,6 +113,36 @@ def _raise_for_bigquery_error(response: requests.Response) -> None:
                 if isinstance(err_obj, dict) and "message" in err_obj:
                     message = err_obj["message"]
         raise polars_bigquery.exceptions.BigQueryError(message) from exc
+
+
+def _parse_json_response(response: requests.Response) -> dict[str, Any]:
+    """Safely parse a JSON dict response from the BigQuery API."""
+    try:
+        data = response.json()
+    except (ValueError, TypeError) as exc:
+        raise polars_bigquery.exceptions.BigQueryError(
+            "Invalid JSON response from BigQuery API"
+        ) from exc
+    if not isinstance(data, dict):
+        raise polars_bigquery.exceptions.BigQueryError(
+            "Expected JSON object from BigQuery API"
+        )
+    return data
+
+
+def _extract_destination_table(job: dict[str, Any]) -> str:
+    """Extract destination table reference from a completed job resource."""
+    dest = job.get("configuration", {}).get("query", {}).get("destinationTable")
+    if (
+        not isinstance(dest, dict)
+        or not isinstance(dest.get("projectId"), str)
+        or not isinstance(dest.get("datasetId"), str)
+        or not isinstance(dest.get("tableId"), str)
+    ):
+        raise polars_bigquery.exceptions.BigQueryError(
+            "BigQuery query job completed without a destination table."
+        )
+    return f"{dest['projectId']}.{dest['datasetId']}.{dest['tableId']}"
 
 
 def _get_table_metadata_url(
@@ -189,12 +226,13 @@ def _wait_for_job(
             timeout=timeout,
         )
         _raise_for_bigquery_error(response)
-        job = response.json()
+        job = _parse_json_response(response)
 
-        if job["status"]["state"] == "DONE":
-            if "errorResult" in job["status"]:
+        status = job.get("status")
+        if isinstance(status, dict) and status.get("state") == "DONE":
+            if "errorResult" in status and isinstance(status["errorResult"], dict):
                 raise polars_bigquery.exceptions.BigQueryError(
-                    job["status"]["errorResult"]["message"]
+                    status["errorResult"].get("message", "BigQuery job failed")
                 )
             return job
 
@@ -207,14 +245,13 @@ def _wait_for_job(
             timeout=timeout,
         )
         _raise_for_bigquery_error(poll_response)
-        poll_data = poll_response.json()
-        if isinstance(poll_data, dict) and poll_data.get("jobComplete") is True:
-            if poll_data.get("errors"):
-                err_msg = poll_data["errors"][0].get("message", "BigQuery job failed")
+        poll_data = _parse_json_response(poll_response)
+        if poll_data.get("jobComplete") is True:
+            errors = poll_data.get("errors")
+            if isinstance(errors, list) and errors and isinstance(errors[0], dict):
+                err_msg = errors[0].get("message", "BigQuery job failed")
                 raise polars_bigquery.exceptions.BigQueryError(err_msg)
-            if isinstance(job, dict) and "destinationTable" in job.get(
-                "configuration", {}
-            ).get("query", {}):
+            if "destinationTable" in job.get("configuration", {}).get("query", {}):
                 return job
 
         # Avoid busy-spinning if the polling endpoint returns without blocking
@@ -259,29 +296,32 @@ def run_query(
     # 1. Insert the job
     insert_url = _get_jobs_insert_url(quota_project_id)
     body = _get_jobs_insert_body(query, quota_project_id)
+    job_id = body["jobReference"]["jobId"]
     response = _request_with_retry(
         http.post, insert_url, headers=headers, json=body, timeout=timeout
     )
-    _raise_for_bigquery_error(response)
-    job_resource = response.json()
+    if response.status_code == 409:
+        # Job already exists from an earlier retry attempt; proceed to wait for completion.
+        location = None
+    else:
+        _raise_for_bigquery_error(response)
+        job_resource = _parse_json_response(response)
 
-    status = job_resource.get("status", {})
-    if status.get("state") == "DONE":
-        if "errorResult" in status:
-            raise polars_bigquery.exceptions.BigQueryError(
-                status["errorResult"]["message"]
-            )
-        dest = (
-            job_resource.get("configuration", {})
-            .get("query", {})
-            .get("destinationTable")
-        )
-        if dest is not None:
-            return f"{dest['projectId']}.{dest['datasetId']}.{dest['tableId']}"
+        status = job_resource.get("status")
+        if isinstance(status, dict) and status.get("state") == "DONE":
+            if "errorResult" in status and isinstance(status["errorResult"], dict):
+                raise polars_bigquery.exceptions.BigQueryError(
+                    status["errorResult"].get("message", "BigQuery job failed")
+                )
+            return _extract_destination_table(job_resource)
 
-    job_ref = job_resource.get("jobReference", {})
-    job_id = job_ref["jobId"]
-    location = job_ref.get("location")
+        job_ref = job_resource.get("jobReference")
+        if isinstance(job_ref, dict):
+            if isinstance(job_ref.get("jobId"), str):
+                job_id = job_ref["jobId"]
+            location = job_ref.get("location")
+        else:
+            location = None
 
     # 2. Wait for the job to complete (refreshing credentials on each poll)
     job = _wait_for_job(
@@ -295,8 +335,7 @@ def run_query(
     )
 
     # 3. Return the destination table ID
-    dest = job["configuration"]["query"]["destinationTable"]
-    return f"{dest['projectId']}.{dest['datasetId']}.{dest['tableId']}"
+    return _extract_destination_table(job)
 
 
 def get_table_metadata(
@@ -319,7 +358,7 @@ def get_table_metadata(
         http.get, table_metadata_url, headers=headers, timeout=timeout
     )
     _raise_for_bigquery_error(response)
-    return response.json()
+    return _parse_json_response(response)
 
 
 class BigQueryRestClient:
