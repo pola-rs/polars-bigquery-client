@@ -3,7 +3,7 @@ from __future__ import annotations
 import functools
 import math
 import unicodedata
-from collections import deque
+import collections
 
 from polars_bigquery.core.predicates.ir import (
     And,
@@ -350,7 +350,7 @@ def _compile_ir_to_sql(root: Expr) -> tuple[str | None, bool]:
     """
     nodes: list[Expr] = [root]
     children_map: list[tuple[int, ...]] = [()]
-    queue: deque[int] = deque([0])
+    queue: collections.deque[int] = collections.deque([0])
 
     while queue:
         curr_idx = queue.popleft()

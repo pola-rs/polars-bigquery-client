@@ -4,7 +4,7 @@ import functools
 import io
 import json
 import operator
-from collections import deque
+import collections
 import dataclasses
 from typing import Any
 
@@ -64,7 +64,7 @@ def _json_literal_to_sql(literal_json: dict[str, Any]) -> str | None:
 
 def _is_ir_exact(root: Expr) -> bool:
     """Return True if the IR tree contains no Unsupported nodes."""
-    queue: deque[Expr] = deque([root])
+    queue: collections.deque[Expr] = collections.deque([root])
     while queue:
         node = queue.popleft()
         if isinstance(node, Unsupported):
