@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import enum
-from dataclasses import dataclass
+import dataclasses
 from typing import Any
 
 from polars_bigquery.core.predicates.ir.base import Expr, Literal, Unsupported
@@ -14,14 +14,14 @@ class TimestampUnit(enum.Enum):
     MILLISECONDS = "Milliseconds"
 
 
-@dataclass(frozen=True)
+@dataclasses.dataclass(frozen=True)
 class DateLiteral(Literal):
     """IR node representing a date literal (days since UNIX epoch)."""
 
     days: int
 
 
-@dataclass(frozen=True)
+@dataclasses.dataclass(frozen=True)
 class TimestampLiteral(Literal):
     """IR node representing a timestamp or timezone-naive datetime literal."""
 

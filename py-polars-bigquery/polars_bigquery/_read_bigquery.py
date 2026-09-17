@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterator
-from dataclasses import dataclass
+import dataclasses
 from typing import Any
 
 import arrow_bigquery
@@ -25,7 +25,7 @@ def _get_user_agent(user_agent: str | None) -> str:
         return ua
 
 
-@dataclass(frozen=True)
+@dataclasses.dataclass(frozen=True)
 class ScanPlan:
     """Pure execution plan for a BigQuery table scan."""
 

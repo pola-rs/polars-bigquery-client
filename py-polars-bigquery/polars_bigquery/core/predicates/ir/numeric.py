@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+import dataclasses
 from typing import Any
 
 from polars_bigquery.core.predicates.ir.base import (
@@ -28,36 +28,36 @@ INT_TYPES = frozenset(
 FLOAT_TYPES = frozenset({"Float", "Float32", "Float64"})
 
 
-@dataclass(frozen=True)
+@dataclasses.dataclass(frozen=True)
 class IntLiteral(Literal):
     """IR node representing an integer literal."""
 
     value: int
 
 
-@dataclass(frozen=True)
+@dataclasses.dataclass(frozen=True)
 class FloatLiteral(Literal):
     """IR node representing a floating-point literal."""
 
     value: float
 
 
-@dataclass(frozen=True)
+@dataclasses.dataclass(frozen=True)
 class IsNan(UnaryExpr):
     """IR node representing an IS_NAN check on a numeric expression."""
 
 
-@dataclass(frozen=True)
+@dataclasses.dataclass(frozen=True)
 class IsNotNan(UnaryExpr):
     """IR node representing a NOT IS_NAN check on a numeric expression."""
 
 
-@dataclass(frozen=True)
+@dataclasses.dataclass(frozen=True)
 class IsInfinite(UnaryExpr):
     """IR node representing an IS_INF check on a numeric expression."""
 
 
-@dataclass(frozen=True)
+@dataclasses.dataclass(frozen=True)
 class IsFinite(UnaryExpr):
     """IR node representing a finite check (NOT IS_INF AND NOT IS_NAN) on a numeric expression."""
 

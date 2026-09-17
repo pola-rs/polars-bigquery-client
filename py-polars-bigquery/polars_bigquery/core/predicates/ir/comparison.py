@@ -1,36 +1,36 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+import dataclasses
 
 from polars_bigquery.core.predicates.ir.base import BinaryExpr
 
 
-@dataclass(frozen=True)
+@dataclasses.dataclass(frozen=True)
 class Eq(BinaryExpr):
     """IR node representing equality comparison (=)."""
 
 
-@dataclass(frozen=True)
+@dataclasses.dataclass(frozen=True)
 class NotEq(BinaryExpr):
     """IR node representing inequality comparison (!=)."""
 
 
-@dataclass(frozen=True)
+@dataclasses.dataclass(frozen=True)
 class Gt(BinaryExpr):
     """IR node representing greater-than comparison (>)."""
 
 
-@dataclass(frozen=True)
+@dataclasses.dataclass(frozen=True)
 class GtEq(BinaryExpr):
     """IR node representing greater-than-or-equal comparison (>=)."""
 
 
-@dataclass(frozen=True)
+@dataclasses.dataclass(frozen=True)
 class Lt(BinaryExpr):
     """IR node representing less-than comparison (<)."""
 
 
-@dataclass(frozen=True)
+@dataclasses.dataclass(frozen=True)
 class LtEq(BinaryExpr):
     """IR node representing less-than-or-equal comparison (<=)."""
 

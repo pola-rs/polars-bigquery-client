@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+import dataclasses
 from typing import Any
 
 from polars_bigquery.core.predicates.ir.base import BinaryExpr, Expr, Literal
@@ -8,14 +8,14 @@ from polars_bigquery.core.predicates.ir.base import BinaryExpr, Expr, Literal
 STRING_TYPES = frozenset({"String", "StringOwned"})
 
 
-@dataclass(frozen=True)
+@dataclasses.dataclass(frozen=True)
 class StringLiteral(Literal):
     """IR node representing a string literal."""
 
     value: str
 
 
-@dataclass(frozen=True)
+@dataclasses.dataclass(frozen=True)
 class StartsWith(BinaryExpr):
     """IR node representing a string STARTS_WITH check."""
 
@@ -28,7 +28,7 @@ class StartsWith(BinaryExpr):
         return self.right
 
 
-@dataclass(frozen=True)
+@dataclasses.dataclass(frozen=True)
 class EndsWith(BinaryExpr):
     """IR node representing a string ENDS_WITH check."""
 

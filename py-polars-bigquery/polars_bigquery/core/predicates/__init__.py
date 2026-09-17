@@ -5,7 +5,7 @@ import io
 import json
 import operator
 from collections import deque
-from dataclasses import dataclass
+import dataclasses
 from typing import Any
 
 import polars as pl
@@ -45,7 +45,7 @@ __all__ = [
 ]
 
 
-@dataclass(frozen=True)
+@dataclasses.dataclass(frozen=True)
 class CompiledPredicate:
     """Result of compiling a Polars predicate expression for BigQuery scan pushdown."""
 

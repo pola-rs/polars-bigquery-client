@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections import deque
+import collections
 from typing import Any
 
 from polars_bigquery.core.predicates.ir.base import (
@@ -159,7 +159,7 @@ def json_to_ir(expr_json: Any) -> Expr:
     """
     raw_nodes: list[Any] = [expr_json]
     records: list[tuple[str, Any, tuple[int, ...]]] = []
-    queue: deque[int] = deque([0])
+    queue: collections.deque[int] = collections.deque([0])
 
     while queue:
         curr_idx = queue.popleft()

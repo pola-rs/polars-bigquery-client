@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+import dataclasses
 
 
-@dataclass(frozen=True)
+@dataclasses.dataclass(frozen=True)
 class Expr:
     """Base class for all predicate Intermediate Representation (IR) nodes."""
 
@@ -12,7 +12,7 @@ class Expr:
         return ()
 
 
-@dataclass(frozen=True)
+@dataclasses.dataclass(frozen=True)
 class UnaryExpr(Expr):
     """Base class for unary operation IR nodes."""
 
@@ -22,7 +22,7 @@ class UnaryExpr(Expr):
         return (self.expr,)
 
 
-@dataclass(frozen=True)
+@dataclasses.dataclass(frozen=True)
 class BinaryExpr(Expr):
     """Base class for binary operation IR nodes."""
 
@@ -33,7 +33,7 @@ class BinaryExpr(Expr):
         return (self.left, self.right)
 
 
-@dataclass(frozen=True)
+@dataclasses.dataclass(frozen=True)
 class Unsupported(Expr):
     """IR node representing an unsupported or unknown expression."""
 
@@ -43,18 +43,18 @@ class Unsupported(Expr):
         return self.operands
 
 
-@dataclass(frozen=True)
+@dataclasses.dataclass(frozen=True)
 class Column(Expr):
     """IR node representing a column reference."""
 
     name: str
 
 
-@dataclass(frozen=True)
+@dataclasses.dataclass(frozen=True)
 class Literal(Expr):
     """Base class for literal IR nodes."""
 
 
-@dataclass(frozen=True)
+@dataclasses.dataclass(frozen=True)
 class NullLiteral(Literal):
     """IR node representing a NULL literal."""
