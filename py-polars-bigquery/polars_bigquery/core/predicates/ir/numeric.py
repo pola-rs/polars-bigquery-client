@@ -62,6 +62,8 @@ class IsFinite(UnaryExpr):
     """IR node representing a finite check (NOT IS_INF AND NOT IS_NAN) on a numeric expression."""
 
 
+# Keys represent Polars Rust AST `BooleanFunction` enum variant names emitted under
+# `{"Function": {"function": {"Boolean": "<key>"}}}` in serialized Polars JSON.
 NUMERIC_UNARY_FUNCTIONS: dict[str, type[UnaryExpr]] = {
     "IsNan": IsNan,
     "IsNotNan": IsNotNan,

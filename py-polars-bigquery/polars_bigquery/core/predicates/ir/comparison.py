@@ -35,6 +35,8 @@ class LtEq(BinaryExpr):
     """IR node representing less-than-or-equal comparison (<=)."""
 
 
+# Keys represent Polars Rust AST `Operator` enum variant names emitted under
+# `{"BinaryExpr": {"op": "<key>"}}` when serializing `pl.Expr.meta.serialize(format="json")`.
 COMPARISON_BINARY_OPS: dict[str, type[BinaryExpr]] = {
     "Eq": Eq,
     "NotEq": NotEq,

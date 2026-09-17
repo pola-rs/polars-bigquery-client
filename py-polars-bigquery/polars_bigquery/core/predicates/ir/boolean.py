@@ -37,11 +37,15 @@ class IsNotNull(UnaryExpr):
     """IR node representing an IS NOT NULL check."""
 
 
+# Keys represent Polars Rust AST `Operator` enum variant names emitted under
+# `{"BinaryExpr": {"op": "<key>"}}` when serializing `pl.Expr.meta.serialize(format="json")`.
 LOGICAL_BINARY_OPS: dict[str, type[BinaryExpr]] = {
     "And": And,
     "Or": Or,
 }
 
+# Keys represent Polars Rust AST `BooleanFunction` enum variant names emitted under
+# `{"Function": {"function": {"Boolean": "<key>"}}}` in serialized Polars JSON.
 BOOLEAN_UNARY_FUNCTIONS: dict[str, type[UnaryExpr]] = {
     "Not": Not,
     "IsNull": IsNull,

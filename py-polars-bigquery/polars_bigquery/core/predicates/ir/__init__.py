@@ -96,11 +96,18 @@ __all__ = [
     "json_to_ir",
 ]
 
+# Keys represent Polars Rust AST `Operator` enum variant names (e.g., "And", "Eq")
+# emitted in `{"BinaryExpr": {"op": "<key>"}}` when `pl.Expr.meta.serialize(format="json")`
+# is called. Because `json.load` produces untyped `dict` and `str` objects (all keys have
+# runtime type `str`), string-keyed lookup dictionaries are used here to construct IR
+# dataclasses.
 _BINARY_OPS: dict[str, type[BinaryExpr]] = {
     **LOGICAL_BINARY_OPS,
     **COMPARISON_BINARY_OPS,
 }
 
+# Keys represent Polars Rust AST `BooleanFunction` enum variant names (e.g., "Not", "IsNull")
+# emitted in `{"Function": {"function": {"Boolean": "<key>"}}}` in serialized Polars JSON.
 _BOOLEAN_FUNCTIONS: dict[str, type[UnaryExpr]] = {
     **BOOLEAN_UNARY_FUNCTIONS,
     **NUMERIC_UNARY_FUNCTIONS,

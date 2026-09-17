@@ -41,6 +41,8 @@ class EndsWith(BinaryExpr):
         return self.right
 
 
+# Keys represent Polars Rust AST `StringFunction` enum variant names emitted under
+# `{"Function": {"function": {"StringExpr": "<key>"}}}` in serialized Polars JSON.
 STRING_BINARY_FUNCTIONS: dict[str, type[BinaryExpr]] = {
     "StartsWith": StartsWith,
     "EndsWith": EndsWith,

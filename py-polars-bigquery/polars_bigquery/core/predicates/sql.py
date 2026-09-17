@@ -1,13 +1,12 @@
 from __future__ import annotations
 
+import functools
 import math
 import unicodedata
 from collections import deque
-from collections.abc import Callable
 
 from polars_bigquery.core.predicates.ir import (
     And,
-    BinaryExpr,
     BoolLiteral,
     Column,
     DateLiteral,
@@ -35,7 +34,6 @@ from polars_bigquery.core.predicates.ir import (
     StringLiteral,
     TimestampLiteral,
     TimestampUnit,
-    UnaryExpr,
     Unsupported,
 )
 
@@ -134,118 +132,213 @@ def _column_to_sql_identifier(identifier: str) -> str:
     return f"`{identifier}`"
 
 
+@functools.singledispatch
 def _literal_ir_to_sql(node: Literal) -> str:
     """Convert a Literal IR node into a BigQuery SQL string."""
-    if isinstance(node, NullLiteral):
-        return "NULL"
-    if isinstance(node, BoolLiteral):
-        return "TRUE" if node.value else "FALSE"
-    if isinstance(node, IntLiteral):
-        return str(node.value)
-    if isinstance(node, FloatLiteral):
-        if math.isnan(node.value):
-            return "CAST('nan' AS FLOAT64)"
-        if math.isinf(node.value):
-            return (
-                "CAST('-inf' AS FLOAT64)"
-                if node.value < 0
-                else "CAST('inf' AS FLOAT64)"
-            )
-        return repr(node.value)
-    if isinstance(node, StringLiteral):
-        return _escape_sql_string(node.value)
-    if isinstance(node, DateLiteral):
-        return f"DATE(TIMESTAMP_SECONDS({node.days} * 86400))"
-    if isinstance(node, TimestampLiteral):
-        if node.unit == TimestampUnit.MICROSECONDS:
-            ts_sql = f"TIMESTAMP_MICROS({node.ticks})"
-        elif node.unit == TimestampUnit.MILLISECONDS:
-            ts_sql = f"TIMESTAMP_MILLIS({node.ticks})"
-        else:
-            msg = f"Unhandled timestamp unit: {node.unit!r}"
-            raise TypeError(msg)
-        return f"DATETIME({ts_sql})" if node.tz is None else ts_sql
     msg = f"Unhandled literal IR node: {node!r}"
     raise TypeError(msg)
 
 
-_BINARY_SQL_FORMATTERS: dict[type[BinaryExpr], Callable[[str, str], str]] = {
-    Eq: lambda l, r: f"({l} = {r})",
-    NotEq: lambda l, r: f"({l} != {r})",
-    Gt: lambda l, r: f"({l} > {r})",
-    GtEq: lambda l, r: f"({l} >= {r})",
-    Lt: lambda l, r: f"({l} < {r})",
-    LtEq: lambda l, r: f"({l} <= {r})",
-    StartsWith: lambda l, r: f"STARTS_WITH({l}, {r})",
-    EndsWith: lambda l, r: f"ENDS_WITH({l}, {r})",
-}
-
-_UNARY_SQL_FORMATTERS: dict[type[UnaryExpr], Callable[[str], str]] = {
-    Not: lambda x: f"(NOT {x})",
-    IsNull: lambda x: f"({x} IS NULL)",
-    IsNotNull: lambda x: f"({x} IS NOT NULL)",
-    IsNan: lambda x: f"IS_NAN({x})",
-    IsNotNan: lambda x: f"(NOT IS_NAN({x}))",
-    IsInfinite: lambda x: f"IS_INF({x})",
-    IsFinite: lambda x: f"(NOT IS_INF({x}) AND NOT IS_NAN({x}))",
-}
+@_literal_ir_to_sql.register
+def _(node: NullLiteral) -> str:
+    return "NULL"
 
 
+@_literal_ir_to_sql.register
+def _(node: BoolLiteral) -> str:
+    return "TRUE" if node.value else "FALSE"
+
+
+@_literal_ir_to_sql.register
+def _(node: IntLiteral) -> str:
+    return str(node.value)
+
+
+@_literal_ir_to_sql.register
+def _(node: FloatLiteral) -> str:
+    if math.isnan(node.value):
+        return "CAST('nan' AS FLOAT64)"
+    if math.isinf(node.value):
+        return "CAST('-inf' AS FLOAT64)" if node.value < 0 else "CAST('inf' AS FLOAT64)"
+    return repr(node.value)
+
+
+@_literal_ir_to_sql.register
+def _(node: StringLiteral) -> str:
+    return _escape_sql_string(node.value)
+
+
+@_literal_ir_to_sql.register
+def _(node: DateLiteral) -> str:
+    return f"DATE(TIMESTAMP_SECONDS({node.days} * 86400))"
+
+
+@_literal_ir_to_sql.register
+def _(node: TimestampLiteral) -> str:
+    if node.unit == TimestampUnit.MICROSECONDS:
+        ts_sql = f"TIMESTAMP_MICROS({node.ticks})"
+    elif node.unit == TimestampUnit.MILLISECONDS:
+        ts_sql = f"TIMESTAMP_MILLIS({node.ticks})"
+    else:
+        msg = f"Unhandled timestamp unit: {node.unit!r}"
+        raise TypeError(msg)
+    return f"DATETIME({ts_sql})" if node.tz is None else ts_sql
+
+
+@functools.singledispatch
+def _format_operator_sql(node: Expr, *child_sqls: str) -> str | None:
+    """Format SQL string for a non-monotone binary or unary operator node."""
+    return None
+
+
+@_format_operator_sql.register
+def _(node: Eq, left: str, right: str) -> str:
+    return f"({left} = {right})"
+
+
+@_format_operator_sql.register
+def _(node: NotEq, left: str, right: str) -> str:
+    return f"({left} != {right})"
+
+
+@_format_operator_sql.register
+def _(node: Gt, left: str, right: str) -> str:
+    return f"({left} > {right})"
+
+
+@_format_operator_sql.register
+def _(node: GtEq, left: str, right: str) -> str:
+    return f"({left} >= {right})"
+
+
+@_format_operator_sql.register
+def _(node: Lt, left: str, right: str) -> str:
+    return f"({left} < {right})"
+
+
+@_format_operator_sql.register
+def _(node: LtEq, left: str, right: str) -> str:
+    return f"({left} <= {right})"
+
+
+@_format_operator_sql.register
+def _(node: StartsWith, left: str, right: str) -> str:
+    return f"STARTS_WITH({left}, {right})"
+
+
+@_format_operator_sql.register
+def _(node: EndsWith, left: str, right: str) -> str:
+    return f"ENDS_WITH({left}, {right})"
+
+
+@_format_operator_sql.register
+def _(node: Not, operand: str) -> str:
+    return f"(NOT {operand})"
+
+
+@_format_operator_sql.register
+def _(node: IsNull, operand: str) -> str:
+    return f"({operand} IS NULL)"
+
+
+@_format_operator_sql.register
+def _(node: IsNotNull, operand: str) -> str:
+    return f"({operand} IS NOT NULL)"
+
+
+@_format_operator_sql.register
+def _(node: IsNan, operand: str) -> str:
+    return f"IS_NAN({operand})"
+
+
+@_format_operator_sql.register
+def _(node: IsNotNan, operand: str) -> str:
+    return f"(NOT IS_NAN({operand}))"
+
+
+@_format_operator_sql.register
+def _(node: IsInfinite, operand: str) -> str:
+    return f"IS_INF({operand})"
+
+
+@_format_operator_sql.register
+def _(node: IsFinite, operand: str) -> str:
+    return f"(NOT IS_INF({operand}) AND NOT IS_NAN({operand}))"
+
+
+@functools.singledispatch
 def _emit_node_sql(
     node: Expr, child_results: list[tuple[str | None, bool]]
 ) -> tuple[str | None, bool]:
-    """Emit the BigQuery SQL string and exactness flag for a single IR node."""
-    if isinstance(node, Unsupported):
-        return None, False
-    if isinstance(node, Column):
-        return _column_to_sql_identifier(node.name), True
-    if isinstance(node, Literal):
-        return _literal_ir_to_sql(node), True
+    """Emit the BigQuery SQL string and exactness flag for a single IR node.
 
-    if isinstance(node, And):
-        (left_sql, left_exact), (right_sql, right_exact) = (
-            child_results[0],
-            child_results[1],
-        )
-        if left_sql is None and right_sql is None:
-            return None, False
-        if left_sql is None:
-            return right_sql, False
-        if right_sql is None:
-            return left_sql, False
-        return f"({left_sql} AND {right_sql})", (left_exact and right_exact)
-
-    if isinstance(node, Or):
-        (left_sql, left_exact), (right_sql, right_exact) = (
-            child_results[0],
-            child_results[1],
-        )
-        if left_sql is None or right_sql is None:
-            return None, False
-        return f"({left_sql} OR {right_sql})", (left_exact and right_exact)
-
-    # All non-monotone / comparison / function operators require:
-    # 1. All children to have valid non-None SQL representations.
-    # 2. All children to be exact (is_exact=True), because relaxing a child inside
-    #    NOT, =, !=, etc. flips subset/superset polarity and causes silent data loss.
-    # 3. No child to be a bare NullLiteral (e.g. `col = NULL` evaluates to UNKNOWN in SQL).
+    Non-monotone / comparison / function operators require:
+    1. All children to have valid non-None SQL representations.
+    2. All children to be exact (is_exact=True), because relaxing a child inside
+       NOT, =, !=, etc. flips subset/superset polarity and causes silent data loss.
+    3. No child to be a bare NullLiteral (e.g. `col = NULL` evaluates to UNKNOWN in SQL).
+    """
     if any(sql is None or not is_exact for sql, is_exact in child_results):
         return None, False
     if any(isinstance(child, NullLiteral) for child in node.children()):
         return None, False
 
-    binary_formatter = _BINARY_SQL_FORMATTERS.get(type(node))
-    if binary_formatter is not None:
-        return (
-            binary_formatter(child_results[0][0], child_results[1][0]),  # type: ignore[arg-type]
-            True,
-        )
-
-    unary_formatter = _UNARY_SQL_FORMATTERS.get(type(node))
-    if unary_formatter is not None:
-        return unary_formatter(child_results[0][0]), True  # type: ignore[arg-type]
-
+    child_sqls = [sql for sql, _ in child_results if sql is not None]
+    formatted = _format_operator_sql(node, *child_sqls)
+    if formatted is not None:
+        return formatted, True
     return None, False
+
+
+@_emit_node_sql.register
+def _(
+    node: Unsupported, child_results: list[tuple[str | None, bool]]
+) -> tuple[str | None, bool]:
+    return None, False
+
+
+@_emit_node_sql.register
+def _(
+    node: Column, child_results: list[tuple[str | None, bool]]
+) -> tuple[str | None, bool]:
+    return _column_to_sql_identifier(node.name), True
+
+
+@_emit_node_sql.register
+def _(
+    node: Literal, child_results: list[tuple[str | None, bool]]
+) -> tuple[str | None, bool]:
+    return _literal_ir_to_sql(node), True
+
+
+@_emit_node_sql.register
+def _(
+    node: And, child_results: list[tuple[str | None, bool]]
+) -> tuple[str | None, bool]:
+    (left_sql, left_exact), (right_sql, right_exact) = (
+        child_results[0],
+        child_results[1],
+    )
+    if left_sql is None and right_sql is None:
+        return None, False
+    if left_sql is None:
+        return right_sql, False
+    if right_sql is None:
+        return left_sql, False
+    return f"({left_sql} AND {right_sql})", (left_exact and right_exact)
+
+
+@_emit_node_sql.register
+def _(
+    node: Or, child_results: list[tuple[str | None, bool]]
+) -> tuple[str | None, bool]:
+    (left_sql, left_exact), (right_sql, right_exact) = (
+        child_results[0],
+        child_results[1],
+    )
+    if left_sql is None or right_sql is None:
+        return None, False
+    return f"({left_sql} OR {right_sql})", (left_exact and right_exact)
 
 
 def _compile_ir_to_sql(root: Expr) -> tuple[str | None, bool]:
