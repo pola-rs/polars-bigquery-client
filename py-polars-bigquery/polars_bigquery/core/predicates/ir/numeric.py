@@ -64,7 +64,7 @@ class IsFinite(UnaryExpr):
 
 # Keys represent Polars Rust AST `BooleanFunction` enum variant names emitted under
 # `{"Function": {"function": {"Boolean": "<key>"}}}` in serialized Polars JSON.
-NUMERIC_UNARY_FUNCTIONS: dict[str, type[UnaryExpr]] = {
+NUMERIC_UNARY_OPS: dict[str, type[UnaryExpr]] = {
     "IsNan": IsNan,
     "IsNotNan": IsNotNan,
     "IsInfinite": IsInfinite,

@@ -46,7 +46,7 @@ LOGICAL_BINARY_OPS: dict[str, type[BinaryExpr]] = {
 
 # Keys represent Polars Rust AST `BooleanFunction` enum variant names emitted under
 # `{"Function": {"function": {"Boolean": "<key>"}}}` in serialized Polars JSON.
-BOOLEAN_UNARY_FUNCTIONS: dict[str, type[UnaryExpr]] = {
+BOOLEAN_UNARY_OPS: dict[str, type[UnaryExpr]] = {
     "Not": Not,
     "IsNull": IsNull,
     "IsNotNull": IsNotNull,

@@ -13,7 +13,7 @@ from polars_bigquery.core.predicates.ir.base import (
     Unsupported,
 )
 from polars_bigquery.core.predicates.ir.boolean import (
-    BOOLEAN_UNARY_FUNCTIONS,
+    BOOLEAN_UNARY_OPS,
     LOGICAL_BINARY_OPS,
     And,
     BoolLiteral,
@@ -34,7 +34,7 @@ from polars_bigquery.core.predicates.ir.comparison import (
 from polars_bigquery.core.predicates.ir.numeric import (
     FLOAT_TYPES,
     INT_TYPES,
-    NUMERIC_UNARY_FUNCTIONS,
+    NUMERIC_UNARY_OPS,
     FloatLiteral,
     IntLiteral,
     IsFinite,
@@ -45,7 +45,7 @@ from polars_bigquery.core.predicates.ir.numeric import (
     parse_int_literal,
 )
 from polars_bigquery.core.predicates.ir.string import (
-    STRING_BINARY_FUNCTIONS,
+    STRING_BINARY_OPS,
     STRING_TYPES,
     EndsWith,
     StartsWith,
@@ -108,9 +108,9 @@ _BINARY_OPS: dict[str, type[BinaryExpr]] = {
 
 # Keys represent Polars Rust AST `BooleanFunction` enum variant names (e.g., "Not", "IsNull")
 # emitted in `{"Function": {"function": {"Boolean": "<key>"}}}` in serialized Polars JSON.
-_BOOLEAN_FUNCTIONS: dict[str, type[UnaryExpr]] = {
-    **BOOLEAN_UNARY_FUNCTIONS,
-    **NUMERIC_UNARY_FUNCTIONS,
+_BOOLEAN_OPS: dict[str, type[UnaryExpr]] = {
+    **BOOLEAN_UNARY_OPS,
+    **NUMERIC_UNARY_OPS,
 }
 
 
@@ -210,7 +210,7 @@ def json_to_ir(expr_json: Any) -> Expr:
                 boolean_name = function_details.get("Boolean")
                 if (
                     isinstance(boolean_name, str)
-                    and boolean_name in _BOOLEAN_FUNCTIONS
+                    and boolean_name in _BOOLEAN_OPS
                     and len(inputs) >= 1
                 ):
                     child_idx = len(raw_nodes)
@@ -219,7 +219,7 @@ def json_to_ir(expr_json: Any) -> Expr:
                     records.append(
                         (
                             "Unary",
-                            _BOOLEAN_FUNCTIONS[boolean_name],
+                            _BOOLEAN_OPS[boolean_name],
                             (child_idx,),
                         )
                     )
@@ -228,7 +228,7 @@ def json_to_ir(expr_json: Any) -> Expr:
                 string_name = function_details.get("StringExpr")
                 if (
                     isinstance(string_name, str)
-                    and string_name in STRING_BINARY_FUNCTIONS
+                    and string_name in STRING_BINARY_OPS
                     and len(inputs) == 2
                 ):
                     left_idx = len(raw_nodes)
@@ -240,7 +240,7 @@ def json_to_ir(expr_json: Any) -> Expr:
                     records.append(
                         (
                             "Binary",
-                            STRING_BINARY_FUNCTIONS[string_name],
+                            STRING_BINARY_OPS[string_name],
                             (left_idx, right_idx),
                         )
                     )
