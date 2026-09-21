@@ -1,7 +1,8 @@
 from __future__ import annotations
 
-import enum
 import dataclasses
+import enum
+from collections.abc import Callable
 from typing import Any
 
 from polars_bigquery.core.predicates.ir.base import Expr, Literal, Unsupported
@@ -70,3 +71,12 @@ def parse_datetime_literal(value: Any) -> Expr:
             ticks=ticks // 1000, unit=TimestampUnit.MICROSECONDS, tz=tz
         )
     return Unsupported()
+
+
+# Keys represent Polars Rust AST `LiteralValue` / `AnyValue` temporal variant names
+# emitted inside `{"Literal": ...}` in serialized Polars JSON.
+TEMPORAL_LITERAL_PARSERS: dict[str, Callable[[Any], Expr]] = {
+    "Date": parse_date_literal,
+    "Datetime": parse_datetime_literal,
+    "DateTime": parse_datetime_literal,
+}

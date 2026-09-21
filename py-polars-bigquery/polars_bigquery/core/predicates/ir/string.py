@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import dataclasses
+from collections.abc import Callable
 from typing import Any
 
 from polars_bigquery.core.predicates.ir.base import BinaryExpr, Expr, Literal
@@ -52,3 +53,10 @@ STRING_BINARY_OPS: dict[str, type[BinaryExpr]] = {
 def parse_string_literal(value: Any) -> StringLiteral:
     """Parse a string value from Polars JSON into a StringLiteral."""
     return StringLiteral(value=str(value))
+
+
+# Keys represent Polars Rust AST `LiteralValue` / `AnyValue` string variant names
+# emitted inside `{"Literal": ...}` in serialized Polars JSON.
+STRING_LITERAL_PARSERS: dict[str, Callable[[Any], Expr]] = dict.fromkeys(
+    STRING_TYPES, parse_string_literal
+)

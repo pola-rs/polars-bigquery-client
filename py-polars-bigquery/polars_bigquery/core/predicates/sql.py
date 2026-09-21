@@ -1,9 +1,10 @@
 from __future__ import annotations
 
+import collections
 import functools
 import math
 import unicodedata
-import collections
+from typing import Any
 
 from polars_bigquery.core.predicates.ir import (
     And,
@@ -35,6 +36,7 @@ from polars_bigquery.core.predicates.ir import (
     TimestampLiteral,
     TimestampUnit,
     Unsupported,
+    _json_literal_to_ir,
 )
 
 _ALLOWED_FLEXIBLE_SPECIAL_CHARS = frozenset(
@@ -109,16 +111,13 @@ def _is_valid_column_character(ch: str) -> bool:
 def _column_to_sql_identifier(identifier: str) -> str:
     """Validate a BigQuery standard or flexible column name and wrap in backticks.
 
-    Enforces BigQuery column naming constraints (1 to 300 characters, allowed
-    Unicode character categories, whitespace, and permitted flexible symbols).
+    Enforces BigQuery column naming character constraints (allowed Unicode
+    character categories, whitespace, and permitted flexible symbols).
 
-    Raises ValueError if the column name violates BigQuery column naming rules.
+    Raises ValueError if the column name is empty or contains unsupported characters.
     """
-    if not (1 <= len(identifier) <= 300):
-        msg = (
-            f"Invalid BigQuery column name length ({len(identifier)}): {identifier!r}. "
-            "Column names must be between 1 and 300 characters."
-        )
+    if not identifier:
+        msg = f"Invalid BigQuery column name {identifier!r}: column name must not be empty."
         raise ValueError(msg)
 
     for ch in identifier:
@@ -137,6 +136,14 @@ def _literal_ir_to_sql(node: Literal) -> str:
     """Convert a Literal IR node into a BigQuery SQL string."""
     msg = f"Unhandled literal IR node: {node!r}"
     raise TypeError(msg)
+
+
+def _json_literal_to_sql(literal_json: dict[str, Any]) -> str | None:
+    """Convert a literal from a Polars expression JSON into a BigQuery SQL string."""
+    ir_node = _json_literal_to_ir(literal_json)
+    if isinstance(ir_node, Literal):
+        return _literal_ir_to_sql(ir_node)
+    return None
 
 
 @_literal_ir_to_sql.register

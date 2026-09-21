@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import dataclasses
+from collections.abc import Callable
+from typing import Any
 
 
 @dataclasses.dataclass(frozen=True)
@@ -58,3 +60,15 @@ class Literal(Expr):
 @dataclasses.dataclass(frozen=True)
 class NullLiteral(Literal):
     """IR node representing a NULL literal."""
+
+
+def parse_null_literal(_value: Any) -> NullLiteral:
+    """Parse a Null value from Polars JSON into a NullLiteral."""
+    return NullLiteral()
+
+
+# Keys represent Polars Rust AST `LiteralValue` / `AnyValue` enum variant names
+# emitted inside `{"Literal": ...}` in serialized Polars JSON.
+NULL_LITERAL_PARSERS: dict[str, Callable[[Any], Expr]] = {
+    "Null": parse_null_literal,
+}

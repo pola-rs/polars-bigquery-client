@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import dataclasses
+from collections.abc import Callable
 from typing import Any
 
 from polars_bigquery.core.predicates.ir.base import (
@@ -97,3 +98,11 @@ def parse_float_literal(value: Any) -> Expr:
     except (TypeError, ValueError):
         return Unsupported()
     return FloatLiteral(value=float_val)
+
+
+# Keys represent Polars Rust AST `LiteralValue` / `AnyValue` numeric variant names
+# emitted inside `{"Literal": ...}` in serialized Polars JSON.
+NUMERIC_LITERAL_PARSERS: dict[str, Callable[[Any], Expr]] = {
+    **dict.fromkeys(INT_TYPES, parse_int_literal),
+    **dict.fromkeys(FLOAT_TYPES, parse_float_literal),
+}
