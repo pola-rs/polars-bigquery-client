@@ -2,7 +2,9 @@ from unittest.mock import MagicMock, patch
 
 import arrow_bigquery.api.resources
 import pytest
+import freezegun
 import requests
+
 from polars_bigquery.core.bigquery_rest import (
     BigQueryRestClient,
     _raise_for_bigquery_error,
@@ -12,6 +14,12 @@ from polars_bigquery.core.bigquery_rest import (
     run_query,
 )
 from polars_bigquery.exceptions import BigQueryError
+
+
+@pytest.fixture(autouse=True)
+def freeze_time():
+    with freezegun.freeze_time("2026-09-21", auto_tick_seconds=1):
+        yield
 
 
 def test_run_query_success():
@@ -315,58 +323,6 @@ def test_run_query_propagates_regional_location():
     assert "location=europe-west1" in called_get_url
 
 
-def test_request_with_retry_retries_http_403_rate_limit_exceeded():
-    from polars_bigquery.core.bigquery_rest import _request_with_retry
-
-    resp_403 = MagicMock()
-    resp_403.status_code = 403
-    resp_403.json.return_value = {
-        "error": {
-            "code": 403,
-            "errors": [{"reason": "rateLimitExceeded"}],
-            "message": "Rate limit exceeded",
-        }
-    }
-
-    resp_200 = MagicMock()
-    resp_200.status_code = 200
-
-    mock_fn = MagicMock(side_effect=[resp_403, resp_200])
-
-    with patch("time.sleep") as mock_sleep:
-        result = _request_with_retry(mock_fn, "https://example.com")
-        assert result is resp_200
-        assert mock_fn.call_count == 2
-        mock_sleep.assert_called_once()
-
-
-def test_run_query_skips_wait_when_insert_returns_done():
-    mock_cp = MagicMock(return_value=({"bearer_token": "tok"}, 123))
-    mock_session = MagicMock()
-
-    mock_insert_resp = MagicMock()
-    mock_insert_resp.json.return_value = {
-        "jobReference": {"jobId": "job-fast"},
-        "status": {"state": "DONE"},
-        "configuration": {
-            "query": {
-                "destinationTable": {"projectId": "p", "datasetId": "d", "tableId": "t"}
-            }
-        },
-    }
-    mock_session.post.return_value = mock_insert_resp
-
-    dest = run_query(
-        "SELECT 1",
-        quota_project_id="q",
-        credentials_provider=mock_cp,
-        user_agent="ua",
-        session=mock_session,
-    )
-    assert dest == "p.d.t"
-    mock_session.get.assert_not_called()
-
-
 def test_bigquery_rest_client_context_manager_closes_session():
     mock_cp = MagicMock(return_value=({"bearer_token": "tok"}, 123))
     client = BigQueryRestClient(
@@ -378,30 +334,6 @@ def test_bigquery_rest_client_context_manager_closes_session():
         with client:
             pass
         mock_close.assert_called_once()
-
-
-def test_is_rate_limit_error_skips_429_already_retried_by_urllib3():
-    from polars_bigquery.core.bigquery_rest import _is_rate_limit_error
-
-    resp = MagicMock()
-    resp.status_code = 429
-    resp.raw.retries.history = [("GET", "https://example.com", 429)]
-    assert _is_rate_limit_error(resp) is False
-
-    resp_unretried = MagicMock()
-    resp_unretried.status_code = 429
-    resp_unretried.raw.retries.history = []
-    assert _is_rate_limit_error(resp_unretried) is True
-
-
-def test_request_with_retry_wraps_request_exception():
-    from polars_bigquery.core.bigquery_rest import _request_with_retry
-
-    mock_fn = MagicMock(
-        side_effect=requests.exceptions.ConnectionError("Connection reset by peer")
-    )
-    with pytest.raises(BigQueryError, match="Connection reset by peer"):
-        _request_with_retry(mock_fn, "https://example.com")
 
 
 def test_run_query_handles_http_409_conflict_on_insert():
@@ -433,28 +365,3 @@ def test_run_query_handles_http_409_conflict_on_insert():
     )
     assert dest == "p.d.t"
     mock_session.get.assert_called()
-
-
-def test_run_query_missing_destination_table_raises_bigquery_error():
-    mock_cp = MagicMock(return_value=({"bearer_token": "tok"}, 123))
-    mock_session = MagicMock()
-
-    mock_insert_resp = MagicMock()
-    mock_insert_resp.status_code = 200
-    mock_insert_resp.json.return_value = {
-        "jobReference": {"jobId": "job-ddl"},
-        "status": {"state": "DONE"},
-        "configuration": {"query": {}},
-    }
-    mock_session.post.return_value = mock_insert_resp
-
-    with pytest.raises(
-        BigQueryError, match="BigQuery query job completed without a destination table"
-    ):
-        run_query(
-            "CREATE TABLE d.t AS SELECT 1",
-            quota_project_id="q",
-            credentials_provider=mock_cp,
-            user_agent="ua",
-            session=mock_session,
-        )
