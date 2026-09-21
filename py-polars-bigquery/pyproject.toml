@@ -36,6 +36,8 @@ dev = [
     "ruff>=0.15.10",
 ]
 test = [
+    "freezegun>=1.5.5",
+    "pre-commit>=4.3.0",
     "pytest>=8.4.1",
     "pytest-benchmark>=5.1.0",
     "pytest-xdist>=3.8.0",
