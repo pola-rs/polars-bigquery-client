@@ -2,9 +2,20 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 import polars as pl
 import pytest
+
 from polars_bigquery.core import predicates
+
+
+def _json_literal_to_sql(literal_json: dict[str, Any]) -> str | None:
+    """Convert a literal from a Polars expression JSON into a BigQuery SQL string."""
+    ir_node = predicates.json_to_ir({"Literal": literal_json})
+    if isinstance(ir_node, predicates.ir.Literal):
+        return predicates.ir_to_sql(ir_node)
+    return None
 
 
 def test_is_null_expression() -> None:
@@ -165,23 +176,23 @@ def test_nan_and_inf_floats_cast_to_float64() -> None:
 
     # When JSON literals contain nan, inf, and -inf, they are correctly cast to FLOAT64
     assert (
-        predicates.sql._json_literal_to_sql({"Float64": "nan"})
+        _json_literal_to_sql({"Float64": "nan"})
         == "CAST('nan' AS FLOAT64)"
     )
     assert (
-        predicates.sql._json_literal_to_sql({"Float64": "inf"})
+        _json_literal_to_sql({"Float64": "inf"})
         == "CAST('inf' AS FLOAT64)"
     )
     assert (
-        predicates.sql._json_literal_to_sql({"Float64": "-inf"})
+        _json_literal_to_sql({"Float64": "-inf"})
         == "CAST('-inf' AS FLOAT64)"
     )
     assert (
-        predicates.sql._json_literal_to_sql({"Float64": "infinity"})
+        _json_literal_to_sql({"Float64": "infinity"})
         == "CAST('inf' AS FLOAT64)"
     )
     assert (
-        predicates.sql._json_literal_to_sql({"Float64": "-infinity"})
+        _json_literal_to_sql({"Float64": "-infinity"})
         == "CAST('-inf' AS FLOAT64)"
     )
 
@@ -240,13 +251,13 @@ def test_escape_sql_and_column_identifier_helpers() -> None:
 def test_json_literal_to_sql_all_scalar_types_and_immutability() -> None:
     # Verify input dictionary is not mutated by _json_literal_to_sql
     lit_dict = {"Int64": 42}
-    assert predicates.sql._json_literal_to_sql(lit_dict) == "42"
+    assert _json_literal_to_sql(lit_dict) == "42"
     assert lit_dict == {"Int64": 42}
 
     # Empty, multi-key, or non-dict inputs
-    assert predicates.sql._json_literal_to_sql({}) is None
-    assert predicates.sql._json_literal_to_sql({"Int64": 42, "Extra": 1}) is None
-    assert predicates.sql._json_literal_to_sql(None) is None  # type: ignore[arg-type]
+    assert _json_literal_to_sql({}) is None
+    assert _json_literal_to_sql({"Int64": 42, "Extra": 1}) is None
+    assert _json_literal_to_sql(None) is None  # type: ignore[arg-type]
 
     # Integer and Unsigned Integer scalar variants
     for int_type in (
@@ -261,99 +272,99 @@ def test_json_literal_to_sql_all_scalar_types_and_immutability() -> None:
         "UInt32",
         "UInt64",
     ):
-        assert predicates.sql._json_literal_to_sql({int_type: 99}) == "99"
+        assert _json_literal_to_sql({int_type: 99}) == "99"
 
     # Float scalar variants including nan, inf, and -inf
     for float_type in ("Float", "Float32", "Float64"):
-        assert predicates.sql._json_literal_to_sql({float_type: 3.5}) == "3.5"
+        assert _json_literal_to_sql({float_type: 3.5}) == "3.5"
         assert (
-            predicates.sql._json_literal_to_sql({float_type: float("inf")})
+            _json_literal_to_sql({float_type: float("inf")})
             == "CAST('inf' AS FLOAT64)"
         )
         assert (
-            predicates.sql._json_literal_to_sql({float_type: float("-inf")})
+            _json_literal_to_sql({float_type: float("-inf")})
             == "CAST('-inf' AS FLOAT64)"
         )
         assert (
-            predicates.sql._json_literal_to_sql({float_type: float("nan")})
+            _json_literal_to_sql({float_type: float("nan")})
             == "CAST('nan' AS FLOAT64)"
         )
         assert (
-            predicates.sql._json_literal_to_sql({float_type: "nan"})
+            _json_literal_to_sql({float_type: "nan"})
             == "CAST('nan' AS FLOAT64)"
         )
         assert (
-            predicates.sql._json_literal_to_sql({float_type: "+nan"})
+            _json_literal_to_sql({float_type: "+nan"})
             == "CAST('nan' AS FLOAT64)"
         )
         assert (
-            predicates.sql._json_literal_to_sql({float_type: "-nan"})
+            _json_literal_to_sql({float_type: "-nan"})
             == "CAST('nan' AS FLOAT64)"
         )
         assert (
-            predicates.sql._json_literal_to_sql({float_type: "inf"})
+            _json_literal_to_sql({float_type: "inf"})
             == "CAST('inf' AS FLOAT64)"
         )
         assert (
-            predicates.sql._json_literal_to_sql({float_type: "+inf"})
+            _json_literal_to_sql({float_type: "+inf"})
             == "CAST('inf' AS FLOAT64)"
         )
         assert (
-            predicates.sql._json_literal_to_sql({float_type: "infinity"})
+            _json_literal_to_sql({float_type: "infinity"})
             == "CAST('inf' AS FLOAT64)"
         )
         assert (
-            predicates.sql._json_literal_to_sql({float_type: "+infinity"})
+            _json_literal_to_sql({float_type: "+infinity"})
             == "CAST('inf' AS FLOAT64)"
         )
         assert (
-            predicates.sql._json_literal_to_sql({float_type: "-inf"})
+            _json_literal_to_sql({float_type: "-inf"})
             == "CAST('-inf' AS FLOAT64)"
         )
         assert (
-            predicates.sql._json_literal_to_sql({float_type: "-infinity"})
+            _json_literal_to_sql({float_type: "-infinity"})
             == "CAST('-inf' AS FLOAT64)"
         )
-        assert predicates.sql._json_literal_to_sql({float_type: None}) is None
+        assert _json_literal_to_sql({float_type: None}) is None
 
     # String variants
-    assert predicates.sql._json_literal_to_sql({"String": "hello"}) == "'hello'"
-    assert predicates.sql._json_literal_to_sql({"StringOwned": "world"}) == "'world'"
+    assert _json_literal_to_sql({"String": "hello"}) == "'hello'"
+    assert _json_literal_to_sql({"StringOwned": "world"}) == "'world'"
 
     # Boolean and Null
-    assert predicates.sql._json_literal_to_sql({"Boolean": True}) == "TRUE"
-    assert predicates.sql._json_literal_to_sql({"Boolean": False}) == "FALSE"
-    assert predicates.sql._json_literal_to_sql({"Null": None}) == "NULL"
+    assert _json_literal_to_sql({"Boolean": True}) == "TRUE"
+    assert _json_literal_to_sql({"Boolean": False}) == "FALSE"
+    assert _json_literal_to_sql({"Null": None}) == "NULL"
 
     # DateTime units: Microseconds, Milliseconds, Nanoseconds (exact and inexact)
     assert (
-        predicates.sql._json_literal_to_sql({"DateTime": [1000, "Microseconds"]})
+        _json_literal_to_sql({"DateTime": [1000, "Microseconds"]})
         == "TIMESTAMP_MICROS(1000)"
     )
     assert (
-        predicates.sql._json_literal_to_sql({"DateTime": [2000, "Milliseconds"]})
+        _json_literal_to_sql({"DateTime": [2000, "Milliseconds"]})
         == "TIMESTAMP_MILLIS(2000)"
     )
     assert (
-        predicates.sql._json_literal_to_sql({"DateTime": [5000, "Nanoseconds"]})
+        _json_literal_to_sql({"DateTime": [5000, "Nanoseconds"]})
         == "TIMESTAMP_MICROS(5)"
     )
     assert (
-        predicates.sql._json_literal_to_sql({"DateTime": [5555, "Nanoseconds"]}) is None
+        _json_literal_to_sql({"DateTime": [5555, "Nanoseconds"]}) is None
     )
-    assert predicates.sql._json_literal_to_sql({"DateTime": [10, "Seconds"]}) is None
+    assert _json_literal_to_sql({"DateTime": [10, "Seconds"]}) is None
 
     # Malformed literal values catch ValueError/TypeError locally and return None
-    assert predicates.sql._json_literal_to_sql({"Int64": "not-an-int"}) is None
-    assert predicates.sql._json_literal_to_sql({"Float64": "not-a-float"}) is None
+    assert _json_literal_to_sql({"Int64": "not-an-int"}) is None
+    assert _json_literal_to_sql({"Float64": "not-a-float"}) is None
     assert (
-        predicates.sql._json_literal_to_sql(
+        _json_literal_to_sql(
             {"DateTime": ["not-an-int", "Microseconds"]}
         )
         is None
     )
-    assert predicates.sql._json_literal_to_sql({"DateTime": []}) is None
-    assert predicates.sql._json_literal_to_sql({"Date": "not-a-date"}) is None
+    assert _json_literal_to_sql({"DateTime": []}) is None
+    assert _json_literal_to_sql({"Date": "not-a-date"}) is None
 
 
 def test_and_expression_preserves_valid_branch_with_unsupported_branch() -> None:

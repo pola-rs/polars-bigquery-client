@@ -1,3 +1,5 @@
+"""Functions for emitting SQL from an Expr IR tree."""
+
 from __future__ import annotations
 
 import collections
@@ -36,7 +38,6 @@ from polars_bigquery.core.predicates.ir import (
     TimestampLiteral,
     TimestampUnit,
     Unsupported,
-    _json_literal_to_ir,
 )
 
 _ALLOWED_FLEXIBLE_SPECIAL_CHARS = frozenset(
@@ -136,14 +137,6 @@ def _literal_ir_to_sql(node: Literal) -> str:
     """Convert a Literal IR node into a BigQuery SQL string."""
     msg = f"Unhandled literal IR node: {node!r}"
     raise TypeError(msg)
-
-
-def _json_literal_to_sql(literal_json: dict[str, Any]) -> str | None:
-    """Convert a literal from a Polars expression JSON into a BigQuery SQL string."""
-    ir_node = _json_literal_to_ir(literal_json)
-    if isinstance(ir_node, Literal):
-        return _literal_ir_to_sql(ir_node)
-    return None
 
 
 @_literal_ir_to_sql.register
