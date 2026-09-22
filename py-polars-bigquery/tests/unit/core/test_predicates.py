@@ -370,6 +370,14 @@ def test_ir_frozen_dataclasses_and_submodules() -> None:
     lit_10 = compiler.ir.numeric.IntLiteral(10)
     eq_node = compiler.ir.comparison.Eq(left=col_a, right=lit_10)
 
+    assert col_a.children() == ()
+    assert lit_10.children() == ()
+    assert eq_node.children() == (col_a, lit_10)
+
+    # Verify Expr is abstract and requires children() implementation
+    with pytest.raises(TypeError, match="Can't instantiate abstract class Expr"):
+        compiler.ir.base.Expr()  # type: ignore[abstract]
+
     # Verify frozen dataclass immutability
     with pytest.raises(FrozenInstanceError):
         col_a.name = "b"  # type: ignore[misc]

@@ -1,15 +1,16 @@
 from __future__ import annotations
 
+import abc
 import dataclasses
 
 
 @dataclasses.dataclass(frozen=True)
-class Expr:
+class Expr(abc.ABC):
     """Base class for all predicate Intermediate Representation (IR) nodes."""
 
+    @abc.abstractmethod
     def children(self) -> tuple[Expr, ...]:
         """Return the child expressions of this node in order."""
-        return ()
 
 
 @dataclasses.dataclass(frozen=True)
@@ -49,10 +50,16 @@ class Column(Expr):
 
     name: str
 
+    def children(self) -> tuple[Expr, ...]:
+        return ()
+
 
 @dataclasses.dataclass(frozen=True)
 class Literal(Expr):
     """Base class for literal IR nodes."""
+
+    def children(self) -> tuple[Expr, ...]:
+        return ()
 
 
 @dataclasses.dataclass(frozen=True)
