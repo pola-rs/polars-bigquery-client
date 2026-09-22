@@ -1,6 +1,7 @@
 from unittest.mock import MagicMock, patch
 
 import arrow_bigquery.api.resources
+import freezegun
 import pytest
 import requests
 from polars_bigquery.core.bigquery_rest import (
@@ -12,6 +13,12 @@ from polars_bigquery.core.bigquery_rest import (
     run_query,
 )
 from polars_bigquery.exceptions import BigQueryError
+
+
+@pytest.fixture(autouse=True)
+def freeze_time():
+    with freezegun.freeze_time("2026-09-21", auto_tick_seconds=1):
+        yield
 
 
 def test_run_query_success():
@@ -150,11 +157,13 @@ def test_run_query_requires_user_agent():
 
 
 def test_run_query_refreshes_token_during_polling_and_generates_job_id():
-    tokens = iter([
-        ({"bearer_token": "initial-token"}, 12345),
-        ({"bearer_token": "refreshed-token-1"}, 12346),
-        ({"bearer_token": "refreshed-token-2"}, 12347),
-    ])
+    tokens = iter(
+        [
+            ({"bearer_token": "initial-token"}, 12345),
+            ({"bearer_token": "refreshed-token-1"}, 12346),
+            ({"bearer_token": "refreshed-token-2"}, 12347),
+        ]
+    )
     mock_cp = MagicMock(side_effect=lambda: next(tokens))
 
     with (
@@ -220,7 +229,9 @@ def test_create_resilient_session_configures_retries_and_pooling():
 def test_raise_for_bigquery_error_extracts_structured_json_message():
     resp = MagicMock()
     resp.raise_for_status.side_effect = requests.exceptions.HTTPError("400 Bad Request")
-    resp.json.return_value = {"error": {"message": "Table not found: my_dataset.my_table"}}
+    resp.json.return_value = {
+        "error": {"message": "Table not found: my_dataset.my_table"}
+    }
 
     with pytest.raises(BigQueryError, match="Table not found: my_dataset.my_table"):
         _raise_for_bigquery_error(resp)
@@ -240,7 +251,8 @@ def test_wait_for_job_timeout_raises_bigquery_error():
     with (
         patch("time.monotonic", side_effect=[0.0, 100.0]),
         pytest.raises(
-            BigQueryError, match="Timed out waiting for BigQuery job job-123 after 50.0s"
+            BigQueryError,
+            match="Timed out waiting for BigQuery job job-123 after 50.0s",
         ),
     ):
         _wait_for_job(
@@ -308,3 +320,47 @@ def test_run_query_propagates_regional_location():
     # Verify location query parameter was appended to jobs.get URL
     called_get_url = mock_session.get.call_args_list[0].args[0]
     assert "location=europe-west1" in called_get_url
+
+
+def test_bigquery_rest_client_context_manager_closes_session():
+    mock_cp = MagicMock(return_value=({"bearer_token": "tok"}, 123))
+    client = BigQueryRestClient(
+        quota_project_id="q",
+        credentials_provider=mock_cp,
+        user_agent="ua",
+    )
+    with patch.object(client.session, "close") as mock_close:
+        with client:
+            pass
+        mock_close.assert_called_once()
+
+
+def test_run_query_handles_http_409_conflict_on_insert():
+    mock_cp = MagicMock(return_value=({"bearer_token": "tok"}, 123))
+    mock_session = MagicMock()
+
+    mock_insert_resp = MagicMock()
+    mock_insert_resp.status_code = 409
+    mock_session.post.return_value = mock_insert_resp
+
+    mock_poll_resp = MagicMock()
+    mock_poll_resp.status_code = 200
+    mock_poll_resp.json.return_value = {
+        "status": {"state": "DONE"},
+        "configuration": {
+            "query": {
+                "destinationTable": {"projectId": "p", "datasetId": "d", "tableId": "t"}
+            }
+        },
+    }
+    mock_session.get.return_value = mock_poll_resp
+
+    dest = run_query(
+        "SELECT 1",
+        quota_project_id="q",
+        credentials_provider=mock_cp,
+        user_agent="ua",
+        session=mock_session,
+    )
+    assert dest == "p.d.t"
+    mock_session.get.assert_called()

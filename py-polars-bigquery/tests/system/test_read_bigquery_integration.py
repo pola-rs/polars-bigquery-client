@@ -1,6 +1,6 @@
 import os
 
-import polars
+import polars as pl
 import polars_bigquery
 import pytest
 
@@ -24,7 +24,7 @@ def test_read_bigquery_public_data_ordered(client):
         """,
         maintain_order=True,
     )
-    assert isinstance(df, polars.DataFrame)
+    assert isinstance(df, pl.DataFrame)
     # Make sure we got all of the expected data, not just a subset.
     assert df.height == 100  # rows
     assert df.width > 0  # columns
@@ -39,7 +39,7 @@ def test_read_bigquery_public_data_unordered(client):
         """,
         maintain_order=False,
     )
-    assert isinstance(df, polars.DataFrame)
+    assert isinstance(df, pl.DataFrame)
     # Make sure we got all of the expected data, not just a subset.
     assert df.height > 200  # rows
     assert df.width > 0  # columns

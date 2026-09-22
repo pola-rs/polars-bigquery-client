@@ -10,9 +10,7 @@ import polars.io.plugins
 
 import polars_bigquery.core.schema
 import polars_bigquery.core.version
-from polars_bigquery.core import bigquery_rest, predicates
-
-_PSEUDO_COLUMNS = ("_PARTITIONDATE", "_PARTITIONTIME")
+from polars_bigquery.core import bigquery_rest, compiler
 
 
 def _get_user_agent(user_agent: str | None) -> str:
@@ -54,6 +52,16 @@ class Client:
             credentials_provider=credentials_provider,
             user_agent=self._user_agent,
         )
+
+    def close(self) -> None:
+        """Close underlying REST session resources."""
+        self._rest_client.close()
+
+    def __enter__(self) -> Client:  # noqa: PYI034
+        return self
+
+    def __exit__(self, *exc_info: object) -> None:
+        self.close()
 
     @property
     def credentials_provider(self) -> pl.CredentialProviderGCP:
@@ -104,25 +112,17 @@ class Client:
             n_rows: int | None,
             batch_size: int | None,
         ) -> Iterator[pl.DataFrame]:
-            if with_columns is not None:
-                predicate_cols = (
-                    predicate.meta.root_names() if predicate is not None else []
-                )
-                selected_fields = list(dict.fromkeys([*with_columns, *predicate_cols]))
-            else:
-                selected_fields = []
-
-            # Pseudo-columns (_PARTITIONDATE, _PARTITIONTIME) cannot be requested in
-            # selected_fields for the Storage Read API, but are handled via row_restriction.
-            api_selected_fields = [
-                col for col in selected_fields if col not in _PSEUDO_COLUMNS
-            ]
+            columns = with_columns if with_columns is not None else list(schema.keys())
+            predicate_cols = (
+                predicate.meta.root_names() if predicate is not None else []
+            )
+            selected_fields = list(dict.fromkeys([*columns, *predicate_cols]))
 
             arrow_stream_exporter = self._arrow_client.read_table(
                 table_ref,
                 maintain_order=False,
-                selected_fields=api_selected_fields,
-                row_restriction=predicates.predicate_to_row_restriction(
+                selected_fields=selected_fields,
+                row_restriction=compiler.predicate_to_row_restriction(
                     predicate=predicate
                 )
                 if predicate is not None
@@ -130,24 +130,10 @@ class Client:
             )
             lazyframe = pl.scan_arrow_c_stream(arrow_stream_exporter)
 
-            # Apply in-memory filter only if all columns exist in the physical stream.
-            # Pseudo-columns are already filtered by BigQuery server-side via row_restriction.
             if predicate is not None:
-                pred_cols = set(predicate.meta.root_names())
-                if pred_cols.isdisjoint(_PSEUDO_COLUMNS):
-                    lazyframe = lazyframe.filter(predicate)
+                lazyframe = lazyframe.filter(predicate)
 
-            # Synthesize missing pseudo-columns as null to fulfill registered schema contracts.
-            for pseudo_col in _PSEUDO_COLUMNS:
-                if pseudo_col in schema and (
-                    with_columns is None or pseudo_col in with_columns
-                ):
-                    lazyframe = lazyframe.with_columns(
-                        pl.lit(None, dtype=schema[pseudo_col]).alias(pseudo_col)
-                    )
-
-            if with_columns is not None:
-                lazyframe = lazyframe.select(with_columns)
+            lazyframe = lazyframe.select(columns)
 
             if n_rows is not None:
                 lazyframe = lazyframe.limit(n_rows)

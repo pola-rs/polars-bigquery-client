@@ -16,18 +16,18 @@ dependencies = [
     "google-auth >= 2.40.3",
     "polars >= 1.43.0, < 3.0.0",
     "requests >= 2.33.0, < 3.0.0",
-    "cachetools >= 5.0.0",
 ]
 
 [tool.setuptools.packages.find]
 where = ["./"]
-include = ["polars_bigquery"]
+include = ["polars_bigquery*"]
 
 [tool.uv.sources]
 arrow-bigquery = { workspace = true }
 
 [dependency-groups]
 dev = [
+    "freezegun>=1.5.5",
     "pre-commit>=4.3.0",
     "pyparsing>=2.4.7",
     "pytest>=8.4.1",
@@ -36,6 +36,8 @@ dev = [
     "ruff>=0.15.10",
 ]
 test = [
+    "freezegun>=1.5.5",
+    "pre-commit>=4.3.0",
     "pytest>=8.4.1",
     "pytest-benchmark>=5.1.0",
     "pytest-xdist>=3.8.0",

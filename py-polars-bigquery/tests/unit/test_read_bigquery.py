@@ -184,7 +184,7 @@ def test_client_scan_bigquery_calls_arrow_with_parsed_id(mock_arrow_client):
         mock_arrow_client.read_table.assert_called_once_with(
             arrow_bigquery.BigQueryTableId("my-project", "my_dataset", "my_table"),
             maintain_order=False,
-            selected_fields=[],
+            selected_fields=["col1"],
             row_restriction="",
         )
         mock_scan.assert_called_once_with(mock_stream)
@@ -218,7 +218,7 @@ def test_client_scan_bigquery_handles_bigquery_objects(mock_arrow_client):
         mock_arrow_client.read_table.assert_called_once_with(
             arrow_bigquery.BigQueryTableId("p", "d", "t"),
             maintain_order=False,
-            selected_fields=[],
+            selected_fields=["col1"],
             row_restriction="",
         )
         assert df.equals(mock_lazy_df.collect())
@@ -266,6 +266,8 @@ def test_client_scan_bigquery_projects_filter_cols(
 
 
 def test_client_scan_ingestion_time_partitioned_table(mock_arrow_client):
+    from datetime import datetime, timezone
+
     mock_stream = MagicMock()
     mock_arrow_client.read_table.return_value = mock_stream
 
@@ -283,7 +285,16 @@ def test_client_scan_ingestion_time_partitioned_table(mock_arrow_client):
             "schema": {"fields": [{"name": "val", "type": "INTEGER"}]},
             "timePartitioning": {"type": "DAY"},
         }
-        mock_scan.return_value = pl.LazyFrame({"val": [10, 20]})
+        mock_scan.return_value = pl.LazyFrame(
+            {
+                "val": [10, 20],
+                "_PARTITIONDATE": [date(2024, 1, 1), date(2024, 1, 2)],
+                "_PARTITIONTIME": [
+                    datetime(2024, 1, 1, tzinfo=timezone.utc),
+                    datetime(2024, 1, 2, tzinfo=timezone.utc),
+                ],
+            }
+        )
 
         client = Client(quota_project_id="q")
         lf = client.scan_table(table="my-project.my_dataset.my_table")
@@ -293,12 +304,21 @@ def test_client_scan_ingestion_time_partitioned_table(mock_arrow_client):
         raw_df = next(io_source(None, None, None, None))
         assert raw_df.columns == ["val", "_PARTITIONDATE", "_PARTITIONTIME"]
 
-        # 1. Verify unfiltered collect synthesizes pseudo-columns without crashing
+        # 1. Verify unfiltered collect includes pseudo-columns in selected_fields
         df_all = lf.collect()
+        mock_arrow_client.read_table.assert_called_with(
+            arrow_bigquery.BigQueryTableId("my-project", "my_dataset", "my_table"),
+            maintain_order=False,
+            selected_fields=["val", "_PARTITIONDATE", "_PARTITIONTIME"],
+            row_restriction="",
+        )
         assert df_all.columns == ["val", "_PARTITIONDATE", "_PARTITIONTIME"]
-        assert df_all["_PARTITIONDATE"].to_list() == [None, None]
+        assert df_all["_PARTITIONDATE"].to_list() == [
+            date(2024, 1, 1),
+            date(2024, 1, 2),
+        ]
 
-        # 2. Verify filter on _PARTITIONDATE strips pseudo-column from selected_fields
+        # 2. Verify filter on _PARTITIONDATE includes _PARTITIONDATE in selected_fields
         df_filtered = (
             lf.filter(pl.col("_PARTITIONDATE") == date(2024, 1, 1))
             .select("val")
@@ -307,8 +327,27 @@ def test_client_scan_ingestion_time_partitioned_table(mock_arrow_client):
         mock_arrow_client.read_table.assert_called_with(
             arrow_bigquery.BigQueryTableId("my-project", "my_dataset", "my_table"),
             maintain_order=False,
-            selected_fields=["val"],
+            selected_fields=["val", "_PARTITIONDATE"],
             row_restriction="(`_PARTITIONDATE` = DATE(TIMESTAMP_SECONDS(19723 * 86400)))",
         )
         assert df_filtered.columns == ["val"]
-        assert df_filtered["val"].to_list() == [10, 20]
+        assert df_filtered["val"].to_list() == [10]
+
+        # 3. Verify compound filter with _PARTITIONDATE and physical column
+        df_compound = (
+            lf.filter(
+                (pl.col("_PARTITIONDATE") == date(2024, 1, 2)) & (pl.col("val") > 15)
+            )
+            .select("val")
+            .collect()
+        )
+        assert df_compound["val"].to_list() == [20]
+
+
+def test_client_context_manager_closes_rest_session(mock_arrow_client):
+    with patch.object(
+        Client, "close", wraps=Client(quota_project_id="q").close
+    ) as mock_close:
+        with Client(quota_project_id="q") as client:
+            assert client.quota_project_id == "q"
+        mock_close.assert_called_once()

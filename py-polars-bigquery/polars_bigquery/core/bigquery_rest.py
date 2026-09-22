@@ -260,11 +260,23 @@ class BigQueryRestClient:
         self._quota_project_id = quota_project_id
         self._credentials_provider = credentials_provider
         self._user_agent = user_agent
+        self._owns_session = session is None
         self._session = session if session is not None else create_resilient_session()
 
     @property
     def session(self) -> requests.Session:
         return self._session
+
+    def close(self) -> None:
+        """Close the underlying HTTP session if owned by this client."""
+        if self._owns_session:
+            self._session.close()
+
+    def __enter__(self) -> BigQueryRestClient:  # noqa: PYI034
+        return self
+
+    def __exit__(self, *exc_info: object) -> None:
+        self.close()
 
     def run_query(self, query: str) -> str:
         return run_query(
