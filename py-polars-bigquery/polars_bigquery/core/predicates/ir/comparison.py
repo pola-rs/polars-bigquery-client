@@ -38,15 +38,3 @@ class LtEq(BinaryExpr):
 @dataclasses.dataclass(frozen=True)
 class IsIn(BinaryExpr):
     """IR node representing set membership comparison (IN)."""
-
-
-# Keys represent Polars Rust AST `Operator` enum variant names emitted under
-# `{"BinaryExpr": {"op": "<key>"}}` when serializing `pl.Expr.meta.serialize(format="json")`.
-COMPARISON_BINARY_OPS: dict[str, type[BinaryExpr]] = {
-    "Eq": Eq,
-    "NotEq": NotEq,
-    "Gt": Gt,
-    "GtEq": GtEq,
-    "Lt": Lt,
-    "LtEq": LtEq,
-}

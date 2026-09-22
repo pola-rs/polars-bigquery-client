@@ -1,0 +1,80 @@
+from __future__ import annotations
+
+from collections.abc import Callable
+from typing import Any
+
+from polars_bigquery.core.predicates.ir.base import (
+    BinaryExpr,
+    Expr,
+    UnaryExpr,
+)
+from polars_bigquery.core.predicates.ir.boolean import (
+    And,
+    BoolLiteral,
+    IsNotNull,
+    IsNull,
+    Not,
+    Or,
+)
+from polars_bigquery.core.predicates.ir.comparison import IsIn
+from polars_bigquery.core.predicates.parser.base import UNSUPPORTED_RECORD
+from polars_bigquery.core.predicates.parser.numeric import NUMERIC_UNARY_OPS
+
+
+def parse_bool_literal(value: Any) -> BoolLiteral:
+    """Parse a Boolean value from Polars JSON into a BoolLiteral."""
+    return BoolLiteral(value=bool(value))
+
+
+# Keys represent Polars Rust AST `LiteralValue` / `AnyValue` enum variant names
+# emitted inside `{"Literal": ...}` in serialized Polars JSON.
+BOOLEAN_LITERAL_PARSERS: dict[str, Callable[[Any], Expr]] = {
+    "Boolean": parse_bool_literal,
+}
+
+# Keys represent Polars Rust AST `Operator` enum variant names emitted under
+# `{"BinaryExpr": {"op": "<key>"}}` when serializing `pl.Expr.meta.serialize(format="json")`.
+LOGICAL_BINARY_OPS: dict[str, type[BinaryExpr]] = {
+    "And": And,
+    "Or": Or,
+}
+
+# Keys represent Polars Rust AST `BooleanFunction` enum variant names emitted under
+# `{"Function": {"function": {"Boolean": "<key>"}}}` in serialized Polars JSON.
+BOOLEAN_UNARY_OPS: dict[str, type[UnaryExpr]] = {
+    "Not": Not,
+    "IsNull": IsNull,
+    "IsNotNull": IsNotNull,
+}
+
+_BOOLEAN_OPS: dict[str, type[UnaryExpr]] = {
+    **BOOLEAN_UNARY_OPS,
+    **NUMERIC_UNARY_OPS,
+}
+
+
+def parse_boolean_function(
+    boolean_name: Any, inputs: list[Any]
+) -> tuple[str, Any, tuple[Any, ...]]:
+    """Extract IR constructor and child JSON for a Polars `BooleanFunction` node."""
+    if (
+        isinstance(boolean_name, str)
+        and boolean_name in _BOOLEAN_OPS
+        and len(inputs) >= 1
+    ):
+        return ("Unary", _BOOLEAN_OPS[boolean_name], (inputs[0],))
+    if (
+        isinstance(boolean_name, dict)
+        and len(boolean_name) == 1
+        and "IsIn" in boolean_name
+        and len(inputs) == 2
+    ):
+        isin_opts = boolean_name["IsIn"]
+        nulls_equal = (
+            isin_opts.get("nulls_equal", False)
+            if isinstance(isin_opts, dict)
+            else bool(isin_opts)
+        )
+        if not nulls_equal:
+            return ("Binary", IsIn, (inputs[0], inputs[1]))
+    return UNSUPPORTED_RECORD

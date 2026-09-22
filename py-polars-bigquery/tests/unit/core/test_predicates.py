@@ -403,6 +403,28 @@ def test_ir_frozen_dataclasses_and_submodules() -> None:
     )
     assert predicates.ir_to_sql(combined) == expected_sql
 
+    # Verify parser submodules
+    assert (
+        predicates.parser.base.parse_null_literal(None)
+        == predicates.ir.base.NullLiteral()
+    )
+    assert predicates.parser.boolean.parse_bool_literal(
+        True
+    ) == predicates.ir.boolean.BoolLiteral(True)
+    assert (
+        predicates.parser.comparison.COMPARISON_BINARY_OPS["Eq"]
+        is predicates.ir.comparison.Eq
+    )
+    assert predicates.parser.numeric.parse_int_literal(42) == predicates.ir.IntLiteral(
+        42
+    )
+    assert predicates.parser.string.parse_string_literal(
+        "abc"
+    ) == predicates.ir.StringLiteral("abc")
+    assert predicates.parser.temporal.parse_date_literal(
+        10
+    ) == predicates.ir.DateLiteral(10)
+
 
 def test_predicate_to_row_restriction_root_recursion_error_fallback(
     monkeypatch,

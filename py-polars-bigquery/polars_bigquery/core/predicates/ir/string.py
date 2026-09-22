@@ -1,8 +1,6 @@
 from __future__ import annotations
 
 import dataclasses
-from collections.abc import Callable
-from typing import Any
 
 from polars_bigquery.core.predicates.ir.base import (
     BinaryExpr,
@@ -10,8 +8,6 @@ from polars_bigquery.core.predicates.ir.base import (
     Literal,
     UnaryExpr,
 )
-
-STRING_TYPES = frozenset({"String", "StringOwned"})
 
 
 @dataclasses.dataclass(frozen=True)
@@ -70,28 +66,3 @@ class EndsWith(BinaryExpr):
     @property
     def suffix(self) -> Expr:
         return self.right
-
-
-# Keys represent Polars Rust AST `StringFunction` enum variant names emitted under
-# `{"Function": {"function": {"StringExpr": "<key>"}}}` in serialized Polars JSON.
-STRING_UNARY_OPS: dict[str, type[UnaryExpr]] = {
-    "Uppercase": Uppercase,
-    "Lowercase": Lowercase,
-}
-
-STRING_BINARY_OPS: dict[str, type[BinaryExpr]] = {
-    "StartsWith": StartsWith,
-    "EndsWith": EndsWith,
-}
-
-
-def parse_string_literal(value: Any) -> StringLiteral:
-    """Parse a string value from Polars JSON into a StringLiteral."""
-    return StringLiteral(value=str(value))
-
-
-# Keys represent Polars Rust AST `LiteralValue` / `AnyValue` string variant names
-# emitted inside `{"Literal": ...}` in serialized Polars JSON.
-STRING_LITERAL_PARSERS: dict[str, Callable[[Any], Expr]] = dict.fromkeys(
-    STRING_TYPES, parse_string_literal
-)

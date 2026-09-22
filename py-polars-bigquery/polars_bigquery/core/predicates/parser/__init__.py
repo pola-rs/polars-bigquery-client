@@ -3,51 +3,56 @@
 from __future__ import annotations
 
 import collections
-import functools
 import io
 from collections.abc import Callable
 from typing import Any
 
 import polars as pl
 
-from polars_bigquery.core.predicates.ir.base import (
-    NULL_LITERAL_PARSERS,
+from polars_bigquery.core.predicates.ir import (
     BinaryExpr,
-    Column,
+    BoolLiteral,
+    DateLiteral,
     Expr,
+    FloatLiteral,
+    IntLiteral,
     ListLiteral,
     Literal,
     NullLiteral,
-    UnaryExpr,
+    StringLiteral,
+    TimestampLiteral,
     Unsupported,
 )
-from polars_bigquery.core.predicates.ir.boolean import (
+from polars_bigquery.core.predicates.parser import (
+    base,
+    boolean,
+    comparison,
+    numeric,
+    string,
+    temporal,
+)
+from polars_bigquery.core.predicates.parser.base import (
+    NULL_LITERAL_PARSERS,
+    UNSUPPORTED_RECORD,
+    parse_column_expr,
+)
+from polars_bigquery.core.predicates.parser.boolean import (
     BOOLEAN_LITERAL_PARSERS,
-    BOOLEAN_UNARY_OPS,
     LOGICAL_BINARY_OPS,
-    BoolLiteral,
+    parse_boolean_function,
 )
-from polars_bigquery.core.predicates.ir.comparison import (
+from polars_bigquery.core.predicates.parser.comparison import (
     COMPARISON_BINARY_OPS,
-    IsIn,
 )
-from polars_bigquery.core.predicates.ir.numeric import (
+from polars_bigquery.core.predicates.parser.numeric import (
     NUMERIC_LITERAL_PARSERS,
-    NUMERIC_UNARY_OPS,
-    FloatLiteral,
-    IntLiteral,
 )
-from polars_bigquery.core.predicates.ir.string import (
-    STRING_BINARY_OPS,
+from polars_bigquery.core.predicates.parser.string import (
     STRING_LITERAL_PARSERS,
-    STRING_UNARY_OPS,
-    Contains,
-    StringLiteral,
+    parse_string_function,
 )
-from polars_bigquery.core.predicates.ir.temporal import (
+from polars_bigquery.core.predicates.parser.temporal import (
     TEMPORAL_LITERAL_PARSERS,
-    DateLiteral,
-    TimestampLiteral,
     parse_datetime_literal,
 )
 
@@ -59,13 +64,6 @@ from polars_bigquery.core.predicates.ir.temporal import (
 _BINARY_OPS: dict[str, type[BinaryExpr]] = {
     **LOGICAL_BINARY_OPS,
     **COMPARISON_BINARY_OPS,
-}
-
-# Keys represent Polars Rust AST `BooleanFunction` enum variant names (e.g., "Not", "IsNull")
-# emitted in `{"Function": {"function": {"Boolean": "<key>"}}}` in serialized Polars JSON.
-_BOOLEAN_OPS: dict[str, type[UnaryExpr]] = {
-    **BOOLEAN_UNARY_OPS,
-    **NUMERIC_UNARY_OPS,
 }
 
 _DATETIME_UNIT_NAMES: dict[str, str] = {
@@ -164,8 +162,6 @@ _LITERAL_PARSERS: dict[str, Callable[[Any], Expr]] = {
     "Series": _parse_list_literal,
 }
 
-_UNSUPPORTED_RECORD: tuple[str, Any, tuple[Any, ...]] = ("Leaf", Unsupported(), ())
-
 
 def _json_literal_to_ir(literal_json: Any) -> Expr:
     """Convert a literal from a Polars expression JSON into an IR node.
@@ -212,74 +208,14 @@ def _json_literal_to_ir(literal_json: Any) -> Expr:
 def _parse_binary_expr(binary_expr: Any) -> tuple[str, Any, tuple[Any, ...]]:
     """Extract IR constructor and child JSONs for a Polars `BinaryExpr` node."""
     if not isinstance(binary_expr, dict):
-        return _UNSUPPORTED_RECORD
+        return UNSUPPORTED_RECORD
     polars_op = binary_expr.get("op")
     binary_cls = _BINARY_OPS.get(polars_op) if isinstance(polars_op, str) else None
     left_json = binary_expr.get("left")
     right_json = binary_expr.get("right")
     if binary_cls is None or left_json is None or right_json is None:
-        return _UNSUPPORTED_RECORD
+        return UNSUPPORTED_RECORD
     return ("Binary", binary_cls, (left_json, right_json))
-
-
-def _parse_boolean_function(
-    boolean_name: Any, inputs: list[Any]
-) -> tuple[str, Any, tuple[Any, ...]]:
-    """Extract IR constructor and child JSON for a Polars `BooleanFunction` node."""
-    if (
-        isinstance(boolean_name, str)
-        and boolean_name in _BOOLEAN_OPS
-        and len(inputs) >= 1
-    ):
-        return ("Unary", _BOOLEAN_OPS[boolean_name], (inputs[0],))
-    if (
-        isinstance(boolean_name, dict)
-        and len(boolean_name) == 1
-        and "IsIn" in boolean_name
-        and len(inputs) == 2
-    ):
-        isin_opts = boolean_name["IsIn"]
-        nulls_equal = (
-            isin_opts.get("nulls_equal", False)
-            if isinstance(isin_opts, dict)
-            else bool(isin_opts)
-        )
-        if not nulls_equal:
-            return ("Binary", IsIn, (inputs[0], inputs[1]))
-    return _UNSUPPORTED_RECORD
-
-
-def _parse_string_function(
-    string_name: Any, inputs: list[Any]
-) -> tuple[str, Any, tuple[Any, ...]]:
-    """Extract IR constructor and child JSONs for a Polars `StringFunction` node."""
-    if (
-        isinstance(string_name, str)
-        and string_name in STRING_UNARY_OPS
-        and len(inputs) == 1
-    ):
-        return ("Unary", STRING_UNARY_OPS[string_name], (inputs[0],))
-    if (
-        isinstance(string_name, str)
-        and string_name in STRING_BINARY_OPS
-        and len(inputs) == 2
-    ):
-        return ("Binary", STRING_BINARY_OPS[string_name], (inputs[0], inputs[1]))
-    if (
-        isinstance(string_name, dict)
-        and len(string_name) == 1
-        and "Contains" in string_name
-        and len(inputs) == 2
-    ):
-        contains_opts = string_name["Contains"]
-        if isinstance(contains_opts, dict):
-            literal = bool(contains_opts.get("literal", False))
-            return (
-                "Binary",
-                functools.partial(Contains, literal=literal),
-                (inputs[0], inputs[1]),
-            )
-    return _UNSUPPORTED_RECORD
 
 
 # Keys represent Polars Rust AST `FunctionExpr` enum variant names emitted under
@@ -287,30 +223,25 @@ def _parse_string_function(
 _FUNCTION_PARSERS: dict[
     str, Callable[[Any, list[Any]], tuple[str, Any, tuple[Any, ...]]]
 ] = {
-    "Boolean": _parse_boolean_function,
-    "StringExpr": _parse_string_function,
+    "Boolean": parse_boolean_function,
+    "StringExpr": parse_string_function,
 }
 
 
 def _parse_function_expr(function_json: Any) -> tuple[str, Any, tuple[Any, ...]]:
     """Extract IR constructor and child JSONs for a Polars `Function` node."""
     if not isinstance(function_json, dict):
-        return _UNSUPPORTED_RECORD
+        return UNSUPPORTED_RECORD
     inputs = function_json.get("input", [])
     if not isinstance(inputs, list):
-        return _UNSUPPORTED_RECORD
+        return UNSUPPORTED_RECORD
     function_details = function_json.get("function")
     if isinstance(function_details, dict) and len(function_details) == 1:
         func_category, func_name = next(iter(function_details.items()))
         func_parser = _FUNCTION_PARSERS.get(func_category)
         if func_parser is not None:
             return func_parser(func_name, inputs)
-    return _UNSUPPORTED_RECORD
-
-
-def _parse_column_expr(column_json: Any) -> tuple[str, Any, tuple[Any, ...]]:
-    """Extract Column leaf node for a Polars `Column` node."""
-    return ("Leaf", Column(name=str(column_json)), ())
+    return UNSUPPORTED_RECORD
 
 
 def _parse_literal_expr(literal_json: Any) -> tuple[str, Any, tuple[Any, ...]]:
@@ -323,7 +254,7 @@ def _parse_literal_expr(literal_json: Any) -> tuple[str, Any, tuple[Any, ...]]:
 _EXPR_PARSERS: dict[str, Callable[[Any], tuple[str, Any, tuple[Any, ...]]]] = {
     "BinaryExpr": _parse_binary_expr,
     "Function": _parse_function_expr,
-    "Column": _parse_column_expr,
+    "Column": parse_column_expr,
     "Literal": _parse_literal_expr,
 }
 
@@ -353,13 +284,13 @@ def json_to_ir(expr_json: Any) -> Expr:
         curr = raw_nodes[curr_idx]
 
         if not isinstance(curr, dict) or len(curr) != 1:
-            records.append(_UNSUPPORTED_RECORD)
+            records.append(UNSUPPORTED_RECORD)
             continue
 
         expr_type, payload = next(iter(curr.items()))
         parser = _EXPR_PARSERS.get(expr_type)
         if parser is None:
-            records.append(_UNSUPPORTED_RECORD)
+            records.append(UNSUPPORTED_RECORD)
             continue
 
         kind, cls_or_leaf, child_jsons = parser(payload)
@@ -398,5 +329,11 @@ def json_to_ir(expr_json: Any) -> Expr:
 
 
 __all__ = [
+    "base",
+    "boolean",
+    "comparison",
     "json_to_ir",
+    "numeric",
+    "string",
+    "temporal",
 ]
