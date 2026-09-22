@@ -6,6 +6,7 @@ from typing import Any
 
 import polars as pl
 import pytest
+
 from polars_bigquery.core import compiler
 
 
@@ -736,3 +737,39 @@ def test_json_path_parser_registration_and_dispatch() -> None:
         (),
     )
     assert compiler.json_to_ir({"UnknownNode": 123}) == compiler.ir.Unsupported()
+
+    # Duplicate path registration raises ValueError
+    with pytest.raises(ValueError, match="Duplicate parser registration"):
+        compiler.parser.register_parser("$.Column")(lambda x: compiler.ir.Unsupported())
+
+    # Strict type boundary checks (preventing str()/bool()/int(bool) coercion bugs)
+    assert compiler.parser.base.parse_column_expr(None) == (
+        "Leaf",
+        compiler.ir.Unsupported(),
+        (),
+    )
+    assert compiler.parser.base.parse_column_expr({"name": "a"}) == (
+        "Leaf",
+        compiler.ir.Unsupported(),
+        (),
+    )
+    assert (
+        compiler.parser.boolean.parse_bool_literal("false") == compiler.ir.Unsupported()
+    )
+    assert compiler.parser.numeric.parse_int_literal(True) == compiler.ir.Unsupported()
+    assert (
+        compiler.parser.numeric.parse_float_literal(False) == compiler.ir.Unsupported()
+    )
+    assert (
+        compiler.parser.temporal.parse_date_literal(True) == compiler.ir.Unsupported()
+    )
+    assert (
+        compiler.parser.string.parse_string_literal(None) == compiler.ir.Unsupported()
+    )
+
+    # Unit-string Null variant and multi-arg unary function rejection
+    assert compiler.json_to_ir({"Literal": "Null"}) == compiler.ir.NullLiteral()
+    assert compiler.parser.boolean.parse_not(
+        "Not",
+        {"input": [{"Column": "a"}, {"Column": "b"}], "function": {"Boolean": "Not"}},
+    ) == ("Leaf", compiler.ir.Unsupported(), ())

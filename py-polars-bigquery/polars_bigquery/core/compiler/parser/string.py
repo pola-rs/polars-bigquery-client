@@ -3,6 +3,7 @@ from __future__ import annotations
 import functools
 from typing import Any
 
+from polars_bigquery.core.compiler.ir.base import Expr, Unsupported
 from polars_bigquery.core.compiler.ir.string import (
     Contains,
     EndsWith,
@@ -24,9 +25,11 @@ STRING_TYPES = frozenset({"String", "StringOwned"})
 
 
 @register_parser(*(f"$.Literal..{str_type}" for str_type in sorted(STRING_TYPES)))
-def parse_string_literal(value: Any) -> StringLiteral:
-    """Parse a string value from Polars JSON into a StringLiteral."""
-    return StringLiteral(value=str(value))
+def parse_string_literal(value: Any) -> Expr:
+    """Parse a string value from Polars JSON into a StringLiteral or Unsupported."""
+    if not isinstance(value, str):
+        return Unsupported()
+    return StringLiteral(value=value)
 
 
 @register_parser("$.Function.function.StringExpr.Uppercase")

@@ -19,11 +19,17 @@ from polars_bigquery.core.compiler.ir.temporal import DateLiteral, TimestampLite
 from polars_bigquery.core.compiler.parser.base import (
     UNSUPPORTED_RECORD,
     ParseRecord,
-    dispatch_parser,
+    dispatch_literal_parser,
     extract_function_inputs,
     register_parser,
 )
-from polars_bigquery.core.compiler.parser.temporal import parse_datetime_literal
+from polars_bigquery.core.compiler.parser.temporal import (
+    parse_ticks_and_unit,
+    parse_timezone,
+)
+
+MAX_IN_LIST_ELEMENTS = 10_000
+MAX_IPC_BYTES = 1_048_576
 
 _DATETIME_UNIT_NAMES: dict[str, str] = {
     "us": "Microseconds",
@@ -34,12 +40,15 @@ _DATETIME_UNIT_NAMES: dict[str, str] = {
 
 def parse_ipc_series_to_list_literal(raw_bytes: bytes) -> Expr:
     """Decode an Arrow IPC stream representing a 1-column Polars Series into a ListLiteral."""
+    if not raw_bytes or len(raw_bytes) > MAX_IPC_BYTES:
+        return Unsupported()
+
     try:
         df = pl.read_ipc_stream(io.BytesIO(raw_bytes))
     except (pl.exceptions.PolarsError, OSError, ValueError):
         return Unsupported()
 
-    if df.width != 1 or df.height == 0:
+    if df.width != 1 or df.height == 0 or df.height > MAX_IN_LIST_ELEMENTS:
         return Unsupported()
 
     series = df.to_series()
@@ -74,17 +83,36 @@ def parse_ipc_series_to_list_literal(raw_bytes: bytes) -> Expr:
         unit_str = _DATETIME_UNIT_NAMES.get(series.dtype.time_unit)
         if unit_str is None:
             return Unsupported()
-        parsed_items = [
-            parse_datetime_literal([int(t), unit_str, series.dtype.time_zone])
-            for t in series.to_physical().to_list()
-        ]
-        if all(isinstance(item, TimestampLiteral) for item in parsed_items):
-            return ListLiteral(
-                values=tuple(
-                    item for item in parsed_items if isinstance(item, TimestampLiteral)
+        try:
+            tz = parse_timezone(series.dtype.time_zone)
+            timestamps = tuple(
+                TimestampLiteral(
+                    ticks=ticks,
+                    unit=unit,
+                    tz=tz,
                 )
+                for raw_t in series.to_physical().to_list()
+                for ticks, unit in (parse_ticks_and_unit(raw_t, unit_str),)
             )
+        except (TypeError, ValueError):
+            return Unsupported()
+        return ListLiteral(values=timestamps)
     return Unsupported()
+
+
+def _try_extract_ipc_bytes(value: list[Any]) -> bytes | None:
+    """Convert an integer byte list to `bytes` without redundant full-list scans."""
+    first = value[0]
+    if not isinstance(first, int) or isinstance(first, bool):
+        return None
+    if len(value) > MAX_IPC_BYTES:
+        return b""
+    try:
+        if any(isinstance(b, bool) for b in value):
+            return None
+        return bytes(value)
+    except (TypeError, ValueError):
+        return None
 
 
 @register_parser("$.Literal..List", "$.Literal..Series")
@@ -93,14 +121,16 @@ def parse_list_literal(value: Any) -> Expr:
     if not isinstance(value, list) or not value:
         return Unsupported()
 
-    if all(
-        isinstance(b, int) and not isinstance(b, bool) and 0 <= b <= 255 for b in value
-    ):
-        return parse_ipc_series_to_list_literal(bytes(value))
+    ipc_bytes = _try_extract_ipc_bytes(value)
+    if ipc_bytes is not None:
+        return parse_ipc_series_to_list_literal(ipc_bytes)
+
+    if len(value) > MAX_IN_LIST_ELEMENTS:
+        return Unsupported()
 
     parsed_literals: list[Literal] = []
     for elem in value:
-        kind, ir_elem, _ = dispatch_parser({"Literal": elem})
+        kind, ir_elem, _ = dispatch_literal_parser(elem)
         if (
             kind != "Leaf"
             or not isinstance(ir_elem, Literal)

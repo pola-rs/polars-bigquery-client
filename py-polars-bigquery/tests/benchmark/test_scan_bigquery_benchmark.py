@@ -2,8 +2,9 @@ import datetime
 import os
 
 import polars as pl
-import polars_bigquery
 import pytest
+
+import polars_bigquery
 
 
 @pytest.fixture(scope="session")

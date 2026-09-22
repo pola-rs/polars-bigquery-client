@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from polars_bigquery.core.compiler.ir.base import Expr, Unsupported
 from polars_bigquery.core.compiler.ir.boolean import (
     And,
     BoolLiteral,
@@ -19,9 +20,11 @@ from polars_bigquery.core.compiler.parser.base import (
 
 
 @register_parser("$.Literal..Boolean")
-def parse_bool_literal(value: Any) -> BoolLiteral:
-    """Parse a Boolean value from Polars JSON into a BoolLiteral."""
-    return BoolLiteral(value=bool(value))
+def parse_bool_literal(value: Any) -> Expr:
+    """Parse a Boolean value from Polars JSON into a BoolLiteral or Unsupported."""
+    if not isinstance(value, bool):
+        return Unsupported()
+    return BoolLiteral(value=value)
 
 
 @register_parser("$.BinaryExpr.op.And")

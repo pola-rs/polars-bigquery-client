@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import collections
-from collections.abc import Sequence
 from typing import Any
 
 from polars_bigquery.core.compiler.ir import (
@@ -25,6 +24,8 @@ from polars_bigquery.core.compiler.parser.base import (
     parse_json_path,
     register_parser,
 )
+
+MAX_AST_NODES = 10_000
 
 
 def json_to_ir(expr_json: Any) -> Expr:
@@ -53,7 +54,10 @@ def json_to_ir(expr_json: Any) -> Expr:
         curr = raw_nodes[curr_idx]
 
         kind, cls_or_leaf, child_jsons = dispatch_parser(curr)
-        child_indices: Sequence[int] = []
+        if len(raw_nodes) + len(child_jsons) > MAX_AST_NODES:
+            return Unsupported()
+
+        child_indices: list[int] = []
         for child_json in child_jsons:
             child_idx = len(raw_nodes)
             raw_nodes.append(child_json)
@@ -70,11 +74,11 @@ def json_to_ir(expr_json: Any) -> Expr:
     ir_nodes: list[Expr] = [Unsupported()] * len(records)
     for idx in range(len(records) - 1, -1, -1):
         kind, cls_or_leaf, child_indices = records[idx]
-        if kind == "Leaf":
+        if kind == "Leaf" and isinstance(cls_or_leaf, Expr):
             ir_nodes[idx] = cls_or_leaf
-        elif kind == "Unary":
+        elif kind == "Unary" and len(child_indices) == 1:
             ir_nodes[idx] = cls_or_leaf(expr=ir_nodes[child_indices[0]])
-        elif kind == "Binary":
+        elif kind == "Binary" and len(child_indices) == 2:
             ir_nodes[idx] = cls_or_leaf(
                 left=ir_nodes[child_indices[0]],
                 right=ir_nodes[child_indices[1]],

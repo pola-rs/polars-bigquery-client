@@ -65,6 +65,8 @@ def parse_is_finite(_spec: Any, expr_json: Any) -> ParseRecord:
 @register_parser(*(f"$.Literal..{int_type}" for int_type in sorted(INT_TYPES)))
 def parse_int_literal(value: Any) -> Expr:
     """Parse an integer value from Polars JSON into an IntLiteral or Unsupported."""
+    if isinstance(value, bool):
+        return Unsupported()
     try:
         return IntLiteral(value=int(value))
     except (TypeError, ValueError):
@@ -74,7 +76,7 @@ def parse_int_literal(value: Any) -> Expr:
 @register_parser(*(f"$.Literal..{float_type}" for float_type in sorted(FLOAT_TYPES)))
 def parse_float_literal(value: Any) -> Expr:
     """Parse a float value from Polars JSON into a FloatLiteral or Unsupported."""
-    if value is None:
+    if value is None or isinstance(value, bool):
         return Unsupported()
     if isinstance(value, str):
         val_lower = value.strip().lower()

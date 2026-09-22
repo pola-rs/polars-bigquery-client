@@ -14,6 +14,8 @@ from polars_bigquery.core.compiler.parser.base import register_parser
 @register_parser("$.Literal..Date")
 def parse_date_literal(value: Any) -> Expr:
     """Parse a Date value from Polars JSON into a DateLiteral or Unsupported."""
+    if isinstance(value, bool):
+        return Unsupported()
     try:
         days = int(value)
     except (TypeError, ValueError):
@@ -21,8 +23,10 @@ def parse_date_literal(value: Any) -> Expr:
     return DateLiteral(days=days)
 
 
-def _parse_ticks_and_unit(ticks_raw: Any, units_raw: Any) -> tuple[int, TimestampUnit]:
+def parse_ticks_and_unit(ticks_raw: Any, units_raw: Any) -> tuple[int, TimestampUnit]:
     """Parse ticks and unit from Polars JSON, converting exact nanoseconds to microseconds."""
+    if isinstance(ticks_raw, bool):
+        raise TypeError("Boolean is not a valid timestamp tick count")
     ticks = int(ticks_raw)
     if units_raw == "Microseconds":
         return ticks, TimestampUnit.MICROSECONDS
@@ -33,7 +37,7 @@ def _parse_ticks_and_unit(ticks_raw: Any, units_raw: Any) -> tuple[int, Timestam
     raise ValueError(f"Unsupported datetime unit or precision: {units_raw!r}")
 
 
-def _parse_timezone(tz_raw: Any) -> str | None:
+def parse_timezone(tz_raw: Any) -> str | None:
     """Parse a timezone representation from Polars JSON."""
     if tz_raw is None or isinstance(tz_raw, str):
         return tz_raw
@@ -48,8 +52,8 @@ def parse_datetime_literal(value: Any) -> Expr:
     if not isinstance(value, (list, tuple)) or len(value) < 2:
         return Unsupported()
     try:
-        ticks, unit = _parse_ticks_and_unit(value[0], value[1])
-        tz = _parse_timezone(value[2] if len(value) >= 3 else "UTC")
+        ticks, unit = parse_ticks_and_unit(value[0], value[1])
+        tz = parse_timezone(value[2] if len(value) >= 3 else "UTC")
     except (TypeError, ValueError):
         return Unsupported()
     return TimestampLiteral(ticks=ticks, unit=unit, tz=tz)
