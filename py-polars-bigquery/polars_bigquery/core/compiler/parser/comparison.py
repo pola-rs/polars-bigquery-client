@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from polars_bigquery.core.predicates.ir.base import BinaryExpr
-from polars_bigquery.core.predicates.ir.comparison import (
+from polars_bigquery.core.compiler.ir.base import BinaryExpr
+from polars_bigquery.core.compiler.ir.comparison import (
     Eq,
     Gt,
     GtEq,

@@ -9,7 +9,7 @@ from typing import Any
 
 import polars as pl
 
-from polars_bigquery.core.predicates.ir import (
+from polars_bigquery.core.compiler.ir import (
     BinaryExpr,
     BoolLiteral,
     DateLiteral,
@@ -23,7 +23,7 @@ from polars_bigquery.core.predicates.ir import (
     TimestampLiteral,
     Unsupported,
 )
-from polars_bigquery.core.predicates.parser import (
+from polars_bigquery.core.compiler.parser import (
     base,
     boolean,
     comparison,
@@ -31,27 +31,27 @@ from polars_bigquery.core.predicates.parser import (
     string,
     temporal,
 )
-from polars_bigquery.core.predicates.parser.base import (
+from polars_bigquery.core.compiler.parser.base import (
     NULL_LITERAL_PARSERS,
     UNSUPPORTED_RECORD,
     parse_column_expr,
 )
-from polars_bigquery.core.predicates.parser.boolean import (
+from polars_bigquery.core.compiler.parser.boolean import (
     BOOLEAN_LITERAL_PARSERS,
     LOGICAL_BINARY_OPS,
     parse_boolean_function,
 )
-from polars_bigquery.core.predicates.parser.comparison import (
+from polars_bigquery.core.compiler.parser.comparison import (
     COMPARISON_BINARY_OPS,
 )
-from polars_bigquery.core.predicates.parser.numeric import (
+from polars_bigquery.core.compiler.parser.numeric import (
     NUMERIC_LITERAL_PARSERS,
 )
-from polars_bigquery.core.predicates.parser.string import (
+from polars_bigquery.core.compiler.parser.string import (
     STRING_LITERAL_PARSERS,
     parse_string_function,
 )
-from polars_bigquery.core.predicates.parser.temporal import (
+from polars_bigquery.core.compiler.parser.temporal import (
     TEMPORAL_LITERAL_PARSERS,
     parse_datetime_literal,
 )

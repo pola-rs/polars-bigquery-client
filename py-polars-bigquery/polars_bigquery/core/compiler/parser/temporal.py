@@ -3,8 +3,8 @@ from __future__ import annotations
 from collections.abc import Callable
 from typing import Any
 
-from polars_bigquery.core.predicates.ir.base import Expr, Unsupported
-from polars_bigquery.core.predicates.ir.temporal import (
+from polars_bigquery.core.compiler.ir.base import Expr, Unsupported
+from polars_bigquery.core.compiler.ir.temporal import (
     DateLiteral,
     TimestampLiteral,
     TimestampUnit,

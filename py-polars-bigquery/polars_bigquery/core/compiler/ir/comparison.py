@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import dataclasses
 
-from polars_bigquery.core.predicates.ir.base import BinaryExpr
+from polars_bigquery.core.compiler.ir.base import BinaryExpr
 
 
 @dataclasses.dataclass(frozen=True)

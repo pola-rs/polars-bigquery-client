@@ -3,12 +3,12 @@ from __future__ import annotations
 from collections.abc import Callable
 from typing import Any
 
-from polars_bigquery.core.predicates.ir.base import (
+from polars_bigquery.core.compiler.ir.base import (
     Expr,
     UnaryExpr,
     Unsupported,
 )
-from polars_bigquery.core.predicates.ir.numeric import (
+from polars_bigquery.core.compiler.ir.numeric import (
     FloatLiteral,
     IntLiteral,
     IsFinite,

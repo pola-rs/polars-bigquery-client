@@ -10,7 +10,7 @@ import polars.io.plugins
 
 import polars_bigquery.core.schema
 import polars_bigquery.core.version
-from polars_bigquery.core import bigquery_rest, predicates
+from polars_bigquery.core import bigquery_rest, compiler
 
 
 def _get_user_agent(user_agent: str | None) -> str:
@@ -122,7 +122,7 @@ class Client:
                 table_ref,
                 maintain_order=False,
                 selected_fields=selected_fields,
-                row_restriction=predicates.predicate_to_row_restriction(
+                row_restriction=compiler.predicate_to_row_restriction(
                     predicate=predicate
                 )
                 if predicate is not None

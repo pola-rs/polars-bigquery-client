@@ -4,12 +4,12 @@ import functools
 from collections.abc import Callable
 from typing import Any
 
-from polars_bigquery.core.predicates.ir.base import (
+from polars_bigquery.core.compiler.ir.base import (
     BinaryExpr,
     Expr,
     UnaryExpr,
 )
-from polars_bigquery.core.predicates.ir.string import (
+from polars_bigquery.core.compiler.ir.string import (
     Contains,
     EndsWith,
     Lowercase,
@@ -17,7 +17,7 @@ from polars_bigquery.core.predicates.ir.string import (
     StringLiteral,
     Uppercase,
 )
-from polars_bigquery.core.predicates.parser.base import UNSUPPORTED_RECORD
+from polars_bigquery.core.compiler.parser.base import UNSUPPORTED_RECORD
 
 STRING_TYPES = frozenset({"String", "StringOwned"})
 

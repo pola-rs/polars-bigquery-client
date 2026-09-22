@@ -3,12 +3,12 @@ from __future__ import annotations
 from collections.abc import Callable
 from typing import Any
 
-from polars_bigquery.core.predicates.ir.base import (
+from polars_bigquery.core.compiler.ir.base import (
     BinaryExpr,
     Expr,
     UnaryExpr,
 )
-from polars_bigquery.core.predicates.ir.boolean import (
+from polars_bigquery.core.compiler.ir.boolean import (
     And,
     BoolLiteral,
     IsNotNull,
@@ -16,9 +16,9 @@ from polars_bigquery.core.predicates.ir.boolean import (
     Not,
     Or,
 )
-from polars_bigquery.core.predicates.ir.comparison import IsIn
-from polars_bigquery.core.predicates.parser.base import UNSUPPORTED_RECORD
-from polars_bigquery.core.predicates.parser.numeric import NUMERIC_UNARY_OPS
+from polars_bigquery.core.compiler.ir.comparison import IsIn
+from polars_bigquery.core.compiler.parser.base import UNSUPPORTED_RECORD
+from polars_bigquery.core.compiler.parser.numeric import NUMERIC_UNARY_OPS
 
 
 def parse_bool_literal(value: Any) -> BoolLiteral:

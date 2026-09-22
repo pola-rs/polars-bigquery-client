@@ -3,7 +3,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from typing import Any
 
-from polars_bigquery.core.predicates.ir.base import (
+from polars_bigquery.core.compiler.ir.base import (
     Column,
     Expr,
     NullLiteral,

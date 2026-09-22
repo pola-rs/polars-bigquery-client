@@ -7,7 +7,7 @@ import functools
 import math
 import unicodedata
 
-from polars_bigquery.core.predicates.ir import (
+from polars_bigquery.core.compiler.ir import (
     And,
     BoolLiteral,
     Column,

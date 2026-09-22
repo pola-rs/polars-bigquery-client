@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from polars_bigquery.core.predicates.ir.base import (
+from polars_bigquery.core.compiler.ir.base import (
     BinaryExpr,
     Column,
     Expr,
@@ -10,7 +10,7 @@ from polars_bigquery.core.predicates.ir.base import (
     UnaryExpr,
     Unsupported,
 )
-from polars_bigquery.core.predicates.ir.boolean import (
+from polars_bigquery.core.compiler.ir.boolean import (
     And,
     BoolLiteral,
     IsNotNull,
@@ -18,7 +18,7 @@ from polars_bigquery.core.predicates.ir.boolean import (
     Not,
     Or,
 )
-from polars_bigquery.core.predicates.ir.comparison import (
+from polars_bigquery.core.compiler.ir.comparison import (
     Eq,
     Gt,
     GtEq,
@@ -27,7 +27,7 @@ from polars_bigquery.core.predicates.ir.comparison import (
     LtEq,
     NotEq,
 )
-from polars_bigquery.core.predicates.ir.numeric import (
+from polars_bigquery.core.compiler.ir.numeric import (
     FloatLiteral,
     IntLiteral,
     IsFinite,
@@ -35,7 +35,7 @@ from polars_bigquery.core.predicates.ir.numeric import (
     IsNan,
     IsNotNan,
 )
-from polars_bigquery.core.predicates.ir.string import (
+from polars_bigquery.core.compiler.ir.string import (
     Contains,
     EndsWith,
     Lowercase,
@@ -43,7 +43,7 @@ from polars_bigquery.core.predicates.ir.string import (
     StringLiteral,
     Uppercase,
 )
-from polars_bigquery.core.predicates.ir.temporal import (
+from polars_bigquery.core.compiler.ir.temporal import (
     DateLiteral,
     TimestampLiteral,
     TimestampUnit,

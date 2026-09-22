@@ -3,7 +3,7 @@ from __future__ import annotations
 import dataclasses
 import enum
 
-from polars_bigquery.core.predicates.ir.base import Literal
+from polars_bigquery.core.compiler.ir.base import Literal
 
 
 class TimestampUnit(enum.Enum):

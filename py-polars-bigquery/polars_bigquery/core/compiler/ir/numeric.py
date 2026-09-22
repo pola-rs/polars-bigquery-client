@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import dataclasses
 
-from polars_bigquery.core.predicates.ir.base import (
+from polars_bigquery.core.compiler.ir.base import (
     Literal,
     UnaryExpr,
 )

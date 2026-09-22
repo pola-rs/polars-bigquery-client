@@ -6,9 +6,9 @@ from typing import Any
 
 import polars as pl
 
-from polars_bigquery.core.predicates import ir, parser, sql
-from polars_bigquery.core.predicates.parser import json_to_ir
-from polars_bigquery.core.predicates.sql import ir_to_sql
+from polars_bigquery.core.compiler import ir, parser, sql
+from polars_bigquery.core.compiler.parser import json_to_ir
+from polars_bigquery.core.compiler.sql import ir_to_sql
 
 __all__ = [
     "ir",
