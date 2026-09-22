@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from collections.abc import Callable
 from typing import Any
 
 from polars_bigquery.core.compiler.ir.base import Expr, Unsupported
@@ -9,8 +8,10 @@ from polars_bigquery.core.compiler.ir.temporal import (
     TimestampLiteral,
     TimestampUnit,
 )
+from polars_bigquery.core.compiler.parser.base import register_parser
 
 
+@register_parser("$.Literal..Date")
 def parse_date_literal(value: Any) -> Expr:
     """Parse a Date value from Polars JSON into a DateLiteral or Unsupported."""
     try:
@@ -41,6 +42,7 @@ def _parse_timezone(tz_raw: Any) -> str | None:
     raise ValueError(f"Unsupported timezone representation: {tz_raw!r}")
 
 
+@register_parser("$.Literal..Datetime", "$.Literal..DateTime")
 def parse_datetime_literal(value: Any) -> Expr:
     """Parse a DateTime/Datetime value from Polars JSON into a TimestampLiteral or Unsupported."""
     if not isinstance(value, (list, tuple)) or len(value) < 2:
@@ -51,12 +53,3 @@ def parse_datetime_literal(value: Any) -> Expr:
     except (TypeError, ValueError):
         return Unsupported()
     return TimestampLiteral(ticks=ticks, unit=unit, tz=tz)
-
-
-# Keys represent Polars Rust AST `LiteralValue` / `AnyValue` temporal variant names
-# emitted inside `{"Literal": ...}` in serialized Polars JSON.
-TEMPORAL_LITERAL_PARSERS: dict[str, Callable[[Any], Expr]] = {
-    "Date": parse_date_literal,
-    "Datetime": parse_datetime_literal,
-    "DateTime": parse_datetime_literal,
-}

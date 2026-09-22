@@ -415,9 +415,16 @@ def test_ir_frozen_dataclasses_and_submodules() -> None:
     assert compiler.parser.boolean.parse_bool_literal(
         True
     ) == compiler.ir.boolean.BoolLiteral(True)
+    assert compiler.parser.comparison.parse_eq(
+        "Eq", {"left": {"Column": "a"}, "op": "Eq", "right": {"Literal": {"Int64": 10}}}
+    ) == (
+        "Binary",
+        compiler.ir.comparison.Eq,
+        ({"Column": "a"}, {"Literal": {"Int64": 10}}),
+    )
     assert (
-        compiler.parser.comparison.COMPARISON_BINARY_OPS["Eq"]
-        is compiler.ir.comparison.Eq
+        compiler.parser.PARSERS["$.BinaryExpr.op.Eq"]
+        is compiler.parser.comparison.parse_eq
     )
     assert compiler.parser.list_.parse_list_literal(
         [{"Int64": 1}, {"Int64": 2}]
@@ -665,3 +672,67 @@ def test_is_in_and_string_contains_case_expressions() -> None:
         == ""
     )
     assert compiler.predicate_to_row_restriction(pl.col("a").is_in(pl.col("b"))) == ""
+
+
+def test_json_path_parser_registration_and_dispatch() -> None:
+    assert compiler.parser.parse_json_path("$.Column") == ((".", "Column"),)
+    assert compiler.parser.parse_json_path("$.BinaryExpr.op.Eq") == (
+        (".", "BinaryExpr"),
+        (".", "op"),
+        (".", "Eq"),
+    )
+    assert compiler.parser.parse_json_path("$.Literal..Int64") == (
+        (".", "Literal"),
+        ("..", "Int64"),
+    )
+
+    with pytest.raises(ValueError, match="Invalid JSON path"):
+        compiler.parser.parse_json_path("BinaryExpr.op.Eq")
+    with pytest.raises(ValueError, match="Invalid JSON path"):
+        compiler.parser.parse_json_path("$.BinaryExpr.")
+    with pytest.raises(
+        ValueError, match="register_parser requires at least one JSON Path string"
+    ):
+        compiler.parser.register_parser()
+
+    expected_paths = {
+        "$.Column",
+        "$.Literal..Null",
+        "$.Literal..Boolean",
+        "$.BinaryExpr.op.And",
+        "$.BinaryExpr.op.Or",
+        "$.BinaryExpr.op.Eq",
+        "$.BinaryExpr.op.NotEq",
+        "$.BinaryExpr.op.Gt",
+        "$.BinaryExpr.op.GtEq",
+        "$.BinaryExpr.op.Lt",
+        "$.BinaryExpr.op.LtEq",
+        "$.Function.function.Boolean.Not",
+        "$.Function.function.Boolean.IsNull",
+        "$.Function.function.Boolean.IsNotNull",
+        "$.Function.function.Boolean.IsNan",
+        "$.Function.function.Boolean.IsNotNan",
+        "$.Function.function.Boolean.IsInfinite",
+        "$.Function.function.Boolean.IsFinite",
+        "$.Function.function.Boolean.IsIn",
+        "$.Function.function.StringExpr.Uppercase",
+        "$.Function.function.StringExpr.Lowercase",
+        "$.Function.function.StringExpr.StartsWith",
+        "$.Function.function.StringExpr.EndsWith",
+        "$.Function.function.StringExpr.Contains",
+        "$.Literal..Int64",
+        "$.Literal..Float64",
+        "$.Literal..String",
+        "$.Literal..Date",
+        "$.Literal..DateTime",
+        "$.Literal..List",
+    }
+    assert expected_paths.issubset(compiler.parser.PARSERS.keys())
+
+    # Unmatched JSON paths dispatch to an Unsupported IR leaf record
+    assert compiler.parser.dispatch_parser({"UnknownNode": 123}) == (
+        "Leaf",
+        compiler.ir.Unsupported(),
+        (),
+    )
+    assert compiler.json_to_ir({"UnknownNode": 123}) == compiler.ir.Unsupported()
