@@ -6,7 +6,6 @@ import collections
 import functools
 import math
 import unicodedata
-from typing import Any
 
 from polars_bigquery.core.predicates.ir import (
     And,

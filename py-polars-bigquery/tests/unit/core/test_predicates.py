@@ -6,7 +6,6 @@ from typing import Any
 
 import polars as pl
 import pytest
-
 from polars_bigquery.core import predicates
 
 
@@ -175,26 +174,11 @@ def test_nan_and_inf_floats_cast_to_float64() -> None:
     assert predicates.predicate_to_row_restriction(expr_neg_inf) == ""
 
     # When JSON literals contain nan, inf, and -inf, they are correctly cast to FLOAT64
-    assert (
-        _json_literal_to_sql({"Float64": "nan"})
-        == "CAST('nan' AS FLOAT64)"
-    )
-    assert (
-        _json_literal_to_sql({"Float64": "inf"})
-        == "CAST('inf' AS FLOAT64)"
-    )
-    assert (
-        _json_literal_to_sql({"Float64": "-inf"})
-        == "CAST('-inf' AS FLOAT64)"
-    )
-    assert (
-        _json_literal_to_sql({"Float64": "infinity"})
-        == "CAST('inf' AS FLOAT64)"
-    )
-    assert (
-        _json_literal_to_sql({"Float64": "-infinity"})
-        == "CAST('-inf' AS FLOAT64)"
-    )
+    assert _json_literal_to_sql({"Float64": "nan"}) == "CAST('nan' AS FLOAT64)"
+    assert _json_literal_to_sql({"Float64": "inf"}) == "CAST('inf' AS FLOAT64)"
+    assert _json_literal_to_sql({"Float64": "-inf"}) == "CAST('-inf' AS FLOAT64)"
+    assert _json_literal_to_sql({"Float64": "infinity"}) == "CAST('inf' AS FLOAT64)"
+    assert _json_literal_to_sql({"Float64": "-infinity"}) == "CAST('-inf' AS FLOAT64)"
 
     # Boolean functions for NaN and Infinity
     assert (
@@ -278,52 +262,29 @@ def test_json_literal_to_sql_all_scalar_types_and_immutability() -> None:
     for float_type in ("Float", "Float32", "Float64"):
         assert _json_literal_to_sql({float_type: 3.5}) == "3.5"
         assert (
-            _json_literal_to_sql({float_type: float("inf")})
-            == "CAST('inf' AS FLOAT64)"
+            _json_literal_to_sql({float_type: float("inf")}) == "CAST('inf' AS FLOAT64)"
         )
         assert (
             _json_literal_to_sql({float_type: float("-inf")})
             == "CAST('-inf' AS FLOAT64)"
         )
         assert (
-            _json_literal_to_sql({float_type: float("nan")})
-            == "CAST('nan' AS FLOAT64)"
+            _json_literal_to_sql({float_type: float("nan")}) == "CAST('nan' AS FLOAT64)"
+        )
+        assert _json_literal_to_sql({float_type: "nan"}) == "CAST('nan' AS FLOAT64)"
+        assert _json_literal_to_sql({float_type: "+nan"}) == "CAST('nan' AS FLOAT64)"
+        assert _json_literal_to_sql({float_type: "-nan"}) == "CAST('nan' AS FLOAT64)"
+        assert _json_literal_to_sql({float_type: "inf"}) == "CAST('inf' AS FLOAT64)"
+        assert _json_literal_to_sql({float_type: "+inf"}) == "CAST('inf' AS FLOAT64)"
+        assert (
+            _json_literal_to_sql({float_type: "infinity"}) == "CAST('inf' AS FLOAT64)"
         )
         assert (
-            _json_literal_to_sql({float_type: "nan"})
-            == "CAST('nan' AS FLOAT64)"
+            _json_literal_to_sql({float_type: "+infinity"}) == "CAST('inf' AS FLOAT64)"
         )
+        assert _json_literal_to_sql({float_type: "-inf"}) == "CAST('-inf' AS FLOAT64)"
         assert (
-            _json_literal_to_sql({float_type: "+nan"})
-            == "CAST('nan' AS FLOAT64)"
-        )
-        assert (
-            _json_literal_to_sql({float_type: "-nan"})
-            == "CAST('nan' AS FLOAT64)"
-        )
-        assert (
-            _json_literal_to_sql({float_type: "inf"})
-            == "CAST('inf' AS FLOAT64)"
-        )
-        assert (
-            _json_literal_to_sql({float_type: "+inf"})
-            == "CAST('inf' AS FLOAT64)"
-        )
-        assert (
-            _json_literal_to_sql({float_type: "infinity"})
-            == "CAST('inf' AS FLOAT64)"
-        )
-        assert (
-            _json_literal_to_sql({float_type: "+infinity"})
-            == "CAST('inf' AS FLOAT64)"
-        )
-        assert (
-            _json_literal_to_sql({float_type: "-inf"})
-            == "CAST('-inf' AS FLOAT64)"
-        )
-        assert (
-            _json_literal_to_sql({float_type: "-infinity"})
-            == "CAST('-inf' AS FLOAT64)"
+            _json_literal_to_sql({float_type: "-infinity"}) == "CAST('-inf' AS FLOAT64)"
         )
         assert _json_literal_to_sql({float_type: None}) is None
 
@@ -349,20 +310,13 @@ def test_json_literal_to_sql_all_scalar_types_and_immutability() -> None:
         _json_literal_to_sql({"DateTime": [5000, "Nanoseconds"]})
         == "TIMESTAMP_MICROS(5)"
     )
-    assert (
-        _json_literal_to_sql({"DateTime": [5555, "Nanoseconds"]}) is None
-    )
+    assert _json_literal_to_sql({"DateTime": [5555, "Nanoseconds"]}) is None
     assert _json_literal_to_sql({"DateTime": [10, "Seconds"]}) is None
 
     # Malformed literal values catch ValueError/TypeError locally and return None
     assert _json_literal_to_sql({"Int64": "not-an-int"}) is None
     assert _json_literal_to_sql({"Float64": "not-a-float"}) is None
-    assert (
-        _json_literal_to_sql(
-            {"DateTime": ["not-an-int", "Microseconds"]}
-        )
-        is None
-    )
+    assert _json_literal_to_sql({"DateTime": ["not-an-int", "Microseconds"]}) is None
     assert _json_literal_to_sql({"DateTime": []}) is None
     assert _json_literal_to_sql({"Date": "not-a-date"}) is None
 

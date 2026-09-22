@@ -11,8 +11,6 @@ from polars_bigquery.core.predicates.ir.base import (
     BinaryExpr,
     Column,
     Expr,
-    Literal,
-    NullLiteral,
     UnaryExpr,
     Unsupported,
 )
@@ -20,44 +18,20 @@ from polars_bigquery.core.predicates.ir.boolean import (
     BOOLEAN_LITERAL_PARSERS,
     BOOLEAN_UNARY_OPS,
     LOGICAL_BINARY_OPS,
-    And,
-    BoolLiteral,
-    IsNotNull,
-    IsNull,
-    Not,
-    Or,
 )
 from polars_bigquery.core.predicates.ir.comparison import (
     COMPARISON_BINARY_OPS,
-    Eq,
-    Gt,
-    GtEq,
-    Lt,
-    LtEq,
-    NotEq,
 )
 from polars_bigquery.core.predicates.ir.numeric import (
     NUMERIC_LITERAL_PARSERS,
     NUMERIC_UNARY_OPS,
-    FloatLiteral,
-    IntLiteral,
-    IsFinite,
-    IsInfinite,
-    IsNan,
-    IsNotNan,
 )
 from polars_bigquery.core.predicates.ir.string import (
     STRING_BINARY_OPS,
     STRING_LITERAL_PARSERS,
-    EndsWith,
-    StartsWith,
-    StringLiteral,
 )
 from polars_bigquery.core.predicates.ir.temporal import (
     TEMPORAL_LITERAL_PARSERS,
-    DateLiteral,
-    TimestampLiteral,
-    TimestampUnit,
 )
 
 # Keys represent Polars Rust AST `Operator` enum variant names (e.g., "And", "Eq")
