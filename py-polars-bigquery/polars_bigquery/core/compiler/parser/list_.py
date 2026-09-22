@@ -137,11 +137,16 @@ LIST_LITERAL_PARSERS: dict[str, Callable[[Any], Expr]] = {
 
 
 def parse_is_in_function(
-    isin_opts: Any, inputs: list[Any]
+    isin_spec: Any, inputs: list[Any]
 ) -> tuple[str, Any, tuple[Any, ...]]:
     """Extract IR constructor and child JSONs for a Polars `IsIn` function node."""
     if len(inputs) != 2:
         return UNSUPPORTED_RECORD
+    isin_opts = (
+        isin_spec["IsIn"]
+        if isinstance(isin_spec, dict) and "IsIn" in isin_spec
+        else isin_spec
+    )
     nulls_equal = (
         isin_opts.get("nulls_equal", False)
         if isinstance(isin_opts, dict)
@@ -150,3 +155,10 @@ def parse_is_in_function(
     if not nulls_equal:
         return ("Binary", IsIn, (inputs[0], inputs[1]))
     return UNSUPPORTED_RECORD
+
+
+LIST_FUNCTION_PARSERS: dict[
+    str, Callable[[Any, list[Any]], tuple[str, Any, tuple[Any, ...]]]
+] = {
+    "IsIn": parse_is_in_function,
+}

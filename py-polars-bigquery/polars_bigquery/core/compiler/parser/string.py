@@ -77,3 +77,12 @@ def parse_string_function(
                 (inputs[0], inputs[1]),
             )
     return UNSUPPORTED_RECORD
+
+
+STRING_FUNCTION_PARSERS: dict[
+    str, Callable[[Any, list[Any]], tuple[str, Any, tuple[Any, ...]]]
+] = {
+    **dict.fromkeys(STRING_UNARY_OPS, parse_string_function),
+    **dict.fromkeys(STRING_BINARY_OPS, parse_string_function),
+    "Contains": parse_string_function,
+}

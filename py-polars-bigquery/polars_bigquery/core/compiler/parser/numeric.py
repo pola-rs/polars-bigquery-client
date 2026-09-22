@@ -16,6 +16,7 @@ from polars_bigquery.core.compiler.ir.numeric import (
     IsNan,
     IsNotNan,
 )
+from polars_bigquery.core.compiler.parser.base import UNSUPPORTED_RECORD
 
 INT_TYPES = frozenset(
     {
@@ -42,6 +43,24 @@ NUMERIC_UNARY_OPS: dict[str, type[UnaryExpr]] = {
     "IsInfinite": IsInfinite,
     "IsFinite": IsFinite,
 }
+
+
+def parse_numeric_function(
+    numeric_name: Any, inputs: list[Any]
+) -> tuple[str, Any, tuple[Any, ...]]:
+    """Extract IR constructor and child JSON for a numeric Polars `BooleanFunction` node."""
+    if (
+        isinstance(numeric_name, str)
+        and numeric_name in NUMERIC_UNARY_OPS
+        and len(inputs) >= 1
+    ):
+        return ("Unary", NUMERIC_UNARY_OPS[numeric_name], (inputs[0],))
+    return UNSUPPORTED_RECORD
+
+
+NUMERIC_FUNCTION_PARSERS: dict[
+    str, Callable[[Any, list[Any]], tuple[str, Any, tuple[Any, ...]]]
+] = dict.fromkeys(NUMERIC_UNARY_OPS, parse_numeric_function)
 
 
 def parse_int_literal(value: Any) -> Expr:

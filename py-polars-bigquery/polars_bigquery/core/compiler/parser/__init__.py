@@ -27,22 +27,24 @@ from polars_bigquery.core.compiler.parser.base import (
     unwrap_literal_json,
 )
 from polars_bigquery.core.compiler.parser.boolean import (
+    BOOLEAN_FUNCTION_PARSERS,
     BOOLEAN_LITERAL_PARSERS,
     LOGICAL_BINARY_OPS,
-    parse_boolean_function,
 )
 from polars_bigquery.core.compiler.parser.comparison import (
     COMPARISON_BINARY_OPS,
 )
 from polars_bigquery.core.compiler.parser.list_ import (
+    LIST_FUNCTION_PARSERS,
     LIST_LITERAL_PARSERS,
 )
 from polars_bigquery.core.compiler.parser.numeric import (
+    NUMERIC_FUNCTION_PARSERS,
     NUMERIC_LITERAL_PARSERS,
 )
 from polars_bigquery.core.compiler.parser.string import (
+    STRING_FUNCTION_PARSERS,
     STRING_LITERAL_PARSERS,
-    parse_string_function,
 )
 from polars_bigquery.core.compiler.parser.temporal import (
     TEMPORAL_LITERAL_PARSERS,
@@ -116,14 +118,29 @@ def _parse_binary_expr(binary_expr: Any) -> tuple[str, Any, tuple[Any, ...]]:
     return ("Binary", binary_cls, (left_json, right_json))
 
 
-# Keys represent Polars Rust AST `FunctionExpr` enum variant names emitted under
-# `{"Function": {"function": {"<key>": ...}}}` in serialized Polars JSON.
+# Outer keys represent Polars Rust AST `FunctionExpr` enum variant names (e.g. "Boolean",
+# "StringExpr") emitted under `{"Function": {"function": {"<category>": ...}}}` in
+# serialized Polars JSON; inner keys represent the specific function variant names.
 _FUNCTION_PARSERS: dict[
-    str, Callable[[Any, list[Any]], tuple[str, Any, tuple[Any, ...]]]
+    str, dict[str, Callable[[Any, list[Any]], tuple[str, Any, tuple[Any, ...]]]]
 ] = {
-    "Boolean": parse_boolean_function,
-    "StringExpr": parse_string_function,
+    "Boolean": {
+        **BOOLEAN_FUNCTION_PARSERS,
+        **NUMERIC_FUNCTION_PARSERS,
+        **LIST_FUNCTION_PARSERS,
+    },
+    "StringExpr": STRING_FUNCTION_PARSERS,
 }
+
+
+def _extract_function_name(func_spec: Any) -> str | None:
+    """Extract the function variant name from a string or single-key option dict."""
+    if isinstance(func_spec, str):
+        return func_spec
+    if isinstance(func_spec, dict) and len(func_spec) == 1:
+        name = next(iter(func_spec.keys()))
+        return name if isinstance(name, str) else None
+    return None
 
 
 def _parse_function_expr(function_json: Any) -> tuple[str, Any, tuple[Any, ...]]:
@@ -135,10 +152,13 @@ def _parse_function_expr(function_json: Any) -> tuple[str, Any, tuple[Any, ...]]
         return UNSUPPORTED_RECORD
     function_details = function_json.get("function")
     if isinstance(function_details, dict) and len(function_details) == 1:
-        func_category, func_name = next(iter(function_details.items()))
-        func_parser = _FUNCTION_PARSERS.get(func_category)
-        if func_parser is not None:
-            return func_parser(func_name, inputs)
+        func_category, func_spec = next(iter(function_details.items()))
+        category_parsers = _FUNCTION_PARSERS.get(func_category)
+        func_name = _extract_function_name(func_spec)
+        if category_parsers is not None and func_name is not None:
+            func_parser = category_parsers.get(func_name)
+            if func_parser is not None:
+                return func_parser(func_spec, inputs)
     return UNSUPPORTED_RECORD
 
 

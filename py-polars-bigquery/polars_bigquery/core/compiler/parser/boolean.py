@@ -17,7 +17,6 @@ from polars_bigquery.core.compiler.ir.boolean import (
     Or,
 )
 from polars_bigquery.core.compiler.parser.base import UNSUPPORTED_RECORD
-from polars_bigquery.core.compiler.parser.numeric import NUMERIC_UNARY_OPS
 
 
 def parse_bool_literal(value: Any) -> BoolLiteral:
@@ -46,28 +45,20 @@ BOOLEAN_UNARY_OPS: dict[str, type[UnaryExpr]] = {
     "IsNotNull": IsNotNull,
 }
 
-_BOOLEAN_OPS: dict[str, type[UnaryExpr]] = {
-    **BOOLEAN_UNARY_OPS,
-    **NUMERIC_UNARY_OPS,
-}
-
 
 def parse_boolean_function(
     boolean_name: Any, inputs: list[Any]
 ) -> tuple[str, Any, tuple[Any, ...]]:
-    """Extract IR constructor and child JSON for a Polars `BooleanFunction` node."""
+    """Extract IR constructor and child JSON for a Polars boolean `BooleanFunction` node."""
     if (
         isinstance(boolean_name, str)
-        and boolean_name in _BOOLEAN_OPS
+        and boolean_name in BOOLEAN_UNARY_OPS
         and len(inputs) >= 1
     ):
-        return ("Unary", _BOOLEAN_OPS[boolean_name], (inputs[0],))
-    if (
-        isinstance(boolean_name, dict)
-        and len(boolean_name) == 1
-        and "IsIn" in boolean_name
-    ):
-        from polars_bigquery.core.compiler.parser.list_ import parse_is_in_function
-
-        return parse_is_in_function(boolean_name["IsIn"], inputs)
+        return ("Unary", BOOLEAN_UNARY_OPS[boolean_name], (inputs[0],))
     return UNSUPPORTED_RECORD
+
+
+BOOLEAN_FUNCTION_PARSERS: dict[
+    str, Callable[[Any, list[Any]], tuple[str, Any, tuple[Any, ...]]]
+] = dict.fromkeys(BOOLEAN_UNARY_OPS, parse_boolean_function)
