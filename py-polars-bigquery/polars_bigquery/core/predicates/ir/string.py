@@ -4,7 +4,12 @@ import dataclasses
 from collections.abc import Callable
 from typing import Any
 
-from polars_bigquery.core.predicates.ir.base import BinaryExpr, Expr, Literal
+from polars_bigquery.core.predicates.ir.base import (
+    BinaryExpr,
+    Expr,
+    Literal,
+    UnaryExpr,
+)
 
 STRING_TYPES = frozenset({"String", "StringOwned"})
 
@@ -14,6 +19,31 @@ class StringLiteral(Literal):
     """IR node representing a string literal."""
 
     value: str
+
+
+@dataclasses.dataclass(frozen=True)
+class Uppercase(UnaryExpr):
+    """IR node representing a string UPPER conversion."""
+
+
+@dataclasses.dataclass(frozen=True)
+class Lowercase(UnaryExpr):
+    """IR node representing a string LOWER conversion."""
+
+
+@dataclasses.dataclass(frozen=True)
+class Contains(BinaryExpr):
+    """IR node representing a string CONTAINS check (regex or literal substring)."""
+
+    literal: bool = False
+
+    @property
+    def expr(self) -> Expr:
+        return self.left
+
+    @property
+    def pattern(self) -> Expr:
+        return self.right
 
 
 @dataclasses.dataclass(frozen=True)
@@ -44,6 +74,11 @@ class EndsWith(BinaryExpr):
 
 # Keys represent Polars Rust AST `StringFunction` enum variant names emitted under
 # `{"Function": {"function": {"StringExpr": "<key>"}}}` in serialized Polars JSON.
+STRING_UNARY_OPS: dict[str, type[UnaryExpr]] = {
+    "Uppercase": Uppercase,
+    "Lowercase": Lowercase,
+}
+
 STRING_BINARY_OPS: dict[str, type[BinaryExpr]] = {
     "StartsWith": StartsWith,
     "EndsWith": EndsWith,

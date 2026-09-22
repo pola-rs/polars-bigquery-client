@@ -1,5 +1,6 @@
 import polars as pl
 import pytest
+
 from polars_bigquery.core.schema import extract_polars_schema
 
 

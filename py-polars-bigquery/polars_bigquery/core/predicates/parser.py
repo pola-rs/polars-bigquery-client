@@ -3,14 +3,21 @@
 from __future__ import annotations
 
 import collections
+import functools
+import io
 from collections.abc import Callable
 from typing import Any
+
+import polars as pl
 
 from polars_bigquery.core.predicates.ir.base import (
     NULL_LITERAL_PARSERS,
     BinaryExpr,
     Column,
     Expr,
+    ListLiteral,
+    Literal,
+    NullLiteral,
     UnaryExpr,
     Unsupported,
 )
@@ -18,20 +25,30 @@ from polars_bigquery.core.predicates.ir.boolean import (
     BOOLEAN_LITERAL_PARSERS,
     BOOLEAN_UNARY_OPS,
     LOGICAL_BINARY_OPS,
+    BoolLiteral,
 )
 from polars_bigquery.core.predicates.ir.comparison import (
     COMPARISON_BINARY_OPS,
+    IsIn,
 )
 from polars_bigquery.core.predicates.ir.numeric import (
     NUMERIC_LITERAL_PARSERS,
     NUMERIC_UNARY_OPS,
+    FloatLiteral,
+    IntLiteral,
 )
 from polars_bigquery.core.predicates.ir.string import (
     STRING_BINARY_OPS,
     STRING_LITERAL_PARSERS,
+    STRING_UNARY_OPS,
+    Contains,
+    StringLiteral,
 )
 from polars_bigquery.core.predicates.ir.temporal import (
     TEMPORAL_LITERAL_PARSERS,
+    DateLiteral,
+    TimestampLiteral,
+    parse_datetime_literal,
 )
 
 # Keys represent Polars Rust AST `Operator` enum variant names (e.g., "And", "Eq")
@@ -51,6 +68,89 @@ _BOOLEAN_OPS: dict[str, type[UnaryExpr]] = {
     **NUMERIC_UNARY_OPS,
 }
 
+_DATETIME_UNIT_NAMES: dict[str, str] = {
+    "us": "Microseconds",
+    "ms": "Milliseconds",
+    "ns": "Nanoseconds",
+}
+
+
+def _parse_ipc_series_to_list_literal(raw_bytes: bytes) -> Expr:
+    """Decode an Arrow IPC stream representing a 1-column Polars Series into a ListLiteral."""
+    try:
+        df = pl.read_ipc_stream(io.BytesIO(raw_bytes))
+    except (pl.exceptions.PolarsError, OSError, ValueError):
+        return Unsupported()
+
+    if df.width != 1 or df.height == 0:
+        return Unsupported()
+
+    series = df.to_series()
+    if series.null_count() > 0:
+        return Unsupported()
+
+    if series.dtype.is_integer():
+        return ListLiteral(
+            values=tuple(IntLiteral(value=int(v)) for v in series.to_list())
+        )
+    if series.dtype.is_float():
+        if series.is_nan().any():
+            return Unsupported()
+        return ListLiteral(
+            values=tuple(FloatLiteral(value=float(v)) for v in series.to_list())
+        )
+    if series.dtype == pl.String:
+        return ListLiteral(
+            values=tuple(StringLiteral(value=str(v)) for v in series.to_list())
+        )
+    if series.dtype == pl.Boolean:
+        return ListLiteral(
+            values=tuple(BoolLiteral(value=bool(v)) for v in series.to_list())
+        )
+    if series.dtype == pl.Date:
+        return ListLiteral(
+            values=tuple(
+                DateLiteral(days=int(d)) for d in series.to_physical().to_list()
+            )
+        )
+    if isinstance(series.dtype, pl.Datetime):
+        unit_str = _DATETIME_UNIT_NAMES.get(series.dtype.time_unit)
+        if unit_str is None:
+            return Unsupported()
+        parsed_items = [
+            parse_datetime_literal([int(t), unit_str, series.dtype.time_zone])
+            for t in series.to_physical().to_list()
+        ]
+        if all(isinstance(item, TimestampLiteral) for item in parsed_items):
+            return ListLiteral(
+                values=tuple(
+                    item for item in parsed_items if isinstance(item, TimestampLiteral)
+                )
+            )
+    return Unsupported()
+
+
+def _parse_list_literal(value: Any) -> Expr:
+    """Parse a List or Series literal from Polars JSON into a ListLiteral or Unsupported."""
+    if not isinstance(value, list) or not value:
+        return Unsupported()
+
+    if all(
+        isinstance(b, int) and not isinstance(b, bool) and 0 <= b <= 255 for b in value
+    ):
+        return _parse_ipc_series_to_list_literal(bytes(value))
+
+    parsed_literals: list[Literal] = []
+    for elem in value:
+        ir_elem = _json_literal_to_ir(elem)
+        if not isinstance(ir_elem, Literal) or isinstance(
+            ir_elem, (NullLiteral, ListLiteral)
+        ):
+            return Unsupported()
+        parsed_literals.append(ir_elem)
+    return ListLiteral(values=tuple(parsed_literals))
+
+
 # Keys represent Polars Rust AST `LiteralValue` / `AnyValue` enum variant names
 # (e.g., "Int64", "StringOwned", "DateTime") emitted in `{"Literal": ...}` in serialized
 # Polars JSON.
@@ -60,6 +160,8 @@ _LITERAL_PARSERS: dict[str, Callable[[Any], Expr]] = {
     **NUMERIC_LITERAL_PARSERS,
     **STRING_LITERAL_PARSERS,
     **TEMPORAL_LITERAL_PARSERS,
+    "List": _parse_list_literal,
+    "Series": _parse_list_literal,
 }
 
 _UNSUPPORTED_RECORD: tuple[str, Any, tuple[Any, ...]] = ("Leaf", Unsupported(), ())
@@ -79,6 +181,7 @@ def _json_literal_to_ir(literal_json: Any) -> Expr:
       - `{"Date": 19723}` (days since UNIX epoch)
       - `{"DateTime": [1704110400000000, "Microseconds", "UTC"]}` or
         `{"Datetime": [1704110400000000, "Microseconds", None]}`
+      - `{"List": [...]}` or `{"Series": [...]}` (IPC stream bytes)
     - A `Scalar` wrapper (Polars 1.x):
       `{"Scalar": {"dtype": "Int64", "value": {"Int64": 42}}}`
     - A `Dyn` wrapper for untyped literals:
@@ -129,6 +232,20 @@ def _parse_boolean_function(
         and len(inputs) >= 1
     ):
         return ("Unary", _BOOLEAN_OPS[boolean_name], (inputs[0],))
+    if (
+        isinstance(boolean_name, dict)
+        and len(boolean_name) == 1
+        and "IsIn" in boolean_name
+        and len(inputs) == 2
+    ):
+        isin_opts = boolean_name["IsIn"]
+        nulls_equal = (
+            isin_opts.get("nulls_equal", False)
+            if isinstance(isin_opts, dict)
+            else bool(isin_opts)
+        )
+        if not nulls_equal:
+            return ("Binary", IsIn, (inputs[0], inputs[1]))
     return _UNSUPPORTED_RECORD
 
 
@@ -138,10 +255,30 @@ def _parse_string_function(
     """Extract IR constructor and child JSONs for a Polars `StringFunction` node."""
     if (
         isinstance(string_name, str)
+        and string_name in STRING_UNARY_OPS
+        and len(inputs) == 1
+    ):
+        return ("Unary", STRING_UNARY_OPS[string_name], (inputs[0],))
+    if (
+        isinstance(string_name, str)
         and string_name in STRING_BINARY_OPS
         and len(inputs) == 2
     ):
         return ("Binary", STRING_BINARY_OPS[string_name], (inputs[0], inputs[1]))
+    if (
+        isinstance(string_name, dict)
+        and len(string_name) == 1
+        and "Contains" in string_name
+        and len(inputs) == 2
+    ):
+        contains_opts = string_name["Contains"]
+        if isinstance(contains_opts, dict):
+            literal = bool(contains_opts.get("literal", False))
+            return (
+                "Binary",
+                functools.partial(Contains, literal=literal),
+                (inputs[0], inputs[1]),
+            )
     return _UNSUPPORTED_RECORD
 
 

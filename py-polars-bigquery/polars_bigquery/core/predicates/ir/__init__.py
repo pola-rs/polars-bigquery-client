@@ -4,6 +4,7 @@ from polars_bigquery.core.predicates.ir.base import (
     BinaryExpr,
     Column,
     Expr,
+    ListLiteral,
     Literal,
     NullLiteral,
     UnaryExpr,
@@ -21,6 +22,7 @@ from polars_bigquery.core.predicates.ir.comparison import (
     Eq,
     Gt,
     GtEq,
+    IsIn,
     Lt,
     LtEq,
     NotEq,
@@ -34,9 +36,12 @@ from polars_bigquery.core.predicates.ir.numeric import (
     IsNotNan,
 )
 from polars_bigquery.core.predicates.ir.string import (
+    Contains,
     EndsWith,
+    Lowercase,
     StartsWith,
     StringLiteral,
+    Uppercase,
 )
 from polars_bigquery.core.predicates.ir.temporal import (
     DateLiteral,
@@ -49,6 +54,7 @@ __all__ = [
     "BinaryExpr",
     "BoolLiteral",
     "Column",
+    "Contains",
     "DateLiteral",
     "EndsWith",
     "Eq",
@@ -58,12 +64,15 @@ __all__ = [
     "GtEq",
     "IntLiteral",
     "IsFinite",
+    "IsIn",
     "IsInfinite",
     "IsNan",
     "IsNotNan",
     "IsNotNull",
     "IsNull",
+    "ListLiteral",
     "Literal",
+    "Lowercase",
     "Lt",
     "LtEq",
     "Not",
@@ -76,4 +85,5 @@ __all__ = [
     "TimestampUnit",
     "UnaryExpr",
     "Unsupported",
+    "Uppercase",
 ]

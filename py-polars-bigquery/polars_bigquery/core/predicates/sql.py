@@ -11,6 +11,7 @@ from polars_bigquery.core.predicates.ir import (
     And,
     BoolLiteral,
     Column,
+    Contains,
     DateLiteral,
     EndsWith,
     Eq,
@@ -20,12 +21,15 @@ from polars_bigquery.core.predicates.ir import (
     GtEq,
     IntLiteral,
     IsFinite,
+    IsIn,
     IsInfinite,
     IsNan,
     IsNotNan,
     IsNotNull,
     IsNull,
+    ListLiteral,
     Literal,
+    Lowercase,
     Lt,
     LtEq,
     Not,
@@ -37,6 +41,7 @@ from polars_bigquery.core.predicates.ir import (
     TimestampLiteral,
     TimestampUnit,
     Unsupported,
+    Uppercase,
 )
 
 _ALLOWED_FLEXIBLE_SPECIAL_CHARS = frozenset(
@@ -184,6 +189,12 @@ def _(node: TimestampLiteral) -> str:
     return f"DATETIME({ts_sql})" if node.tz is None else ts_sql
 
 
+@_literal_ir_to_sql.register
+def _(node: ListLiteral) -> str:
+    items_sql = ", ".join(_literal_ir_to_sql(v) for v in node.values)
+    return f"({items_sql})"
+
+
 @functools.singledispatch
 def _format_operator_sql(node: Expr, *child_sqls: str) -> str | None:
     """Format SQL string for a non-monotone binary or unary operator node."""
@@ -221,6 +232,18 @@ def _(node: LtEq, left: str, right: str) -> str:
 
 
 @_format_operator_sql.register
+def _(node: IsIn, left: str, right: str) -> str:
+    return f"({left} IN {right})"
+
+
+@_format_operator_sql.register
+def _(node: Contains, left: str, right: str) -> str:
+    if node.literal:
+        return f"(STRPOS({left}, {right}) > 0)"
+    return f"REGEXP_CONTAINS({left}, {right})"
+
+
+@_format_operator_sql.register
 def _(node: StartsWith, left: str, right: str) -> str:
     return f"STARTS_WITH({left}, {right})"
 
@@ -228,6 +251,16 @@ def _(node: StartsWith, left: str, right: str) -> str:
 @_format_operator_sql.register
 def _(node: EndsWith, left: str, right: str) -> str:
     return f"ENDS_WITH({left}, {right})"
+
+
+@_format_operator_sql.register
+def _(node: Uppercase, operand: str) -> str:
+    return f"UPPER({operand})"
+
+
+@_format_operator_sql.register
+def _(node: Lowercase, operand: str) -> str:
+    return f"LOWER({operand})"
 
 
 @_format_operator_sql.register
@@ -281,6 +314,11 @@ def _emit_node_sql(
         return None, False
     if any(isinstance(child, NullLiteral) for child in node.children()):
         return None, False
+    if isinstance(node, IsIn):
+        if not isinstance(node.right, ListLiteral):
+            return None, False
+    elif any(isinstance(child, ListLiteral) for child in node.children()):
+        return None, False
 
     child_sqls = [sql for sql, _ in child_results if sql is not None]
     formatted = _format_operator_sql(node, *child_sqls)
@@ -307,6 +345,15 @@ def _(
 def _(
     node: Literal, child_results: list[tuple[str | None, bool]]
 ) -> tuple[str | None, bool]:
+    if isinstance(node, ListLiteral) and (
+        not node.values
+        or any(
+            isinstance(v, (NullLiteral, ListLiteral))
+            or (isinstance(v, FloatLiteral) and math.isnan(v.value))
+            for v in node.values
+        )
+    ):
+        return None, False
     return _literal_ir_to_sql(node), True
 
 

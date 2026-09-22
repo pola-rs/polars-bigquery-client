@@ -62,6 +62,13 @@ class NullLiteral(Literal):
     """IR node representing a NULL literal."""
 
 
+@dataclasses.dataclass(frozen=True)
+class ListLiteral(Literal):
+    """IR node representing a homogeneous list of scalar literals (e.g. for IN)."""
+
+    values: tuple[Literal, ...]
+
+
 def parse_null_literal(_value: Any) -> NullLiteral:
     """Parse a Null value from Polars JSON into a NullLiteral."""
     return NullLiteral()

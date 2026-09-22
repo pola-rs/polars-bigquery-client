@@ -6,6 +6,7 @@ from typing import Any
 
 import polars as pl
 import pytest
+
 from polars_bigquery.core import predicates
 
 
@@ -492,3 +493,106 @@ def test_datetime_naive_vs_timezone_aware_pushdown() -> None:
         predicates.predicate_to_row_restriction(dt_expr)
         == "(`created_dt` = DATETIME(TIMESTAMP_MICROS(1704110400000000)))"
     )
+
+
+def test_sec_quarterly_financials_submission_partition_pushdown() -> None:
+    from datetime import date
+
+    expr = (
+        (pl.col("_PARTITIONDATE") >= date(2020, 1, 1))
+        & (pl.col("_PARTITIONDATE") <= date(2020, 12, 31))
+        & (
+            pl.col("central_index_key").is_in([1652044, 1288776])
+            | pl.col("company_name").str.to_uppercase().str.contains("ALPHABET INC")
+        )
+    )
+    assert (
+        predicates.predicate_to_row_restriction(expr)
+        == "(((`_PARTITIONDATE` >= DATE(TIMESTAMP_SECONDS(18262 * 86400))) "
+        "AND (`_PARTITIONDATE` <= DATE(TIMESTAMP_SECONDS(18627 * 86400)))) "
+        "AND ((`central_index_key` IN (1652044, 1288776)) "
+        "OR REGEXP_CONTAINS(UPPER(`company_name`), 'ALPHABET INC')))"
+    )
+
+
+def test_sec_quarterly_financials_numbers_partition_pushdown() -> None:
+    from datetime import date
+
+    expr = (
+        (pl.col("_PARTITIONDATE") >= date(2020, 1, 1))
+        & (pl.col("_PARTITIONDATE") <= date(2020, 12, 31))
+        & pl.col("measure_tag").is_in(
+            [
+                "Revenues",
+                "RevenueFromContractWithCustomerExcludingAssessedTax",
+                "OperatingIncomeLoss",
+                "NetIncomeLoss",
+                "ResearchAndDevelopmentExpense",
+                "EarningsPerShareDiluted",
+            ]
+        )
+        & pl.col("units").is_in(["USD", "shares"])
+    )
+    assert (
+        predicates.predicate_to_row_restriction(expr)
+        == "((((`_PARTITIONDATE` >= DATE(TIMESTAMP_SECONDS(18262 * 86400))) "
+        "AND (`_PARTITIONDATE` <= DATE(TIMESTAMP_SECONDS(18627 * 86400)))) "
+        "AND (`measure_tag` IN ('Revenues', 'RevenueFromContractWithCustomerExcludingAssessedTax', "
+        "'OperatingIncomeLoss', 'NetIncomeLoss', 'ResearchAndDevelopmentExpense', "
+        "'EarningsPerShareDiluted'))) "
+        "AND (`units` IN ('USD', 'shares')))"
+    )
+
+
+def test_is_in_and_string_contains_case_expressions() -> None:
+    from datetime import date, datetime, timezone
+
+    # Literal vs regex contains and lowercase
+    assert (
+        predicates.predicate_to_row_restriction(
+            pl.col("name").str.to_lowercase().str.contains("alphabet", literal=True)
+        )
+        == "(STRPOS(LOWER(`name`), 'alphabet') > 0)"
+    )
+
+    # Series, Float, Boolean, Date, and Datetime lists in is_in
+    assert (
+        predicates.predicate_to_row_restriction(
+            pl.col("tag").is_in(pl.Series(["a", "b"]))
+        )
+        == "(`tag` IN ('a', 'b'))"
+    )
+    assert (
+        predicates.predicate_to_row_restriction(pl.col("score").is_in([1.5, 2.5]))
+        == "(`score` IN (1.5, 2.5))"
+    )
+    assert (
+        predicates.predicate_to_row_restriction(pl.col("flag").is_in([True, False]))
+        == "(`flag` IN (TRUE, FALSE))"
+    )
+    assert (
+        predicates.predicate_to_row_restriction(
+            pl.col("dt").is_in([date(2020, 1, 1), date(2020, 12, 31)])
+        )
+        == "(`dt` IN (DATE(TIMESTAMP_SECONDS(18262 * 86400)), DATE(TIMESTAMP_SECONDS(18627 * 86400))))"
+    )
+    assert (
+        predicates.predicate_to_row_restriction(
+            pl.col("ts").is_in([datetime(2024, 1, 1, 12, 0, tzinfo=timezone.utc)])
+        )
+        == "(`ts` IN (TIMESTAMP_MICROS(1704110400000000)))"
+    )
+
+    # Edge cases that must not push down (empty list, nulls_equal=True, NaN in float list, column rhs)
+    assert predicates.predicate_to_row_restriction(pl.col("a").is_in([])) == ""
+    assert (
+        predicates.predicate_to_row_restriction(
+            pl.col("a").is_in([1, 2], nulls_equal=True)
+        )
+        == ""
+    )
+    assert (
+        predicates.predicate_to_row_restriction(pl.col("a").is_in([1.0, float("nan")]))
+        == ""
+    )
+    assert predicates.predicate_to_row_restriction(pl.col("a").is_in(pl.col("b"))) == ""
