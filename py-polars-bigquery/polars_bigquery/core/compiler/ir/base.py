@@ -65,10 +65,3 @@ class Literal(Expr):
 @dataclasses.dataclass(frozen=True)
 class NullLiteral(Literal):
     """IR node representing a NULL literal."""
-
-
-@dataclasses.dataclass(frozen=True)
-class ListLiteral(Literal):
-    """IR node representing a homogeneous list of scalar literals (e.g. for IN)."""
-
-    values: tuple[Literal, ...]

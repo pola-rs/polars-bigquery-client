@@ -33,8 +33,3 @@ class Lt(BinaryExpr):
 @dataclasses.dataclass(frozen=True)
 class LtEq(BinaryExpr):
     """IR node representing less-than-or-equal comparison (<=)."""
-
-
-@dataclasses.dataclass(frozen=True)
-class IsIn(BinaryExpr):
-    """IR node representing set membership comparison (IN)."""

@@ -419,6 +419,18 @@ def test_ir_frozen_dataclasses_and_submodules() -> None:
         compiler.parser.comparison.COMPARISON_BINARY_OPS["Eq"]
         is compiler.ir.comparison.Eq
     )
+    assert compiler.parser.list_.parse_list_literal(
+        [{"Int64": 1}, {"Int64": 2}]
+    ) == compiler.ir.list_.ListLiteral(
+        values=(compiler.ir.IntLiteral(1), compiler.ir.IntLiteral(2))
+    )
+    assert compiler.parser.list_.parse_is_in_function(
+        {"nulls_equal": False}, [{"Column": "a"}, {"Literal": {"List": []}}]
+    ) == (
+        "Binary",
+        compiler.ir.list_.IsIn,
+        ({"Column": "a"}, {"Literal": {"List": []}}),
+    )
     assert compiler.parser.numeric.parse_int_literal(42) == compiler.ir.IntLiteral(42)
     assert compiler.parser.string.parse_string_literal(
         "abc"
@@ -438,6 +450,22 @@ def test_ir_frozen_dataclasses_and_submodules() -> None:
             compiler.ir.Eq(left=col_a, right=lit_10), "`a`", "10"
         )
         == "(`a` = 10)"
+    )
+    assert (
+        compiler.sql.list_.format_list_literal(
+            compiler.ir.list_.ListLiteral(values=(lit_10,))
+        )
+        == "(10)"
+    )
+    assert (
+        compiler.sql.list_.format_is_in(
+            compiler.ir.list_.IsIn(
+                left=col_a, right=compiler.ir.list_.ListLiteral(values=(lit_10,))
+            ),
+            "`a`",
+            "(10)",
+        )
+        == "(`a` IN (10))"
     )
     assert compiler.sql.numeric.format_int_literal(lit_10) == "10"
     assert compiler.sql.string.escape_sql_string("abc") == "'abc'"

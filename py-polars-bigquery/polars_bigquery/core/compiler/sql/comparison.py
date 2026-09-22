@@ -4,7 +4,6 @@ from polars_bigquery.core.compiler.ir.comparison import (
     Eq,
     Gt,
     GtEq,
-    IsIn,
     Lt,
     LtEq,
     NotEq,
@@ -40,8 +39,3 @@ def format_lt(_node: Lt, left: str, right: str) -> str:
 @format_operator_sql.register
 def format_lt_eq(_node: LtEq, left: str, right: str) -> str:
     return f"({left} <= {right})"
-
-
-@format_operator_sql.register
-def format_is_in(_node: IsIn, left: str, right: str) -> str:
-    return f"({left} IN {right})"

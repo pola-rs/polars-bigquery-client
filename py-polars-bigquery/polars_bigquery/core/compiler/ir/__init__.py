@@ -1,10 +1,18 @@
 from __future__ import annotations
 
+from polars_bigquery.core.compiler.ir import (
+    base,
+    boolean,
+    comparison,
+    list_,
+    numeric,
+    string,
+    temporal,
+)
 from polars_bigquery.core.compiler.ir.base import (
     BinaryExpr,
     Column,
     Expr,
-    ListLiteral,
     Literal,
     NullLiteral,
     UnaryExpr,
@@ -22,11 +30,11 @@ from polars_bigquery.core.compiler.ir.comparison import (
     Eq,
     Gt,
     GtEq,
-    IsIn,
     Lt,
     LtEq,
     NotEq,
 )
+from polars_bigquery.core.compiler.ir.list_ import IsIn, ListLiteral
 from polars_bigquery.core.compiler.ir.numeric import (
     FloatLiteral,
     IntLiteral,
@@ -86,4 +94,11 @@ __all__ = [
     "UnaryExpr",
     "Unsupported",
     "Uppercase",
+    "base",
+    "boolean",
+    "comparison",
+    "list_",
+    "numeric",
+    "string",
+    "temporal",
 ]

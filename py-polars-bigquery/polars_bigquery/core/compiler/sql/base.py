@@ -1,19 +1,16 @@
 from __future__ import annotations
 
 import functools
-import math
 import unicodedata
 
 from polars_bigquery.core.compiler.ir.base import (
     Column,
     Expr,
-    ListLiteral,
     Literal,
     NullLiteral,
     Unsupported,
 )
-from polars_bigquery.core.compiler.ir.comparison import IsIn
-from polars_bigquery.core.compiler.ir.numeric import FloatLiteral
+from polars_bigquery.core.compiler.ir.list_ import ListLiteral
 
 _ALLOWED_FLEXIBLE_SPECIAL_CHARS = frozenset(
     {"&", "%", "=", "+", ":", "'", "<", ">", "#", "|"}
@@ -111,13 +108,6 @@ def format_null_literal(_node: NullLiteral) -> str:
     return "NULL"
 
 
-@literal_ir_to_sql.register
-def format_list_literal(node: ListLiteral) -> str:
-    """Format a ListLiteral IR node as a parenthesized SQL tuple."""
-    items_sql = ", ".join(literal_ir_to_sql(v) for v in node.values)
-    return f"({items_sql})"
-
-
 @functools.singledispatch
 def format_operator_sql(node: Expr, *child_sqls: str) -> str | None:
     """Format SQL string for a non-monotone binary or unary operator node."""
@@ -138,12 +128,7 @@ def emit_node_sql(
     """
     if any(sql is None or not is_exact for sql, is_exact in child_results):
         return None, False
-    if any(isinstance(child, NullLiteral) for child in node.children()):
-        return None, False
-    if isinstance(node, IsIn):
-        if not isinstance(node.right, ListLiteral):
-            return None, False
-    elif any(isinstance(child, ListLiteral) for child in node.children()):
+    if any(isinstance(child, (NullLiteral, ListLiteral)) for child in node.children()):
         return None, False
 
     child_sqls = [sql for sql, _ in child_results if sql is not None]
@@ -171,13 +156,4 @@ def emit_column_sql(
 def emit_literal_sql(
     node: Literal, child_results: list[tuple[str | None, bool]]
 ) -> tuple[str | None, bool]:
-    if isinstance(node, ListLiteral) and (
-        not node.values
-        or any(
-            isinstance(v, (NullLiteral, ListLiteral))
-            or (isinstance(v, FloatLiteral) and math.isnan(v.value))
-            for v in node.values
-        )
-    ):
-        return None, False
     return literal_ir_to_sql(node), True

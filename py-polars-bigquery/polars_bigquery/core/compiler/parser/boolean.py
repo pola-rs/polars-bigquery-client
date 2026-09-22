@@ -16,7 +16,6 @@ from polars_bigquery.core.compiler.ir.boolean import (
     Not,
     Or,
 )
-from polars_bigquery.core.compiler.ir.comparison import IsIn
 from polars_bigquery.core.compiler.parser.base import UNSUPPORTED_RECORD
 from polars_bigquery.core.compiler.parser.numeric import NUMERIC_UNARY_OPS
 
@@ -67,14 +66,8 @@ def parse_boolean_function(
         isinstance(boolean_name, dict)
         and len(boolean_name) == 1
         and "IsIn" in boolean_name
-        and len(inputs) == 2
     ):
-        isin_opts = boolean_name["IsIn"]
-        nulls_equal = (
-            isin_opts.get("nulls_equal", False)
-            if isinstance(isin_opts, dict)
-            else bool(isin_opts)
-        )
-        if not nulls_equal:
-            return ("Binary", IsIn, (inputs[0], inputs[1]))
+        from polars_bigquery.core.compiler.parser.list_ import parse_is_in_function
+
+        return parse_is_in_function(boolean_name["IsIn"], inputs)
     return UNSUPPORTED_RECORD

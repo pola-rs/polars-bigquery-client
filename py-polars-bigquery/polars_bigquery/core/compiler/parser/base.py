@@ -28,3 +28,18 @@ NULL_LITERAL_PARSERS: dict[str, Callable[[Any], Expr]] = {
 def parse_column_expr(column_json: Any) -> tuple[str, Any, tuple[Any, ...]]:
     """Extract Column leaf node for a Polars `Column` node."""
     return ("Leaf", Column(name=str(column_json)), ())
+
+
+def unwrap_literal_json(literal_json: Any) -> Any:
+    """Unwrap Polars `Dyn`, `Scalar`, and `{"dtype": ..., "value": ...}` literal wrappers."""
+    curr = literal_json
+    while isinstance(curr, dict):
+        if len(curr) == 1 and "Dyn" in curr:
+            curr = curr["Dyn"]
+        elif len(curr) == 1 and "Scalar" in curr:
+            curr = curr["Scalar"]
+        elif len(curr) == 2 and "dtype" in curr and "value" in curr:
+            curr = curr["value"]
+        else:
+            break
+    return curr
