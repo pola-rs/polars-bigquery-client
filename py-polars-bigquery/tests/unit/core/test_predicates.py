@@ -6,7 +6,6 @@ from typing import Any
 
 import polars as pl
 import pytest
-
 from polars_bigquery.core import compiler
 
 
@@ -426,6 +425,25 @@ def test_ir_frozen_dataclasses_and_submodules() -> None:
     ) == compiler.ir.StringLiteral("abc")
     assert compiler.parser.temporal.parse_date_literal(10) == compiler.ir.DateLiteral(
         10
+    )
+
+    # Verify sql submodules
+    assert compiler.sql.base.column_to_sql_identifier("col") == "`col`"
+    assert (
+        compiler.sql.boolean.format_bool_literal(compiler.ir.BoolLiteral(True))
+        == "TRUE"
+    )
+    assert (
+        compiler.sql.comparison.format_eq(
+            compiler.ir.Eq(left=col_a, right=lit_10), "`a`", "10"
+        )
+        == "(`a` = 10)"
+    )
+    assert compiler.sql.numeric.format_int_literal(lit_10) == "10"
+    assert compiler.sql.string.escape_sql_string("abc") == "'abc'"
+    assert (
+        compiler.sql.temporal.format_date_literal(compiler.ir.DateLiteral(10))
+        == "DATE(TIMESTAMP_SECONDS(10 * 86400))"
     )
 
 
