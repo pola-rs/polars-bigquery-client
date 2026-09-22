@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import collections
 import io
-from collections.abc import Callable
-from typing import Any, Sequence
+from collections.abc import Callable, Sequence
+from typing import Any
 
 import polars as pl
 
