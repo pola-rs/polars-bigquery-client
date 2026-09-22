@@ -5,7 +5,7 @@ from __future__ import annotations
 import collections
 import io
 from collections.abc import Callable
-from typing import Any
+from typing import Any, Sequence
 
 import polars as pl
 
@@ -294,7 +294,7 @@ def json_to_ir(expr_json: Any) -> Expr:
             continue
 
         kind, cls_or_leaf, child_jsons = parser(payload)
-        child_indices: list[int] = []
+        child_indices: Sequence[int] = []
         for child_json in child_jsons:
             child_idx = len(raw_nodes)
             raw_nodes.append(child_json)
