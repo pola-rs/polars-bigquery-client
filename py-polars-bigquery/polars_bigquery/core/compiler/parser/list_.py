@@ -164,6 +164,36 @@ def _try_extract_ipc_bytes(value: list[Any]) -> bytes | None:
     return bytes(buf)
 
 
+class _LiteralChildView(Sequence[dict[str, Any]]):
+    """Zero-copy sequence view wrapping raw list elements as `{"Literal": elem}` on demand."""
+
+    __slots__ = ("_items",)
+
+    def __init__(self, items: Sequence[Any]) -> None:
+        self._items = items
+
+    def __len__(self) -> int:
+        return len(self._items)
+
+    def __getitem__(self, index: int | slice) -> Any:
+        if isinstance(index, slice):
+            return tuple({"Literal": elem} for elem in self._items[index])
+        return {"Literal": self._items[index]}
+
+    def __eq__(self, other: object) -> bool:
+        if isinstance(other, _LiteralChildView):
+            return self._items == other._items
+        if isinstance(other, tuple):
+            return len(self._items) == len(other) and all(
+                {"Literal": item} == other_item
+                for item, other_item in zip(self._items, other, strict=True)
+            )
+        return NotImplemented
+
+    def __repr__(self) -> str:
+        return repr(tuple(self))
+
+
 @register_parser("$.Literal..List", "$.Literal..Series")
 def parse_list_literal(value: Any) -> Expr | ParseRecord:
     """Parse a List or Series literal from Polars JSON into a Variadic ParseRecord or Expr."""
@@ -180,7 +210,7 @@ def parse_list_literal(value: Any) -> Expr | ParseRecord:
     return ParseRecord(
         "Variadic",
         construct_list_literal,
-        tuple({"Literal": elem} for elem in value),
+        _LiteralChildView(value),
     )
 
 

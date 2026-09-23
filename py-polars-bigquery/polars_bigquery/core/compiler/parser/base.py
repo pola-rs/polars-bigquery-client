@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import collections.abc
+import dataclasses
 import inspect
 import types
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from typing import Any, Literal, NamedTuple, TypeVar
 
 from polars_bigquery.core.compiler.ir.base import (
@@ -22,7 +24,7 @@ class ParseRecord(NamedTuple):
 
     kind: RecordKind
     node: Any
-    children: tuple[Any, ...]
+    children: Sequence[Any]
 
 
 ParserResult = Expr | ParseRecord
@@ -32,10 +34,37 @@ _F = TypeVar("_F", bound=ParserFunc)
 UNSUPPORTED_RECORD: ParseRecord = ParseRecord("Leaf", Unsupported(), ())
 MAX_TRIE_DEPTH = 16
 
+_VALID_BINARY_EXPR_KEYS = frozenset({"left", "op", "right"})
+_VALID_FUNCTION_EXPR_KEYS = frozenset({"input", "function"})
+_STRUCT_STEP_ALLOWED_KEYS: dict[str, frozenset[str]] = {
+    "op": _VALID_BINARY_EXPR_KEYS,
+    "function": _VALID_FUNCTION_EXPR_KEYS,
+}
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class _CompiledRoute:
+    """Pre-compiled dispatch route bound to a terminal Trie node."""
+
+    path: str
+    parser: ParserFunc
+    accepts_expr_json: bool
+
+
+@dataclasses.dataclass(slots=True)
+class _DispatchTrieNode:
+    """Compiled JSON Path trie node supporting `.segment` and `..segment` transitions."""
+
+    children: dict[str, _DispatchTrieNode] = dataclasses.field(default_factory=dict)
+    descendants: dict[str, _DispatchTrieNode] = dataclasses.field(default_factory=dict)
+    route: _CompiledRoute | None = None
+
+
 # Registry mapping JSON Path expressions (e.g. "$.BinaryExpr.op.Eq",
 # "$.Function.function.Boolean.Not", "$.Literal..Int64") to parser functions.
 _PARSERS_REGISTRY: dict[str, ParserFunc] = {}
 _PARSER_ACCEPTS_EXPR_JSON: dict[str, bool] = {}
+_TRIE_ROOT = _DispatchTrieNode()
 PARSERS: types.MappingProxyType[str, ParserFunc] = types.MappingProxyType(
     _PARSERS_REGISTRY
 )
@@ -96,18 +125,32 @@ def _accepts_second_positional_arg(func: ParserFunc) -> bool:
     return positional_count >= 2
 
 
+def _insert_compiled_route(
+    steps: tuple[tuple[str, str], ...], route: _CompiledRoute
+) -> None:
+    """Insert a validated JSON Path step sequence into `_TRIE_ROOT`."""
+    curr_node = _TRIE_ROOT
+    for op, segment in steps:
+        table = curr_node.descendants if op == ".." else curr_node.children
+        next_node = table.get(segment)
+        if next_node is None:
+            next_node = _DispatchTrieNode()
+            table[segment] = next_node
+        curr_node = next_node
+    curr_node.route = route
+
+
 def register_parser(*paths: str) -> Callable[[_F], _F]:
     """Decorator to register a parser function for one or more JSON Paths."""
     if not paths:
         msg = "register_parser requires at least one JSON Path string"
         raise ValueError(msg)
 
-    for path in paths:
-        parse_json_path(path)
+    parsed_paths = [(path, parse_json_path(path)) for path in paths]
 
     def _decorator(func: _F) -> _F:
         accepts_expr_json = _accepts_second_positional_arg(func)
-        for path in paths:
+        for path, _ in parsed_paths:
             existing = _PARSERS_REGISTRY.get(path)
             if existing is not None and existing is not func:
                 msg = (
@@ -115,9 +158,17 @@ def register_parser(*paths: str) -> Callable[[_F], _F]:
                     f"{existing!r} vs {func!r}"
                 )
                 raise ValueError(msg)
-        for path in paths:
+        for path, steps in parsed_paths:
             _PARSERS_REGISTRY[path] = func
             _PARSER_ACCEPTS_EXPR_JSON[path] = accepts_expr_json
+            _insert_compiled_route(
+                steps,
+                _CompiledRoute(
+                    path=path,
+                    parser=func,
+                    accepts_expr_json=accepts_expr_json,
+                ),
+            )
         return func
 
     return _decorator
@@ -159,66 +210,108 @@ def _extract_enum_tag_and_payload(val: Any) -> tuple[str, Any] | None:
     return None
 
 
-def _resolve_literal_path(literal_body: Any) -> tuple[str, Any] | None:
-    """Resolve a `Literal` payload across wrapper envelopes within `MAX_TRIE_DEPTH`."""
-    curr = literal_body
-    depth = 1
-    while depth <= MAX_TRIE_DEPTH:
-        curr, depth = _unwrap_literal_with_depth(curr, depth)
-        if depth > MAX_TRIE_DEPTH:
+def _match_descendants(
+    node: _DispatchTrieNode, payload: Any, depth: int
+) -> tuple[_CompiledRoute, Any] | None:
+    """Resolve recursive descent (`..segment`) transitions across transparent literal wrappers."""
+    curr = payload
+    curr_depth = depth
+    while curr_depth <= MAX_TRIE_DEPTH:
+        curr, curr_depth = _unwrap_literal_with_depth(curr, curr_depth)
+        if curr_depth > MAX_TRIE_DEPTH:
             return None
         tag_and_val = _extract_enum_tag_and_payload(curr)
         if tag_and_val is None:
             return None
-        lit_tag, lit_val = tag_and_val
-        candidate_path = f"$.Literal..{lit_tag}"
-        if candidate_path in _PARSERS_REGISTRY:
-            return candidate_path, lit_val
-        if lit_val is None:
-            return None
-        curr = lit_val
-        depth += 1
+        tag, val = tag_and_val
+        desc_node = node.descendants.get(tag)
+        if desc_node is not None and desc_node.route is not None:
+            return desc_node.route, val
+        return None
     return None
 
 
-def _resolve_json_path(expr_json: Any) -> tuple[str, Any] | None:
-    """Resolve a Polars expression JSON node to its canonical `(json_path, matched_val)`."""
-    root = _extract_enum_tag_and_payload(expr_json)
-    if root is None:
+def _match_trie_route(expr_json: Any) -> tuple[_CompiledRoute, Any] | None:
+    """Walk `_TRIE_ROOT` against `expr_json` without runtime string formatting."""
+    if not isinstance(expr_json, dict) or len(expr_json) != 1:
         return None
-    root_tag, body = root
 
-    if root_tag == "Column":
-        return "$.Column", body
+    curr_node = _TRIE_ROOT
+    curr_val: Any = expr_json
+    depth = 0
 
-    if root_tag == "Literal":
-        return _resolve_literal_path(body)
+    while depth <= MAX_TRIE_DEPTH:
+        if curr_node.descendants:
+            matched_desc = _match_descendants(curr_node, curr_val, depth)
+            if matched_desc is not None:
+                return matched_desc
 
-    if root_tag == "BinaryExpr":
-        if not isinstance(body, dict):
+        if not curr_node.children:
             return None
-        op = _extract_enum_tag_and_payload(body.get("op"))
-        if op is None:
-            return None
-        op_tag, op_spec = op
-        return f"$.BinaryExpr.op.{op_tag}", op_spec
 
-    if root_tag == "Function":
-        if not isinstance(body, dict):
-            return None
-        fn = _extract_enum_tag_and_payload(body.get("function"))
-        if fn is None:
-            return None
-        domain_tag, domain_body = fn
-        if domain_body is None:
-            return f"$.Function.function.{domain_tag}", domain_tag
-        sub = _extract_enum_tag_and_payload(domain_body)
-        if sub is None:
-            return None
-        func_tag, func_spec = sub
-        return f"$.Function.function.{domain_tag}.{func_tag}", func_spec
+        # Check for struct field transitions (e.g., `.op` inside `BinaryExpr` or `.function` inside `Function`)
+        if isinstance(curr_val, dict) and len(curr_val) >= 1:
+            matched_struct_step = False
+            for struct_key, allowed_keys in _STRUCT_STEP_ALLOWED_KEYS.items():
+                if struct_key in curr_node.children and struct_key in curr_val:
+                    if not (set(curr_val) <= allowed_keys):
+                        return None
+                    curr_node = curr_node.children[struct_key]
+                    curr_val = curr_val[struct_key]
+                    depth += 1
+                    matched_struct_step = True
+                    break
+            if matched_struct_step:
+                continue
 
-    return f"$.{root_tag}", body
+        tag_and_payload = _extract_enum_tag_and_payload(curr_val)
+        if tag_and_payload is None:
+            return None
+        tag, payload = tag_and_payload
+        next_node = curr_node.children.get(tag)
+        if next_node is None:
+            return None
+
+        depth += 1
+        if next_node.route is not None and (
+            payload is None or not (next_node.children or next_node.descendants)
+        ):
+            matched_val = (
+                tag if (payload is None and isinstance(curr_val, str)) else payload
+            )
+            return next_node.route, matched_val
+
+        curr_node = next_node
+        curr_val = payload
+
+    return None
+
+
+def _validate_parse_record(record: ParseRecord) -> ParseRecord:
+    """Validate structural invariants of a `ParseRecord` at the parser dispatch boundary."""
+    kind, node, children = record
+    if not isinstance(children, collections.abc.Sequence) or isinstance(
+        children, (str, bytes, bytearray)
+    ):
+        return UNSUPPORTED_RECORD
+
+    if kind == "Leaf":
+        if isinstance(node, Expr) and len(children) == 0:
+            return record
+        return UNSUPPORTED_RECORD
+    if kind == "Unary":
+        if callable(node) and len(children) == 1:
+            return record
+        return UNSUPPORTED_RECORD
+    if kind == "Binary":
+        if callable(node) and len(children) == 2:
+            return record
+        return UNSUPPORTED_RECORD
+    if kind == "Variadic":
+        if callable(node) and len(children) >= 1:
+            return record
+        return UNSUPPORTED_RECORD
+    return UNSUPPORTED_RECORD
 
 
 def _invoke_matched_parser(
@@ -228,7 +321,7 @@ def _invoke_matched_parser(
     *,
     accepts_expr_json: bool = False,
 ) -> ParseRecord:
-    """Invoke `parser` within an exception boundary and normalize into a `ParseRecord`."""
+    """Invoke `parser` within an exception boundary and normalize into a validated `ParseRecord`."""
     if parser is None:
         return UNSUPPORTED_RECORD
 
@@ -250,7 +343,7 @@ def _invoke_matched_parser(
     if isinstance(result, Expr):
         return ParseRecord("Leaf", result, ())
     if isinstance(result, ParseRecord):
-        return result
+        return _validate_parse_record(result)
     return UNSUPPORTED_RECORD
 
 
@@ -270,18 +363,15 @@ def dispatch_parser(expr_json: Any) -> ParseRecord:
     JSON Path matches `expr_json`.
     """
     _ensure_builtin_parsers_registered()
-    resolved = _resolve_json_path(expr_json)
-    if resolved is None:
+    matched = _match_trie_route(expr_json)
+    if matched is None:
         return UNSUPPORTED_RECORD
-    path, matched_val = resolved
-    parser = _PARSERS_REGISTRY.get(path)
-    if parser is None:
-        return UNSUPPORTED_RECORD
+    route, matched_val = matched
     return _invoke_matched_parser(
-        parser,
+        route.parser,
         matched_val,
         expr_json,
-        accepts_expr_json=_PARSER_ACCEPTS_EXPR_JSON.get(path, False),
+        accepts_expr_json=route.accepts_expr_json,
     )
 
 
@@ -293,8 +383,16 @@ def _is_valid_unit_spec(spec: Any) -> bool:
 def extract_binary_operands(expr_json: Any) -> tuple[Any, Any] | None:
     """Extract `(left, right)` operand JSONs from a Polars `BinaryExpr` JSON node."""
     if isinstance(expr_json, dict):
-        binary_body = expr_json.get("BinaryExpr", expr_json)
-        if isinstance(binary_body, dict):
+        if "BinaryExpr" in expr_json:
+            if len(expr_json) != 1:
+                return None
+            binary_body = expr_json["BinaryExpr"]
+        else:
+            binary_body = expr_json
+        if (
+            isinstance(binary_body, dict)
+            and set(binary_body) <= _VALID_BINARY_EXPR_KEYS
+        ):
             op_val = binary_body.get("op")
             if op_val is not None and not isinstance(op_val, str):
                 return None
@@ -323,11 +421,20 @@ def parse_binary_op(
 def _has_valid_function_envelope(
     expr_json: Any, *, require_unit_leaf: bool = False
 ) -> bool:
-    """Verify that a `Function` JSON envelope contains only single-key enum tags."""
+    """Verify that a `Function` JSON envelope contains only valid keys and single-key enum tags."""
     if not isinstance(expr_json, dict):
         return True
-    func_body = expr_json.get("Function", expr_json)
-    if not isinstance(func_body, dict) or "function" not in func_body:
+    if "Function" in expr_json:
+        if len(expr_json) != 1:
+            return False
+        func_body = expr_json["Function"]
+    else:
+        func_body = expr_json
+    if not isinstance(func_body, dict) or not (
+        set(func_body) <= _VALID_FUNCTION_EXPR_KEYS
+    ):
+        return False
+    if "function" not in func_body:
         return True
     fn_spec = func_body["function"]
     if isinstance(fn_spec, str):

@@ -91,19 +91,32 @@ def json_to_ir(expr_json: Any) -> Expr:
     ir_nodes: list[Expr] = [Unsupported()] * len(records)
     for idx in range(len(records) - 1, -1, -1):
         kind, cls_or_leaf, child_indices = records[idx]
-        if kind == "Leaf" and isinstance(cls_or_leaf, Expr):
-            ir_nodes[idx] = cls_or_leaf
-        elif kind == "Unary" and len(child_indices) == 1:
-            ir_nodes[idx] = cls_or_leaf(expr=ir_nodes[child_indices[0]])
-        elif kind == "Binary" and len(child_indices) == 2:
-            ir_nodes[idx] = cls_or_leaf(
-                left=ir_nodes[child_indices[0]],
-                right=ir_nodes[child_indices[1]],
-            )
-        elif kind == "Variadic":
-            ir_nodes[idx] = cls_or_leaf(
-                tuple(ir_nodes[c_idx] for c_idx in child_indices)
-            )
+        constructed: Any = None
+        try:
+            if kind == "Leaf" and isinstance(cls_or_leaf, Expr):
+                constructed = cls_or_leaf
+            elif kind == "Unary" and len(child_indices) == 1:
+                constructed = cls_or_leaf(expr=ir_nodes[child_indices[0]])
+            elif kind == "Binary" and len(child_indices) == 2:
+                constructed = cls_or_leaf(
+                    left=ir_nodes[child_indices[0]],
+                    right=ir_nodes[child_indices[1]],
+                )
+            elif kind == "Variadic":
+                constructed = cls_or_leaf(
+                    tuple(ir_nodes[c_idx] for c_idx in child_indices)
+                )
+        except (
+            ArithmeticError,
+            LookupError,
+            RuntimeError,
+            TypeError,
+            ValueError,
+        ):
+            constructed = None
+
+        if isinstance(constructed, Expr):
+            ir_nodes[idx] = constructed
         else:
             ir_nodes[idx] = Unsupported(
                 operands=tuple(ir_nodes[c_idx] for c_idx in child_indices)

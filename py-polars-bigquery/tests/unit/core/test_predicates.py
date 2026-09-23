@@ -1227,3 +1227,52 @@ def test_parser_dispatch_rejects_multi_key_enum_envelopes_and_isolates_parser_ex
         right=compiler.ir.Unsupported(),
     )
     assert len(dispatched_nodes) == 3
+
+
+def test_compiled_trie_envelope_and_constructor_resilience_boundaries() -> None:
+    # Arrange
+    non_transparent_decimal_literal = {"Literal": {"Decimal": {"Int128": 42}}}
+    non_transparent_duration_literal = {"Literal": {"Duration": {"Int64": 100}}}
+    function_with_unknown_modifier = {
+        "Function": {
+            "input": [{"Column": "a"}],
+            "function": {"Boolean": "Not"},
+            "options": {"collect_groups": "ApplyFlat"},
+        }
+    }
+    binary_with_unknown_modifier = {
+        "BinaryExpr": {
+            "left": {"Column": "a"},
+            "op": "Eq",
+            "right": {"Literal": {"Int64": 1}},
+            "flags": {"null_propagate": False},
+        }
+    }
+
+    # Act
+    decimal_ir = compiler.json_to_ir(non_transparent_decimal_literal)
+    duration_ir = compiler.json_to_ir(non_transparent_duration_literal)
+    func_mod_ir = compiler.json_to_ir(function_with_unknown_modifier)
+    bin_mod_ir = compiler.json_to_ir(binary_with_unknown_modifier)
+    wrong_arity_record = compiler.parser.base._invoke_matched_parser(
+        lambda _x: compiler.parser.base.ParseRecord(
+            "Unary", compiler.ir.Not, ({"Column": "a"}, {"Column": "b"})
+        ),
+        1,
+        {},
+    )
+    non_callable_record = compiler.parser.base._invoke_matched_parser(
+        lambda _x: compiler.parser.base.ParseRecord(
+            "Unary", "not-a-callable", ({"Column": "a"},)
+        ),
+        1,
+        {},
+    )
+
+    # Assert
+    assert decimal_ir == compiler.ir.Unsupported()
+    assert duration_ir == compiler.ir.Unsupported()
+    assert func_mod_ir == compiler.ir.Unsupported()
+    assert bin_mod_ir == compiler.ir.Unsupported()
+    assert wrong_arity_record == compiler.parser.base.UNSUPPORTED_RECORD
+    assert non_callable_record == compiler.parser.base.UNSUPPORTED_RECORD
