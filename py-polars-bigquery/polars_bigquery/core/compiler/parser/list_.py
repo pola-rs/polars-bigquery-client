@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import math
+from collections.abc import Sequence
 from typing import Any
 
 import polars as pl
@@ -20,7 +21,6 @@ from polars_bigquery.core.compiler.ir.temporal import DateLiteral, TimestampLite
 from polars_bigquery.core.compiler.parser.base import (
     UNSUPPORTED_RECORD,
     ParseRecord,
-    dispatch_literal_parser,
     extract_function_inputs,
     register_parser,
 )
@@ -56,6 +56,20 @@ def _is_compatible_list_element(candidate: Literal, first: Literal) -> bool:
     if isinstance(candidate, TimestampLiteral) and isinstance(first, TimestampLiteral):
         return (candidate.tz is None) == (first.tz is None)
     return True
+
+
+def construct_list_literal(children: Sequence[Expr]) -> Expr:
+    """Validate parsed child `Expr`s and construct a homogeneous `ListLiteral`."""
+    if not children or len(children) > MAX_IN_LIST_ELEMENTS:
+        return Unsupported()
+    parsed_literals: list[Literal] = []
+    for ir_elem in children:
+        if not isinstance(ir_elem, Literal) or not _is_compatible_list_element(
+            ir_elem, parsed_literals[0] if parsed_literals else ir_elem
+        ):
+            return Unsupported()
+        parsed_literals.append(ir_elem)
+    return ListLiteral(values=tuple(parsed_literals))
 
 
 def parse_ipc_series_to_list_literal(raw_bytes: bytes) -> Expr:
@@ -151,8 +165,8 @@ def _try_extract_ipc_bytes(value: list[Any]) -> bytes | None:
 
 
 @register_parser("$.Literal..List", "$.Literal..Series")
-def parse_list_literal(value: Any) -> Expr:
-    """Parse a List or Series literal from Polars JSON into a ListLiteral or Unsupported."""
+def parse_list_literal(value: Any) -> Expr | ParseRecord:
+    """Parse a List or Series literal from Polars JSON into a Variadic ParseRecord or Expr."""
     if not isinstance(value, list) or not value:
         return Unsupported()
 
@@ -163,19 +177,11 @@ def parse_list_literal(value: Any) -> Expr:
     if len(value) > MAX_IN_LIST_ELEMENTS:
         return Unsupported()
 
-    parsed_literals: list[Literal] = []
-    for elem in value:
-        kind, ir_elem, _ = dispatch_literal_parser(elem)
-        if (
-            kind != "Leaf"
-            or not isinstance(ir_elem, Literal)
-            or not _is_compatible_list_element(
-                ir_elem, parsed_literals[0] if parsed_literals else ir_elem
-            )
-        ):
-            return Unsupported()
-        parsed_literals.append(ir_elem)
-    return ListLiteral(values=tuple(parsed_literals))
+    return ParseRecord(
+        "Variadic",
+        construct_list_literal,
+        tuple({"Literal": elem} for elem in value),
+    )
 
 
 @register_parser("$.Function.function.Boolean.IsIn")

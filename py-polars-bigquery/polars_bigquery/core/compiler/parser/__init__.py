@@ -7,6 +7,7 @@ from typing import Any
 
 from polars_bigquery.core.compiler.ir import (
     Expr,
+    ListLiteral,
     Unsupported,
 )
 from polars_bigquery.core.compiler.parser import (
@@ -49,29 +50,29 @@ def json_to_ir(expr_json: Any) -> Expr:
     raw_nodes: list[Any] = [expr_json]
     records: list[tuple[str, Any, tuple[int, ...]]] = []
     queue: collections.deque[int] = collections.deque([0])
-    embedded_leaf_nodes = 0
+    ipc_leaf_nodes = 0
 
     while queue:
         curr_idx = queue.popleft()
         curr = raw_nodes[curr_idx]
 
-        kind, cls_or_leaf, child_jsons = dispatch_parser(curr)
-        leaf_fanout = (
-            len(getattr(cls_or_leaf, "values", ()))
-            if kind == "Leaf" and isinstance(cls_or_leaf, Expr)
-            else 0
-        )
-        if (
-            len(raw_nodes) + embedded_leaf_nodes + len(child_jsons) + leaf_fanout
-            > MAX_AST_NODES
-        ):
-            # Degrade only the oversized subtree to Unsupported() rather than
-            # aborting the entire root AST so shallow conjunctive (AND) filters
-            # already discovered in BFS order can still be pushed down.
+        if len(raw_nodes) + ipc_leaf_nodes > MAX_AST_NODES:
             kind, cls_or_leaf, child_jsons = UNSUPPORTED_RECORD
-            leaf_fanout = 0
-
-        embedded_leaf_nodes += leaf_fanout
+        else:
+            kind, cls_or_leaf, child_jsons = dispatch_parser(curr)
+            ipc_fanout = (
+                len(cls_or_leaf.values) if isinstance(cls_or_leaf, ListLiteral) else 0
+            )
+            if (
+                len(raw_nodes) + ipc_leaf_nodes + len(child_jsons) + ipc_fanout
+                > MAX_AST_NODES
+            ):
+                # Degrade only the oversized subtree to Unsupported() rather than
+                # aborting the entire root AST so shallow conjunctive (AND) filters
+                # already discovered in BFS order can still be pushed down.
+                kind, cls_or_leaf, child_jsons = UNSUPPORTED_RECORD
+                ipc_fanout = 0
+            ipc_leaf_nodes += ipc_fanout
 
         child_indices: list[int] = []
         for child_json in child_jsons:
@@ -98,6 +99,10 @@ def json_to_ir(expr_json: Any) -> Expr:
             ir_nodes[idx] = cls_or_leaf(
                 left=ir_nodes[child_indices[0]],
                 right=ir_nodes[child_indices[1]],
+            )
+        elif kind == "Variadic":
+            ir_nodes[idx] = cls_or_leaf(
+                tuple(ir_nodes[c_idx] for c_idx in child_indices)
             )
         else:
             ir_nodes[idx] = Unsupported(

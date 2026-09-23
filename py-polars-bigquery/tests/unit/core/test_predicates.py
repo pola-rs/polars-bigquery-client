@@ -427,10 +427,10 @@ def test_ir_frozen_dataclasses_and_submodules() -> None:
         compiler.parser.PARSERS["$.BinaryExpr.op.Eq"]
         is compiler.parser.comparison.parse_eq
     )
-    assert compiler.parser.list_.parse_list_literal(
-        [{"Int64": 1}, {"Int64": 2}]
-    ) == compiler.ir.list_.ListLiteral(
-        values=(compiler.ir.IntLiteral(1), compiler.ir.IntLiteral(2))
+    assert compiler.parser.list_.parse_list_literal([{"Int64": 1}, {"Int64": 2}]) == (
+        "Variadic",
+        compiler.parser.list_.construct_list_literal,
+        ({"Literal": {"Int64": 1}}, {"Literal": {"Int64": 2}}),
     )
     assert compiler.parser.list_.parse_is_in_function(
         {"nulls_equal": False}, [{"Column": "a"}, {"Literal": {"List": []}}]
@@ -942,7 +942,6 @@ def test_trie_wrapper_unwrapping_enforces_unified_depth_and_record_contract() ->
     deep_dyn_only: dict[str, Any] = {"Int64": 1}
     for _ in range(compiler.parser.base.MAX_TRIE_DEPTH + 2):
         deep_dyn_only = {"Dyn": deep_dyn_only}
-    bad_node = compiler.parser.base._PathTrieNode(parser=lambda _x: "not-a-record")  # type: ignore[arg-type,return-value]
 
     # Act
     unwrapped = compiler.parser.base.unwrap_literal_json(wrapped_literal)
@@ -950,7 +949,11 @@ def test_trie_wrapper_unwrapping_enforces_unified_depth_and_record_contract() ->
     deep_ir = compiler.json_to_ir({"Literal": deep_wrapped})
     deep_dyn_ir = compiler.json_to_ir({"Literal": deep_dyn_only})
     unknown_unit_ir = compiler.json_to_ir({"Literal": "UnknownUnitLiteral"})
-    fallback_record = compiler.parser.base._invoke_matched_parser(bad_node, 1, {})
+    fallback_record = compiler.parser.base._invoke_matched_parser(
+        lambda _x: "not-a-record",  # type: ignore[arg-type,return-value]
+        1,
+        {},
+    )
 
     # Assert
     assert unwrapped == {"Int64": 7}
@@ -1102,7 +1105,7 @@ def test_parse_list_literal_rejects_heterogeneous_and_nan_elements(
     expected_ir = compiler.ir.Unsupported()
 
     # Act
-    actual_ir = compiler.parser.list_.parse_list_literal(list_elements)
+    actual_ir = compiler.json_to_ir({"Literal": {"List": list_elements}})
 
     # Assert
     assert actual_ir == expected_ir
@@ -1129,7 +1132,7 @@ def test_nested_list_literal_avoids_recursion_and_enforces_leaf_fanout_budget(
     fanout_ir = compiler.json_to_ir(fanout_list_expr)
 
     # Assert
-    assert nested_ir == compiler.ir.Unsupported()
+    assert isinstance(nested_ir, compiler.ir.Unsupported)
     assert fanout_ir == compiler.ir.Eq(
         left=compiler.ir.Column("a"),
         right=compiler.ir.Unsupported(),
@@ -1156,3 +1159,71 @@ def test_contains_strict_false_and_direct_unit_parser_reject_parameterized_specs
     assert non_strict_sql == ""
     assert direct_not_record == compiler.parser.base.UNSUPPORTED_RECORD
     assert direct_eq_record == compiler.parser.base.UNSUPPORTED_RECORD
+
+
+def test_parser_dispatch_rejects_multi_key_enum_envelopes_and_isolates_parser_exceptions(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Arrange
+    multi_key_domain_expr = {
+        "Function": {
+            "input": [{"Column": "a"}, {"Literal": {"String": "x"}}],
+            "function": {
+                "StringExpr": {"Contains": {"literal": True, "strict": True}},
+                "Boolean": "Not",
+            },
+        }
+    }
+    multi_key_variant_expr = {
+        "Function": {
+            "input": [{"Column": "a"}, {"Literal": {"String": "x"}}],
+            "function": {
+                "StringExpr": {
+                    "Contains": {"literal": True, "strict": True},
+                    "StartsWith": None,
+                }
+            },
+        }
+    }
+    dispatched_nodes: list[Any] = []
+    orig_dispatch = compiler.parser.dispatch_parser
+
+    def spy_dispatch(node: Any) -> Any:
+        dispatched_nodes.append(node)
+        return orig_dispatch(node)
+
+    monkeypatch.setattr(compiler.parser, "dispatch_parser", spy_dispatch)
+    monkeypatch.setattr(compiler.parser, "MAX_AST_NODES", 4)
+    budget_exceeded_list_expr = {
+        "BinaryExpr": {
+            "left": {"Column": "a"},
+            "op": "Eq",
+            "right": {"Literal": {"List": [{"Int64": i} for i in range(50)]}},
+        }
+    }
+
+    # Act
+    domain_ir = compiler.json_to_ir(multi_key_domain_expr)
+    variant_ir = compiler.json_to_ir(multi_key_variant_expr)
+    direct_contains_record = compiler.parser.string.parse_contains(
+        {"literal": True, "strict": True},
+        multi_key_variant_expr,
+    )
+    isolated_record = compiler.parser.base._invoke_matched_parser(
+        lambda _x: (_ for _ in ()).throw(RuntimeError("parser boom")),
+        1,
+        {},
+    )
+    dispatched_nodes.clear()
+    budget_ir = compiler.json_to_ir(budget_exceeded_list_expr)
+
+    # Assert
+    assert domain_ir == compiler.ir.Unsupported()
+    assert variant_ir == compiler.ir.Unsupported()
+    assert direct_contains_record == compiler.parser.base.UNSUPPORTED_RECORD
+    assert isolated_record == compiler.parser.base.UNSUPPORTED_RECORD
+    assert budget_ir == compiler.ir.Eq(
+        left=compiler.ir.Column("a"),
+        right=compiler.ir.Unsupported(),
+    )
+    assert len(dispatched_nodes) == 3
