@@ -25,10 +25,12 @@ from polars_bigquery.core.compiler.parser.base import (
     register_parser,
 )
 from polars_bigquery.core.compiler.parser.numeric import (
-    parse_int_literal,
+    BQ_INT64_MAX,
+    BQ_INT64_MIN,
 )
 from polars_bigquery.core.compiler.parser.temporal import (
-    parse_date_literal,
+    BQ_MAX_DATE_DAYS,
+    BQ_MIN_DATE_DAYS,
     parse_ticks_and_unit,
     parse_timezone,
 )
@@ -74,35 +76,40 @@ def parse_ipc_series_to_list_literal(raw_bytes: bytes) -> Expr:
         return Unsupported()
 
     if series.dtype.is_integer():
-        int_items: list[IntLiteral] = []
-        for v in series.to_list():
-            parsed_int = parse_int_literal(v)
-            if not isinstance(parsed_int, IntLiteral):
-                return Unsupported()
-            int_items.append(parsed_int)
-        return ListLiteral(values=tuple(int_items))
+        min_val = series.min()
+        max_val = series.max()
+        if (
+            not isinstance(min_val, int)
+            or not isinstance(max_val, int)
+            or min_val < BQ_INT64_MIN
+            or max_val > BQ_INT64_MAX
+        ):
+            return Unsupported()
+        return ListLiteral(values=tuple(IntLiteral(value=v) for v in series.to_list()))
     if series.dtype.is_float():
         if series.is_nan().any():
             return Unsupported()
         return ListLiteral(
-            values=tuple(FloatLiteral(value=float(v)) for v in series.to_list())
+            values=tuple(FloatLiteral(value=v) for v in series.to_list())
         )
     if series.dtype == pl.String:
         return ListLiteral(
-            values=tuple(StringLiteral(value=str(v)) for v in series.to_list())
+            values=tuple(StringLiteral(value=v) for v in series.to_list())
         )
     if series.dtype == pl.Boolean:
-        return ListLiteral(
-            values=tuple(BoolLiteral(value=bool(v)) for v in series.to_list())
-        )
+        return ListLiteral(values=tuple(BoolLiteral(value=v) for v in series.to_list()))
     if series.dtype == pl.Date:
-        date_items: list[DateLiteral] = []
-        for d in series.to_physical().to_list():
-            parsed_date = parse_date_literal(d)
-            if not isinstance(parsed_date, DateLiteral):
-                return Unsupported()
-            date_items.append(parsed_date)
-        return ListLiteral(values=tuple(date_items))
+        phys = series.to_physical()
+        min_day = phys.min()
+        max_day = phys.max()
+        if (
+            not isinstance(min_day, int)
+            or not isinstance(max_day, int)
+            or min_day < BQ_MIN_DATE_DAYS
+            or max_day > BQ_MAX_DATE_DAYS
+        ):
+            return Unsupported()
+        return ListLiteral(values=tuple(DateLiteral(days=d) for d in phys.to_list()))
     if isinstance(series.dtype, pl.Datetime):
         unit_str = _DATETIME_UNIT_NAMES.get(series.dtype.time_unit)
         if unit_str is None:
@@ -125,18 +132,22 @@ def parse_ipc_series_to_list_literal(raw_bytes: bytes) -> Expr:
 
 
 def _try_extract_ipc_bytes(value: list[Any]) -> bytes | None:
-    """Convert an integer byte list to `bytes` without redundant full-list scans."""
+    """Convert an integer byte list to `bytes` in a single pass."""
     first = value[0]
     if not isinstance(first, int) or isinstance(first, bool):
         return None
     if len(value) > MAX_IPC_BYTES:
         return b""
-    try:
-        if any(isinstance(b, bool) for b in value):
+    buf = bytearray(len(value))
+    for idx, elem in enumerate(value):
+        if (
+            not isinstance(elem, int)
+            or isinstance(elem, bool)
+            or not (0 <= elem <= 255)
+        ):
             return None
-        return bytes(value)
-    except (TypeError, ValueError):
-        return None
+        buf[idx] = elem
+    return bytes(buf)
 
 
 @register_parser("$.Literal..List", "$.Literal..Series")

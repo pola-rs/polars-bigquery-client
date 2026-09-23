@@ -33,27 +33,27 @@ def parse_string_literal(value: Any) -> Expr:
 
 
 @register_parser("$.Function.function.StringExpr.Uppercase")
-def parse_uppercase(_spec: Any, expr_json: Any) -> ParseRecord:
+def parse_uppercase(spec: Any, expr_json: Any) -> ParseRecord:
     """Parse a Polars `Uppercase` StringFunction node into an IR `Uppercase` record."""
-    return parse_unary_function(expr_json, Uppercase, exact_inputs=True)
+    return parse_unary_function(expr_json, Uppercase, exact_inputs=True, func_spec=spec)
 
 
 @register_parser("$.Function.function.StringExpr.Lowercase")
-def parse_lowercase(_spec: Any, expr_json: Any) -> ParseRecord:
+def parse_lowercase(spec: Any, expr_json: Any) -> ParseRecord:
     """Parse a Polars `Lowercase` StringFunction node into an IR `Lowercase` record."""
-    return parse_unary_function(expr_json, Lowercase, exact_inputs=True)
+    return parse_unary_function(expr_json, Lowercase, exact_inputs=True, func_spec=spec)
 
 
 @register_parser("$.Function.function.StringExpr.StartsWith")
-def parse_starts_with(_spec: Any, expr_json: Any) -> ParseRecord:
+def parse_starts_with(spec: Any, expr_json: Any) -> ParseRecord:
     """Parse a Polars `StartsWith` StringFunction node into an IR `StartsWith` record."""
-    return parse_binary_function(expr_json, StartsWith)
+    return parse_binary_function(expr_json, StartsWith, func_spec=spec)
 
 
 @register_parser("$.Function.function.StringExpr.EndsWith")
-def parse_ends_with(_spec: Any, expr_json: Any) -> ParseRecord:
+def parse_ends_with(spec: Any, expr_json: Any) -> ParseRecord:
     """Parse a Polars `EndsWith` StringFunction node into an IR `EndsWith` record."""
-    return parse_binary_function(expr_json, EndsWith)
+    return parse_binary_function(expr_json, EndsWith, func_spec=spec)
 
 
 @register_parser("$.Function.function.StringExpr.Contains")
@@ -73,6 +73,8 @@ def parse_contains(contains_spec: Any, expr_json: Any) -> ParseRecord:
         raw_literal = contains_opts.get("literal", False)
         raw_strict = contains_opts.get("strict", True)
         if not isinstance(raw_literal, bool) or not isinstance(raw_strict, bool):
+            return UNSUPPORTED_RECORD
+        if not raw_literal and not raw_strict:
             return UNSUPPORTED_RECORD
         return ParseRecord(
             "Binary",

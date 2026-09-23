@@ -1106,3 +1106,53 @@ def test_parse_list_literal_rejects_heterogeneous_and_nan_elements(
 
     # Assert
     assert actual_ir == expected_ir
+
+
+def test_nested_list_literal_avoids_recursion_and_enforces_leaf_fanout_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Arrange
+    nested_list: dict[str, Any] = {"Int64": 1}
+    for _ in range(1500):
+        nested_list = {"List": [nested_list]}
+    monkeypatch.setattr(compiler.parser, "MAX_AST_NODES", 5)
+    fanout_list_expr = {
+        "BinaryExpr": {
+            "left": {"Column": "a"},
+            "op": "Eq",
+            "right": {"Literal": {"List": [{"Int64": i} for i in range(10)]}},
+        }
+    }
+
+    # Act
+    nested_ir = compiler.json_to_ir({"Literal": nested_list})
+    fanout_ir = compiler.json_to_ir(fanout_list_expr)
+
+    # Assert
+    assert nested_ir == compiler.ir.Unsupported()
+    assert fanout_ir == compiler.ir.Eq(
+        left=compiler.ir.Column("a"),
+        right=compiler.ir.Unsupported(),
+    )
+
+
+def test_contains_strict_false_and_direct_unit_parser_reject_parameterized_specs() -> (
+    None
+):
+    # Arrange
+    non_strict_regex_expr = pl.col("name").str.contains("[invalid", strict=False)
+
+    # Act
+    non_strict_sql = compiler.predicate_to_row_restriction(non_strict_regex_expr)
+    direct_not_record = compiler.parser.boolean.parse_not(
+        {"unexpected": True}, [{"Column": "a"}]
+    )
+    direct_eq_record = compiler.parser.comparison.parse_eq(
+        {"null_equals": True},
+        {"left": {"Column": "a"}, "right": {"Literal": {"Int64": 1}}},
+    )
+
+    # Assert
+    assert non_strict_sql == ""
+    assert direct_not_record == compiler.parser.base.UNSUPPORTED_RECORD
+    assert direct_eq_record == compiler.parser.base.UNSUPPORTED_RECORD

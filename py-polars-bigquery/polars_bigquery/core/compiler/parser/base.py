@@ -116,6 +116,8 @@ def _insert_steps_into_trie(
     path: str,
     steps: tuple[tuple[str, str], ...],
     func: ParserFunc,
+    *,
+    accepts_expr_json: bool,
 ) -> None:
     """Insert a pre-parsed JSON Path and its bound parser callable into `root`."""
     curr = root
@@ -133,7 +135,7 @@ def _insert_steps_into_trie(
         )
         raise ValueError(msg)
     curr.parser = func
-    curr.accepts_expr_json = _accepts_second_positional_arg(func)
+    curr.accepts_expr_json = accepts_expr_json
 
 
 def register_parser(*paths: str) -> Callable[[_F], _F]:
@@ -145,6 +147,7 @@ def register_parser(*paths: str) -> Callable[[_F], _F]:
     parsed_paths = [(path, parse_json_path(path)) for path in paths]
 
     def _decorator(func: _F) -> _F:
+        accepts_expr_json = _accepts_second_positional_arg(func)
         for path, _ in parsed_paths:
             existing = _PARSERS_REGISTRY.get(path)
             if existing is not None and existing is not func:
@@ -154,7 +157,13 @@ def register_parser(*paths: str) -> Callable[[_F], _F]:
                 )
                 raise ValueError(msg)
         for path, steps in parsed_paths:
-            _insert_steps_into_trie(_DISPATCH_TRIE, path, steps, func)
+            _insert_steps_into_trie(
+                _DISPATCH_TRIE,
+                path,
+                steps,
+                func,
+                accepts_expr_json=accepts_expr_json,
+            )
             _PARSERS_REGISTRY[path] = func
         return func
 
@@ -206,7 +215,7 @@ def _match_descendant(
         child_node = descendant_map.get(unwrapped)
         if child_node is not None:
             matched = _match_node(
-                child_node, unwrapped, is_root=False, depth=unwrapped_depth + 1
+                child_node, None, is_root=False, depth=unwrapped_depth + 1
             )
             if matched is not None:
                 return matched
@@ -256,6 +265,18 @@ def _match_node(
                         )
                         if matched is not None:
                             return matched
+            elif len(curr_val) < len(curr_node.children):
+                for k, v in curr_val.items():
+                    child_node = curr_node.children.get(k)
+                    if child_node is not None:
+                        matched = _match_node(
+                            child_node,
+                            v,
+                            is_root=False,
+                            depth=depth + 1,
+                        )
+                        if matched is not None:
+                            return matched
             else:
                 for k, child_node in curr_node.children.items():
                     if k in curr_val:
@@ -270,9 +291,7 @@ def _match_node(
         elif isinstance(curr_val, str):
             child_node = curr_node.children.get(curr_val)
             if child_node is not None:
-                matched = _match_node(
-                    child_node, curr_val, is_root=False, depth=depth + 1
-                )
+                matched = _match_node(child_node, None, is_root=False, depth=depth + 1)
                 if matched is not None:
                     return matched
 
@@ -340,7 +359,9 @@ def dispatch_parser(expr_json: Any) -> ParseRecord:
     return _invoke_matched_parser(node, matched_val, expr_json)
 
 
-def dispatch_literal_parser(literal_payload: Any) -> ParseRecord:
+def dispatch_literal_parser(
+    literal_payload: Any, *, allow_containers: bool = False
+) -> ParseRecord:
     """Dispatch a Polars literal payload directly against the `$.Literal` subtrie.
 
     Avoids allocating synthetic `{"Literal": elem}` wrapper dictionaries when
@@ -354,7 +375,17 @@ def dispatch_literal_parser(literal_payload: Any) -> ParseRecord:
     if matched is None:
         return UNSUPPORTED_RECORD
     node, matched_val = matched
+    if (
+        not allow_containers
+        and getattr(node.parser, "__name__", "") == "parse_list_literal"
+    ):
+        return UNSUPPORTED_RECORD
     return _invoke_matched_parser(node, matched_val, literal_payload)
+
+
+def _is_valid_unit_spec(spec: Any) -> bool:
+    """Return True if `spec` represents an unparameterized unit variant payload."""
+    return spec is None or isinstance(spec, str) or spec == {}
 
 
 def extract_binary_operands(expr_json: Any) -> tuple[Any, Any] | None:
@@ -372,8 +403,15 @@ def extract_binary_operands(expr_json: Any) -> tuple[Any, Any] | None:
     return None
 
 
-def parse_binary_op(expr_json: Any, binary_cls: type[BinaryExpr]) -> ParseRecord:
+def parse_binary_op(
+    expr_json: Any,
+    binary_cls: type[BinaryExpr],
+    *,
+    op_spec: Any = None,
+) -> ParseRecord:
     """Build a Binary `ParseRecord` for `binary_cls` from a `BinaryExpr` JSON node."""
+    if not _is_valid_unit_spec(op_spec):
+        return UNSUPPORTED_RECORD
     operands = extract_binary_operands(expr_json)
     if operands is None:
         return UNSUPPORTED_RECORD
@@ -418,8 +456,11 @@ def parse_unary_function(
     unary_cls: type[UnaryExpr],
     *,
     exact_inputs: bool = True,
+    func_spec: Any = None,
 ) -> ParseRecord:
     """Build a Unary `ParseRecord` for `unary_cls` from a `Function` JSON node."""
+    if not _is_valid_unit_spec(func_spec):
+        return UNSUPPORTED_RECORD
     if not _has_valid_unit_function_spec(expr_json):
         return UNSUPPORTED_RECORD
     inputs = extract_function_inputs(expr_json)
@@ -433,8 +474,12 @@ def parse_unary_function(
 def parse_binary_function(
     expr_json: Any,
     binary_cls: Any,
+    *,
+    func_spec: Any = None,
 ) -> ParseRecord:
     """Build a Binary `ParseRecord` for `binary_cls` from a 2-input `Function` JSON node."""
+    if not _is_valid_unit_spec(func_spec):
+        return UNSUPPORTED_RECORD
     if not _has_valid_unit_function_spec(expr_json):
         return UNSUPPORTED_RECORD
     inputs = extract_function_inputs(expr_json)

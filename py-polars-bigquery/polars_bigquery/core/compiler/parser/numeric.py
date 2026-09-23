@@ -43,27 +43,27 @@ BQ_INT64_MAX = (1 << 63) - 1
 
 
 @register_parser("$.Function.function.Boolean.IsNan")
-def parse_is_nan(_spec: Any, expr_json: Any) -> ParseRecord:
+def parse_is_nan(spec: Any, expr_json: Any) -> ParseRecord:
     """Parse a Polars `IsNan` BooleanFunction node into an IR `IsNan` record."""
-    return parse_unary_function(expr_json, IsNan)
+    return parse_unary_function(expr_json, IsNan, func_spec=spec)
 
 
 @register_parser("$.Function.function.Boolean.IsNotNan")
-def parse_is_not_nan(_spec: Any, expr_json: Any) -> ParseRecord:
+def parse_is_not_nan(spec: Any, expr_json: Any) -> ParseRecord:
     """Parse a Polars `IsNotNan` BooleanFunction node into an IR `IsNotNan` record."""
-    return parse_unary_function(expr_json, IsNotNan)
+    return parse_unary_function(expr_json, IsNotNan, func_spec=spec)
 
 
 @register_parser("$.Function.function.Boolean.IsInfinite")
-def parse_is_infinite(_spec: Any, expr_json: Any) -> ParseRecord:
+def parse_is_infinite(spec: Any, expr_json: Any) -> ParseRecord:
     """Parse a Polars `IsInfinite` BooleanFunction node into an IR `IsInfinite` record."""
-    return parse_unary_function(expr_json, IsInfinite)
+    return parse_unary_function(expr_json, IsInfinite, func_spec=spec)
 
 
 @register_parser("$.Function.function.Boolean.IsFinite")
-def parse_is_finite(_spec: Any, expr_json: Any) -> ParseRecord:
+def parse_is_finite(spec: Any, expr_json: Any) -> ParseRecord:
     """Parse a Polars `IsFinite` BooleanFunction node into an IR `IsFinite` record."""
-    return parse_unary_function(expr_json, IsFinite)
+    return parse_unary_function(expr_json, IsFinite, func_spec=spec)
 
 
 @register_parser(*(f"$.Literal..{int_type}" for int_type in sorted(INT_TYPES)))
