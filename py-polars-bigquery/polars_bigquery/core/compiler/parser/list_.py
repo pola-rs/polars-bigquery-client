@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import io
 import math
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
 from typing import Any
 
 import polars as pl
@@ -21,6 +21,7 @@ from polars_bigquery.core.compiler.ir.temporal import DateLiteral, TimestampLite
 from polars_bigquery.core.compiler.parser.base import (
     UNSUPPORTED_RECORD,
     ParseRecord,
+    extract_bool_options,
     extract_function_inputs,
     register_parser,
 )
@@ -148,7 +149,7 @@ def parse_ipc_series_to_list_literal(raw_bytes: bytes) -> Expr:
 def _try_extract_ipc_bytes(value: list[Any]) -> bytes | None:
     """Convert an integer byte list to `bytes` in a single pass."""
     first = value[0]
-    if not isinstance(first, int) or isinstance(first, bool):
+    if not isinstance(first, int) or isinstance(first, bool) or not (0 <= first <= 255):
         return None
     if len(value) > MAX_IPC_BYTES:
         return b""
@@ -179,6 +180,10 @@ class _LiteralChildView(Sequence[dict[str, Any]]):
         if isinstance(index, slice):
             return tuple({"Literal": elem} for elem in self._items[index])
         return {"Literal": self._items[index]}
+
+    def __iter__(self) -> Iterator[dict[str, Any]]:
+        for elem in self._items:
+            yield {"Literal": elem}
 
     def __eq__(self, other: object) -> bool:
         if isinstance(other, _LiteralChildView):
@@ -220,21 +225,13 @@ def parse_is_in_function(isin_spec: Any, expr_json: Any) -> ParseRecord:
     inputs = extract_function_inputs(expr_json)
     if inputs is None or len(inputs) != 2:
         return UNSUPPORTED_RECORD
-    isin_opts = (
-        isin_spec["IsIn"]
-        if isinstance(isin_spec, dict) and "IsIn" in isin_spec
-        else isin_spec
+    opts = extract_bool_options(
+        isin_spec,
+        "IsIn",
+        {"nulls_equal": False},
+        allow_unit_or_bool_for="nulls_equal",
     )
-    if isinstance(isin_opts, dict):
-        if set(isin_opts) - {"nulls_equal"}:
-            return UNSUPPORTED_RECORD
-        raw_flag = isin_opts.get("nulls_equal", False)
-        if not isinstance(raw_flag, bool) or raw_flag:
-            return UNSUPPORTED_RECORD
-    elif isinstance(isin_opts, bool):
-        if isin_opts:
-            return UNSUPPORTED_RECORD
-    elif isin_opts is not None and isin_opts != "IsIn":
+    if opts is None or opts["nulls_equal"]:
         return UNSUPPORTED_RECORD
 
     return ParseRecord("Binary", IsIn, (inputs[0], inputs[1]))

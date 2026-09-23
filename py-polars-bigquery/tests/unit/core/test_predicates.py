@@ -1276,3 +1276,37 @@ def test_compiled_trie_envelope_and_constructor_resilience_boundaries() -> None:
     assert bin_mod_ir == compiler.ir.Unsupported()
     assert wrong_arity_record == compiler.parser.base.UNSUPPORTED_RECORD
     assert non_callable_record == compiler.parser.base.UNSUPPORTED_RECORD
+
+
+def test_trie_depth_guard_attribute_error_isolation_and_deep_function_envelope() -> (
+    None
+):
+    # Arrange
+    over_depth_path = "$" + ".seg" * (compiler.parser.base.MAX_TRIE_DEPTH + 1)
+    deep_unit_func_envelope = {
+        "Function": {
+            "input": [{"Column": "a"}],
+            "function": {"Category": {"SubCategory": {"LeafOp": None}}},
+        }
+    }
+    child_view = compiler.parser.list_._LiteralChildView([{"Int64": 1}, {"Int64": 2}])
+
+    # Act
+    attr_err_record = compiler.parser.base._invoke_matched_parser(
+        lambda _x: (_ for _ in ()).throw(AttributeError("unexpected missing attr")),
+        1,
+        {},
+    )
+    deep_inputs = compiler.parser.base.extract_function_inputs(
+        deep_unit_func_envelope, require_unit_leaf=True
+    )
+    negative_first_ipc = compiler.parser.list_._try_extract_ipc_bytes([-1, 0, 1])
+    iterated_children = list(child_view)
+
+    # Assert
+    with pytest.raises(ValueError, match="exceeds MAX_TRIE_DEPTH"):
+        compiler.parser.parse_json_path(over_depth_path)
+    assert attr_err_record == compiler.parser.base.UNSUPPORTED_RECORD
+    assert deep_inputs == [{"Column": "a"}]
+    assert negative_first_ipc is None
+    assert iterated_children == [{"Literal": {"Int64": 1}}, {"Literal": {"Int64": 2}}]

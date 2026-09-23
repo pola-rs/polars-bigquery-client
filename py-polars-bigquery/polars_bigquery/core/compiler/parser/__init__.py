@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import collections
+import logging
 from typing import Any
 
 from polars_bigquery.core.compiler.ir import (
@@ -21,11 +22,14 @@ from polars_bigquery.core.compiler.parser import (
 )
 from polars_bigquery.core.compiler.parser.base import (
     PARSERS,
+    RECOVERABLE_PARSE_ERRORS,
     UNSUPPORTED_RECORD,
     dispatch_parser,
     parse_json_path,
     register_parser,
 )
+
+logger = logging.getLogger(__name__)
 
 MAX_AST_NODES = 10_000
 
@@ -106,13 +110,13 @@ def json_to_ir(expr_json: Any) -> Expr:
                 constructed = cls_or_leaf(
                     tuple(ir_nodes[c_idx] for c_idx in child_indices)
                 )
-        except (
-            ArithmeticError,
-            LookupError,
-            RuntimeError,
-            TypeError,
-            ValueError,
-        ):
+        except RECOVERABLE_PARSE_ERRORS:
+            logger.debug(
+                "IR constructor %r failed for record kind %r; degrading to Unsupported",
+                cls_or_leaf,
+                kind,
+                exc_info=True,
+            )
             constructed = None
 
         if isinstance(constructed, Expr):

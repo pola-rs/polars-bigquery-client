@@ -3,8 +3,9 @@ from __future__ import annotations
 import collections.abc
 import dataclasses
 import inspect
+import logging
 import types
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from typing import Any, Literal, NamedTuple, TypeVar
 
 from polars_bigquery.core.compiler.ir.base import (
@@ -15,6 +16,8 @@ from polars_bigquery.core.compiler.ir.base import (
     UnaryExpr,
     Unsupported,
 )
+
+logger = logging.getLogger(__name__)
 
 RecordKind = Literal["Leaf", "Unary", "Binary", "Variadic"]
 
@@ -33,13 +36,17 @@ _F = TypeVar("_F", bound=ParserFunc)
 
 UNSUPPORTED_RECORD: ParseRecord = ParseRecord("Leaf", Unsupported(), ())
 MAX_TRIE_DEPTH = 16
+RECOVERABLE_PARSE_ERRORS: tuple[type[Exception], ...] = (
+    ArithmeticError,
+    AttributeError,
+    LookupError,
+    RuntimeError,
+    TypeError,
+    ValueError,
+)
 
 _VALID_BINARY_EXPR_KEYS = frozenset({"left", "op", "right"})
 _VALID_FUNCTION_EXPR_KEYS = frozenset({"input", "function"})
-_STRUCT_STEP_ALLOWED_KEYS: dict[str, frozenset[str]] = {
-    "op": _VALID_BINARY_EXPR_KEYS,
-    "function": _VALID_FUNCTION_EXPR_KEYS,
-}
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -108,6 +115,12 @@ def parse_json_path(path: str) -> tuple[tuple[str, str], ...]:
             raise ValueError(msg)
         steps.append((op, segment))
 
+    if len(steps) > MAX_TRIE_DEPTH:
+        msg = (
+            f"Invalid JSON path {path!r}: depth {len(steps)} exceeds "
+            f"MAX_TRIE_DEPTH ({MAX_TRIE_DEPTH})"
+        )
+        raise ValueError(msg)
     return tuple(steps)
 
 
@@ -137,6 +150,12 @@ def _insert_compiled_route(
             next_node = _DispatchTrieNode()
             table[segment] = next_node
         curr_node = next_node
+    if curr_node.route is not None and curr_node.route.parser is not route.parser:
+        msg = (
+            f"Conflicting trie route for {route.path!r}: node already bound to "
+            f"{curr_node.route.path!r} ({curr_node.route.parser!r})"
+        )
+        raise ValueError(msg)
     curr_node.route = route
 
 
@@ -210,24 +229,41 @@ def _extract_enum_tag_and_payload(val: Any) -> tuple[str, Any] | None:
     return None
 
 
-def _match_descendants(
+def _step_descendant(
     node: _DispatchTrieNode, payload: Any, depth: int
-) -> tuple[_CompiledRoute, Any] | None:
-    """Resolve recursive descent (`..segment`) transitions across transparent literal wrappers."""
-    curr = payload
-    curr_depth = depth
-    while curr_depth <= MAX_TRIE_DEPTH:
-        curr, curr_depth = _unwrap_literal_with_depth(curr, curr_depth)
-        if curr_depth > MAX_TRIE_DEPTH:
-            return None
-        tag_and_val = _extract_enum_tag_and_payload(curr)
-        if tag_and_val is None:
-            return None
-        tag, val = tag_and_val
-        desc_node = node.descendants.get(tag)
-        if desc_node is not None and desc_node.route is not None:
-            return desc_node.route, val
+) -> tuple[_DispatchTrieNode, str, Any, int] | None:
+    """Resolve a `..segment` transition across transparent literal wrappers."""
+    curr, curr_depth = _unwrap_literal_with_depth(payload, depth)
+    if curr_depth > MAX_TRIE_DEPTH:
         return None
+    tag_and_val = _extract_enum_tag_and_payload(curr)
+    if tag_and_val is None:
+        return None
+    tag, val = tag_and_val
+    desc_node = node.descendants.get(tag)
+    if desc_node is None:
+        return None
+    return desc_node, tag, val, curr_depth + 1
+
+
+def _step_child(
+    node: _DispatchTrieNode, curr_val: Any
+) -> tuple[_DispatchTrieNode, str, Any] | None:
+    """Resolve a direct `.segment` transition on `node.children`."""
+    if not node.children:
+        return None
+    tag_and_payload = _extract_enum_tag_and_payload(curr_val)
+    if tag_and_payload is not None:
+        tag, payload = tag_and_payload
+        cand_node = node.children.get(tag)
+        if cand_node is not None:
+            return cand_node, tag, payload
+        return None
+    if isinstance(curr_val, dict) and len(curr_val) > 1:
+        matched_keys = curr_val.keys() & node.children.keys()
+        if len(matched_keys) == 1:
+            tag = next(iter(matched_keys))
+            return node.children[tag], tag, curr_val[tag]
     return None
 
 
@@ -241,38 +277,22 @@ def _match_trie_route(expr_json: Any) -> tuple[_CompiledRoute, Any] | None:
     depth = 0
 
     while depth <= MAX_TRIE_DEPTH:
-        if curr_node.descendants:
-            matched_desc = _match_descendants(curr_node, curr_val, depth)
-            if matched_desc is not None:
-                return matched_desc
+        next_node: _DispatchTrieNode | None = None
+        tag: str = ""
+        payload: Any = None
 
-        if not curr_node.children:
+        child_step = _step_child(curr_node, curr_val)
+        if child_step is not None:
+            next_node, tag, payload = child_step
+            depth += 1
+        elif curr_node.descendants:
+            desc_step = _step_descendant(curr_node, curr_val, depth)
+            if desc_step is not None:
+                next_node, tag, payload, depth = desc_step
+
+        if next_node is None or depth > MAX_TRIE_DEPTH + 1:
             return None
 
-        # Check for struct field transitions (e.g., `.op` inside `BinaryExpr` or `.function` inside `Function`)
-        if isinstance(curr_val, dict) and len(curr_val) >= 1:
-            matched_struct_step = False
-            for struct_key, allowed_keys in _STRUCT_STEP_ALLOWED_KEYS.items():
-                if struct_key in curr_node.children and struct_key in curr_val:
-                    if not (set(curr_val) <= allowed_keys):
-                        return None
-                    curr_node = curr_node.children[struct_key]
-                    curr_val = curr_val[struct_key]
-                    depth += 1
-                    matched_struct_step = True
-                    break
-            if matched_struct_step:
-                continue
-
-        tag_and_payload = _extract_enum_tag_and_payload(curr_val)
-        if tag_and_payload is None:
-            return None
-        tag, payload = tag_and_payload
-        next_node = curr_node.children.get(tag)
-        if next_node is None:
-            return None
-
-        depth += 1
         if next_node.route is not None and (
             payload is None or not (next_node.children or next_node.descendants)
         ):
@@ -331,13 +351,12 @@ def _invoke_matched_parser(
             if accepts_expr_json
             else parser(matched_val)
         )
-    except (
-        ArithmeticError,
-        LookupError,
-        RuntimeError,
-        TypeError,
-        ValueError,
-    ):
+    except RECOVERABLE_PARSE_ERRORS:
+        logger.debug(
+            "Parser %r raised an exception; degrading node to UNSUPPORTED_RECORD",
+            parser,
+            exc_info=True,
+        )
         return UNSUPPORTED_RECORD
 
     if isinstance(result, Expr):
@@ -391,7 +410,7 @@ def extract_binary_operands(expr_json: Any) -> tuple[Any, Any] | None:
             binary_body = expr_json
         if (
             isinstance(binary_body, dict)
-            and set(binary_body) <= _VALID_BINARY_EXPR_KEYS
+            and binary_body.keys() <= _VALID_BINARY_EXPR_KEYS
         ):
             op_val = binary_body.get("op")
             if op_val is not None and not isinstance(op_val, str):
@@ -431,24 +450,59 @@ def _has_valid_function_envelope(
     else:
         func_body = expr_json
     if not isinstance(func_body, dict) or not (
-        set(func_body) <= _VALID_FUNCTION_EXPR_KEYS
+        func_body.keys() <= _VALID_FUNCTION_EXPR_KEYS
     ):
         return False
     if "function" not in func_body:
         return True
-    fn_spec = func_body["function"]
-    if isinstance(fn_spec, str):
+
+    curr_spec: Any = func_body["function"]
+    if isinstance(curr_spec, str):
         return True
-    if isinstance(fn_spec, dict) and len(fn_spec) == 1:
-        (inner_spec,) = fn_spec.values()
-        if isinstance(inner_spec, str) or inner_spec is None:
+    for _ in range(MAX_TRIE_DEPTH):
+        if not isinstance(curr_spec, dict) or len(curr_spec) != 1:
+            return False
+        (curr_spec,) = curr_spec.values()
+        if curr_spec is None or isinstance(curr_spec, str):
             return True
-        if isinstance(inner_spec, dict) and len(inner_spec) == 1:
-            if not require_unit_leaf:
-                return True
-            (leaf_spec,) = inner_spec.values()
-            return leaf_spec is None or isinstance(leaf_spec, str)
+        if (
+            isinstance(curr_spec, dict)
+            and not require_unit_leaf
+            and all(isinstance(v, bool) for v in curr_spec.values())
+        ):
+            return True
     return False
+
+
+def extract_bool_options(
+    spec: Any,
+    variant_name: str,
+    defaults: Mapping[str, bool],
+    *,
+    allow_unit_or_bool_for: str | None = None,
+) -> dict[str, bool] | None:
+    """Unwrap and validate a boolean options dictionary for a parameterized function variant."""
+    opts = (
+        spec[variant_name]
+        if isinstance(spec, dict) and len(spec) == 1 and variant_name in spec
+        else spec
+    )
+    if isinstance(opts, dict):
+        if not (opts.keys() <= defaults.keys()):
+            return None
+        resolved: dict[str, bool] = {}
+        for key, default_val in defaults.items():
+            raw_val = opts.get(key, default_val)
+            if not isinstance(raw_val, bool):
+                return None
+            resolved[key] = raw_val
+        return resolved
+    if allow_unit_or_bool_for is not None:
+        if isinstance(opts, bool):
+            return {**defaults, allow_unit_or_bool_for: opts}
+        if opts is None or opts == variant_name:
+            return dict(defaults)
+    return None
 
 
 def extract_function_inputs(

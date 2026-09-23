@@ -15,6 +15,7 @@ from polars_bigquery.core.compiler.ir.string import (
 from polars_bigquery.core.compiler.parser.base import (
     UNSUPPORTED_RECORD,
     ParseRecord,
+    extract_bool_options,
     extract_function_inputs,
     parse_binary_function,
     parse_unary_function,
@@ -62,23 +63,15 @@ def parse_contains(contains_spec: Any, expr_json: Any) -> ParseRecord:
     inputs = extract_function_inputs(expr_json)
     if inputs is None or len(inputs) != 2:
         return UNSUPPORTED_RECORD
-    contains_opts = (
-        contains_spec["Contains"]
-        if isinstance(contains_spec, dict) and "Contains" in contains_spec
-        else contains_spec
+    opts = extract_bool_options(
+        contains_spec,
+        "Contains",
+        {"literal": False, "strict": True},
     )
-    if isinstance(contains_opts, dict):
-        if set(contains_opts) - {"literal", "strict"}:
-            return UNSUPPORTED_RECORD
-        raw_literal = contains_opts.get("literal", False)
-        raw_strict = contains_opts.get("strict", True)
-        if not isinstance(raw_literal, bool) or not isinstance(raw_strict, bool):
-            return UNSUPPORTED_RECORD
-        if not raw_literal and not raw_strict:
-            return UNSUPPORTED_RECORD
-        return ParseRecord(
-            "Binary",
-            functools.partial(Contains, literal=raw_literal),
-            (inputs[0], inputs[1]),
-        )
-    return UNSUPPORTED_RECORD
+    if opts is None or (not opts["literal"] and not opts["strict"]):
+        return UNSUPPORTED_RECORD
+    return ParseRecord(
+        "Binary",
+        functools.partial(Contains, literal=opts["literal"]),
+        (inputs[0], inputs[1]),
+    )
