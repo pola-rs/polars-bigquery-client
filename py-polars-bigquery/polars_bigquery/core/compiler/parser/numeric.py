@@ -37,6 +37,9 @@ INT_TYPES = frozenset(
 
 FLOAT_TYPES = frozenset({"Float", "Float32", "Float64"})
 
+BQ_INT64_MIN = -(1 << 63)
+BQ_INT64_MAX = (1 << 63) - 1
+
 
 @register_parser("$.Function.function.Boolean.IsNan")
 def parse_is_nan(_spec: Any, expr_json: Any) -> ParseRecord:
@@ -65,12 +68,15 @@ def parse_is_finite(_spec: Any, expr_json: Any) -> ParseRecord:
 @register_parser(*(f"$.Literal..{int_type}" for int_type in sorted(INT_TYPES)))
 def parse_int_literal(value: Any) -> Expr:
     """Parse an integer value from Polars JSON into an IntLiteral or Unsupported."""
-    if isinstance(value, bool):
+    if isinstance(value, bool) or not isinstance(value, (int, str)):
         return Unsupported()
     try:
-        return IntLiteral(value=int(value))
+        int_val = int(value)
     except (TypeError, ValueError):
         return Unsupported()
+    if not (BQ_INT64_MIN <= int_val <= BQ_INT64_MAX):
+        return Unsupported()
+    return IntLiteral(value=int_val)
 
 
 @register_parser(*(f"$.Literal..{float_type}" for float_type in sorted(FLOAT_TYPES)))

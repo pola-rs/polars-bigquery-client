@@ -20,6 +20,7 @@ from polars_bigquery.core.compiler.parser import (
 )
 from polars_bigquery.core.compiler.parser.base import (
     PARSERS,
+    UNSUPPORTED_RECORD,
     dispatch_parser,
     parse_json_path,
     register_parser,
@@ -55,7 +56,10 @@ def json_to_ir(expr_json: Any) -> Expr:
 
         kind, cls_or_leaf, child_jsons = dispatch_parser(curr)
         if len(raw_nodes) + len(child_jsons) > MAX_AST_NODES:
-            return Unsupported()
+            # Degrade only the oversized subtree to Unsupported() rather than
+            # aborting the entire root AST so shallow conjunctive (AND) filters
+            # already discovered in BFS order can still be pushed down.
+            kind, cls_or_leaf, child_jsons = UNSUPPORTED_RECORD
 
         child_indices: list[int] = []
         for child_json in child_jsons:

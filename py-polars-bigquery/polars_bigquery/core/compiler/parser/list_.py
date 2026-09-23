@@ -23,7 +23,11 @@ from polars_bigquery.core.compiler.parser.base import (
     extract_function_inputs,
     register_parser,
 )
+from polars_bigquery.core.compiler.parser.numeric import (
+    parse_int_literal,
+)
 from polars_bigquery.core.compiler.parser.temporal import (
+    parse_date_literal,
     parse_ticks_and_unit,
     parse_timezone,
 )
@@ -56,9 +60,13 @@ def parse_ipc_series_to_list_literal(raw_bytes: bytes) -> Expr:
         return Unsupported()
 
     if series.dtype.is_integer():
-        return ListLiteral(
-            values=tuple(IntLiteral(value=int(v)) for v in series.to_list())
-        )
+        int_items: list[IntLiteral] = []
+        for v in series.to_list():
+            parsed_int = parse_int_literal(v)
+            if not isinstance(parsed_int, IntLiteral):
+                return Unsupported()
+            int_items.append(parsed_int)
+        return ListLiteral(values=tuple(int_items))
     if series.dtype.is_float():
         if series.is_nan().any():
             return Unsupported()
@@ -74,11 +82,13 @@ def parse_ipc_series_to_list_literal(raw_bytes: bytes) -> Expr:
             values=tuple(BoolLiteral(value=bool(v)) for v in series.to_list())
         )
     if series.dtype == pl.Date:
-        return ListLiteral(
-            values=tuple(
-                DateLiteral(days=int(d)) for d in series.to_physical().to_list()
-            )
-        )
+        date_items: list[DateLiteral] = []
+        for d in series.to_physical().to_list():
+            parsed_date = parse_date_literal(d)
+            if not isinstance(parsed_date, DateLiteral):
+                return Unsupported()
+            date_items.append(parsed_date)
+        return ListLiteral(values=tuple(date_items))
     if isinstance(series.dtype, pl.Datetime):
         unit_str = _DATETIME_UNIT_NAMES.get(series.dtype.time_unit)
         if unit_str is None:
@@ -152,11 +162,14 @@ def parse_is_in_function(isin_spec: Any, expr_json: Any) -> ParseRecord:
         if isinstance(isin_spec, dict) and "IsIn" in isin_spec
         else isin_spec
     )
-    nulls_equal = (
-        isin_opts.get("nulls_equal", False)
-        if isinstance(isin_opts, dict)
-        else bool(isin_opts)
-    )
-    if not nulls_equal:
-        return ("Binary", IsIn, (inputs[0], inputs[1]))
-    return UNSUPPORTED_RECORD
+    if isinstance(isin_opts, dict):
+        raw_flag = isin_opts.get("nulls_equal", False)
+        if not isinstance(raw_flag, bool) or raw_flag:
+            return UNSUPPORTED_RECORD
+    elif isinstance(isin_opts, bool):
+        if isin_opts:
+            return UNSUPPORTED_RECORD
+    elif isin_opts is not None and isin_opts != "IsIn":
+        return UNSUPPORTED_RECORD
+
+    return ParseRecord("Binary", IsIn, (inputs[0], inputs[1]))

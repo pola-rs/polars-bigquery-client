@@ -149,21 +149,29 @@ def register_parser(*paths: str) -> Callable[[_F], _F]:
     return _decorator
 
 
-def unwrap_literal_json(literal_json: Any) -> Any:
-    """Unwrap Polars `Dyn`, `Scalar`, and `{"dtype": ..., "value": ...}` literal wrappers."""
+def _unwrap_literal_with_depth(literal_json: Any, depth: int) -> tuple[Any, int]:
+    """Unwrap Polars `Dyn`, `Scalar`, and `{"dtype": ..., "value": ...}` wrappers within `MAX_TRIE_DEPTH`."""
     curr = literal_json
-    depth = 0
-    while isinstance(curr, dict) and depth < MAX_TRIE_DEPTH:
-        depth += 1
+    curr_depth = depth
+    while isinstance(curr, dict) and curr_depth < MAX_TRIE_DEPTH:
         if len(curr) == 1 and "Dyn" in curr:
             curr = curr["Dyn"]
+            curr_depth += 1
         elif len(curr) == 1 and "Scalar" in curr:
             curr = curr["Scalar"]
+            curr_depth += 1
         elif len(curr) == 2 and "dtype" in curr and "value" in curr:
             curr = curr["value"]
+            curr_depth += 1
         else:
             break
-    return curr
+    return curr, curr_depth
+
+
+def unwrap_literal_json(literal_json: Any) -> Any:
+    """Unwrap Polars `Dyn`, `Scalar`, and `{"dtype": ..., "value": ...}` literal wrappers."""
+    unwrapped, _ = _unwrap_literal_with_depth(literal_json, depth=0)
+    return unwrapped
 
 
 def _match_descendant(
@@ -176,11 +184,16 @@ def _match_descendant(
     if depth > MAX_TRIE_DEPTH:
         return None
 
-    unwrapped = unwrap_literal_json(curr_val)
+    unwrapped, unwrapped_depth = _unwrap_literal_with_depth(curr_val, depth)
+    if unwrapped_depth > MAX_TRIE_DEPTH:
+        return None
+
     if isinstance(unwrapped, str):
         child_node = descendant_map.get(unwrapped)
         if child_node is not None:
-            matched = _match_node(child_node, unwrapped, is_root=False, depth=depth + 1)
+            matched = _match_node(
+                child_node, unwrapped, is_root=False, depth=unwrapped_depth + 1
+            )
             if matched is not None:
                 return matched
         return None
@@ -189,10 +202,12 @@ def _match_descendant(
         k, v = next(iter(unwrapped.items()))
         child_node = descendant_map.get(k)
         if child_node is not None:
-            matched = _match_node(child_node, v, is_root=False, depth=depth + 1)
+            matched = _match_node(
+                child_node, v, is_root=False, depth=unwrapped_depth + 1
+            )
             if matched is not None:
                 return matched
-        return _match_descendant(descendant_map, v, depth=depth + 1)
+        return _match_descendant(descendant_map, v, depth=unwrapped_depth + 1)
 
     return None
 
@@ -285,7 +300,7 @@ def _invoke_matched_parser(
         return ParseRecord("Leaf", result, ())
     if isinstance(result, ParseRecord):
         return result
-    return ParseRecord(result[0], result[1], tuple(result[2]))
+    return UNSUPPORTED_RECORD
 
 
 def dispatch_parser(expr_json: Any) -> ParseRecord:

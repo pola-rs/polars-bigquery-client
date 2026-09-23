@@ -4,7 +4,6 @@ import arrow_bigquery.api.resources
 import freezegun
 import pytest
 import requests
-
 from polars_bigquery.core.bigquery_rest import (
     BigQueryRestClient,
     _raise_for_bigquery_error,

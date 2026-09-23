@@ -2,11 +2,11 @@
 
 from __future__ import annotations
 
+import io
 from typing import Any
 
 import polars as pl
 import pytest
-
 from polars_bigquery.core import compiler
 
 
@@ -773,3 +773,182 @@ def test_json_path_parser_registration_and_dispatch() -> None:
         "Not",
         {"input": [{"Column": "a"}, {"Column": "b"}], "function": {"Boolean": "Not"}},
     ) == ("Leaf", compiler.ir.Unsupported(), ())
+
+
+def test_json_to_ir_partial_ast_degradation_preserves_shallow_and_branch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Arrange
+    monkeypatch.setattr(compiler.parser, "MAX_AST_NODES", 7)
+    oversized_and_json = {
+        "BinaryExpr": {
+            "left": {
+                "BinaryExpr": {
+                    "left": {"Column": "_PARTITIONDATE"},
+                    "op": "Eq",
+                    "right": {"Literal": {"Date": 19723}},
+                }
+            },
+            "op": "And",
+            "right": {
+                "BinaryExpr": {
+                    "left": {
+                        "BinaryExpr": {
+                            "left": {"Column": "x"},
+                            "op": "Eq",
+                            "right": {"Literal": {"Int64": 1}},
+                        }
+                    },
+                    "op": "Or",
+                    "right": {
+                        "BinaryExpr": {
+                            "left": {"Column": "y"},
+                            "op": "Eq",
+                            "right": {"Literal": {"Int64": 2}},
+                        }
+                    },
+                }
+            },
+        }
+    }
+
+    # Act
+    ir_tree = compiler.json_to_ir(oversized_and_json)
+    sql = compiler.ir_to_sql(ir_tree)
+
+    # Assert
+    assert sql == "(`_PARTITIONDATE` = DATE(TIMESTAMP_SECONDS(19723 * 86400)))"
+
+
+def test_parse_int_and_date_literals_reject_float_truncation() -> None:
+    # Arrange
+    float_int_input = 3.9
+    float_date_input = 10.5
+    float_ticks_input = 100.5
+
+    # Act
+    int_ir = compiler.parser.numeric.parse_int_literal(float_int_input)
+    date_ir = compiler.parser.temporal.parse_date_literal(float_date_input)
+
+    # Assert
+    assert int_ir == compiler.ir.Unsupported()
+    assert date_ir == compiler.ir.Unsupported()
+    with pytest.raises(TypeError, match="Invalid timestamp tick count type"):
+        compiler.parser.temporal.parse_ticks_and_unit(float_ticks_input, "Microseconds")
+
+
+def test_parse_int_literal_enforces_bigquery_int64_bounds() -> None:
+    # Arrange
+    max_int64 = (1 << 63) - 1
+    overflow_uint64 = 1 << 63
+    underflow_int128 = -(1 << 63) - 1
+    overflow_series_expr = pl.col("id").is_in(
+        pl.Series([1, overflow_uint64], dtype=pl.UInt64)
+    )
+
+    # Act
+    valid_max_ir = compiler.parser.numeric.parse_int_literal(max_int64)
+    overflow_ir = compiler.parser.numeric.parse_int_literal(overflow_uint64)
+    underflow_ir = compiler.parser.numeric.parse_int_literal(underflow_int128)
+    series_sql = compiler.predicate_to_row_restriction(overflow_series_expr)
+
+    # Assert
+    assert valid_max_ir == compiler.ir.IntLiteral(max_int64)
+    assert overflow_ir == compiler.ir.Unsupported()
+    assert underflow_ir == compiler.ir.Unsupported()
+    assert series_sql == ""
+
+
+def test_parse_temporal_literals_enforce_bigquery_date_and_timestamp_bounds() -> None:
+    # Arrange
+    ipc_buf = io.BytesIO()
+    pl.Series("d", [-800_000], dtype=pl.Int32).cast(
+        pl.Date
+    ).to_frame().write_ipc_stream(ipc_buf)
+    out_of_range_date_ipc = ipc_buf.getvalue()
+
+    # Act
+    scalar_date_ir = compiler.parser.temporal.parse_date_literal(3_000_000)
+    ipc_date_ir = compiler.parser.list_.parse_ipc_series_to_list_literal(
+        out_of_range_date_ipc
+    )
+
+    # Assert
+    assert scalar_date_ir == compiler.ir.Unsupported()
+    assert ipc_date_ir == compiler.ir.Unsupported()
+    with pytest.raises(
+        ValueError, match="Timestamp microseconds out of BigQuery bounds"
+    ):
+        compiler.parser.temporal.parse_ticks_and_unit(
+            300_000_000_000_000_000, "Microseconds"
+        )
+    with pytest.raises(
+        ValueError, match="Timestamp milliseconds out of BigQuery bounds"
+    ):
+        compiler.parser.temporal.parse_ticks_and_unit(
+            300_000_000_000_000, "Milliseconds"
+        )
+    with pytest.raises(
+        ValueError, match="Timestamp nanoseconds out of BigQuery bounds"
+    ):
+        compiler.parser.temporal.parse_ticks_and_unit(
+            300_000_000_000_000_000_000, "Nanoseconds"
+        )
+
+
+def test_parse_is_in_and_contains_validate_unit_and_boolean_options() -> None:
+    # Arrange
+    binary_inputs = [{"Column": "a"}, {"Literal": {"List": [{"Int64": 1}]}}]
+    string_inputs = [{"Column": "a"}, {"Literal": {"String": "x"}}]
+
+    # Act
+    unit_isin = compiler.parser.list_.parse_is_in_function("IsIn", binary_inputs)
+    bool_false_isin = compiler.parser.list_.parse_is_in_function(False, binary_inputs)
+    bool_true_isin = compiler.parser.list_.parse_is_in_function(True, binary_inputs)
+    invalid_spec_isin = compiler.parser.list_.parse_is_in_function(
+        "InvalidSpec", binary_inputs
+    )
+    non_bool_opt_isin = compiler.parser.list_.parse_is_in_function(
+        {"nulls_equal": "false"}, binary_inputs
+    )
+    non_bool_contains = compiler.parser.string.parse_contains(
+        {"literal": "false"}, string_inputs
+    )
+    invalid_spec_contains = compiler.parser.string.parse_contains(
+        "InvalidContainsSpec", string_inputs
+    )
+    wrong_arity_contains = compiler.parser.string.parse_contains(
+        {"literal": True}, [{"Column": "a"}]
+    )
+
+    # Assert
+    assert isinstance(unit_isin, compiler.parser.base.ParseRecord)
+    assert unit_isin.kind == "Binary"
+    assert bool_false_isin.kind == "Binary"
+    assert bool_true_isin == compiler.parser.base.UNSUPPORTED_RECORD
+    assert invalid_spec_isin == compiler.parser.base.UNSUPPORTED_RECORD
+    assert non_bool_opt_isin == compiler.parser.base.UNSUPPORTED_RECORD
+    assert non_bool_contains == compiler.parser.base.UNSUPPORTED_RECORD
+    assert invalid_spec_contains == compiler.parser.base.UNSUPPORTED_RECORD
+    assert wrong_arity_contains == compiler.parser.base.UNSUPPORTED_RECORD
+
+
+def test_trie_wrapper_unwrapping_enforces_unified_depth_and_record_contract() -> None:
+    # Arrange
+    wrapped_literal = {"Dyn": {"Scalar": {"dtype": "Int64", "value": {"Int64": 7}}}}
+    deep_wrapped: dict[str, Any] = {"Int64": 1}
+    for _ in range(compiler.parser.base.MAX_TRIE_DEPTH + 2):
+        deep_wrapped = {"Dyn": {"CustomWrapper": deep_wrapped}}
+    bad_node = compiler.parser.base._PathTrieNode(parser=lambda _x: "not-a-record")  # type: ignore[arg-type,return-value]
+
+    # Act
+    unwrapped = compiler.parser.base.unwrap_literal_json(wrapped_literal)
+    deep_ir = compiler.json_to_ir({"Literal": deep_wrapped})
+    unknown_unit_ir = compiler.json_to_ir({"Literal": "UnknownUnitLiteral"})
+    fallback_record = compiler.parser.base._invoke_matched_parser(bad_node, 1, {})
+
+    # Assert
+    assert unwrapped == {"Int64": 7}
+    assert deep_ir == compiler.ir.Unsupported()
+    assert unknown_unit_ir == compiler.ir.Unsupported()
+    assert fallback_record == compiler.parser.base.UNSUPPORTED_RECORD

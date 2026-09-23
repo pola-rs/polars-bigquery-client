@@ -68,10 +68,12 @@ def parse_contains(contains_spec: Any, expr_json: Any) -> ParseRecord:
         else contains_spec
     )
     if isinstance(contains_opts, dict):
-        literal = bool(contains_opts.get("literal", False))
-        return (
+        raw_literal = contains_opts.get("literal", False)
+        if not isinstance(raw_literal, bool):
+            return UNSUPPORTED_RECORD
+        return ParseRecord(
             "Binary",
-            functools.partial(Contains, literal=literal),
+            functools.partial(Contains, literal=raw_literal),
             (inputs[0], inputs[1]),
         )
     return UNSUPPORTED_RECORD
