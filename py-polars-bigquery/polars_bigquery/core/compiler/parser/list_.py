@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import math
 from typing import Any
 
 import polars as pl
@@ -40,6 +41,19 @@ _DATETIME_UNIT_NAMES: dict[str, str] = {
     "ms": "Milliseconds",
     "ns": "Nanoseconds",
 }
+
+
+def _is_compatible_list_element(candidate: Literal, first: Literal) -> bool:
+    """Verify that `candidate` is a valid, BigQuery-homogeneous scalar relative to `first`."""
+    if isinstance(candidate, (NullLiteral, ListLiteral)):
+        return False
+    if isinstance(candidate, FloatLiteral) and math.isnan(candidate.value):
+        return False
+    if type(candidate) is not type(first):
+        return False
+    if isinstance(candidate, TimestampLiteral) and isinstance(first, TimestampLiteral):
+        return (candidate.tz is None) == (first.tz is None)
+    return True
 
 
 def parse_ipc_series_to_list_literal(raw_bytes: bytes) -> Expr:
@@ -144,7 +158,9 @@ def parse_list_literal(value: Any) -> Expr:
         if (
             kind != "Leaf"
             or not isinstance(ir_elem, Literal)
-            or isinstance(ir_elem, (NullLiteral, ListLiteral))
+            or not _is_compatible_list_element(
+                ir_elem, parsed_literals[0] if parsed_literals else ir_elem
+            )
         ):
             return Unsupported()
         parsed_literals.append(ir_elem)
@@ -163,6 +179,8 @@ def parse_is_in_function(isin_spec: Any, expr_json: Any) -> ParseRecord:
         else isin_spec
     )
     if isinstance(isin_opts, dict):
+        if set(isin_opts) - {"nulls_equal"}:
+            return UNSUPPORTED_RECORD
         raw_flag = isin_opts.get("nulls_equal", False)
         if not isinstance(raw_flag, bool) or raw_flag:
             return UNSUPPORTED_RECORD

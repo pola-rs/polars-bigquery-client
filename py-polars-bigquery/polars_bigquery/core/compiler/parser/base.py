@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import dataclasses
 import inspect
+import types
 from collections.abc import Callable
 from typing import Any, Literal, NamedTuple, TypeVar
 
@@ -34,7 +35,11 @@ MAX_TRIE_DEPTH = 16
 
 # Registry mapping JSON Path expressions (e.g. "$.BinaryExpr.op.Eq",
 # "$.Function.function.Boolean.Not", "$.Literal..Int64") to parser functions.
-PARSERS: dict[str, ParserFunc] = {}
+_PARSERS_REGISTRY: dict[str, ParserFunc] = {}
+PARSERS: types.MappingProxyType[str, ParserFunc] = types.MappingProxyType(
+    _PARSERS_REGISTRY
+)
+_BUILTIN_PARSERS_LOADED = False
 
 
 def parse_json_path(path: str) -> tuple[tuple[str, str], ...]:
@@ -106,9 +111,13 @@ def _accepts_second_positional_arg(func: ParserFunc) -> bool:
     return positional_count >= 2
 
 
-def _insert_path_into_trie(root: _PathTrieNode, path: str, func: ParserFunc) -> None:
-    """Insert a single JSON Path and its bound parser callable into `root`."""
-    steps = parse_json_path(path)
+def _insert_steps_into_trie(
+    root: _PathTrieNode,
+    path: str,
+    steps: tuple[tuple[str, str], ...],
+    func: ParserFunc,
+) -> None:
+    """Insert a pre-parsed JSON Path and its bound parser callable into `root`."""
     curr = root
     for op, segment in steps:
         target_map = curr.descendant_children if op == ".." else curr.children
@@ -133,17 +142,20 @@ def register_parser(*paths: str) -> Callable[[_F], _F]:
         msg = "register_parser requires at least one JSON Path string"
         raise ValueError(msg)
 
+    parsed_paths = [(path, parse_json_path(path)) for path in paths]
+
     def _decorator(func: _F) -> _F:
-        for path in paths:
-            existing = PARSERS.get(path)
+        for path, _ in parsed_paths:
+            existing = _PARSERS_REGISTRY.get(path)
             if existing is not None and existing is not func:
                 msg = (
                     f"Duplicate parser registration for JSON path {path!r}: "
                     f"{existing!r} vs {func!r}"
                 )
                 raise ValueError(msg)
-            PARSERS[path] = func
-            _insert_path_into_trie(_DISPATCH_TRIE, path, func)
+        for path, steps in parsed_paths:
+            _insert_steps_into_trie(_DISPATCH_TRIE, path, steps, func)
+            _PARSERS_REGISTRY[path] = func
         return func
 
     return _decorator
@@ -153,7 +165,7 @@ def _unwrap_literal_with_depth(literal_json: Any, depth: int) -> tuple[Any, int]
     """Unwrap Polars `Dyn`, `Scalar`, and `{"dtype": ..., "value": ...}` wrappers within `MAX_TRIE_DEPTH`."""
     curr = literal_json
     curr_depth = depth
-    while isinstance(curr, dict) and curr_depth < MAX_TRIE_DEPTH:
+    while isinstance(curr, dict) and curr_depth <= MAX_TRIE_DEPTH:
         if len(curr) == 1 and "Dyn" in curr:
             curr = curr["Dyn"]
             curr_depth += 1
@@ -170,7 +182,9 @@ def _unwrap_literal_with_depth(literal_json: Any, depth: int) -> tuple[Any, int]
 
 def unwrap_literal_json(literal_json: Any) -> Any:
     """Unwrap Polars `Dyn`, `Scalar`, and `{"dtype": ..., "value": ...}` literal wrappers."""
-    unwrapped, _ = _unwrap_literal_with_depth(literal_json, depth=0)
+    unwrapped, unwrapped_depth = _unwrap_literal_with_depth(literal_json, depth=0)
+    if unwrapped_depth > MAX_TRIE_DEPTH:
+        return None
     return unwrapped
 
 
@@ -303,12 +317,22 @@ def _invoke_matched_parser(
     return UNSUPPORTED_RECORD
 
 
+def _ensure_builtin_parsers_registered() -> None:
+    """Ensure all domain parser modules have registered their paths into `_DISPATCH_TRIE`."""
+    global _BUILTIN_PARSERS_LOADED
+    if not _BUILTIN_PARSERS_LOADED:
+        from polars_bigquery.core.compiler import parser as _parser_pkg  # noqa: F401
+
+        _BUILTIN_PARSERS_LOADED = True
+
+
 def dispatch_parser(expr_json: Any) -> ParseRecord:
     """Dispatch a Polars expression JSON node to its matching registered parser.
 
     Returns `UNSUPPORTED_RECORD` (`("Leaf", Unsupported(), ())`) if no registered
     JSON Path matches `expr_json`.
     """
+    _ensure_builtin_parsers_registered()
     matched = _match_trie(_DISPATCH_TRIE, expr_json)
     if matched is None:
         return UNSUPPORTED_RECORD
@@ -322,6 +346,7 @@ def dispatch_literal_parser(literal_payload: Any) -> ParseRecord:
     Avoids allocating synthetic `{"Literal": elem}` wrapper dictionaries when
     compiling large list literals.
     """
+    _ensure_builtin_parsers_registered()
     literal_root = _DISPATCH_TRIE.children.get("Literal")
     if literal_root is None:
         return UNSUPPORTED_RECORD
@@ -337,6 +362,9 @@ def extract_binary_operands(expr_json: Any) -> tuple[Any, Any] | None:
     if isinstance(expr_json, dict):
         binary_body = expr_json.get("BinaryExpr", expr_json)
         if isinstance(binary_body, dict):
+            op_val = binary_body.get("op")
+            if op_val is not None and not isinstance(op_val, str):
+                return None
             left_json = binary_body.get("left")
             right_json = binary_body.get("right")
             if left_json is not None and right_json is not None:
@@ -365,6 +393,26 @@ def extract_function_inputs(expr_json: Any) -> list[Any] | None:
     return None
 
 
+def _has_valid_unit_function_spec(expr_json: Any) -> bool:
+    """Verify that a unit `Function` node does not carry unrecognized option payloads."""
+    if not isinstance(expr_json, dict):
+        return True
+    func_body = expr_json.get("Function", expr_json)
+    if not isinstance(func_body, dict) or "function" not in func_body:
+        return True
+    fn_spec = func_body["function"]
+    if isinstance(fn_spec, str):
+        return True
+    if isinstance(fn_spec, dict) and len(fn_spec) == 1:
+        (inner_spec,) = fn_spec.values()
+        if isinstance(inner_spec, str) or inner_spec is None:
+            return True
+        if isinstance(inner_spec, dict) and len(inner_spec) == 1:
+            (leaf_spec,) = inner_spec.values()
+            return leaf_spec is None or leaf_spec == {}
+    return False
+
+
 def parse_unary_function(
     expr_json: Any,
     unary_cls: type[UnaryExpr],
@@ -372,6 +420,8 @@ def parse_unary_function(
     exact_inputs: bool = True,
 ) -> ParseRecord:
     """Build a Unary `ParseRecord` for `unary_cls` from a `Function` JSON node."""
+    if not _has_valid_unit_function_spec(expr_json):
+        return UNSUPPORTED_RECORD
     inputs = extract_function_inputs(expr_json)
     if inputs is None:
         return UNSUPPORTED_RECORD
@@ -385,6 +435,8 @@ def parse_binary_function(
     binary_cls: Any,
 ) -> ParseRecord:
     """Build a Binary `ParseRecord` for `binary_cls` from a 2-input `Function` JSON node."""
+    if not _has_valid_unit_function_spec(expr_json):
+        return UNSUPPORTED_RECORD
     inputs = extract_function_inputs(expr_json)
     if inputs is None or len(inputs) != 2:
         return UNSUPPORTED_RECORD

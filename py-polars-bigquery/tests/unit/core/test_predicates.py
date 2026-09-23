@@ -939,16 +939,170 @@ def test_trie_wrapper_unwrapping_enforces_unified_depth_and_record_contract() ->
     deep_wrapped: dict[str, Any] = {"Int64": 1}
     for _ in range(compiler.parser.base.MAX_TRIE_DEPTH + 2):
         deep_wrapped = {"Dyn": {"CustomWrapper": deep_wrapped}}
+    deep_dyn_only: dict[str, Any] = {"Int64": 1}
+    for _ in range(compiler.parser.base.MAX_TRIE_DEPTH + 2):
+        deep_dyn_only = {"Dyn": deep_dyn_only}
     bad_node = compiler.parser.base._PathTrieNode(parser=lambda _x: "not-a-record")  # type: ignore[arg-type,return-value]
 
     # Act
     unwrapped = compiler.parser.base.unwrap_literal_json(wrapped_literal)
+    unwrapped_deep = compiler.parser.base.unwrap_literal_json(deep_dyn_only)
     deep_ir = compiler.json_to_ir({"Literal": deep_wrapped})
+    deep_dyn_ir = compiler.json_to_ir({"Literal": deep_dyn_only})
     unknown_unit_ir = compiler.json_to_ir({"Literal": "UnknownUnitLiteral"})
     fallback_record = compiler.parser.base._invoke_matched_parser(bad_node, 1, {})
 
     # Assert
     assert unwrapped == {"Int64": 7}
+    assert unwrapped_deep is None
     assert deep_ir == compiler.ir.Unsupported()
+    assert deep_dyn_ir == compiler.ir.Unsupported()
     assert unknown_unit_ir == compiler.ir.Unsupported()
     assert fallback_record == compiler.parser.base.UNSUPPORTED_RECORD
+
+
+@pytest.mark.parametrize(
+    "expr_json",
+    [
+        pytest.param(
+            {
+                "BinaryExpr": {
+                    "left": {"Column": "a"},
+                    "op": {"Eq": {"null_equals": True}},
+                    "right": {"Literal": {"Int64": 1}},
+                }
+            },
+            id="parameterized_binary_op_eq",
+        ),
+        pytest.param(
+            {
+                "Function": {
+                    "input": [{"Column": "a"}, {"Literal": {"String": "pre"}}],
+                    "function": {"StringExpr": {"StartsWith": {"ignore_case": True}}},
+                }
+            },
+            id="parameterized_function_starts_with",
+        ),
+    ],
+)
+def test_unit_operator_and_function_dispatch_rejects_parameterized_specs(
+    expr_json: dict[str, Any],
+) -> None:
+    # Arrange
+    expected_ir = compiler.ir.Unsupported()
+
+    # Act
+    actual_ir = compiler.json_to_ir(expr_json)
+
+    # Assert
+    assert actual_ir == expected_ir
+
+
+@pytest.mark.parametrize(
+    ("parser_fn", "spec", "inputs"),
+    [
+        pytest.param(
+            compiler.parser.list_.parse_is_in_function,
+            {"null_equals": True},
+            [{"Column": "a"}, {"Literal": {"List": [{"Int64": 1}]}}],
+            id="is_in_unknown_option_key",
+        ),
+        pytest.param(
+            compiler.parser.string.parse_contains,
+            {"literal": True, "ignore_case": True},
+            [{"Column": "a"}, {"Literal": {"String": "x"}}],
+            id="contains_unknown_option_key",
+        ),
+    ],
+)
+def test_is_in_and_contains_reject_unknown_option_keys(
+    parser_fn: Any,
+    spec: dict[str, Any],
+    inputs: list[dict[str, Any]],
+) -> None:
+    # Arrange
+    expected_record = compiler.parser.base.UNSUPPORTED_RECORD
+
+    # Act
+    actual_record = parser_fn(spec, inputs)
+
+    # Assert
+    assert actual_record == expected_record
+
+
+@pytest.mark.parametrize(
+    "raw_value",
+    [
+        pytest.param("1e500", id="positive_string_overflow"),
+        pytest.param("-1e500", id="negative_string_overflow"),
+        pytest.param(10**400, id="integer_overflow"),
+        pytest.param(b"1.5", id="bytes_input"),
+    ],
+)
+def test_parse_float_literal_rejects_finite_overflow_to_infinity(
+    raw_value: Any,
+) -> None:
+    # Arrange
+    expected_ir = compiler.ir.Unsupported()
+
+    # Act
+    actual_ir = compiler.parser.numeric.parse_float_literal(raw_value)
+
+    # Assert
+    assert actual_ir == expected_ir
+
+
+@pytest.mark.parametrize(
+    "tz_raw",
+    [
+        pytest.param("", id="empty_string"),
+        pytest.param("   ", id="whitespace_string"),
+        pytest.param({"inner": ""}, id="nested_empty_string"),
+    ],
+)
+def test_parse_timezone_normalizes_empty_strings_to_naive_datetime(
+    tz_raw: Any,
+) -> None:
+    # Arrange
+    datetime_literal_json = {"DateTime": [1000, "Microseconds", tz_raw]}
+
+    # Act
+    parsed_tz = compiler.parser.temporal.parse_timezone(tz_raw)
+    sql = _json_literal_to_sql(datetime_literal_json)
+
+    # Assert
+    assert parsed_tz is None
+    assert sql == "DATETIME(TIMESTAMP_MICROS(1000))"
+
+
+@pytest.mark.parametrize(
+    "list_elements",
+    [
+        pytest.param(
+            [{"Int64": 1}, {"String": "two"}],
+            id="mixed_int_and_string",
+        ),
+        pytest.param(
+            [
+                {"DateTime": [1000, "Microseconds", "UTC"]},
+                {"DateTime": [1000, "Microseconds", None]},
+            ],
+            id="mixed_aware_and_naive_datetime",
+        ),
+        pytest.param(
+            [{"Float64": "nan"}],
+            id="nan_float_element",
+        ),
+    ],
+)
+def test_parse_list_literal_rejects_heterogeneous_and_nan_elements(
+    list_elements: list[dict[str, Any]],
+) -> None:
+    # Arrange
+    expected_ir = compiler.ir.Unsupported()
+
+    # Act
+    actual_ir = compiler.parser.list_.parse_list_literal(list_elements)
+
+    # Assert
+    assert actual_ir == expected_ir

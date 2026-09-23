@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from typing import Any
 
 from polars_bigquery.core.compiler.ir.base import (
@@ -82,7 +83,7 @@ def parse_int_literal(value: Any) -> Expr:
 @register_parser(*(f"$.Literal..{float_type}" for float_type in sorted(FLOAT_TYPES)))
 def parse_float_literal(value: Any) -> Expr:
     """Parse a float value from Polars JSON into a FloatLiteral or Unsupported."""
-    if value is None or isinstance(value, bool):
+    if isinstance(value, bool) or not isinstance(value, (int, float, str)):
         return Unsupported()
     if isinstance(value, str):
         val_lower = value.strip().lower()
@@ -94,6 +95,8 @@ def parse_float_literal(value: Any) -> Expr:
             return FloatLiteral(value=float("-inf"))
     try:
         float_val = float(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
+        return Unsupported()
+    if math.isinf(float_val) and not (isinstance(value, float) and math.isinf(value)):
         return Unsupported()
     return FloatLiteral(value=float_val)

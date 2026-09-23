@@ -68,8 +68,11 @@ def parse_contains(contains_spec: Any, expr_json: Any) -> ParseRecord:
         else contains_spec
     )
     if isinstance(contains_opts, dict):
+        if set(contains_opts) - {"literal", "strict"}:
+            return UNSUPPORTED_RECORD
         raw_literal = contains_opts.get("literal", False)
-        if not isinstance(raw_literal, bool):
+        raw_strict = contains_opts.get("strict", True)
+        if not isinstance(raw_literal, bool) or not isinstance(raw_strict, bool):
             return UNSUPPORTED_RECORD
         return ParseRecord(
             "Binary",

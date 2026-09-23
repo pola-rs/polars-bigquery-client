@@ -54,10 +54,14 @@ def parse_ticks_and_unit(ticks_raw: Any, units_raw: Any) -> tuple[int, Timestamp
 
 def parse_timezone(tz_raw: Any) -> str | None:
     """Parse a timezone representation from Polars JSON."""
-    if tz_raw is None or isinstance(tz_raw, str):
-        return tz_raw
+    if tz_raw is None:
+        return None
+    if isinstance(tz_raw, str):
+        stripped = tz_raw.strip()
+        return stripped if stripped else None
     if isinstance(tz_raw, dict) and isinstance(tz_raw.get("inner"), str):
-        return tz_raw["inner"]
+        stripped = tz_raw["inner"].strip()
+        return stripped if stripped else None
     raise ValueError(f"Unsupported timezone representation: {tz_raw!r}")
 
 
