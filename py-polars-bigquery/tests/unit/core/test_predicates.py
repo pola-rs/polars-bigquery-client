@@ -1310,3 +1310,57 @@ def test_trie_depth_guard_attribute_error_isolation_and_deep_function_envelope()
     assert deep_inputs == [{"Column": "a"}]
     assert negative_first_ipc is None
     assert iterated_children == [{"Literal": {"Int64": 1}}, {"Literal": {"Int64": 2}}]
+
+
+def test_trie_inner_wrapper_unwrapping_and_architecture_decoupling() -> None:
+    # Arrange
+    inner_wrapped_int = {"Literal": {"Int64": {"Scalar": 42}}}
+    non_bool_scalar_options_envelope = {
+        "Function": {
+            "input": [{"Column": "x"}],
+            "function": {"Round": {"decimals": 2}},
+        }
+    }
+    nested_dict_options_envelope = {
+        "Function": {
+            "input": [{"Column": "x"}],
+            "function": {"Round": {"decimals": {"nested": 2}}},
+        }
+    }
+    list_record = compiler.parser.base.ParseRecord(
+        "Leaf",
+        compiler.ir.ListLiteral(
+            values=(compiler.ir.IntLiteral(1), compiler.ir.IntLiteral(2))
+        ),
+        (),
+    )
+
+    def parser_with_optional_param(val: Any, strict: bool = True) -> Any:
+        return (val, strict)
+
+    def parser_with_expr_json_default(val: Any, expr_json: Any = None) -> Any:
+        return (val, expr_json)
+
+    # Act
+    unwrapped_ir = compiler.json_to_ir(inner_wrapped_int)
+    scalar_opt_inputs = compiler.parser.base.extract_function_inputs(
+        non_bool_scalar_options_envelope
+    )
+    nested_opt_inputs = compiler.parser.base.extract_function_inputs(
+        nested_dict_options_envelope
+    )
+    accepts_optional = compiler.parser.base._accepts_second_positional_arg(
+        parser_with_optional_param
+    )
+    accepts_named_context = compiler.parser.base._accepts_second_positional_arg(
+        parser_with_expr_json_default
+    )
+    fanout = compiler.parser.base.record_leaf_fanout(list_record)
+
+    # Assert
+    assert unwrapped_ir == compiler.ir.IntLiteral(value=42)
+    assert scalar_opt_inputs == [{"Column": "x"}]
+    assert nested_opt_inputs is None
+    assert accepts_optional is False
+    assert accepts_named_context is True
+    assert fanout == 2

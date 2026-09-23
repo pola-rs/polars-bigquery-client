@@ -4,6 +4,7 @@ import collections.abc
 import dataclasses
 import inspect
 import logging
+import threading
 import types
 from collections.abc import Callable, Mapping, Sequence
 from typing import Any, Literal, NamedTuple, TypeVar
@@ -16,6 +17,7 @@ from polars_bigquery.core.compiler.ir.base import (
     UnaryExpr,
     Unsupported,
 )
+from polars_bigquery.core.compiler.ir.list_ import ListLiteral
 
 logger = logging.getLogger(__name__)
 
@@ -76,6 +78,7 @@ PARSERS: types.MappingProxyType[str, ParserFunc] = types.MappingProxyType(
     _PARSERS_REGISTRY
 )
 _BUILTIN_PARSERS_LOADED = False
+_REGISTRY_LOCK = threading.RLock()
 
 
 def parse_json_path(path: str) -> tuple[tuple[str, str], ...]:
@@ -125,17 +128,23 @@ def parse_json_path(path: str) -> tuple[tuple[str, str], ...]:
 
 
 def _accepts_second_positional_arg(func: ParserFunc) -> bool:
-    """Return True if `func` can accept at least 2 positional arguments."""
-    positional_count = 0
+    """Return True if `func` requires a 2nd positional arg or explicitly names context JSON."""
+    positional_params: list[inspect.Parameter] = []
     for param in inspect.signature(func).parameters.values():
         if param.kind in (
             inspect.Parameter.POSITIONAL_ONLY,
             inspect.Parameter.POSITIONAL_OR_KEYWORD,
         ):
-            positional_count += 1
+            positional_params.append(param)
         elif param.kind == inspect.Parameter.VAR_POSITIONAL:
             return True
-    return positional_count >= 2
+    if len(positional_params) < 2:
+        return False
+    second = positional_params[1]
+    return second.default is inspect.Parameter.empty or second.name in (
+        "expr_json",
+        "context_json",
+    )
 
 
 def _insert_compiled_route(
@@ -169,25 +178,26 @@ def register_parser(*paths: str) -> Callable[[_F], _F]:
 
     def _decorator(func: _F) -> _F:
         accepts_expr_json = _accepts_second_positional_arg(func)
-        for path, _ in parsed_paths:
-            existing = _PARSERS_REGISTRY.get(path)
-            if existing is not None and existing is not func:
-                msg = (
-                    f"Duplicate parser registration for JSON path {path!r}: "
-                    f"{existing!r} vs {func!r}"
+        with _REGISTRY_LOCK:
+            for path, _ in parsed_paths:
+                existing = _PARSERS_REGISTRY.get(path)
+                if existing is not None and existing is not func:
+                    msg = (
+                        f"Duplicate parser registration for JSON path {path!r}: "
+                        f"{existing!r} vs {func!r}"
+                    )
+                    raise ValueError(msg)
+            for path, steps in parsed_paths:
+                _PARSERS_REGISTRY[path] = func
+                _PARSER_ACCEPTS_EXPR_JSON[path] = accepts_expr_json
+                _insert_compiled_route(
+                    steps,
+                    _CompiledRoute(
+                        path=path,
+                        parser=func,
+                        accepts_expr_json=accepts_expr_json,
+                    ),
                 )
-                raise ValueError(msg)
-        for path, steps in parsed_paths:
-            _PARSERS_REGISTRY[path] = func
-            _PARSER_ACCEPTS_EXPR_JSON[path] = accepts_expr_json
-            _insert_compiled_route(
-                steps,
-                _CompiledRoute(
-                    path=path,
-                    parser=func,
-                    accepts_expr_json=accepts_expr_json,
-                ),
-            )
         return func
 
     return _decorator
@@ -243,6 +253,11 @@ def _step_descendant(
     desc_node = node.descendants.get(tag)
     if desc_node is None:
         return None
+    if isinstance(val, dict) and not (desc_node.children or desc_node.descendants):
+        val, curr_depth = _unwrap_literal_with_depth(val, curr_depth + 1)
+        if curr_depth > MAX_TRIE_DEPTH:
+            return None
+        return desc_node, tag, val, curr_depth
     return desc_node, tag, val, curr_depth + 1
 
 
@@ -275,6 +290,8 @@ def _match_trie_route(expr_json: Any) -> tuple[_CompiledRoute, Any] | None:
     curr_node = _TRIE_ROOT
     curr_val: Any = expr_json
     depth = 0
+    fallback_match: tuple[_CompiledRoute, Any] | None = None
+    descendant_backtrack: tuple[_DispatchTrieNode, Any, int] | None = None
 
     while depth <= MAX_TRIE_DEPTH:
         next_node: _DispatchTrieNode | None = None
@@ -283,6 +300,8 @@ def _match_trie_route(expr_json: Any) -> tuple[_CompiledRoute, Any] | None:
 
         child_step = _step_child(curr_node, curr_val)
         if child_step is not None:
+            if curr_node.descendants:
+                descendant_backtrack = (curr_node, curr_val, depth)
             next_node, tag, payload = child_step
             depth += 1
         elif curr_node.descendants:
@@ -290,21 +309,35 @@ def _match_trie_route(expr_json: Any) -> tuple[_CompiledRoute, Any] | None:
             if desc_step is not None:
                 next_node, tag, payload, depth = desc_step
 
-        if next_node is None or depth > MAX_TRIE_DEPTH + 1:
-            return None
+        if next_node is None and descendant_backtrack is not None:
+            bt_node, bt_val, bt_depth = descendant_backtrack
+            descendant_backtrack = None
+            desc_step = _step_descendant(bt_node, bt_val, bt_depth)
+            if desc_step is not None:
+                next_node, tag, payload, depth = desc_step
 
-        if next_node.route is not None and (
-            payload is None or not (next_node.children or next_node.descendants)
-        ):
+        if next_node is None or depth > MAX_TRIE_DEPTH + 1:
+            return fallback_match
+
+        if next_node.route is not None:
             matched_val = (
                 tag if (payload is None and isinstance(curr_val, str)) else payload
             )
-            return next_node.route, matched_val
+            if payload is None or not (next_node.children or next_node.descendants):
+                return next_node.route, matched_val
+            fallback_match = (next_node.route, matched_val)
 
         curr_node = next_node
         curr_val = payload
 
-    return None
+    return fallback_match
+
+
+def record_leaf_fanout(record: ParseRecord) -> int:
+    """Return the additional AST leaf node weight encapsulated by `record`."""
+    if record.kind == "Leaf" and isinstance(record.node, ListLiteral):
+        return len(record.node.values)
+    return 0
 
 
 def _validate_parse_record(record: ParseRecord) -> ParseRecord:
@@ -370,9 +403,18 @@ def _ensure_builtin_parsers_registered() -> None:
     """Ensure all domain parser modules have registered their paths into `_PARSERS_REGISTRY`."""
     global _BUILTIN_PARSERS_LOADED
     if not _BUILTIN_PARSERS_LOADED:
-        from polars_bigquery.core.compiler import parser as _parser_pkg  # noqa: F401
+        with _REGISTRY_LOCK:
+            if not _BUILTIN_PARSERS_LOADED:
+                from polars_bigquery.core.compiler.parser import (  # noqa: F401
+                    boolean,
+                    comparison,
+                    list_,
+                    numeric,
+                    string,
+                    temporal,
+                )
 
-        _BUILTIN_PARSERS_LOADED = True
+                _BUILTIN_PARSERS_LOADED = True
 
 
 def dispatch_parser(expr_json: Any) -> ParseRecord:
@@ -458,17 +500,28 @@ def _has_valid_function_envelope(
 
     curr_spec: Any = func_body["function"]
     if isinstance(curr_spec, str):
-        return True
+        return not curr_spec[:1].islower()
     for _ in range(MAX_TRIE_DEPTH):
         if not isinstance(curr_spec, dict) or len(curr_spec) != 1:
             return False
-        (curr_spec,) = curr_spec.values()
-        if curr_spec is None or isinstance(curr_spec, str):
+        ((tag, curr_spec),) = curr_spec.items()
+        if not isinstance(tag, str) or not tag or tag[0].islower():
+            return False
+        if curr_spec is None or (
+            isinstance(curr_spec, str) and not curr_spec[:1].islower()
+        ):
             return True
         if (
             isinstance(curr_spec, dict)
+            and bool(curr_spec)
             and not require_unit_leaf
-            and all(isinstance(v, bool) for v in curr_spec.values())
+            and all(
+                isinstance(k, str)
+                and bool(k)
+                and k[0].islower()
+                and not isinstance(v, (dict, list))
+                for k, v in curr_spec.items()
+            )
         ):
             return True
     return False

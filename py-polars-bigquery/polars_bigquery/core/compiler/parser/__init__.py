@@ -8,7 +8,6 @@ from typing import Any
 
 from polars_bigquery.core.compiler.ir import (
     Expr,
-    ListLiteral,
     Unsupported,
 )
 from polars_bigquery.core.compiler.parser import (
@@ -26,6 +25,7 @@ from polars_bigquery.core.compiler.parser.base import (
     UNSUPPORTED_RECORD,
     dispatch_parser,
     parse_json_path,
+    record_leaf_fanout,
     register_parser,
 )
 
@@ -63,10 +63,9 @@ def json_to_ir(expr_json: Any) -> Expr:
         if len(raw_nodes) + ipc_leaf_nodes > MAX_AST_NODES:
             kind, cls_or_leaf, child_jsons = UNSUPPORTED_RECORD
         else:
-            kind, cls_or_leaf, child_jsons = dispatch_parser(curr)
-            ipc_fanout = (
-                len(cls_or_leaf.values) if isinstance(cls_or_leaf, ListLiteral) else 0
-            )
+            record = dispatch_parser(curr)
+            kind, cls_or_leaf, child_jsons = record
+            ipc_fanout = record_leaf_fanout(record)
             if (
                 len(raw_nodes) + ipc_leaf_nodes + len(child_jsons) + ipc_fanout
                 > MAX_AST_NODES
