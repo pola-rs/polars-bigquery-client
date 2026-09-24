@@ -229,4 +229,3 @@ target/*
 target/criterion/**
 !target/criterion/**/
 !target/criterion/**/v0.2.0/**
-
