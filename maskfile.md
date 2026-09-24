@@ -3,7 +3,10 @@
 Development and documentation tasks for `polars-bigquery-client`.
 
 Requires Rust (install with `rustup`), [`uv`](https://docs.astral.sh/uv/), and
-[`mask`](https://github.com/jacobdeichert/mask).
+[`mask`](https://github.com/jacobdeichert/mask). On Windows, ensure Git's
+native `bash.exe` (`C:\Program Files\Git\bin`) is on `PATH` ahead of
+`C:\Windows\System32` so `mask` runs native Windows processes rather than the
+WSL `bash.exe` stub.
 
 For integration and benchmark tests, authenticate with Google Cloud
 (`gcloud auth application-default login`) and set the `GOOGLE_CLOUD_PROJECT`

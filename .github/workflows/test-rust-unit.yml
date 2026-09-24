@@ -27,6 +27,10 @@ env:
   RUSTFLAGS: -C debuginfo=0  # Do not produce debug symbols to keep memory usage down
   RUST_BACKTRACE: 1
 
+defaults:
+  run:
+    shell: bash
+
 jobs:
   test:
     name: Test Rust (Unit)
@@ -39,6 +43,10 @@ jobs:
       - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
         with:
           persist-credentials: false
+
+      - name: Configure native Git Bash on PATH (override System32 WSL bash.exe stub)
+        if: matrix.os == 'windows-latest'
+        run: echo "C:\Program Files\Git\bin" >> "$GITHUB_PATH"
 
       - name: Set up Rust
         run: rustup show
