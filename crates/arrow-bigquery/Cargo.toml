@@ -22,6 +22,13 @@ tracing = "0.1"
 tracing-subscriber = { version ="0.3", features = ["env-filter"] }
 winnow = "1.0.4"
 
+[lib]
+bench = false
+
 [dev-dependencies]
 tokio = { version = "1.51.0", features = ["rt-multi-thread", "macros"] }
+criterion = { version = "0.5.1", features = ["async_tokio", "html_reports"] }
 
+[[bench]]
+name = "read"
+harness = false
