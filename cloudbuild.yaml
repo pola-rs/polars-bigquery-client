@@ -1,0 +1,52 @@
+substitutions:
+  _GOOGLE_CLOUD_PROJECT: polars-bigquery-community
+  _CI_IMAGE_NAME: test-py-polars-integration
+
+steps:
+  - id: build-ci-image
+    name: gcr.io/cloud-builders/docker
+    entrypoint: bash
+    args:
+      - -c
+      - |
+        set -euo pipefail
+        CI_IMAGE="gcr.io/${PROJECT_ID}/${_CI_IMAGE_NAME}:latest"
+        docker pull "$${CI_IMAGE}" || true
+        DOCKER_BUILDKIT=1 docker build \
+          --build-arg BUILDKIT_INLINE_CACHE=1 \
+          --cache-from "$${CI_IMAGE}" \
+          -t "$${CI_IMAGE}" \
+          -f .cloudbuild/Dockerfile \
+          .
+        docker push "$${CI_IMAGE}" || echo "Warning: could not push cache image to $${CI_IMAGE}"
+
+  - id: install-dependencies-and-build
+    name: gcr.io/${PROJECT_ID}/${_CI_IMAGE_NAME}:latest
+    env:
+      - RUSTFLAGS=-C debuginfo=0
+      - RUST_BACKTRACE=1
+      - PYTHONUTF8=1
+    entrypoint: bash
+    args:
+      - -c
+      - |
+        set -euo pipefail
+        mask py-polars-bigquery build
+
+  - id: run-integration-tests
+    name: gcr.io/${PROJECT_ID}/${_CI_IMAGE_NAME}:latest
+    env:
+      - GOOGLE_CLOUD_PROJECT=${_GOOGLE_CLOUD_PROJECT}
+      - RUSTFLAGS=-C debuginfo=0
+      - RUST_BACKTRACE=1
+      - PYTHONUTF8=1
+    entrypoint: bash
+    args:
+      - -c
+      - |
+        set -euo pipefail
+        mask test integration
+
+options:
+  dynamicSubstitutions: true
+  machineType: E2_HIGHCPU_8

@@ -1,0 +1,15 @@
+# Ignore everything except manifests and lockfiles needed to build and warm the CI image
+*
+!rust-toolchain.toml
+!Cargo.toml
+!Cargo.lock
+!pyproject.toml
+!uv.lock
+!crates/
+!crates/arrow-bigquery/
+!crates/arrow-bigquery/Cargo.toml
+!py-arrow-bigquery/
+!py-arrow-bigquery/Cargo.toml
+!py-arrow-bigquery/pyproject.toml
+!py-polars-bigquery/
+!py-polars-bigquery/pyproject.toml
