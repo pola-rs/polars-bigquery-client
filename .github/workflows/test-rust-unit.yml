@@ -5,6 +5,7 @@ on:
     paths:
       - crates/**
       - Cargo.toml
+      - maskfile.md
       - .github/workflows/test-rust-unit.yml
   push:
     branches:
@@ -12,6 +13,7 @@ on:
     paths:
       - crates/**
       - Cargo.toml
+      - maskfile.md
       - .github/workflows/test-rust-unit.yml
 
 permissions:
@@ -41,16 +43,19 @@ jobs:
       - name: Set up Rust
         run: rustup show
 
+      - name: Install mask
+        uses: taiki-e/install-action@9983c65e42da123ff25d1f78505eb6de315aa172 # v2.87.20
+        with:
+          tool: mask
+
       - name: Cache Rust
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 #v2.9.1
         with:
           save-if: ${{ github.ref_name == 'main' }}
 
       - name: Compile tests
-        # Specify --lib and --bins to exclude the integration and doc tests.
-        run: cargo test --workspace --exclude py-arrow-bigquery --lib --bins --all-features --no-run
+        run: mask rust-arrow-bigquery build
 
       - name: Run tests
         if: github.ref_name != 'main'
-        run: >
-          cargo test --workspace --exclude py-arrow-bigquery --lib --bins --all-features
+        run: mask rust-arrow-bigquery test unit

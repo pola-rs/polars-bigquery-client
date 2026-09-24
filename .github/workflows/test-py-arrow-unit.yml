@@ -6,6 +6,7 @@ on:
       - Cargo.lock
       - crates/**
       - docs/source/src/python/**
+      - maskfile.md
       - py-arrow-bigquery/**
       - .github/workflows/test-py-arrow-unit.yml
   push:
@@ -15,6 +16,7 @@ on:
       - Cargo.lock
       - crates/**
       - docs/source/src/python/**
+      - maskfile.md
       - py-arrow-bigquery/**
       - .github/workflows/test-py-arrow-unit.yml
 
@@ -26,11 +28,6 @@ env:
   RUSTFLAGS: -C debuginfo=0 # Do not produce debug symbols to keep memory usage down
   RUST_BACKTRACE: 1
   PYTHONUTF8: 1
-
-defaults:
-  run:
-    working-directory: py-arrow-bigquery
-    shell: bash
 
 permissions:
   contents: read
@@ -71,35 +68,11 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
 
-      - name: Create virtual environment
-        env:
-          BIN: ${{ matrix.os == 'windows-latest' && 'Scripts' || 'bin' }}
-        run: |
-          python -m venv .venv
-          echo "$GITHUB_WORKSPACE/py-arrow-bigquery/.venv/$BIN" >> "$GITHUB_PATH"
-          echo "VIRTUAL_ENV=$GITHUB_WORKSPACE/py-arrow-bigquery/.venv" >> "$GITHUB_ENV"
-          echo "VENV=$GITHUB_WORKSPACE/py-arrow-bigquery/.venv" >> "$GITHUB_ENV"
+      - name: Install mask
+        uses: taiki-e/install-action@9983c65e42da123ff25d1f78505eb6de315aa172 # v2.87.20
+        with:
+          tool: mask
 
-      - name: Install maturin
-        if: matrix.python-version == '3.14t'
-        run: |
-          pip install uv
-          uv pip install maturin
-
-      - name: Install Python dependencies
-        env:
-          PYTHON_VERSION: ${{ matrix.python-version }}
-        run: |
-          pip install uv
-          if [ "$PYTHON_VERSION" = "3.10" ]; then
-            uv sync --active --resolution lowest --no-install-project --group test --no-dev
-          else
-            # Install typing-extensions separately whilst the `--extra-index-url` in `requirements-ci.txt`
-            # doesn't have an up-to-date typing-extensions, see
-            # https://github.com/astral-sh/uv/issues/6028#issuecomment-2287232150
-            uv pip install -U typing-extensions
-            uv sync --active --upgrade --no-install-project --group test --no-dev
-          fi
       - name: Set up Rust
         run: rustup show
 
@@ -109,9 +82,13 @@ jobs:
           workspaces: py-arrow-bigquery
           save-if: ${{ github.ref_name == 'main' }}
 
-      - name: Install Arrow BigQuery
+      - name: Run unit tests
+        env:
+          PYTHON_VERSION: ${{ matrix.python-version }}
         run: |
-          pip install --no-deps -e .
-
-      - name: Run tests
-        run: pytest -n auto tests/unit
+          pip install uv
+          if [ "$PYTHON_VERSION" = "3.10" ]; then
+            mask py-arrow-bigquery test unit --resolution lowest
+          else
+            mask py-arrow-bigquery test unit --resolution highest --upgrade
+          fi
