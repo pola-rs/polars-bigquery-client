@@ -29,10 +29,6 @@ env:
   RUST_BACKTRACE: 1
   PYTHONUTF8: 1
 
-defaults:
-  run:
-    shell: bash
-
 permissions:
   contents: read
 
@@ -60,12 +56,11 @@ jobs:
         uses: endersonmenezes/free-disk-space@7901478139cff6e9d44df5972fd8ab8fcade4db1 #v3.2.2
         if: ${{ matrix.os != 'windows-latest' }}
 
-      - name: Enable long paths and configure native Git Bash on Windows
+      - name: Enable long paths on Windows
         if: matrix.os == 'windows-latest'
         shell: powershell
         run: |
           Set-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\FileSystem' -Name 'LongPathsEnabled' -Value 1
-          "C:\Program Files\Git\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
 
       - name: Set up Python
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 #v7.0.0
@@ -87,12 +82,6 @@ jobs:
           save-if: ${{ github.ref_name == 'main' }}
 
       - name: Run unit tests
-        env:
-          PYTHON_VERSION: ${{ matrix.python-version }}
         run: |
           pip install uv
-          if [ "$PYTHON_VERSION" = "3.10" ]; then
-            mask py-polars-bigquery test unit --resolution lowest
-          else
-            mask py-polars-bigquery test unit --resolution highest --upgrade
-          fi
+          mask py-polars-bigquery test unit ${{ matrix.python-version == '3.10' && '--resolution lowest' || '--resolution highest --upgrade' }}
