@@ -225,5 +225,8 @@ debug
 #.idea/
 
 target/*
-!target/criterion/*/*/*/v0.2.0/
-!target/criterion/*/*/*/v0.2.0/*
+!target/criterion/
+target/criterion/**
+!target/criterion/**/
+!target/criterion/**/v0.2.0/**
+
