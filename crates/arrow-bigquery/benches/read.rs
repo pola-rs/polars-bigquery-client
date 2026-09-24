@@ -98,7 +98,7 @@ fn read_table(c: &mut Criterion) {
 
     // The portion of the "numbers" table we are reading is about 5 GB total, so
     // these reads vary from about 500 MB to 5 GB.
-    let proportions = vec![0.1, 0.2, 0.3, 0.4, 0.5, 1.0];
+    let proportions = vec![0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0];
 
     for proportion in proportions {
         group.bench_with_input(
