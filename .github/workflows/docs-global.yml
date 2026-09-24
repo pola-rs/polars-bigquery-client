@@ -1,0 +1,93 @@
+name: Build documentation
+
+on:
+  pull_request:
+    paths:
+      - docs/**
+      - maskfile.md
+      - mkdocs.yml
+      - .github/workflows/docs-global.yml
+  repository_dispatch:
+    types:
+      - python-release-docs
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  markdown-link-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
+        with:
+          ref: ${{ github.event.client_payload.sha || github.sha }}
+          persist-credentials: false
+      - uses: tcort/github-action-markdown-link-check@f3d33029dca1c4a24b87e2df648f9f4604ef6533 # v1.1.1
+        with:
+          config-file: docs/mlc-config.json
+          folder-path: docs
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
+        with:
+          ref: ${{ github.event.client_payload.sha || github.sha }}
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.12'
+
+      - name: Install mask
+        uses: taiki-e/install-action@9983c65e42da123ff25d1f78505eb6de315aa172 # v2.87.20
+        with:
+          tool: mask
+
+      - name: Run lint checks
+        run: |
+          pip install uv
+          mask lint
+
+  deploy:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
+        with:
+          ref: ${{ github.event.client_payload.sha || github.sha }}
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.12'
+
+      - name: Install mask
+        uses: taiki-e/install-action@9983c65e42da123ff25d1f78505eb6de315aa172 # v2.87.20
+        with:
+          tool: mask
+
+      - name: Build documentation
+        run: |
+          pip install uv
+          mask docs build
+
+      - name: Add .nojekyll
+        if: github.event_name == 'repository_dispatch' || github.event_name == 'workflow_dispatch'
+        working-directory: site
+        run: touch .nojekyll
+
+      - name: Deploy docs
+        if: github.event_name == 'repository_dispatch' || github.event_name == 'workflow_dispatch'
+        uses: JamesIves/github-pages-deploy-action@fa24774553152dd7873cd16ebd8d959b010c5445 # v4.9.0
+        with:
+          folder: site
+          single-commit: true

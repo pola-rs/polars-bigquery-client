@@ -1,0 +1,78 @@
+# https://www.mkdocs.org/user-guide/configuration/
+
+# Project information
+site_name: Polars BigQuery
+site_url: https://pola-rs.github.io/polars-bigquery-client/
+repo_url: https://github.com/pola-rs/polars-bigquery-client
+repo_name: pola-rs/polars-bigquery-client
+
+docs_dir: docs/source
+
+# Documentation layout
+nav:
+  - Home: index.md
+  - Development:
+    - Contributing:
+      - development/contributing/index.md
+      - Tasks: development/contributing/maskfile.md
+
+validation:
+  links:
+    unrecognized_links: warn
+    not_found: warn
+
+# Build directories
+theme:
+  name: material
+  locale: en
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: indigo
+      toggle:
+        icon: material/brightness-7
+        name: Switch to dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: indigo
+      toggle:
+        icon: material/brightness-4
+        name: Switch to light mode
+  features:
+    - navigation.tracking
+    - navigation.sections
+    - navigation.instant
+    - navigation.tabs
+    - navigation.tabs.sticky
+    - navigation.footer
+    - navigation.indexes
+    - content.tabs.link
+    - content.code.copy
+  icon:
+    repo: fontawesome/brands/github
+
+# Preview controls
+strict: true
+
+# Formatting options
+markdown_extensions:
+  - admonition
+  - md_in_html
+  - pymdownx.details
+  - attr_list
+  - pymdownx.emoji:
+      emoji_index: !!python/name:material.extensions.emoji.twemoji
+      emoji_generator: !!python/name:material.extensions.emoji.to_svg
+  - pymdownx.superfences
+  - pymdownx.tabbed:
+      alternate_style: true
+  - pymdownx.snippets:
+      base_path: ["."]
+      check_paths: true
+      dedent_subsections: true
+  - footnotes
+
+plugins:
+  - search:
+      lang: en
+  - markdown-exec
