@@ -48,5 +48,6 @@ steps:
         mask test integration
 
 options:
+  defaultLogsBucketBehavior: REGIONAL_USER_OWNED_BUCKET
   dynamicSubstitutions: true
   machineType: E2_HIGHCPU_8
