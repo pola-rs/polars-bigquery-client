@@ -1,6 +1,7 @@
 substitutions:
   _GOOGLE_CLOUD_PROJECT: polars-bigquery-community
-  _CI_IMAGE_NAME: test-py-polars-integration
+  _CI_IMAGE_NAME: test-polars-bigquery-community
+  _REGION: us-central1
 
 steps:
   - id: build-ci-image
@@ -21,7 +22,7 @@ steps:
         docker push "$${CI_IMAGE}" || echo "Warning: could not push cache image to $${CI_IMAGE}"
 
   - id: install-dependencies-and-build
-    name: gcr.io/${PROJECT_ID}/${_CI_IMAGE_NAME}:latest
+    name: {_REGION}-docker.pkg.dev/${PROJECT_ID}/${_CI_IMAGE_NAME}:latest
     env:
       - RUSTFLAGS=-C debuginfo=0
       - RUST_BACKTRACE=1
