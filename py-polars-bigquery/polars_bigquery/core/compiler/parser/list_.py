@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import io
-from collections.abc import Callable
+import math
+from collections.abc import Iterator, Sequence
 from typing import Any
 
 import polars as pl
@@ -18,17 +19,25 @@ from polars_bigquery.core.compiler.ir.numeric import FloatLiteral, IntLiteral
 from polars_bigquery.core.compiler.ir.string import StringLiteral
 from polars_bigquery.core.compiler.ir.temporal import DateLiteral, TimestampLiteral
 from polars_bigquery.core.compiler.parser.base import (
-    NULL_LITERAL_PARSERS,
     UNSUPPORTED_RECORD,
-    unwrap_literal_json,
+    ParseRecord,
+    extract_bool_options,
+    extract_function_inputs,
+    register_parser,
 )
-from polars_bigquery.core.compiler.parser.boolean import BOOLEAN_LITERAL_PARSERS
-from polars_bigquery.core.compiler.parser.numeric import NUMERIC_LITERAL_PARSERS
-from polars_bigquery.core.compiler.parser.string import STRING_LITERAL_PARSERS
+from polars_bigquery.core.compiler.parser.numeric import (
+    BQ_INT64_MAX,
+    BQ_INT64_MIN,
+)
 from polars_bigquery.core.compiler.parser.temporal import (
-    TEMPORAL_LITERAL_PARSERS,
-    parse_datetime_literal,
+    BQ_MAX_DATE_DAYS,
+    BQ_MIN_DATE_DAYS,
+    parse_ticks_and_unit,
+    parse_timezone,
 )
+
+MAX_IN_LIST_ELEMENTS = 10_000
+MAX_IPC_BYTES = 1_048_576
 
 _DATETIME_UNIT_NAMES: dict[str, str] = {
     "us": "Microseconds",
@@ -36,23 +45,45 @@ _DATETIME_UNIT_NAMES: dict[str, str] = {
     "ns": "Nanoseconds",
 }
 
-_SCALAR_LITERAL_PARSERS: dict[str, Callable[[Any], Expr]] = {
-    **NULL_LITERAL_PARSERS,
-    **BOOLEAN_LITERAL_PARSERS,
-    **NUMERIC_LITERAL_PARSERS,
-    **STRING_LITERAL_PARSERS,
-    **TEMPORAL_LITERAL_PARSERS,
-}
+
+def _is_compatible_list_element(candidate: Literal, first: Literal) -> bool:
+    """Verify that `candidate` is a valid, BigQuery-homogeneous scalar relative to `first`."""
+    if isinstance(candidate, (NullLiteral, ListLiteral)):
+        return False
+    if isinstance(candidate, FloatLiteral) and math.isnan(candidate.value):
+        return False
+    if type(candidate) is not type(first):
+        return False
+    if isinstance(candidate, TimestampLiteral) and isinstance(first, TimestampLiteral):
+        return (candidate.tz is None) == (first.tz is None)
+    return True
+
+
+def construct_list_literal(children: Sequence[Expr]) -> Expr:
+    """Validate parsed child `Expr`s and construct a homogeneous `ListLiteral`."""
+    if not children or len(children) > MAX_IN_LIST_ELEMENTS:
+        return Unsupported()
+    parsed_literals: list[Literal] = []
+    for ir_elem in children:
+        if not isinstance(ir_elem, Literal) or not _is_compatible_list_element(
+            ir_elem, parsed_literals[0] if parsed_literals else ir_elem
+        ):
+            return Unsupported()
+        parsed_literals.append(ir_elem)
+    return ListLiteral(values=tuple(parsed_literals))
 
 
 def parse_ipc_series_to_list_literal(raw_bytes: bytes) -> Expr:
     """Decode an Arrow IPC stream representing a 1-column Polars Series into a ListLiteral."""
+    if not raw_bytes or len(raw_bytes) > MAX_IPC_BYTES:
+        return Unsupported()
+
     try:
         df = pl.read_ipc_stream(io.BytesIO(raw_bytes))
     except (pl.exceptions.PolarsError, OSError, ValueError):
         return Unsupported()
 
-    if df.width != 1 or df.height == 0:
+    if df.width != 1 or df.height == 0 or df.height > MAX_IN_LIST_ELEMENTS:
         return Unsupported()
 
     series = df.to_series()
@@ -60,105 +91,147 @@ def parse_ipc_series_to_list_literal(raw_bytes: bytes) -> Expr:
         return Unsupported()
 
     if series.dtype.is_integer():
-        return ListLiteral(
-            values=tuple(IntLiteral(value=int(v)) for v in series.to_list())
-        )
+        min_val = series.min()
+        max_val = series.max()
+        if (
+            not isinstance(min_val, int)
+            or not isinstance(max_val, int)
+            or min_val < BQ_INT64_MIN
+            or max_val > BQ_INT64_MAX
+        ):
+            return Unsupported()
+        return ListLiteral(values=tuple(IntLiteral(value=v) for v in series.to_list()))
     if series.dtype.is_float():
         if series.is_nan().any():
             return Unsupported()
         return ListLiteral(
-            values=tuple(FloatLiteral(value=float(v)) for v in series.to_list())
+            values=tuple(FloatLiteral(value=v) for v in series.to_list())
         )
     if series.dtype == pl.String:
         return ListLiteral(
-            values=tuple(StringLiteral(value=str(v)) for v in series.to_list())
+            values=tuple(StringLiteral(value=v) for v in series.to_list())
         )
     if series.dtype == pl.Boolean:
-        return ListLiteral(
-            values=tuple(BoolLiteral(value=bool(v)) for v in series.to_list())
-        )
+        return ListLiteral(values=tuple(BoolLiteral(value=v) for v in series.to_list()))
     if series.dtype == pl.Date:
-        return ListLiteral(
-            values=tuple(
-                DateLiteral(days=int(d)) for d in series.to_physical().to_list()
-            )
-        )
+        phys = series.to_physical()
+        min_day = phys.min()
+        max_day = phys.max()
+        if (
+            not isinstance(min_day, int)
+            or not isinstance(max_day, int)
+            or min_day < BQ_MIN_DATE_DAYS
+            or max_day > BQ_MAX_DATE_DAYS
+        ):
+            return Unsupported()
+        return ListLiteral(values=tuple(DateLiteral(days=d) for d in phys.to_list()))
     if isinstance(series.dtype, pl.Datetime):
         unit_str = _DATETIME_UNIT_NAMES.get(series.dtype.time_unit)
         if unit_str is None:
             return Unsupported()
-        parsed_items = [
-            parse_datetime_literal([int(t), unit_str, series.dtype.time_zone])
-            for t in series.to_physical().to_list()
-        ]
-        if all(isinstance(item, TimestampLiteral) for item in parsed_items):
-            return ListLiteral(
-                values=tuple(
-                    item for item in parsed_items if isinstance(item, TimestampLiteral)
+        try:
+            tz = parse_timezone(series.dtype.time_zone)
+            timestamps = tuple(
+                TimestampLiteral(
+                    ticks=ticks,
+                    unit=unit,
+                    tz=tz,
                 )
+                for raw_t in series.to_physical().to_list()
+                for ticks, unit in (parse_ticks_and_unit(raw_t, unit_str),)
             )
+        except (TypeError, ValueError):
+            return Unsupported()
+        return ListLiteral(values=timestamps)
     return Unsupported()
 
 
-def parse_list_literal(value: Any) -> Expr:
-    """Parse a List or Series literal from Polars JSON into a ListLiteral or Unsupported."""
+def _try_extract_ipc_bytes(value: list[Any]) -> bytes | None:
+    """Convert an integer byte list to `bytes` in a single pass."""
+    first = value[0]
+    if not isinstance(first, int) or isinstance(first, bool) or not (0 <= first <= 255):
+        return None
+    if len(value) > MAX_IPC_BYTES:
+        return b""
+    buf = bytearray(len(value))
+    for idx, elem in enumerate(value):
+        if (
+            not isinstance(elem, int)
+            or isinstance(elem, bool)
+            or not (0 <= elem <= 255)
+        ):
+            return None
+        buf[idx] = elem
+    return bytes(buf)
+
+
+class _LiteralChildView(Sequence[dict[str, Any]]):
+    """Zero-copy sequence view wrapping raw list elements as `{"Literal": elem}` on demand."""
+
+    __slots__ = ("_items",)
+
+    def __init__(self, items: Sequence[Any]) -> None:
+        self._items = items
+
+    def __len__(self) -> int:
+        return len(self._items)
+
+    def __getitem__(self, index: int | slice) -> Any:
+        if isinstance(index, slice):
+            return tuple({"Literal": elem} for elem in self._items[index])
+        return {"Literal": self._items[index]}
+
+    def __iter__(self) -> Iterator[dict[str, Any]]:
+        for elem in self._items:
+            yield {"Literal": elem}
+
+    def __eq__(self, other: object) -> bool:
+        if isinstance(other, _LiteralChildView):
+            return self._items == other._items
+        if isinstance(other, tuple):
+            return len(self._items) == len(other) and all(
+                {"Literal": item} == other_item
+                for item, other_item in zip(self._items, other, strict=True)
+            )
+        return NotImplemented
+
+    def __repr__(self) -> str:
+        return repr(tuple(self))
+
+
+@register_parser("$.Literal..List", "$.Literal..Series")
+def parse_list_literal(value: Any) -> Expr | ParseRecord:
+    """Parse a List or Series literal from Polars JSON into a Variadic ParseRecord or Expr."""
     if not isinstance(value, list) or not value:
         return Unsupported()
 
-    if all(
-        isinstance(b, int) and not isinstance(b, bool) and 0 <= b <= 255 for b in value
-    ):
-        return parse_ipc_series_to_list_literal(bytes(value))
+    ipc_bytes = _try_extract_ipc_bytes(value)
+    if ipc_bytes is not None:
+        return parse_ipc_series_to_list_literal(ipc_bytes)
 
-    parsed_literals: list[Literal] = []
-    for elem in value:
-        unwrapped = unwrap_literal_json(elem)
-        if not isinstance(unwrapped, dict) or len(unwrapped) != 1:
-            return Unsupported()
-        polars_type, elem_val = next(iter(unwrapped.items()))
-        parser = _SCALAR_LITERAL_PARSERS.get(polars_type)
-        if parser is None:
-            return Unsupported()
-        ir_elem = parser(elem_val)
-        if not isinstance(ir_elem, Literal) or isinstance(
-            ir_elem, (NullLiteral, ListLiteral)
-        ):
-            return Unsupported()
-        parsed_literals.append(ir_elem)
-    return ListLiteral(values=tuple(parsed_literals))
+    if len(value) > MAX_IN_LIST_ELEMENTS:
+        return Unsupported()
+
+    return ParseRecord(
+        "Variadic",
+        construct_list_literal,
+        _LiteralChildView(value),
+    )
 
 
-# Keys represent Polars Rust AST `LiteralValue` / `AnyValue` list/series variant names
-# emitted inside `{"Literal": ...}` in serialized Polars JSON.
-LIST_LITERAL_PARSERS: dict[str, Callable[[Any], Expr]] = {
-    "List": parse_list_literal,
-    "Series": parse_list_literal,
-}
-
-
-def parse_is_in_function(
-    isin_spec: Any, inputs: list[Any]
-) -> tuple[str, Any, tuple[Any, ...]]:
+@register_parser("$.Function.function.Boolean.IsIn")
+def parse_is_in_function(isin_spec: Any, expr_json: Any) -> ParseRecord:
     """Extract IR constructor and child JSONs for a Polars `IsIn` function node."""
-    if len(inputs) != 2:
+    inputs = extract_function_inputs(expr_json)
+    if inputs is None or len(inputs) != 2:
         return UNSUPPORTED_RECORD
-    isin_opts = (
-        isin_spec["IsIn"]
-        if isinstance(isin_spec, dict) and "IsIn" in isin_spec
-        else isin_spec
+    opts = extract_bool_options(
+        isin_spec,
+        "IsIn",
+        {"nulls_equal": False},
+        allow_unit_or_bool_for="nulls_equal",
     )
-    nulls_equal = (
-        isin_opts.get("nulls_equal", False)
-        if isinstance(isin_opts, dict)
-        else bool(isin_opts)
-    )
-    if not nulls_equal:
-        return ("Binary", IsIn, (inputs[0], inputs[1]))
-    return UNSUPPORTED_RECORD
+    if opts is None or opts["nulls_equal"]:
+        return UNSUPPORTED_RECORD
 
-
-LIST_FUNCTION_PARSERS: dict[
-    str, Callable[[Any, list[Any]], tuple[str, Any, tuple[Any, ...]]]
-] = {
-    "IsIn": parse_is_in_function,
-}
+    return ParseRecord("Binary", IsIn, (inputs[0], inputs[1]))

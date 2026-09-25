@@ -1,11 +1,10 @@
 from __future__ import annotations
 
-from collections.abc import Callable
+import math
 from typing import Any
 
 from polars_bigquery.core.compiler.ir.base import (
     Expr,
-    UnaryExpr,
     Unsupported,
 )
 from polars_bigquery.core.compiler.ir.numeric import (
@@ -16,7 +15,11 @@ from polars_bigquery.core.compiler.ir.numeric import (
     IsNan,
     IsNotNan,
 )
-from polars_bigquery.core.compiler.parser.base import UNSUPPORTED_RECORD
+from polars_bigquery.core.compiler.parser.base import (
+    ParseRecord,
+    parse_unary_function,
+    register_parser,
+)
 
 INT_TYPES = frozenset(
     {
@@ -35,45 +38,52 @@ INT_TYPES = frozenset(
 
 FLOAT_TYPES = frozenset({"Float", "Float32", "Float64"})
 
-# Keys represent Polars Rust AST `BooleanFunction` enum variant names emitted under
-# `{"Function": {"function": {"Boolean": "<key>"}}}` in serialized Polars JSON.
-NUMERIC_UNARY_OPS: dict[str, type[UnaryExpr]] = {
-    "IsNan": IsNan,
-    "IsNotNan": IsNotNan,
-    "IsInfinite": IsInfinite,
-    "IsFinite": IsFinite,
-}
+BQ_INT64_MIN = -(1 << 63)
+BQ_INT64_MAX = (1 << 63) - 1
 
 
-def parse_numeric_function(
-    numeric_name: Any, inputs: list[Any]
-) -> tuple[str, Any, tuple[Any, ...]]:
-    """Extract IR constructor and child JSON for a numeric Polars `BooleanFunction` node."""
-    if (
-        isinstance(numeric_name, str)
-        and numeric_name in NUMERIC_UNARY_OPS
-        and len(inputs) >= 1
-    ):
-        return ("Unary", NUMERIC_UNARY_OPS[numeric_name], (inputs[0],))
-    return UNSUPPORTED_RECORD
+@register_parser("$.Function.function.Boolean.IsNan")
+def parse_is_nan(spec: Any, expr_json: Any) -> ParseRecord:
+    """Parse a Polars `IsNan` BooleanFunction node into an IR `IsNan` record."""
+    return parse_unary_function(expr_json, IsNan, func_spec=spec)
 
 
-NUMERIC_FUNCTION_PARSERS: dict[
-    str, Callable[[Any, list[Any]], tuple[str, Any, tuple[Any, ...]]]
-] = dict.fromkeys(NUMERIC_UNARY_OPS, parse_numeric_function)
+@register_parser("$.Function.function.Boolean.IsNotNan")
+def parse_is_not_nan(spec: Any, expr_json: Any) -> ParseRecord:
+    """Parse a Polars `IsNotNan` BooleanFunction node into an IR `IsNotNan` record."""
+    return parse_unary_function(expr_json, IsNotNan, func_spec=spec)
 
 
+@register_parser("$.Function.function.Boolean.IsInfinite")
+def parse_is_infinite(spec: Any, expr_json: Any) -> ParseRecord:
+    """Parse a Polars `IsInfinite` BooleanFunction node into an IR `IsInfinite` record."""
+    return parse_unary_function(expr_json, IsInfinite, func_spec=spec)
+
+
+@register_parser("$.Function.function.Boolean.IsFinite")
+def parse_is_finite(spec: Any, expr_json: Any) -> ParseRecord:
+    """Parse a Polars `IsFinite` BooleanFunction node into an IR `IsFinite` record."""
+    return parse_unary_function(expr_json, IsFinite, func_spec=spec)
+
+
+@register_parser(*(f"$.Literal..{int_type}" for int_type in sorted(INT_TYPES)))
 def parse_int_literal(value: Any) -> Expr:
     """Parse an integer value from Polars JSON into an IntLiteral or Unsupported."""
+    if isinstance(value, bool) or not isinstance(value, (int, str)):
+        return Unsupported()
     try:
-        return IntLiteral(value=int(value))
+        int_val = int(value)
     except (TypeError, ValueError):
         return Unsupported()
+    if not (BQ_INT64_MIN <= int_val <= BQ_INT64_MAX):
+        return Unsupported()
+    return IntLiteral(value=int_val)
 
 
+@register_parser(*(f"$.Literal..{float_type}" for float_type in sorted(FLOAT_TYPES)))
 def parse_float_literal(value: Any) -> Expr:
     """Parse a float value from Polars JSON into a FloatLiteral or Unsupported."""
-    if value is None:
+    if isinstance(value, bool) or not isinstance(value, (int, float, str)):
         return Unsupported()
     if isinstance(value, str):
         val_lower = value.strip().lower()
@@ -85,14 +95,8 @@ def parse_float_literal(value: Any) -> Expr:
             return FloatLiteral(value=float("-inf"))
     try:
         float_val = float(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
+        return Unsupported()
+    if math.isinf(float_val) and not (isinstance(value, float) and math.isinf(value)):
         return Unsupported()
     return FloatLiteral(value=float_val)
-
-
-# Keys represent Polars Rust AST `LiteralValue` / `AnyValue` numeric variant names
-# emitted inside `{"Literal": ...}` in serialized Polars JSON.
-NUMERIC_LITERAL_PARSERS: dict[str, Callable[[Any], Expr]] = {
-    **dict.fromkeys(INT_TYPES, parse_int_literal),
-    **dict.fromkeys(FLOAT_TYPES, parse_float_literal),
-}

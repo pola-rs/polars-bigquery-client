@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import io
 from typing import Any
 
 import polars as pl
@@ -415,14 +416,21 @@ def test_ir_frozen_dataclasses_and_submodules() -> None:
     assert compiler.parser.boolean.parse_bool_literal(
         True
     ) == compiler.ir.boolean.BoolLiteral(True)
-    assert (
-        compiler.parser.comparison.COMPARISON_BINARY_OPS["Eq"]
-        is compiler.ir.comparison.Eq
+    assert compiler.parser.comparison.parse_eq(
+        "Eq", {"left": {"Column": "a"}, "op": "Eq", "right": {"Literal": {"Int64": 10}}}
+    ) == (
+        "Binary",
+        compiler.ir.comparison.Eq,
+        ({"Column": "a"}, {"Literal": {"Int64": 10}}),
     )
-    assert compiler.parser.list_.parse_list_literal(
-        [{"Int64": 1}, {"Int64": 2}]
-    ) == compiler.ir.list_.ListLiteral(
-        values=(compiler.ir.IntLiteral(1), compiler.ir.IntLiteral(2))
+    assert (
+        compiler.parser.PARSERS["$.BinaryExpr.op.Eq"]
+        is compiler.parser.comparison.parse_eq
+    )
+    assert compiler.parser.list_.parse_list_literal([{"Int64": 1}, {"Int64": 2}]) == (
+        "Variadic",
+        compiler.parser.list_.construct_list_literal,
+        ({"Literal": {"Int64": 1}}, {"Literal": {"Int64": 2}}),
     )
     assert compiler.parser.list_.parse_is_in_function(
         {"nulls_equal": False}, [{"Column": "a"}, {"Literal": {"List": []}}]
@@ -665,3 +673,694 @@ def test_is_in_and_string_contains_case_expressions() -> None:
         == ""
     )
     assert compiler.predicate_to_row_restriction(pl.col("a").is_in(pl.col("b"))) == ""
+
+
+def test_json_path_parser_registration_and_dispatch() -> None:
+    assert compiler.parser.parse_json_path("$.Column") == ((".", "Column"),)
+    assert compiler.parser.parse_json_path("$.BinaryExpr.op.Eq") == (
+        (".", "BinaryExpr"),
+        (".", "op"),
+        (".", "Eq"),
+    )
+    assert compiler.parser.parse_json_path("$.Literal..Int64") == (
+        (".", "Literal"),
+        ("..", "Int64"),
+    )
+
+    with pytest.raises(ValueError, match="Invalid JSON path"):
+        compiler.parser.parse_json_path("BinaryExpr.op.Eq")
+    with pytest.raises(ValueError, match="Invalid JSON path"):
+        compiler.parser.parse_json_path("$.BinaryExpr.")
+    with pytest.raises(
+        ValueError, match="register_parser requires at least one JSON Path string"
+    ):
+        compiler.parser.register_parser()
+
+    expected_paths = {
+        "$.Column",
+        "$.Literal..Null",
+        "$.Literal..Boolean",
+        "$.BinaryExpr.op.And",
+        "$.BinaryExpr.op.Or",
+        "$.BinaryExpr.op.Eq",
+        "$.BinaryExpr.op.NotEq",
+        "$.BinaryExpr.op.Gt",
+        "$.BinaryExpr.op.GtEq",
+        "$.BinaryExpr.op.Lt",
+        "$.BinaryExpr.op.LtEq",
+        "$.Function.function.Boolean.Not",
+        "$.Function.function.Boolean.IsNull",
+        "$.Function.function.Boolean.IsNotNull",
+        "$.Function.function.Boolean.IsNan",
+        "$.Function.function.Boolean.IsNotNan",
+        "$.Function.function.Boolean.IsInfinite",
+        "$.Function.function.Boolean.IsFinite",
+        "$.Function.function.Boolean.IsIn",
+        "$.Function.function.StringExpr.Uppercase",
+        "$.Function.function.StringExpr.Lowercase",
+        "$.Function.function.StringExpr.StartsWith",
+        "$.Function.function.StringExpr.EndsWith",
+        "$.Function.function.StringExpr.Contains",
+        "$.Literal..Int64",
+        "$.Literal..Float64",
+        "$.Literal..String",
+        "$.Literal..Date",
+        "$.Literal..DateTime",
+        "$.Literal..List",
+    }
+    assert expected_paths.issubset(compiler.parser.PARSERS.keys())
+
+    # Unmatched JSON paths dispatch to an Unsupported IR leaf record
+    assert compiler.parser.dispatch_parser({"UnknownNode": 123}) == (
+        "Leaf",
+        compiler.ir.Unsupported(),
+        (),
+    )
+    assert compiler.json_to_ir({"UnknownNode": 123}) == compiler.ir.Unsupported()
+
+    # Duplicate path registration raises ValueError
+    with pytest.raises(ValueError, match="Duplicate parser registration"):
+        compiler.parser.register_parser("$.Column")(lambda x: compiler.ir.Unsupported())
+
+    # Strict type boundary checks (preventing str()/bool()/int(bool) coercion bugs)
+    assert compiler.parser.base.parse_column_expr(None) == (
+        "Leaf",
+        compiler.ir.Unsupported(),
+        (),
+    )
+    assert compiler.parser.base.parse_column_expr({"name": "a"}) == (
+        "Leaf",
+        compiler.ir.Unsupported(),
+        (),
+    )
+    assert (
+        compiler.parser.boolean.parse_bool_literal("false") == compiler.ir.Unsupported()
+    )
+    assert compiler.parser.numeric.parse_int_literal(True) == compiler.ir.Unsupported()
+    assert (
+        compiler.parser.numeric.parse_float_literal(False) == compiler.ir.Unsupported()
+    )
+    assert (
+        compiler.parser.temporal.parse_date_literal(True) == compiler.ir.Unsupported()
+    )
+    assert (
+        compiler.parser.string.parse_string_literal(None) == compiler.ir.Unsupported()
+    )
+
+    # Unit-string Null variant and multi-arg unary function rejection
+    assert compiler.json_to_ir({"Literal": "Null"}) == compiler.ir.NullLiteral()
+    assert compiler.parser.boolean.parse_not(
+        "Not",
+        {"input": [{"Column": "a"}, {"Column": "b"}], "function": {"Boolean": "Not"}},
+    ) == ("Leaf", compiler.ir.Unsupported(), ())
+
+
+def test_json_to_ir_partial_ast_degradation_preserves_shallow_and_branch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Arrange
+    monkeypatch.setattr(compiler.parser, "MAX_AST_NODES", 7)
+    oversized_and_json = {
+        "BinaryExpr": {
+            "left": {
+                "BinaryExpr": {
+                    "left": {"Column": "_PARTITIONDATE"},
+                    "op": "Eq",
+                    "right": {"Literal": {"Date": 19723}},
+                }
+            },
+            "op": "And",
+            "right": {
+                "BinaryExpr": {
+                    "left": {
+                        "BinaryExpr": {
+                            "left": {"Column": "x"},
+                            "op": "Eq",
+                            "right": {"Literal": {"Int64": 1}},
+                        }
+                    },
+                    "op": "Or",
+                    "right": {
+                        "BinaryExpr": {
+                            "left": {"Column": "y"},
+                            "op": "Eq",
+                            "right": {"Literal": {"Int64": 2}},
+                        }
+                    },
+                }
+            },
+        }
+    }
+
+    # Act
+    ir_tree = compiler.json_to_ir(oversized_and_json)
+    sql = compiler.ir_to_sql(ir_tree)
+
+    # Assert
+    assert sql == "(`_PARTITIONDATE` = DATE(TIMESTAMP_SECONDS(19723 * 86400)))"
+
+
+def test_parse_int_and_date_literals_reject_float_truncation() -> None:
+    # Arrange
+    float_int_input = 3.9
+    float_date_input = 10.5
+    float_ticks_input = 100.5
+
+    # Act
+    int_ir = compiler.parser.numeric.parse_int_literal(float_int_input)
+    date_ir = compiler.parser.temporal.parse_date_literal(float_date_input)
+
+    # Assert
+    assert int_ir == compiler.ir.Unsupported()
+    assert date_ir == compiler.ir.Unsupported()
+    with pytest.raises(TypeError, match="Invalid timestamp tick count type"):
+        compiler.parser.temporal.parse_ticks_and_unit(float_ticks_input, "Microseconds")
+
+
+def test_parse_int_literal_enforces_bigquery_int64_bounds() -> None:
+    # Arrange
+    max_int64 = (1 << 63) - 1
+    overflow_uint64 = 1 << 63
+    underflow_int128 = -(1 << 63) - 1
+    overflow_series_expr = pl.col("id").is_in(
+        pl.Series([1, overflow_uint64], dtype=pl.UInt64)
+    )
+
+    # Act
+    valid_max_ir = compiler.parser.numeric.parse_int_literal(max_int64)
+    overflow_ir = compiler.parser.numeric.parse_int_literal(overflow_uint64)
+    underflow_ir = compiler.parser.numeric.parse_int_literal(underflow_int128)
+    series_sql = compiler.predicate_to_row_restriction(overflow_series_expr)
+
+    # Assert
+    assert valid_max_ir == compiler.ir.IntLiteral(max_int64)
+    assert overflow_ir == compiler.ir.Unsupported()
+    assert underflow_ir == compiler.ir.Unsupported()
+    assert series_sql == ""
+
+
+def test_parse_temporal_literals_enforce_bigquery_date_and_timestamp_bounds() -> None:
+    # Arrange
+    ipc_buf = io.BytesIO()
+    pl.Series("d", [-800_000], dtype=pl.Int32).cast(
+        pl.Date
+    ).to_frame().write_ipc_stream(ipc_buf)
+    out_of_range_date_ipc = ipc_buf.getvalue()
+
+    # Act
+    scalar_date_ir = compiler.parser.temporal.parse_date_literal(3_000_000)
+    ipc_date_ir = compiler.parser.list_.parse_ipc_series_to_list_literal(
+        out_of_range_date_ipc
+    )
+
+    # Assert
+    assert scalar_date_ir == compiler.ir.Unsupported()
+    assert ipc_date_ir == compiler.ir.Unsupported()
+    with pytest.raises(
+        ValueError, match="Timestamp microseconds out of BigQuery bounds"
+    ):
+        compiler.parser.temporal.parse_ticks_and_unit(
+            300_000_000_000_000_000, "Microseconds"
+        )
+    with pytest.raises(
+        ValueError, match="Timestamp milliseconds out of BigQuery bounds"
+    ):
+        compiler.parser.temporal.parse_ticks_and_unit(
+            300_000_000_000_000, "Milliseconds"
+        )
+    with pytest.raises(
+        ValueError, match="Timestamp nanoseconds out of BigQuery bounds"
+    ):
+        compiler.parser.temporal.parse_ticks_and_unit(
+            300_000_000_000_000_000_000, "Nanoseconds"
+        )
+
+
+def test_parse_is_in_and_contains_validate_unit_and_boolean_options() -> None:
+    # Arrange
+    binary_inputs = [{"Column": "a"}, {"Literal": {"List": [{"Int64": 1}]}}]
+    string_inputs = [{"Column": "a"}, {"Literal": {"String": "x"}}]
+
+    # Act
+    unit_isin = compiler.parser.list_.parse_is_in_function("IsIn", binary_inputs)
+    bool_false_isin = compiler.parser.list_.parse_is_in_function(False, binary_inputs)
+    bool_true_isin = compiler.parser.list_.parse_is_in_function(True, binary_inputs)
+    invalid_spec_isin = compiler.parser.list_.parse_is_in_function(
+        "InvalidSpec", binary_inputs
+    )
+    non_bool_opt_isin = compiler.parser.list_.parse_is_in_function(
+        {"nulls_equal": "false"}, binary_inputs
+    )
+    non_bool_contains = compiler.parser.string.parse_contains(
+        {"literal": "false"}, string_inputs
+    )
+    invalid_spec_contains = compiler.parser.string.parse_contains(
+        "InvalidContainsSpec", string_inputs
+    )
+    wrong_arity_contains = compiler.parser.string.parse_contains(
+        {"literal": True}, [{"Column": "a"}]
+    )
+
+    # Assert
+    assert isinstance(unit_isin, compiler.parser.base.ParseRecord)
+    assert unit_isin.kind == "Binary"
+    assert bool_false_isin.kind == "Binary"
+    assert bool_true_isin == compiler.parser.base.UNSUPPORTED_RECORD
+    assert invalid_spec_isin == compiler.parser.base.UNSUPPORTED_RECORD
+    assert non_bool_opt_isin == compiler.parser.base.UNSUPPORTED_RECORD
+    assert non_bool_contains == compiler.parser.base.UNSUPPORTED_RECORD
+    assert invalid_spec_contains == compiler.parser.base.UNSUPPORTED_RECORD
+    assert wrong_arity_contains == compiler.parser.base.UNSUPPORTED_RECORD
+
+
+def test_trie_wrapper_unwrapping_enforces_unified_depth_and_record_contract() -> None:
+    # Arrange
+    wrapped_literal = {"Dyn": {"Scalar": {"dtype": "Int64", "value": {"Int64": 7}}}}
+    deep_wrapped: dict[str, Any] = {"Int64": 1}
+    for _ in range(compiler.parser.base.MAX_TRIE_DEPTH + 2):
+        deep_wrapped = {"Dyn": {"CustomWrapper": deep_wrapped}}
+    deep_dyn_only: dict[str, Any] = {"Int64": 1}
+    for _ in range(compiler.parser.base.MAX_TRIE_DEPTH + 2):
+        deep_dyn_only = {"Dyn": deep_dyn_only}
+
+    # Act
+    unwrapped = compiler.parser.base.unwrap_literal_json(wrapped_literal)
+    unwrapped_deep = compiler.parser.base.unwrap_literal_json(deep_dyn_only)
+    deep_ir = compiler.json_to_ir({"Literal": deep_wrapped})
+    deep_dyn_ir = compiler.json_to_ir({"Literal": deep_dyn_only})
+    unknown_unit_ir = compiler.json_to_ir({"Literal": "UnknownUnitLiteral"})
+    fallback_record = compiler.parser.base._invoke_matched_parser(
+        lambda _x: "not-a-record",  # type: ignore[arg-type,return-value]
+        1,
+        {},
+    )
+
+    # Assert
+    assert unwrapped == {"Int64": 7}
+    assert unwrapped_deep is None
+    assert deep_ir == compiler.ir.Unsupported()
+    assert deep_dyn_ir == compiler.ir.Unsupported()
+    assert unknown_unit_ir == compiler.ir.Unsupported()
+    assert fallback_record == compiler.parser.base.UNSUPPORTED_RECORD
+
+
+@pytest.mark.parametrize(
+    "expr_json",
+    [
+        pytest.param(
+            {
+                "BinaryExpr": {
+                    "left": {"Column": "a"},
+                    "op": {"Eq": {"null_equals": True}},
+                    "right": {"Literal": {"Int64": 1}},
+                }
+            },
+            id="parameterized_binary_op_eq",
+        ),
+        pytest.param(
+            {
+                "Function": {
+                    "input": [{"Column": "a"}, {"Literal": {"String": "pre"}}],
+                    "function": {"StringExpr": {"StartsWith": {"ignore_case": True}}},
+                }
+            },
+            id="parameterized_function_starts_with",
+        ),
+    ],
+)
+def test_unit_operator_and_function_dispatch_rejects_parameterized_specs(
+    expr_json: dict[str, Any],
+) -> None:
+    # Arrange
+    expected_ir = compiler.ir.Unsupported()
+
+    # Act
+    actual_ir = compiler.json_to_ir(expr_json)
+
+    # Assert
+    assert actual_ir == expected_ir
+
+
+@pytest.mark.parametrize(
+    ("parser_fn", "spec", "inputs"),
+    [
+        pytest.param(
+            compiler.parser.list_.parse_is_in_function,
+            {"null_equals": True},
+            [{"Column": "a"}, {"Literal": {"List": [{"Int64": 1}]}}],
+            id="is_in_unknown_option_key",
+        ),
+        pytest.param(
+            compiler.parser.string.parse_contains,
+            {"literal": True, "ignore_case": True},
+            [{"Column": "a"}, {"Literal": {"String": "x"}}],
+            id="contains_unknown_option_key",
+        ),
+    ],
+)
+def test_is_in_and_contains_reject_unknown_option_keys(
+    parser_fn: Any,
+    spec: dict[str, Any],
+    inputs: list[dict[str, Any]],
+) -> None:
+    # Arrange
+    expected_record = compiler.parser.base.UNSUPPORTED_RECORD
+
+    # Act
+    actual_record = parser_fn(spec, inputs)
+
+    # Assert
+    assert actual_record == expected_record
+
+
+@pytest.mark.parametrize(
+    "raw_value",
+    [
+        pytest.param("1e500", id="positive_string_overflow"),
+        pytest.param("-1e500", id="negative_string_overflow"),
+        pytest.param(10**400, id="integer_overflow"),
+        pytest.param(b"1.5", id="bytes_input"),
+    ],
+)
+def test_parse_float_literal_rejects_finite_overflow_to_infinity(
+    raw_value: Any,
+) -> None:
+    # Arrange
+    expected_ir = compiler.ir.Unsupported()
+
+    # Act
+    actual_ir = compiler.parser.numeric.parse_float_literal(raw_value)
+
+    # Assert
+    assert actual_ir == expected_ir
+
+
+@pytest.mark.parametrize(
+    "tz_raw",
+    [
+        pytest.param("", id="empty_string"),
+        pytest.param("   ", id="whitespace_string"),
+        pytest.param({"inner": ""}, id="nested_empty_string"),
+    ],
+)
+def test_parse_timezone_normalizes_empty_strings_to_naive_datetime(
+    tz_raw: Any,
+) -> None:
+    # Arrange
+    datetime_literal_json = {"DateTime": [1000, "Microseconds", tz_raw]}
+
+    # Act
+    parsed_tz = compiler.parser.temporal.parse_timezone(tz_raw)
+    sql = _json_literal_to_sql(datetime_literal_json)
+
+    # Assert
+    assert parsed_tz is None
+    assert sql == "DATETIME(TIMESTAMP_MICROS(1000))"
+
+
+@pytest.mark.parametrize(
+    "list_elements",
+    [
+        pytest.param(
+            [{"Int64": 1}, {"String": "two"}],
+            id="mixed_int_and_string",
+        ),
+        pytest.param(
+            [
+                {"DateTime": [1000, "Microseconds", "UTC"]},
+                {"DateTime": [1000, "Microseconds", None]},
+            ],
+            id="mixed_aware_and_naive_datetime",
+        ),
+        pytest.param(
+            [{"Float64": "nan"}],
+            id="nan_float_element",
+        ),
+    ],
+)
+def test_parse_list_literal_rejects_heterogeneous_and_nan_elements(
+    list_elements: list[dict[str, Any]],
+) -> None:
+    # Arrange
+    expected_ir = compiler.ir.Unsupported()
+
+    # Act
+    actual_ir = compiler.json_to_ir({"Literal": {"List": list_elements}})
+
+    # Assert
+    assert actual_ir == expected_ir
+
+
+def test_nested_list_literal_avoids_recursion_and_enforces_leaf_fanout_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Arrange
+    nested_list: dict[str, Any] = {"Int64": 1}
+    for _ in range(1500):
+        nested_list = {"List": [nested_list]}
+    monkeypatch.setattr(compiler.parser, "MAX_AST_NODES", 5)
+    fanout_list_expr = {
+        "BinaryExpr": {
+            "left": {"Column": "a"},
+            "op": "Eq",
+            "right": {"Literal": {"List": [{"Int64": i} for i in range(10)]}},
+        }
+    }
+
+    # Act
+    nested_ir = compiler.json_to_ir({"Literal": nested_list})
+    fanout_ir = compiler.json_to_ir(fanout_list_expr)
+
+    # Assert
+    assert isinstance(nested_ir, compiler.ir.Unsupported)
+    assert fanout_ir == compiler.ir.Eq(
+        left=compiler.ir.Column("a"),
+        right=compiler.ir.Unsupported(),
+    )
+
+
+def test_contains_strict_false_and_direct_unit_parser_reject_parameterized_specs() -> (
+    None
+):
+    # Arrange
+    non_strict_regex_expr = pl.col("name").str.contains("[invalid", strict=False)
+
+    # Act
+    non_strict_sql = compiler.predicate_to_row_restriction(non_strict_regex_expr)
+    direct_not_record = compiler.parser.boolean.parse_not(
+        {"unexpected": True}, [{"Column": "a"}]
+    )
+    direct_eq_record = compiler.parser.comparison.parse_eq(
+        {"null_equals": True},
+        {"left": {"Column": "a"}, "right": {"Literal": {"Int64": 1}}},
+    )
+
+    # Assert
+    assert non_strict_sql == ""
+    assert direct_not_record == compiler.parser.base.UNSUPPORTED_RECORD
+    assert direct_eq_record == compiler.parser.base.UNSUPPORTED_RECORD
+
+
+def test_parser_dispatch_rejects_multi_key_enum_envelopes_and_isolates_parser_exceptions(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Arrange
+    multi_key_domain_expr = {
+        "Function": {
+            "input": [{"Column": "a"}, {"Literal": {"String": "x"}}],
+            "function": {
+                "StringExpr": {"Contains": {"literal": True, "strict": True}},
+                "Boolean": "Not",
+            },
+        }
+    }
+    multi_key_variant_expr = {
+        "Function": {
+            "input": [{"Column": "a"}, {"Literal": {"String": "x"}}],
+            "function": {
+                "StringExpr": {
+                    "Contains": {"literal": True, "strict": True},
+                    "StartsWith": None,
+                }
+            },
+        }
+    }
+    dispatched_nodes: list[Any] = []
+    orig_dispatch = compiler.parser.dispatch_parser
+
+    def spy_dispatch(node: Any) -> Any:
+        dispatched_nodes.append(node)
+        return orig_dispatch(node)
+
+    monkeypatch.setattr(compiler.parser, "dispatch_parser", spy_dispatch)
+    monkeypatch.setattr(compiler.parser, "MAX_AST_NODES", 4)
+    budget_exceeded_list_expr = {
+        "BinaryExpr": {
+            "left": {"Column": "a"},
+            "op": "Eq",
+            "right": {"Literal": {"List": [{"Int64": i} for i in range(50)]}},
+        }
+    }
+
+    # Act
+    domain_ir = compiler.json_to_ir(multi_key_domain_expr)
+    variant_ir = compiler.json_to_ir(multi_key_variant_expr)
+    direct_contains_record = compiler.parser.string.parse_contains(
+        {"literal": True, "strict": True},
+        multi_key_variant_expr,
+    )
+    isolated_record = compiler.parser.base._invoke_matched_parser(
+        lambda _x: (_ for _ in ()).throw(RuntimeError("parser boom")),
+        1,
+        {},
+    )
+    dispatched_nodes.clear()
+    budget_ir = compiler.json_to_ir(budget_exceeded_list_expr)
+
+    # Assert
+    assert domain_ir == compiler.ir.Unsupported()
+    assert variant_ir == compiler.ir.Unsupported()
+    assert direct_contains_record == compiler.parser.base.UNSUPPORTED_RECORD
+    assert isolated_record == compiler.parser.base.UNSUPPORTED_RECORD
+    assert budget_ir == compiler.ir.Eq(
+        left=compiler.ir.Column("a"),
+        right=compiler.ir.Unsupported(),
+    )
+    assert len(dispatched_nodes) == 3
+
+
+def test_compiled_trie_envelope_and_constructor_resilience_boundaries() -> None:
+    # Arrange
+    non_transparent_decimal_literal = {"Literal": {"Decimal": {"Int128": 42}}}
+    non_transparent_duration_literal = {"Literal": {"Duration": {"Int64": 100}}}
+    function_with_unknown_modifier = {
+        "Function": {
+            "input": [{"Column": "a"}],
+            "function": {"Boolean": "Not"},
+            "options": {"collect_groups": "ApplyFlat"},
+        }
+    }
+    binary_with_unknown_modifier = {
+        "BinaryExpr": {
+            "left": {"Column": "a"},
+            "op": "Eq",
+            "right": {"Literal": {"Int64": 1}},
+            "flags": {"null_propagate": False},
+        }
+    }
+
+    # Act
+    decimal_ir = compiler.json_to_ir(non_transparent_decimal_literal)
+    duration_ir = compiler.json_to_ir(non_transparent_duration_literal)
+    func_mod_ir = compiler.json_to_ir(function_with_unknown_modifier)
+    bin_mod_ir = compiler.json_to_ir(binary_with_unknown_modifier)
+    wrong_arity_record = compiler.parser.base._invoke_matched_parser(
+        lambda _x: compiler.parser.base.ParseRecord(
+            "Unary", compiler.ir.Not, ({"Column": "a"}, {"Column": "b"})
+        ),
+        1,
+        {},
+    )
+    non_callable_record = compiler.parser.base._invoke_matched_parser(
+        lambda _x: compiler.parser.base.ParseRecord(
+            "Unary", "not-a-callable", ({"Column": "a"},)
+        ),
+        1,
+        {},
+    )
+
+    # Assert
+    assert decimal_ir == compiler.ir.Unsupported()
+    assert duration_ir == compiler.ir.Unsupported()
+    assert func_mod_ir == compiler.ir.Unsupported()
+    assert bin_mod_ir == compiler.ir.Unsupported()
+    assert wrong_arity_record == compiler.parser.base.UNSUPPORTED_RECORD
+    assert non_callable_record == compiler.parser.base.UNSUPPORTED_RECORD
+
+
+def test_trie_depth_guard_attribute_error_isolation_and_deep_function_envelope() -> (
+    None
+):
+    # Arrange
+    over_depth_path = "$" + ".seg" * (compiler.parser.base.MAX_TRIE_DEPTH + 1)
+    deep_unit_func_envelope = {
+        "Function": {
+            "input": [{"Column": "a"}],
+            "function": {"Category": {"SubCategory": {"LeafOp": None}}},
+        }
+    }
+    child_view = compiler.parser.list_._LiteralChildView([{"Int64": 1}, {"Int64": 2}])
+
+    # Act
+    attr_err_record = compiler.parser.base._invoke_matched_parser(
+        lambda _x: (_ for _ in ()).throw(AttributeError("unexpected missing attr")),
+        1,
+        {},
+    )
+    deep_inputs = compiler.parser.base.extract_function_inputs(
+        deep_unit_func_envelope, require_unit_leaf=True
+    )
+    negative_first_ipc = compiler.parser.list_._try_extract_ipc_bytes([-1, 0, 1])
+    iterated_children = list(child_view)
+
+    # Assert
+    with pytest.raises(ValueError, match="exceeds MAX_TRIE_DEPTH"):
+        compiler.parser.parse_json_path(over_depth_path)
+    assert attr_err_record == compiler.parser.base.UNSUPPORTED_RECORD
+    assert deep_inputs == [{"Column": "a"}]
+    assert negative_first_ipc is None
+    assert iterated_children == [{"Literal": {"Int64": 1}}, {"Literal": {"Int64": 2}}]
+
+
+def test_trie_inner_wrapper_unwrapping_and_architecture_decoupling() -> None:
+    # Arrange
+    inner_wrapped_int = {"Literal": {"Int64": {"Scalar": 42}}}
+    non_bool_scalar_options_envelope = {
+        "Function": {
+            "input": [{"Column": "x"}],
+            "function": {"Round": {"decimals": 2}},
+        }
+    }
+    nested_dict_options_envelope = {
+        "Function": {
+            "input": [{"Column": "x"}],
+            "function": {"Round": {"decimals": {"nested": 2}}},
+        }
+    }
+    list_record = compiler.parser.base.ParseRecord(
+        "Leaf",
+        compiler.ir.ListLiteral(
+            values=(compiler.ir.IntLiteral(1), compiler.ir.IntLiteral(2))
+        ),
+        (),
+    )
+
+    def parser_with_optional_param(val: Any, strict: bool = True) -> Any:
+        return (val, strict)
+
+    def parser_with_expr_json_default(val: Any, expr_json: Any = None) -> Any:
+        return (val, expr_json)
+
+    # Act
+    unwrapped_ir = compiler.json_to_ir(inner_wrapped_int)
+    scalar_opt_inputs = compiler.parser.base.extract_function_inputs(
+        non_bool_scalar_options_envelope
+    )
+    nested_opt_inputs = compiler.parser.base.extract_function_inputs(
+        nested_dict_options_envelope
+    )
+    accepts_optional = compiler.parser.base._accepts_second_positional_arg(
+        parser_with_optional_param
+    )
+    accepts_named_context = compiler.parser.base._accepts_second_positional_arg(
+        parser_with_expr_json_default
+    )
+    fanout = compiler.parser.base.record_leaf_fanout(list_record)
+
+    # Assert
+    assert unwrapped_ir == compiler.ir.IntLiteral(value=42)
+    assert scalar_opt_inputs == [{"Column": "x"}]
+    assert nested_opt_inputs is None
+    assert accepts_optional is False
+    assert accepts_named_context is True
+    assert fanout == 2
