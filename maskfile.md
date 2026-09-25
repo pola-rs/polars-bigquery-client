@@ -274,7 +274,7 @@ if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
 #### integration
 
-> Run `py-polars-bigquery` system/integration tests (`py-polars-bigquery/tests/system`), matching `.github/workflows/test-py-polars-integration.yml`. Requires `GOOGLE_CLOUD_PROJECT`.
+> Run `py-polars-bigquery` system/integration tests (`py-polars-bigquery/tests/system`), matching `cloudbuild.yaml`. Requires `GOOGLE_CLOUD_PROJECT`.
 
 ```bash
 set -euo pipefail
