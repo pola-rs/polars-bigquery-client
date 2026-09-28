@@ -8,11 +8,13 @@ SHELL ["/bin/bash", "-euxo", "pipefail", "-c"]
 # Install pinned uv and uvx from the official image
 COPY --from=uv /uv /uvx /usr/local/bin/
 
-# Install cmake (needed for aws-lc-sys), cargo-chef, and mask CLI (statically-linked musl binaries)
+# Install cmake (needed for aws-lc-sys), cargo-chef, mask, and bencher CLI
 ARG CARGO_CHEF_VERSION=0.1.78
 ARG CARGO_CHEF_SHA256=aca691abfbfbbe00d482e0ed2249eec3091b65e96a0ce92947fb5b254d48b16d
 ARG MASK_VERSION=0.11.7
 ARG MASK_SHA256=5c9fed48ecd6a9cbbf7332d67258930c0b2fcc18689850ce617b899c0eeae0c9
+ARG BENCHER_VERSION=0.6.13
+ARG BENCHER_SHA256=41b172864a1cd347f75a68688100688453b02f28e1d1b831b326931b895b4b3d
 RUN apt-get update && apt-get install -y --no-install-recommends \
     cmake \
     unzip \
@@ -31,7 +33,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && echo "${MASK_SHA256}  /tmp/mask.zip" | sha256sum -c - \
     && unzip -j /tmp/mask.zip "mask-${MASK_VERSION}-x86_64-unknown-linux-musl/mask" -d /usr/local/bin \
     && chmod +x /usr/local/bin/mask \
-    && rm /tmp/mask.zip
+    && rm /tmp/mask.zip \
+    && curl --retry 5 --retry-delay 2 --retry-all-errors -fsSL \
+       "https://github.com/bencherdev/bencher/releases/download/v${BENCHER_VERSION}/bencher-v${BENCHER_VERSION}-linux-x86-64" \
+       -o /usr/local/bin/bencher \
+    && echo "${BENCHER_SHA256}  /usr/local/bin/bencher" | sha256sum -c - \
+    && chmod +x /usr/local/bin/bencher
 
 ENV RUSTUP_HOME=/usr/local/rustup \
     CARGO_HOME=/usr/local/cargo \
@@ -68,7 +75,8 @@ RUN cargo chef prepare --recipe-path recipe.json
 FROM base
 # 1. Pre-warm Cargo cache in an isolated layer so Python lockfile updates never trigger Rust rebuilds
 COPY --from=planner /tmp/warmup/recipe.json recipe.json
-RUN cargo chef cook --locked --package arrow-bigquery --tests --all-features --recipe-path recipe.json \
+RUN cargo chef cook --locked --package arrow-bigquery --tests --benches --all-features --recipe-path recipe.json \
+    && cargo chef cook --locked --release --package arrow-bigquery --benches --all-features --recipe-path recipe.json \
     && cargo chef cook --locked --release --package py-arrow-bigquery --features extension-module --recipe-path recipe.json \
     && cargo clean -p arrow-bigquery -p py-arrow-bigquery \
     && cargo clean --release -p arrow-bigquery -p py-arrow-bigquery

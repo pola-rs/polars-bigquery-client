@@ -33,6 +33,7 @@ steps:
       - -c
       - |
         set -euo pipefail
+        mask rust-arrow-bigquery build
         mask py-polars-bigquery build
 
   - id: run-integration-tests
