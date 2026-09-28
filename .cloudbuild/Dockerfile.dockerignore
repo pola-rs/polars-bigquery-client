@@ -1,4 +1,4 @@
-# Ignore everything except manifests and lockfiles needed to build and warm the CI image
+# Ignore everything except manifests, lockfiles, and Rust target paths needed for cargo-chef and uv warmup
 *
 !rust-toolchain.toml
 !Cargo.toml
@@ -8,8 +8,14 @@
 !crates/
 !crates/arrow-bigquery/
 !crates/arrow-bigquery/Cargo.toml
+!crates/arrow-bigquery/src/
+!crates/arrow-bigquery/src/**
+!crates/arrow-bigquery/tests/
+!crates/arrow-bigquery/tests/**
 !py-arrow-bigquery/
 !py-arrow-bigquery/Cargo.toml
 !py-arrow-bigquery/pyproject.toml
+!py-arrow-bigquery/src/
+!py-arrow-bigquery/src/**
 !py-polars-bigquery/
 !py-polars-bigquery/pyproject.toml
