@@ -1,8 +1,21 @@
-# Ignore build outputs, caches, and non-code directories not needed for CI image warmup
-.git
-.github
-.venv
-__pycache__
-docs
-site
-target
+# Ignore everything except manifests, lockfiles, and Rust target paths needed for cargo-chef and uv warmup
+*
+!rust-toolchain.toml
+!Cargo.toml
+!Cargo.lock
+!pyproject.toml
+!uv.lock
+!crates/
+!crates/arrow-bigquery/
+!crates/arrow-bigquery/Cargo.toml
+!crates/arrow-bigquery/src/
+!crates/arrow-bigquery/src/**
+!crates/arrow-bigquery/tests/
+!crates/arrow-bigquery/tests/**
+!py-arrow-bigquery/
+!py-arrow-bigquery/Cargo.toml
+!py-arrow-bigquery/pyproject.toml
+!py-arrow-bigquery/src/
+!py-arrow-bigquery/src/**
+!py-polars-bigquery/
+!py-polars-bigquery/pyproject.toml
