@@ -1,14 +1,18 @@
-FROM rust:bookworm
+FROM rust:bookworm AS base
 
 # Install uv and uvx from the official image
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /usr/local/bin/
 
-# Install cmake (needed for aws-lc-sys) and mask CLI (statically-linked musl binary)
+# Install cmake (needed for aws-lc-sys), cargo-chef, and mask CLI (statically-linked musl binaries)
+ARG CARGO_CHEF_VERSION=0.1.78
 ARG MASK_VERSION=0.11.7
 RUN apt-get update && apt-get install -y --no-install-recommends \
     cmake \
     unzip \
+    xz-utils \
     && rm -rf /var/lib/apt/lists/* \
+    && curl -fsSL "https://github.com/LukeMathWalker/cargo-chef/releases/download/v${CARGO_CHEF_VERSION}/cargo-chef-x86_64-unknown-linux-musl.tar.xz" \
+       | tar -xJ --strip-components=1 -C /usr/local/bin cargo-chef-x86_64-unknown-linux-musl/cargo-chef \
     && curl -fsSL "https://github.com/jacobdeichert/mask/releases/download/mask/${MASK_VERSION}/mask-${MASK_VERSION}-x86_64-unknown-linux-musl.zip" -o /tmp/mask.zip \
     && unzip -j /tmp/mask.zip "mask-${MASK_VERSION}-x86_64-unknown-linux-musl/mask" -d /usr/local/bin \
     && chmod +x /usr/local/bin/mask \
@@ -33,25 +37,20 @@ WORKDIR /tmp/warmup
 COPY rust-toolchain.toml ./
 RUN rustup show
 
-# Pre-warm Cargo and uv caches using project manifests and lockfiles
-COPY Cargo.toml Cargo.lock pyproject.toml uv.lock ./
-COPY crates/arrow-bigquery/Cargo.toml crates/arrow-bigquery/Cargo.toml
-COPY py-arrow-bigquery/Cargo.toml py-arrow-bigquery/pyproject.toml py-arrow-bigquery/
+FROM base AS planner
+COPY . .
+RUN cargo chef prepare --recipe-path recipe.json
+
+FROM base
+# Pre-warm Cargo and uv caches using cargo-chef recipe and Python manifests/lockfiles
+COPY --from=planner /tmp/warmup/recipe.json recipe.json
+COPY pyproject.toml uv.lock ./
+COPY py-arrow-bigquery/pyproject.toml py-arrow-bigquery/pyproject.toml
 COPY py-polars-bigquery/pyproject.toml py-polars-bigquery/pyproject.toml
 
-RUN mkdir -p crates/arrow-bigquery/src crates/arrow-bigquery/tests \
-             py-arrow-bigquery/src py-arrow-bigquery/arrow_bigquery \
-             py-polars-bigquery/polars_bigquery \
-    && touch crates/arrow-bigquery/src/lib.rs \
-             crates/arrow-bigquery/tests/integration_test.rs \
-             py-arrow-bigquery/src/lib.rs \
-             py-arrow-bigquery/arrow_bigquery/__init__.py \
-             py-polars-bigquery/polars_bigquery/__init__.py \
-    && cargo test --package arrow-bigquery --test integration_test --all-features --no-run \
-    && cargo build --release --package py-arrow-bigquery --features extension-module \
+RUN cargo chef cook --package arrow-bigquery --tests --benches --all-features --recipe-path recipe.json \
+    && cargo chef cook --release --package py-arrow-bigquery --features extension-module --recipe-path recipe.json \
     && uv sync --project py-polars-bigquery --group dev --group test --no-install-workspace \
-    && cargo clean -p arrow-bigquery -p py-arrow-bigquery \
-    && cargo clean --release -p arrow-bigquery -p py-arrow-bigquery \
     && rm -rf /tmp/warmup
 
 ENV UV_LINK_MODE=copy
