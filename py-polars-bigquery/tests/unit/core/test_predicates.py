@@ -526,25 +526,86 @@ def test_predicate_to_row_restriction_pseudo_column_and_physical_column() -> Non
 
 
 def test_negation_over_partial_and_does_not_drop_data() -> None:
+    # Arrange
     # ~((a == 1) & (sin(b) > 0.5)) must NOT relax to NOT (a = 1), which would
     # drop rows where a == 1 and sin(b) <= 0.5.
     expr = ~((pl.col("a") == 1) & (pl.col("b").sin() > 0.5))
-    assert compiler.predicate_to_row_restriction(expr) == ""
 
-    # Negation over 100% exact AND is safe to push down
-    exact_expr = ~((pl.col("a") == 1) & (pl.col("b") == 2))
-    assert (
-        compiler.predicate_to_row_restriction(exact_expr)
-        == "(NOT ((`a` = 1) AND (`b` = 2)))"
+    # Act
+    sql = compiler.predicate_to_row_restriction(expr)
+
+    # Assert
+    assert sql == ""
+
+
+def test_negation_over_exact_and_pushes_down() -> None:
+    # Arrange
+    expr = ~((pl.col("a") == 1) & (pl.col("b") == 2))
+
+    # Act
+    sql = compiler.predicate_to_row_restriction(expr)
+
+    # Assert
+    assert sql == "(NOT ((`a` = 1) AND (`b` = 2)))"
+
+
+def test_or_over_partial_and_relaxes_to_superset() -> None:
+    # Arrange
+    expr = ((pl.col("a") == 1) & (pl.col("b").sin() > 0.5)) | (pl.col("c") == 3)
+
+    # Act
+    sql = compiler.predicate_to_row_restriction(expr)
+
+    # Assert
+    assert sql == "((`a` = 1) OR (`c` = 3))"
+
+
+def test_ir_to_sql_negation_over_relaxed_or_returns_none() -> None:
+    # Arrange
+    unrewritten_neg_or_ir = compiler.ir.Not(
+        expr=compiler.ir.Or(
+            left=compiler.ir.And(
+                left=compiler.ir.Eq(
+                    left=compiler.ir.Column("a"), right=compiler.ir.IntLiteral(1)
+                ),
+                right=compiler.ir.Unsupported(),
+            ),
+            right=compiler.ir.Eq(
+                left=compiler.ir.Column("c"), right=compiler.ir.IntLiteral(3)
+            ),
+        )
     )
 
-    # Positive monotone OR over partial AND safely relaxes to superset ((a = 1) OR (c = 3))
-    or_expr = ((pl.col("a") == 1) & (pl.col("b").sin() > 0.5)) | (pl.col("c") == 3)
-    assert compiler.predicate_to_row_restriction(or_expr) == "((`a` = 1) OR (`c` = 3))"
+    # Act
+    sql = compiler.ir_to_sql(unrewritten_neg_or_ir)
 
-    # Negation over that OR must NOT push down because its child is a relaxed superset
-    neg_or_expr = ~or_expr
-    assert compiler.predicate_to_row_restriction(neg_or_expr) == ""
+    # Assert
+    assert sql is None
+
+
+def test_negation_over_or_with_partial_and_branch_pushes_down_exact_branch() -> None:
+    # Arrange
+    expr = ~(((pl.col("a") == 1) & (pl.col("b").sin() > 0.5)) | (pl.col("c") == 3))
+
+    # Act
+    sql = compiler.predicate_to_row_restriction(expr)
+
+    # Assert
+    assert sql == "(NOT (`c` = 3))"
+
+
+def test_negation_over_or_with_both_partial_and_branches_does_not_drop_data() -> None:
+    # Arrange
+    expr = ~(
+        ((pl.col("a") == 1) & (pl.col("b").sin() > 0.5))
+        | ((pl.col("c") == 3) & (pl.col("d").sin() > 0.5))
+    )
+
+    # Act
+    sql = compiler.predicate_to_row_restriction(expr)
+
+    # Assert
+    assert sql == ""
 
 
 def test_bare_null_literal_comparison_not_pushed_down() -> None:
@@ -1364,3 +1425,277 @@ def test_trie_inner_wrapper_unwrapping_and_architecture_decoupling() -> None:
     assert accepts_optional is False
     assert accepts_named_context is True
     assert fanout == 2
+
+
+@pytest.mark.parametrize(
+    ("input_ir", "expected_ir"),
+    [
+        pytest.param(
+            compiler.ir.Not(
+                expr=compiler.ir.Or(
+                    left=compiler.ir.Eq(
+                        left=compiler.ir.Column("a"), right=compiler.ir.IntLiteral(1)
+                    ),
+                    right=compiler.ir.Eq(
+                        left=compiler.ir.Column("b"), right=compiler.ir.IntLiteral(2)
+                    ),
+                )
+            ),
+            compiler.ir.And(
+                left=compiler.ir.Not(
+                    expr=compiler.ir.Eq(
+                        left=compiler.ir.Column("a"), right=compiler.ir.IntLiteral(1)
+                    )
+                ),
+                right=compiler.ir.Not(
+                    expr=compiler.ir.Eq(
+                        left=compiler.ir.Column("b"), right=compiler.ir.IntLiteral(2)
+                    )
+                ),
+            ),
+            id="single_not_or",
+        ),
+        pytest.param(
+            compiler.ir.Not(
+                expr=compiler.ir.Or(
+                    left=compiler.ir.Or(
+                        left=compiler.ir.Eq(
+                            left=compiler.ir.Column("a"),
+                            right=compiler.ir.IntLiteral(1),
+                        ),
+                        right=compiler.ir.Eq(
+                            left=compiler.ir.Column("b"),
+                            right=compiler.ir.IntLiteral(2),
+                        ),
+                    ),
+                    right=compiler.ir.Eq(
+                        left=compiler.ir.Column("c"), right=compiler.ir.IntLiteral(3)
+                    ),
+                )
+            ),
+            compiler.ir.And(
+                left=compiler.ir.And(
+                    left=compiler.ir.Not(
+                        expr=compiler.ir.Eq(
+                            left=compiler.ir.Column("a"),
+                            right=compiler.ir.IntLiteral(1),
+                        )
+                    ),
+                    right=compiler.ir.Not(
+                        expr=compiler.ir.Eq(
+                            left=compiler.ir.Column("b"),
+                            right=compiler.ir.IntLiteral(2),
+                        )
+                    ),
+                ),
+                right=compiler.ir.Not(
+                    expr=compiler.ir.Eq(
+                        left=compiler.ir.Column("c"), right=compiler.ir.IntLiteral(3)
+                    )
+                ),
+            ),
+            id="nested_not_or",
+        ),
+        pytest.param(
+            compiler.ir.Not(
+                expr=compiler.ir.And(
+                    left=compiler.ir.Eq(
+                        left=compiler.ir.Column("a"), right=compiler.ir.IntLiteral(1)
+                    ),
+                    right=compiler.ir.Eq(
+                        left=compiler.ir.Column("b"), right=compiler.ir.IntLiteral(2)
+                    ),
+                )
+            ),
+            compiler.ir.Not(
+                expr=compiler.ir.And(
+                    left=compiler.ir.Eq(
+                        left=compiler.ir.Column("a"), right=compiler.ir.IntLiteral(1)
+                    ),
+                    right=compiler.ir.Eq(
+                        left=compiler.ir.Column("b"), right=compiler.ir.IntLiteral(2)
+                    ),
+                )
+            ),
+            id="not_and_unchanged",
+        ),
+    ],
+)
+def test_rewrite_ir_applies_de_morgan_law(
+    input_ir: compiler.ir.Expr,
+    expected_ir: compiler.ir.Expr,
+) -> None:
+    # Arrange & Act
+    actual_ir = compiler.rewrite_ir(input_ir)
+
+    # Assert
+    assert actual_ir == expected_ir
+
+
+@pytest.mark.parametrize(
+    ("expr", "expected_sql"),
+    [
+        pytest.param(
+            ~((pl.col("a") == 1) | (pl.col("b") == 2)),
+            "((NOT (`a` = 1)) AND (NOT (`b` = 2)))",
+            id="both_branches_supported",
+        ),
+        pytest.param(
+            ~((pl.col("a") == 1) | (pl.col("b").sin() > 0.5)),
+            "(NOT (`a` = 1))",
+            id="right_branch_unsupported",
+        ),
+        pytest.param(
+            ~((pl.col("a").sin() > 0.5) | (pl.col("b") == 2)),
+            "(NOT (`b` = 2))",
+            id="left_branch_unsupported",
+        ),
+        pytest.param(
+            ~((pl.col("a") == 1) | (pl.col("b").sin() > 0.5) | (pl.col("c") == 3)),
+            "((NOT (`a` = 1)) AND (NOT (`c` = 3)))",
+            id="nested_or_with_middle_branch_unsupported",
+        ),
+    ],
+)
+def test_de_morgan_rewriter_preserves_pushdown_for_supported_branches(
+    expr: pl.Expr,
+    expected_sql: str,
+) -> None:
+    # Arrange & Act
+    actual_sql = compiler.predicate_to_row_restriction(expr)
+
+    # Assert
+    assert actual_sql == expected_sql
+
+
+def test_rewriter_deep_expression_avoids_stack_overflow() -> None:
+    # Arrange
+    curr: compiler.ir.Expr = compiler.ir.Eq(
+        left=compiler.ir.Column("x"),
+        right=compiler.ir.IntLiteral(0),
+    )
+    depth = 2500
+    for i in range(1, depth):
+        right_leaf = compiler.ir.Eq(
+            left=compiler.ir.Column("x"),
+            right=compiler.ir.IntLiteral(i),
+        )
+        curr = compiler.ir.Or(left=curr, right=right_leaf)
+    deep_not_or = compiler.ir.Not(expr=curr)
+
+    # Act
+    rewritten = compiler.rewrite_ir(deep_not_or)
+    sql_result = compiler.ir_to_sql(rewritten)
+
+    # Assert
+    assert isinstance(rewritten, compiler.ir.And)
+    assert isinstance(rewritten.right, compiler.ir.Not)
+    assert sql_result is not None
+    assert sql_result.endswith(f"AND (NOT (`x` = {depth - 1})))")
+
+
+@pytest.mark.parametrize(
+    ("node", "new_children", "expected_node", "expect_same_identity"),
+    [
+        pytest.param(
+            col_a := compiler.ir.Column("a"),
+            (),
+            col_a,
+            True,
+            id="leaf_unchanged",
+        ),
+        pytest.param(
+            not_a := compiler.ir.Not(expr=col_a),
+            (col_a,),
+            not_a,
+            True,
+            id="unary_same_child_identity",
+        ),
+        pytest.param(
+            not_a,
+            (col_b := compiler.ir.Column("b"),),
+            compiler.ir.Not(expr=col_b),
+            False,
+            id="unary_new_child",
+        ),
+        pytest.param(
+            and_ab := compiler.ir.And(left=col_a, right=col_b),
+            (col_a, col_b),
+            and_ab,
+            True,
+            id="binary_same_children_identity",
+        ),
+        pytest.param(
+            and_ab,
+            (col_b, col_a),
+            compiler.ir.And(left=col_b, right=col_a),
+            False,
+            id="binary_new_children",
+        ),
+        pytest.param(
+            unsupported_ab := compiler.ir.Unsupported(operands=(col_a, col_b)),
+            (col_a, col_b),
+            unsupported_ab,
+            True,
+            id="unsupported_same_operands_identity",
+        ),
+        pytest.param(
+            unsupported_ab,
+            (col_b,),
+            compiler.ir.Unsupported(operands=(col_b,)),
+            False,
+            id="unsupported_new_operands",
+        ),
+    ],
+)
+def test_rewriter_replace_children_replaces_or_preserves_identity(
+    node: compiler.ir.Expr,
+    new_children: tuple[compiler.ir.Expr, ...],
+    expected_node: compiler.ir.Expr,
+    expect_same_identity: bool,
+) -> None:
+    # Arrange & Act
+    actual_node = compiler.rewriter.base.replace_children(node, new_children)
+
+    # Assert
+    assert actual_node == expected_node
+    assert (actual_node is node) is expect_same_identity
+
+
+@pytest.mark.parametrize(
+    ("node", "invalid_children", "exc_type", "match"),
+    [
+        pytest.param(
+            compiler.ir.Column("a"),
+            (compiler.ir.Column("b"),),
+            TypeError,
+            "Cannot replace children on leaf",
+            id="leaf_with_children",
+        ),
+        pytest.param(
+            compiler.ir.Not(expr=compiler.ir.Column("a")),
+            (compiler.ir.Column("a"), compiler.ir.Column("b")),
+            ValueError,
+            "UnaryExpr requires exactly 1 child",
+            id="unary_wrong_arity",
+        ),
+        pytest.param(
+            compiler.ir.And(
+                left=compiler.ir.Column("a"), right=compiler.ir.Column("b")
+            ),
+            (compiler.ir.Column("a"),),
+            ValueError,
+            "BinaryExpr requires exactly 2 children",
+            id="binary_wrong_arity",
+        ),
+    ],
+)
+def test_rewriter_replace_children_rejects_invalid_arity(
+    node: compiler.ir.Expr,
+    invalid_children: tuple[compiler.ir.Expr, ...],
+    exc_type: type[Exception],
+    match: str,
+) -> None:
+    # Arrange, Act & Assert
+    with pytest.raises(exc_type, match=match):
+        compiler.rewriter.base.replace_children(node, invalid_children)
