@@ -3,6 +3,7 @@
 - Update the CHANGELOG.
 - Update the version in `py-polars-bigquery/pyproject.toml`.
 - Update the version in `py-polars-bigquery/polars_bigquery/core/version.py`.
+- Update uv lock files. `uv lock`.
 - Send PR.
 - Merge.
 - Trigger Build Wheels workflow.

@@ -6,8 +6,9 @@ from typing import Any
 
 import polars as pl
 
-from polars_bigquery.core.compiler import ir, parser, sql
+from polars_bigquery.core.compiler import ir, parser, rewriter, sql
 from polars_bigquery.core.compiler.parser import json_to_ir
+from polars_bigquery.core.compiler.rewriter import rewrite_ir
 from polars_bigquery.core.compiler.sql import ir_to_sql
 
 __all__ = [
@@ -16,6 +17,8 @@ __all__ = [
     "json_to_ir",
     "parser",
     "predicate_to_row_restriction",
+    "rewrite_ir",
+    "rewriter",
     "sql",
 ]
 
@@ -26,6 +29,7 @@ def _json_expr_to_row_restriction(expr_json: dict[str, Any]) -> str | None:
     Returns None if unknown operators are found and can't guarantee a superset of rows.
     """
     ir_tree = json_to_ir(expr_json)
+    ir_tree = rewrite_ir(ir_tree)
     return ir_to_sql(ir_tree)
 
 
