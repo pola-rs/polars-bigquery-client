@@ -8,6 +8,7 @@ from collections.abc import Callable
 from polars_bigquery.core.compiler.ir.base import (
     BinaryExpr,
     Expr,
+    TernaryExpr,
     UnaryExpr,
     Unsupported,
 )
@@ -45,6 +46,23 @@ def replace_binary_children(node: BinaryExpr, children: tuple[Expr, ...]) -> Exp
     if children[0] is node.left and children[1] is node.right:
         return node
     return dataclasses.replace(node, left=children[0], right=children[1])
+
+
+@replace_children.register
+def replace_ternary_children(node: TernaryExpr, children: tuple[Expr, ...]) -> Expr:
+    """Return a copy of a `TernaryExpr` node with its three children replaced."""
+    if len(children) != 3:
+        msg = f"TernaryExpr requires exactly 3 children, got {len(children)}"
+        raise ValueError(msg)
+    if (
+        children[0] is node.predicate
+        and children[1] is node.truthy
+        and children[2] is node.falsy
+    ):
+        return node
+    return dataclasses.replace(
+        node, predicate=children[0], truthy=children[1], falsy=children[2]
+    )
 
 
 @replace_children.register
