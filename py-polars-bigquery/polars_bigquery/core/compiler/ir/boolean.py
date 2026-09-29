@@ -5,6 +5,7 @@ import dataclasses
 from polars_bigquery.core.compiler.ir.base import (
     BinaryExpr,
     Literal,
+    TernaryExpr,
     UnaryExpr,
     VariadicExpr,
 )
@@ -45,3 +46,8 @@ class IsNotNull(UnaryExpr):
 @dataclasses.dataclass(frozen=True)
 class Coalesce(VariadicExpr):
     """IR node representing a COALESCE expression."""
+
+
+@dataclasses.dataclass(frozen=True)
+class When(TernaryExpr):
+    """IR node representing a conditional expression (WHEN / THEN / OTHERWISE)."""

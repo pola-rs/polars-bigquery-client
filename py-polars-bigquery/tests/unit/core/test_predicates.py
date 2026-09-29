@@ -778,6 +778,7 @@ def test_json_path_parser_registration_and_dispatch() -> None:
         "$.BinaryExpr.op.GtEq",
         "$.BinaryExpr.op.Lt",
         "$.BinaryExpr.op.LtEq",
+        "$.Function.function.Boolean.AllHorizontal",
         "$.Function.function.Boolean.Not",
         "$.Function.function.Boolean.IsNull",
         "$.Function.function.Boolean.IsNotNull",
@@ -798,6 +799,7 @@ def test_json_path_parser_registration_and_dispatch() -> None:
         "$.Literal..Date",
         "$.Literal..DateTime",
         "$.Literal..List",
+        "$.Ternary",
     }
     assert expected_paths.issubset(compiler.parser.PARSERS.keys())
 
@@ -1661,6 +1663,24 @@ def test_rewriter_deep_expression_avoids_stack_overflow() -> None:
             id="variadic_new_operands",
         ),
         pytest.param(
+            when_abc := compiler.ir.When(
+                predicate=col_a,
+                truthy=col_b,
+                falsy=(col_c := compiler.ir.Column("c")),
+            ),
+            (col_a, col_b, col_c),
+            when_abc,
+            True,
+            id="ternary_same_children_identity",
+        ),
+        pytest.param(
+            when_abc,
+            (col_c, col_b, col_a),
+            compiler.ir.When(predicate=col_c, truthy=col_b, falsy=col_a),
+            False,
+            id="ternary_new_children",
+        ),
+        pytest.param(
             unsupported_ab := compiler.ir.Unsupported(operands=(col_a, col_b)),
             (col_a, col_b),
             unsupported_ab,
@@ -1724,6 +1744,17 @@ def test_rewriter_replace_children_replaces_or_preserves_identity(
             ValueError,
             "VariadicExpr requires at least 1 child",
             id="variadic_empty_children",
+        ),
+        pytest.param(
+            compiler.ir.When(
+                predicate=compiler.ir.Column("a"),
+                truthy=compiler.ir.Column("b"),
+                falsy=compiler.ir.Column("c"),
+            ),
+            (compiler.ir.Column("a"), compiler.ir.Column("b")),
+            ValueError,
+            "TernaryExpr requires exactly 3 children",
+            id="ternary_wrong_arity",
         ),
     ],
 )
@@ -1944,6 +1975,462 @@ def test_parse_coalesce_rejects_invalid_inputs(
 )
 def test_emit_coalesce_sql_rejects_invalid_inputs(
     node: compiler.ir.Coalesce,
+    child_results: list[tuple[str | None, bool]],
+) -> None:
+    # Arrange & Act
+    actual = compiler.sql.emit_node_sql(node, child_results)
+
+    # Assert
+    assert actual == (None, False)
+
+
+@pytest.mark.parametrize(
+    ("expr", "expected_sql"),
+    [
+        pytest.param(
+            pl.when(pl.col("a") == 1)
+            .then(pl.col("b") == 2)
+            .otherwise(pl.col("c") == 3),
+            "CASE WHEN (`a` = 1) THEN (`b` = 2) ELSE (`c` = 3) END",
+            id="single_when_then_otherwise_boolean",
+        ),
+        pytest.param(
+            pl.when(pl.col("a") > 0).then(10).otherwise(20) == 10,
+            "(CASE WHEN (`a` > 0) THEN 10 ELSE 20 END = 10)",
+            id="single_when_then_otherwise_scalar_comparison",
+        ),
+        pytest.param(
+            pl.when(pl.col("a") == 1).then(None).otherwise(2) == 2,
+            "(CASE WHEN (`a` = 1) THEN NULL ELSE 2 END = 2)",
+            id="single_when_then_null_otherwise_non_null",
+        ),
+        pytest.param(
+            pl.when(pl.col("a") == 1).then(pl.col("b") == 2),
+            "CASE WHEN (`a` = 1) THEN (`b` = 2) END",
+            id="single_when_then_without_otherwise",
+        ),
+        pytest.param(
+            pl.when(pl.col("a") == 1).then(pl.lit("yes")) == "yes",
+            "(CASE WHEN (`a` = 1) THEN 'yes' END = 'yes')",
+            id="single_when_then_without_otherwise_scalar_comparison",
+        ),
+        pytest.param(
+            pl.when(pl.col("a") == 1)
+            .then(10)
+            .when(pl.col("b") == 2)
+            .then(20)
+            .otherwise(30)
+            == 20,
+            "(CASE WHEN (`a` = 1) THEN 10 WHEN (`b` = 2) THEN 20 ELSE 30 END = 20)",
+            id="chained_two_when_then_with_otherwise",
+        ),
+        pytest.param(
+            pl.when(pl.col("a") == 1)
+            .then(pl.lit("x"))
+            .when(pl.col("b") == 2)
+            .then(pl.lit("y"))
+            .when(pl.col("c") == 3)
+            .then(pl.lit("z"))
+            .otherwise(pl.lit("w"))
+            == "y",
+            "(CASE WHEN (`a` = 1) THEN 'x' WHEN (`b` = 2) THEN 'y' WHEN (`c` = 3) THEN 'z' ELSE 'w' END = 'y')",
+            id="chained_three_when_then_with_otherwise",
+        ),
+        pytest.param(
+            pl.when(pl.col("a") == 1).then(True).when(pl.col("b") == 2).then(False),
+            "CASE WHEN (`a` = 1) THEN TRUE WHEN (`b` = 2) THEN FALSE END",
+            id="chained_two_when_then_without_otherwise",
+        ),
+        pytest.param(
+            pl.when(pl.col("a") == 1)
+            .then(None)
+            .when(pl.col("b") == 2)
+            .then(pl.lit("ok"))
+            == "ok",
+            "(CASE WHEN (`a` = 1) THEN NULL WHEN (`b` = 2) THEN 'ok' END = 'ok')",
+            id="chained_when_with_leading_null_branch",
+        ),
+        pytest.param(
+            pl.when(pl.col("a") > 0, pl.col("b") < 10).then(True).otherwise(False),
+            "CASE WHEN ((`a` > 0) AND (`b` < 10)) THEN TRUE ELSE FALSE END",
+            id="when_multiple_positional_predicates",
+        ),
+        pytest.param(
+            pl.when(a=1, b=2).then(True).otherwise(False),
+            "CASE WHEN ((`a` = 1) AND (`b` = 2)) THEN TRUE ELSE FALSE END",
+            id="when_keyword_constraint_predicates",
+        ),
+        pytest.param(
+            pl.when(pl.col("a") == 1)
+            .then(pl.when(pl.col("b") == 2).then(True).otherwise(False))
+            .otherwise(False),
+            "CASE WHEN (`a` = 1) THEN CASE WHEN (`b` = 2) THEN TRUE ELSE FALSE END ELSE FALSE END",
+            id="nested_when_in_truthy_branch",
+        ),
+        pytest.param(
+            pl.when(~((pl.col("a") == 1) | (pl.col("b") == 2)))
+            .then(True)
+            .otherwise(False),
+            "CASE WHEN ((NOT (`a` = 1)) AND (NOT (`b` = 2))) THEN TRUE ELSE FALSE END",
+            id="when_with_de_morgan_rewritten_predicate",
+        ),
+        pytest.param(
+            (pl.col("keep") == 1)
+            & pl.when(unsupported(pl.col("a")) > 0).then(True).otherwise(False),
+            "(`keep` = 1)",
+            id="and_with_unsupported_when_preserves_supported_branch",
+        ),
+    ],
+)
+def test_when_then_otherwise_pushdown(expr: pl.Expr, expected_sql: str) -> None:
+    # Arrange & Act
+    actual_sql = compiler.predicate_to_row_restriction(expr)
+
+    # Assert
+    assert actual_sql == expected_sql
+
+
+@pytest.mark.parametrize(
+    "expr",
+    [
+        pytest.param(
+            pl.when(unsupported(pl.col("a")) > 0.5).then(True).otherwise(False),
+            id="unsupported_predicate",
+        ),
+        pytest.param(
+            pl.when(pl.col("a") == 1)
+            .then(unsupported(pl.col("b")) > 0.5)
+            .otherwise(False),
+            id="unsupported_truthy",
+        ),
+        pytest.param(
+            pl.when(pl.col("a") == 1)
+            .then(True)
+            .otherwise(unsupported(pl.col("b")) > 0.5),
+            id="unsupported_falsy",
+        ),
+        pytest.param(
+            pl.when(pl.col("a") == 1)
+            .then(10)
+            .when(unsupported(pl.col("b")) > 0.5)
+            .then(20)
+            .otherwise(30)
+            == 10,
+            id="unsupported_in_chained_when_predicate",
+        ),
+        pytest.param(
+            pl.when(pl.col("a") == 1)
+            .then(10)
+            .when(pl.col("b") == 2)
+            .then(unsupported(pl.col("c")))
+            .otherwise(30)
+            == 10,
+            id="unsupported_in_chained_when_truthy",
+        ),
+        pytest.param(
+            pl.when((pl.col("a") == 1) & (unsupported(pl.col("b")) > 0.5))
+            .then(True)
+            .otherwise(False),
+            id="partial_relaxed_and_in_predicate",
+        ),
+        pytest.param(
+            pl.when(pl.col("a") == 1)
+            .then((pl.col("b") == 2) & (unsupported(pl.col("c")) > 0.5))
+            .otherwise(False),
+            id="partial_relaxed_and_in_truthy",
+        ),
+        pytest.param(
+            pl.when(pl.col("a") == 1)
+            .then(True)
+            .otherwise((pl.col("b") == 2) & (unsupported(pl.col("c")) > 0.5)),
+            id="partial_relaxed_and_in_falsy",
+        ),
+        pytest.param(
+            pl.when(~((pl.col("a") == 1) | (unsupported(pl.col("b")) > 0.5)))
+            .then(True)
+            .otherwise(False),
+            id="partial_de_morgan_and_in_predicate",
+        ),
+        pytest.param(
+            pl.when(pl.col("a") == 1, unsupported(pl.col("b")) > 0.5)
+            .then(True)
+            .otherwise(False),
+            id="partial_all_horizontal_in_predicate",
+        ),
+        pytest.param(
+            pl.when(pl.col("a") == 1).then(None),
+            id="all_null_without_otherwise",
+        ),
+        pytest.param(
+            pl.when(pl.col("a") == 1).then(None).otherwise(None),
+            id="all_null_with_explicit_null_otherwise",
+        ),
+        pytest.param(
+            pl.when(pl.col("a") == 1).then(None).when(pl.col("b") == 2).then(None),
+            id="chained_all_null_branches",
+        ),
+    ],
+)
+def test_when_rejects_any_unsupported_or_inexact_descendant(expr: pl.Expr) -> None:
+    # Arrange & Act
+    actual_sql = compiler.predicate_to_row_restriction(expr)
+
+    # Assert
+    assert actual_sql == ""
+
+
+@pytest.mark.parametrize(
+    ("expr_json", "expected"),
+    [
+        pytest.param(
+            {
+                "Ternary": {
+                    "predicate": {"Column": "a"},
+                    "truthy": {"Column": "b"},
+                    "falsy": {"Column": "c"},
+                }
+            },
+            ({"Column": "a"}, {"Column": "b"}, {"Column": "c"}),
+            id="valid_ternary_envelope",
+        ),
+        pytest.param(
+            {
+                "predicate": {"Column": "a"},
+                "truthy": {"Column": "b"},
+                "falsy": {"Column": "c"},
+            },
+            ({"Column": "a"}, {"Column": "b"}, {"Column": "c"}),
+            id="valid_ternary_body",
+        ),
+        pytest.param(
+            {"Ternary": {"predicate": {"Column": "a"}}, "extra": 1},
+            None,
+            id="extra_outer_key",
+        ),
+        pytest.param(
+            {
+                "predicate": {"Column": "a"},
+                "truthy": {"Column": "b"},
+                "falsy": {"Column": "c"},
+                "unknown_key": True,
+            },
+            None,
+            id="unknown_body_key",
+        ),
+        pytest.param(
+            {"predicate": {"Column": "a"}, "truthy": {"Column": "b"}},
+            None,
+            id="missing_falsy_operand",
+        ),
+        pytest.param(
+            "not-a-dict",
+            None,
+            id="non_dict_input",
+        ),
+    ],
+)
+def test_extract_ternary_operands(
+    expr_json: Any,
+    expected: tuple[Any, Any, Any] | None,
+) -> None:
+    # Arrange & Act
+    actual = compiler.parser.base.extract_ternary_operands(expr_json)
+
+    # Assert
+    assert actual == expected
+
+
+@pytest.mark.parametrize(
+    "expr_json",
+    [
+        pytest.param("not-a-dict", id="non_dict_input"),
+        pytest.param(
+            {"predicate": {"Column": "a"}, "truthy": {"Column": "b"}},
+            id="missing_operand",
+        ),
+    ],
+)
+def test_parse_ternary_op_rejects_invalid_envelope(expr_json: Any) -> None:
+    # Arrange & Act
+    actual = compiler.parser.base.parse_ternary_op(expr_json, compiler.ir.When)
+
+    # Assert
+    assert actual == compiler.parser.base.UNSUPPORTED_RECORD
+
+
+@pytest.mark.parametrize(
+    ("record", "expected"),
+    [
+        pytest.param(
+            compiler.parser.base.ParseRecord(
+                "Ternary",
+                compiler.ir.When,
+                ({"Column": "a"}, {"Column": "b"}, {"Column": "c"}),
+            ),
+            compiler.parser.base.ParseRecord(
+                "Ternary",
+                compiler.ir.When,
+                ({"Column": "a"}, {"Column": "b"}, {"Column": "c"}),
+            ),
+            id="valid_three_children",
+        ),
+        pytest.param(
+            compiler.parser.base.ParseRecord(
+                "Ternary",
+                compiler.ir.When,
+                ({"Column": "a"}, {"Column": "b"}),
+            ),
+            compiler.parser.base.UNSUPPORTED_RECORD,
+            id="too_few_children",
+        ),
+        pytest.param(
+            compiler.parser.base.ParseRecord(
+                "Ternary",
+                "not-callable",
+                ({"Column": "a"}, {"Column": "b"}, {"Column": "c"}),
+            ),
+            compiler.parser.base.UNSUPPORTED_RECORD,
+            id="non_callable_node",
+        ),
+    ],
+)
+def test_validate_parse_record_ternary(
+    record: compiler.parser.base.ParseRecord,
+    expected: compiler.parser.base.ParseRecord,
+) -> None:
+    # Arrange & Act
+    actual = compiler.parser.base._validate_parse_record(record)
+
+    # Assert
+    assert actual == expected
+
+
+@pytest.mark.parametrize(
+    ("children", "expected"),
+    [
+        pytest.param((), compiler.ir.Unsupported(), id="empty_children"),
+        pytest.param(
+            (compiler.ir.Column("a"),),
+            compiler.ir.Column("a"),
+            id="single_child",
+        ),
+        pytest.param(
+            (compiler.ir.Column("a"), compiler.ir.Column("b")),
+            compiler.ir.And(
+                left=compiler.ir.Column("a"),
+                right=compiler.ir.Column("b"),
+            ),
+            id="two_children",
+        ),
+    ],
+)
+def test_construct_all_horizontal(
+    children: tuple[compiler.ir.Expr, ...],
+    expected: compiler.ir.Expr,
+) -> None:
+    # Arrange & Act
+    actual = compiler.parser.boolean.construct_all_horizontal(children)
+
+    # Assert
+    assert actual == expected
+
+
+@pytest.mark.parametrize(
+    ("spec", "expr_json"),
+    [
+        pytest.param(
+            {"unexpected": True},
+            {"input": [{"Column": "a"}]},
+            id="parameterized_spec",
+        ),
+        pytest.param(
+            "AllHorizontal",
+            {"input": []},
+            id="empty_inputs",
+        ),
+        pytest.param(
+            "AllHorizontal",
+            {"input": "not-a-list"},
+            id="invalid_inputs_type",
+        ),
+    ],
+)
+def test_parse_all_horizontal_rejects_invalid_inputs(
+    spec: Any,
+    expr_json: Any,
+) -> None:
+    # Arrange & Act
+    actual = compiler.parser.boolean.parse_all_horizontal(spec, expr_json)
+
+    # Assert
+    assert actual == compiler.parser.base.UNSUPPORTED_RECORD
+
+
+@pytest.mark.parametrize(
+    ("node", "child_results"),
+    [
+        pytest.param(
+            compiler.ir.When(
+                predicate=compiler.ir.Column("a"),
+                truthy=compiler.ir.Column("b"),
+                falsy=compiler.ir.Column("c"),
+            ),
+            [("`a`", True), ("`b`", True)],
+            id="wrong_child_results_length",
+        ),
+        pytest.param(
+            compiler.ir.When(
+                predicate=compiler.ir.NullLiteral(),
+                truthy=compiler.ir.Column("b"),
+                falsy=compiler.ir.Column("c"),
+            ),
+            [("NULL", True), ("`b`", True), ("`c`", True)],
+            id="null_literal_predicate",
+        ),
+        pytest.param(
+            compiler.ir.When(
+                predicate=compiler.ir.ListLiteral(values=(compiler.ir.IntLiteral(1),)),
+                truthy=compiler.ir.Column("b"),
+                falsy=compiler.ir.Column("c"),
+            ),
+            [("(1)", True), ("`b`", True), ("`c`", True)],
+            id="list_literal_predicate",
+        ),
+        pytest.param(
+            compiler.ir.When(
+                predicate=compiler.ir.Column("a"),
+                truthy=compiler.ir.ListLiteral(values=(compiler.ir.IntLiteral(1),)),
+                falsy=compiler.ir.Column("c"),
+            ),
+            [("`a`", True), ("(1)", True), ("`c`", True)],
+            id="list_literal_truthy",
+        ),
+        pytest.param(
+            compiler.ir.When(
+                predicate=compiler.ir.Column("a"),
+                truthy=compiler.ir.Column("b"),
+                falsy=compiler.ir.ListLiteral(values=(compiler.ir.IntLiteral(1),)),
+            ),
+            [("`a`", True), ("`b`", True), ("(1)", True)],
+            id="list_literal_falsy",
+        ),
+        pytest.param(
+            compiler.ir.When(
+                predicate=compiler.ir.Column("a"),
+                truthy=compiler.ir.Column("b"),
+                falsy=compiler.ir.When(
+                    predicate=compiler.ir.Column("b"),
+                    truthy=compiler.ir.Column("c"),
+                    falsy=compiler.ir.NullLiteral(),
+                ),
+            ),
+            [("`a`", True), ("`b`", True), ("INVALID_SQL", True)],
+            id="chained_when_with_non_case_falsy_sql",
+        ),
+    ],
+)
+def test_emit_when_sql_rejects_invalid_inputs(
+    node: compiler.ir.When,
     child_results: list[tuple[str | None, bool]],
 ) -> None:
     # Arrange & Act
