@@ -8,6 +8,8 @@
 !crates/
 !crates/arrow-bigquery/
 !crates/arrow-bigquery/Cargo.toml
+!crates/arrow-bigquery/benches/
+!crates/arrow-bigquery/benches/**
 !crates/arrow-bigquery/src/
 !crates/arrow-bigquery/src/**
 !crates/arrow-bigquery/tests/
