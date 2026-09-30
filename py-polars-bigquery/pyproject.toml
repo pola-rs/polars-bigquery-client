@@ -24,10 +24,12 @@ include = ["polars_bigquery*"]
 
 [tool.uv.sources]
 arrow-bigquery = { workspace = true }
+polars-expressions-testing = { workspace = true }
 
 [dependency-groups]
 dev = [
     "freezegun>=1.5.5",
+    "polars-expressions-testing",
     "pre-commit>=4.3.0",
     "pyparsing>=2.4.7",
     "pytest>=8.4.1",
@@ -37,6 +39,7 @@ dev = [
 ]
 test = [
     "freezegun>=1.5.5",
+    "polars-expressions-testing",
     "pre-commit>=4.3.0",
     "pytest>=8.4.1",
     "pytest-benchmark>=5.1.0",

@@ -21,3 +21,8 @@
 !py-arrow-bigquery/src/**
 !py-polars-bigquery/
 !py-polars-bigquery/pyproject.toml
+!py-polars-expressions-testing/
+!py-polars-expressions-testing/Cargo.toml
+!py-polars-expressions-testing/pyproject.toml
+!py-polars-expressions-testing/src/
+!py-polars-expressions-testing/src/**

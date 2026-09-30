@@ -1,0 +1,17 @@
+[package]
+name = "py-polars-expressions-testing"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "polars_expressions_testing"
+crate-type = ["cdylib"]
+
+[dependencies]
+polars = { version = "0.53.0", default-features = false }
+pyo3 = { version = "0.27", features = ["abi3-py310", "chrono"] }
+pyo3-polars = { version = "0.26.0", features = ["derive", "lazy"] }
+
+[features]
+extension-module = ["pyo3/extension-module"]
+default = []

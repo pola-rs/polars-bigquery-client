@@ -43,12 +43,12 @@ if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
 ```bash
 set -euo pipefail
-cargo test --workspace --exclude py-arrow-bigquery --lib --bins --benches --all-features --no-run
+cargo test --workspace --exclude py-arrow-bigquery --exclude py-polars-expressions-testing --lib --bins --benches --all-features --no-run
 ```
 
 ```powershell
 $ErrorActionPreference = "Stop"
-cargo test --workspace --exclude py-arrow-bigquery --lib --bins --benches --all-features --no-run
+cargo test --workspace --exclude py-arrow-bigquery --exclude py-polars-expressions-testing --lib --bins --benches --all-features --no-run
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 ```
 
@@ -62,12 +62,12 @@ if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
 ```bash
 set -euo pipefail
-cargo test --workspace --exclude py-arrow-bigquery --lib --bins --all-features
+cargo test --workspace --exclude py-arrow-bigquery --exclude py-polars-expressions-testing --lib --bins --all-features
 ```
 
 ```powershell
 $ErrorActionPreference = "Stop"
-cargo test --workspace --exclude py-arrow-bigquery --lib --bins --all-features
+cargo test --workspace --exclude py-arrow-bigquery --exclude py-polars-expressions-testing --lib --bins --all-features
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 ```
 

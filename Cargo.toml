@@ -2,5 +2,6 @@
 members = [
     "crates/arrow-bigquery",
     "py-arrow-bigquery",
+    "py-polars-expressions-testing",
 ]
 resolver = "2"

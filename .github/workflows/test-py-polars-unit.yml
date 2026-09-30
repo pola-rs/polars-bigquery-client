@@ -8,6 +8,7 @@ on:
       - docs/source/src/python/**
       - maskfile.md
       - py-polars-bigquery/**
+      - py-polars-expressions-testing/**
       - .github/workflows/test-py-polars-unit.yml
   push:
     branches:
@@ -18,6 +19,7 @@ on:
       - docs/source/src/python/**
       - maskfile.md
       - py-polars-bigquery/**
+      - py-polars-expressions-testing/**
       - .github/workflows/test-py-polars-unit.yml
 
 concurrency:
@@ -78,7 +80,9 @@ jobs:
       - name: Cache Rust
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 #v2.9.1
         with:
-          workspaces: py-arrow-bigquery
+          workspaces: |
+            py-arrow-bigquery
+            py-polars-expressions-testing
           save-if: ${{ github.ref_name == 'main' }}
 
       - name: Run unit tests

@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import io
+import json
 from typing import Any
 
 import polars as pl
 import pytest
 from polars_bigquery.core import compiler
+from polars_expressions_testing import unsupported
 
 
 def _json_literal_to_sql(literal_json: dict[str, Any]) -> str | None:
@@ -321,8 +323,13 @@ def test_json_literal_to_sql_all_scalar_types_and_immutability() -> None:
 
 
 def test_and_expression_preserves_valid_branch_with_unsupported_branch() -> None:
-    expr = (pl.col("keep_col") == 1) & (pl.col("other_col").sin() > 0.5)
+    expr = (pl.col("keep_col") == 1) & (unsupported(pl.col("other_col")) > 0.5)
     assert compiler.predicate_to_row_restriction(expr) == "(`keep_col` = 1)"
+    df = pl.DataFrame({"keep_col": [1, 1, 2], "other_col": [0.1, 0.8, 0.9]})
+    assert df.filter(expr).to_dict(as_series=False) == {
+        "keep_col": [1],
+        "other_col": [0.8],
+    }
 
 
 def test_deep_expression_avoids_stack_overflow() -> None:
@@ -498,13 +505,11 @@ def test_escape_sql_string_tabs_and_null_bytes() -> None:
 
 
 def test_json_to_ir_prunes_unsupported_subtrees() -> None:
-    unsupported_json = {
-        "BinaryExpr": {
-            "left": {"Column": "a"},
-            "op": "Plus",
-            "right": {"Column": "b"},
-        }
-    }
+    expr = unsupported(pl.col("a"))
+    buf = io.BytesIO()
+    expr.meta.serialize(buf, format="json")
+    buf.seek(0)
+    unsupported_json = json.load(buf)
     ir_node = compiler.json_to_ir(unsupported_json)
     assert isinstance(ir_node, compiler.ir.Unsupported)
     assert ir_node.children() == ()
@@ -513,23 +518,25 @@ def test_json_to_ir_prunes_unsupported_subtrees() -> None:
 def test_predicate_to_row_restriction_pseudo_column_and_physical_column() -> None:
     from datetime import date
 
-    expr = (pl.col("_PARTITIONDATE") == date(2024, 1, 1)) & (pl.col("val").sin() > 0.5)
+    expr = (pl.col("_PARTITIONDATE") == date(2024, 1, 1)) & (
+        unsupported(pl.col("val")) > 0.5
+    )
     assert (
         compiler.predicate_to_row_restriction(expr)
         == "(`_PARTITIONDATE` = DATE(TIMESTAMP_SECONDS(19723 * 86400)))"
     )
 
     expr_or = (pl.col("_PARTITIONDATE") == date(2024, 1, 1)) | (
-        pl.col("val").sin() > 0.5
+        unsupported(pl.col("val")) > 0.5
     )
     assert compiler.predicate_to_row_restriction(expr_or) == ""
 
 
 def test_negation_over_partial_and_does_not_drop_data() -> None:
     # Arrange
-    # ~((a == 1) & (sin(b) > 0.5)) must NOT relax to NOT (a = 1), which would
-    # drop rows where a == 1 and sin(b) <= 0.5.
-    expr = ~((pl.col("a") == 1) & (pl.col("b").sin() > 0.5))
+    # ~((a == 1) & (unsupported(b) > 0.5)) must NOT relax to NOT (a = 1), which would
+    # drop rows where a == 1 and unsupported(b) <= 0.5.
+    expr = ~((pl.col("a") == 1) & (unsupported(pl.col("b")) > 0.5))
 
     # Act
     sql = compiler.predicate_to_row_restriction(expr)
@@ -551,7 +558,7 @@ def test_negation_over_exact_and_pushes_down() -> None:
 
 def test_or_over_partial_and_relaxes_to_superset() -> None:
     # Arrange
-    expr = ((pl.col("a") == 1) & (pl.col("b").sin() > 0.5)) | (pl.col("c") == 3)
+    expr = ((pl.col("a") == 1) & (unsupported(pl.col("b")) > 0.5)) | (pl.col("c") == 3)
 
     # Act
     sql = compiler.predicate_to_row_restriction(expr)
@@ -585,7 +592,9 @@ def test_ir_to_sql_negation_over_relaxed_or_returns_none() -> None:
 
 def test_negation_over_or_with_partial_and_branch_pushes_down_exact_branch() -> None:
     # Arrange
-    expr = ~(((pl.col("a") == 1) & (pl.col("b").sin() > 0.5)) | (pl.col("c") == 3))
+    expr = ~(
+        ((pl.col("a") == 1) & (unsupported(pl.col("b")) > 0.5)) | (pl.col("c") == 3)
+    )
 
     # Act
     sql = compiler.predicate_to_row_restriction(expr)
@@ -597,8 +606,8 @@ def test_negation_over_or_with_partial_and_branch_pushes_down_exact_branch() -> 
 def test_negation_over_or_with_both_partial_and_branches_does_not_drop_data() -> None:
     # Arrange
     expr = ~(
-        ((pl.col("a") == 1) & (pl.col("b").sin() > 0.5))
-        | ((pl.col("c") == 3) & (pl.col("d").sin() > 0.5))
+        ((pl.col("a") == 1) & (unsupported(pl.col("b")) > 0.5))
+        | ((pl.col("c") == 3) & (unsupported(pl.col("d")) > 0.5))
     )
 
     # Act
@@ -1541,17 +1550,21 @@ def test_rewrite_ir_applies_de_morgan_law(
             id="both_branches_supported",
         ),
         pytest.param(
-            ~((pl.col("a") == 1) | (pl.col("b").sin() > 0.5)),
+            ~((pl.col("a") == 1) | (unsupported(pl.col("b")) > 0.5)),
             "(NOT (`a` = 1))",
             id="right_branch_unsupported",
         ),
         pytest.param(
-            ~((pl.col("a").sin() > 0.5) | (pl.col("b") == 2)),
+            ~((unsupported(pl.col("a")) > 0.5) | (pl.col("b") == 2)),
             "(NOT (`b` = 2))",
             id="left_branch_unsupported",
         ),
         pytest.param(
-            ~((pl.col("a") == 1) | (pl.col("b").sin() > 0.5) | (pl.col("c") == 3)),
+            ~(
+                (pl.col("a") == 1)
+                | (unsupported(pl.col("b")) > 0.5)
+                | (pl.col("c") == 3)
+            ),
             "((NOT (`a` = 1)) AND (NOT (`c` = 3)))",
             id="nested_or_with_middle_branch_unsupported",
         ),

@@ -5,4 +5,4 @@ description = "Root workspace"
 dependencies = []
 
 [tool.uv.workspace]
-members = ["py-arrow-bigquery", "py-polars-bigquery"]
+members = ["py-arrow-bigquery", "py-polars-bigquery", "py-polars-expressions-testing"]
