@@ -761,12 +761,14 @@ dev = [
     { name = "maturin" },
     { name = "maturin", extra = ["patchelf"], marker = "sys_platform == 'linux'" },
     { name = "pytest" },
+    { name = "pytest-xdist" },
     { name = "ruff" },
 ]
 test = [
     { name = "maturin" },
     { name = "maturin", extra = ["patchelf"], marker = "sys_platform == 'linux'" },
     { name = "pytest" },
+    { name = "pytest-xdist" },
 ]
 
 [package.metadata]
@@ -777,12 +779,14 @@ dev = [
     { name = "maturin", marker = "sys_platform != 'linux'", specifier = ">=1.13.1" },
     { name = "maturin", extras = ["patchelf"], marker = "sys_platform == 'linux'", specifier = ">=1.13.1" },
     { name = "pytest", specifier = ">=8.4.1" },
+    { name = "pytest-xdist", specifier = ">=3.8.0" },
     { name = "ruff", specifier = ">=0.15.10" },
 ]
 test = [
     { name = "maturin", marker = "sys_platform != 'linux'", specifier = ">=1.13.1" },
     { name = "maturin", extras = ["patchelf"], marker = "sys_platform == 'linux'", specifier = ">=1.13.1" },
     { name = "pytest", specifier = ">=8.4.1" },
+    { name = "pytest-xdist", specifier = ">=3.8.0" },
 ]
 
 [[package]]

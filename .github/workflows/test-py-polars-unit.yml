@@ -80,12 +80,10 @@ jobs:
       - name: Cache Rust
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 #v2.9.1
         with:
-          workspaces: |
-            py-arrow-bigquery
-            py-polars-expressions-testing
           save-if: ${{ github.ref_name == 'main' }}
 
       - name: Run unit tests
         run: |
           pip install uv
+          mask py-polars-expressions-testing test unit ${{ matrix.python-version == '3.10' && '--resolution lowest' || '--resolution highest --upgrade' }}
           mask py-polars-bigquery test unit ${{ matrix.python-version == '3.10' && '--resolution lowest' || '--resolution highest --upgrade' }}
