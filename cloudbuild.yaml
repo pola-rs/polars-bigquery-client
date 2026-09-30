@@ -6,8 +6,6 @@ substitutions:
   _BENCHER_PROJECT: polars-bigquery-client
   _BENCHER_TESTBED: cloudbuild-e2-highcpu-8
   _BENCHER_API_KEY_SECRET: bencher-api-key
-  _GITHUB_TOKEN_SECRET: github-token
-  _GITHUB_REPO: pola-rs/polars-bigquery-client
   _BASE_BRANCH: main
   _RUST_BENCH_FILTER: ""
 
@@ -61,7 +59,6 @@ steps:
     name: ${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_CI_REPOSITORY_NAME}/${_CI_IMAGE_NAME}:latest
     secretEnv:
       - BENCHER_API_KEY
-      - GITHUB_TOKEN
     env:
       - GOOGLE_CLOUD_PROJECT=${_GOOGLE_CLOUD_PROJECT}
       - RUSTFLAGS=-C debuginfo=0
@@ -69,8 +66,6 @@ steps:
       - PYTHONUTF8=1
       - COMMIT_SHA=${COMMIT_SHA}
       - BRANCH_NAME=${BRANCH_NAME}
-      - REPO_FULL_NAME=${REPO_FULL_NAME}
-      - _GITHUB_REPO=${_GITHUB_REPO}
       - _PR_NUMBER=${_PR_NUMBER}
       - _HEAD_BRANCH=${_HEAD_BRANCH}
       - _BASE_BRANCH=${_BASE_BRANCH}
@@ -126,19 +121,12 @@ steps:
           mask_cmd="$${mask_cmd} --filter '${_RUST_BENCH_FILTER}'"
         fi
 
-        set +e
-        bencher run "$${bencher_args[@]}" "$${mask_cmd}" | tee /workspace/bencher_rust.log
-        bencher_exit=$${PIPESTATUS[0]}
-        set -e
-
-        python3 .cloudbuild/post_bencher_comment.py
-        exit "$${bencher_exit}"
+        bencher run "$${bencher_args[@]}" "$${mask_cmd}"
 
   - id: run-python-benchmarks
     name: ${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_CI_REPOSITORY_NAME}/${_CI_IMAGE_NAME}:latest
     secretEnv:
       - BENCHER_API_KEY
-      - GITHUB_TOKEN
     env:
       - GOOGLE_CLOUD_PROJECT=${_GOOGLE_CLOUD_PROJECT}
       - RUSTFLAGS=-C debuginfo=0
@@ -146,8 +134,6 @@ steps:
       - PYTHONUTF8=1
       - COMMIT_SHA=${COMMIT_SHA}
       - BRANCH_NAME=${BRANCH_NAME}
-      - REPO_FULL_NAME=${REPO_FULL_NAME}
-      - _GITHUB_REPO=${_GITHUB_REPO}
       - _PR_NUMBER=${_PR_NUMBER}
       - _HEAD_BRANCH=${_HEAD_BRANCH}
       - _BASE_BRANCH=${_BASE_BRANCH}
@@ -197,21 +183,13 @@ steps:
           fi
         fi
 
-        set +e
         bencher run "$${bencher_args[@]}" \
-          "mask py-polars-bigquery test benchmark --output $${results_file}" | tee /workspace/bencher_python.log
-        bencher_exit=$${PIPESTATUS[0]}
-        set -e
-
-        python3 .cloudbuild/post_bencher_comment.py
-        exit "$${bencher_exit}"
+          "mask py-polars-bigquery test benchmark --output $${results_file}"
 
 availableSecrets:
   secretManager:
     - versionName: projects/${PROJECT_ID}/secrets/${_BENCHER_API_KEY_SECRET}/versions/latest
       env: BENCHER_API_KEY
-    - versionName: projects/${PROJECT_ID}/secrets/${_GITHUB_TOKEN_SECRET}/versions/latest
-      env: GITHUB_TOKEN
 
 options:
   defaultLogsBucketBehavior: REGIONAL_USER_OWNED_BUCKET
