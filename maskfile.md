@@ -39,16 +39,16 @@ if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
 ### build
 
-> Compile the Rust workspace and unit test binaries (`crates/arrow-bigquery`).
+> Compile the Rust workspace, unit test, and benchmark binaries (`crates/arrow-bigquery`).
 
 ```bash
 set -euo pipefail
-cargo test --workspace --exclude py-arrow-bigquery --lib --bins --all-features --no-run
+cargo test --workspace --exclude py-arrow-bigquery --lib --bins --benches --all-features --no-run
 ```
 
 ```powershell
 $ErrorActionPreference = "Stop"
-cargo test --workspace --exclude py-arrow-bigquery --lib --bins --all-features --no-run
+cargo test --workspace --exclude py-arrow-bigquery --lib --bins --benches --all-features --no-run
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 ```
 
@@ -88,6 +88,40 @@ if (-not $env:GOOGLE_CLOUD_PROJECT) {
   exit 1
 }
 cargo test --package arrow-bigquery --test integration_test --all-features
+if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+```
+
+#### benchmark
+
+> Run Rust BigQuery Criterion benchmarks (`crates/arrow-bigquery/benches/read.rs`). Requires `GOOGLE_CLOUD_PROJECT`.
+
+**OPTIONS**
+* filter
+    * flags: -f --filter
+    * type: string
+    * desc: Only run Criterion benchmarks matching the given regular expression
+
+```bash
+set -euo pipefail
+: "${GOOGLE_CLOUD_PROJECT:?Set GOOGLE_CLOUD_PROJECT to run BigQuery benchmark tests}"
+bench_args=()
+if [ -n "${filter:-}" ]; then
+  bench_args+=("$filter")
+fi
+cargo bench --package arrow-bigquery --bench read -- "${bench_args[@]}"
+```
+
+```powershell
+$ErrorActionPreference = "Stop"
+if (-not $env:GOOGLE_CLOUD_PROJECT) {
+  Write-Error "Set GOOGLE_CLOUD_PROJECT to run BigQuery benchmark tests"
+  exit 1
+}
+$benchArgs = @()
+if ($env:filter) {
+  $benchArgs += $env:filter
+}
+cargo bench --package arrow-bigquery --bench read -- @benchArgs
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 ```
 
@@ -296,10 +330,20 @@ if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
 > Run `py-polars-bigquery` local benchmarks (`py-polars-bigquery/tests/benchmark`) with `pytest-benchmark`. Requires `GOOGLE_CLOUD_PROJECT`.
 
+**OPTIONS**
+* output
+    * flags: -o --output
+    * type: string
+    * desc: Write pytest-benchmark results to a JSON file (--benchmark-json)
+
 ```bash
 set -euo pipefail
 : "${GOOGLE_CLOUD_PROJECT:?Set GOOGLE_CLOUD_PROJECT to run BigQuery benchmark tests}"
-uv run --project py-polars-bigquery --group test pytest --benchmark-only py-polars-bigquery/tests/benchmark
+pytest_args=(--benchmark-only)
+if [ -n "${output:-}" ]; then
+  pytest_args+=(--benchmark-json "$output")
+fi
+uv run --project py-polars-bigquery --group test pytest "${pytest_args[@]}" py-polars-bigquery/tests/benchmark
 ```
 
 ```powershell
@@ -308,7 +352,11 @@ if (-not $env:GOOGLE_CLOUD_PROJECT) {
   Write-Error "Set GOOGLE_CLOUD_PROJECT to run BigQuery benchmark tests"
   exit 1
 }
-uv run --project py-polars-bigquery --group test pytest --benchmark-only py-polars-bigquery/tests/benchmark
+$pytestArgs = @("--benchmark-only")
+if ($env:output) {
+  $pytestArgs += @("--benchmark-json", $env:output)
+}
+uv run --project py-polars-bigquery --group test pytest @pytestArgs py-polars-bigquery/tests/benchmark
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 ```
 
@@ -442,15 +490,18 @@ if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
 ### benchmark
 
-> Run all BigQuery benchmark tests locally (`py-polars-bigquery`). Requires `GOOGLE_CLOUD_PROJECT`.
+> Run all BigQuery benchmark tests locally (`rust-arrow-bigquery` and `py-polars-bigquery`). Requires `GOOGLE_CLOUD_PROJECT`.
 
 ```bash
 set -euo pipefail
+$MASK rust-arrow-bigquery test benchmark
 $MASK py-polars-bigquery test benchmark
 ```
 
 ```powershell
 $ErrorActionPreference = "Stop"
+& $env:MASK rust-arrow-bigquery test benchmark
+if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 & $env:MASK py-polars-bigquery test benchmark
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 ```
