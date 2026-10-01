@@ -43,12 +43,12 @@ if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
 ```bash
 set -euo pipefail
-cargo test --workspace --exclude py-arrow-bigquery --lib --bins --benches --all-features --no-run
+cargo test --workspace --exclude py-arrow-bigquery --exclude py-polars-expressions-testing --lib --bins --benches --all-features --no-run
 ```
 
 ```powershell
 $ErrorActionPreference = "Stop"
-cargo test --workspace --exclude py-arrow-bigquery --lib --bins --benches --all-features --no-run
+cargo test --workspace --exclude py-arrow-bigquery --exclude py-polars-expressions-testing --lib --bins --benches --all-features --no-run
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 ```
 
@@ -62,12 +62,12 @@ if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
 ```bash
 set -euo pipefail
-cargo test --workspace --exclude py-arrow-bigquery --lib --bins --all-features
+cargo test --workspace --exclude py-arrow-bigquery --exclude py-polars-expressions-testing --lib --bins --all-features
 ```
 
 ```powershell
 $ErrorActionPreference = "Stop"
-cargo test --workspace --exclude py-arrow-bigquery --lib --bins --all-features
+cargo test --workspace --exclude py-arrow-bigquery --exclude py-polars-expressions-testing --lib --bins --all-features
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 ```
 
@@ -360,6 +360,90 @@ uv run --project py-polars-bigquery --group test pytest @pytestArgs py-polars-bi
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 ```
 
+## py-polars-expressions-testing
+
+> Commands for the `polars-expressions-testing` Python package (`py-polars-expressions-testing`).
+
+### build
+
+> Build the `py-polars-expressions-testing` Rust extension and install editable dependencies via `uv`.
+
+**OPTIONS**
+* resolution
+    * flags: -r --resolution
+    * type: string
+    * desc: Dependency resolution strategy for uv (highest, lowest, lowest-direct)
+* upgrade
+    * flags: -U --upgrade
+    * desc: Allow package upgrades, ignoring pinned versions in uv.lock
+
+```bash
+set -euo pipefail
+uv_args=()
+if [ -n "${resolution:-}" ]; then
+  uv_args+=(--resolution "$resolution")
+fi
+if [ "${upgrade:-}" = "true" ]; then
+  uv_args+=(--upgrade)
+fi
+uv sync "${uv_args[@]}" --project py-polars-expressions-testing --group dev
+```
+
+```powershell
+$ErrorActionPreference = "Stop"
+$uvArgs = @()
+if ($env:resolution) {
+  $uvArgs += @("--resolution", $env:resolution)
+}
+if ($env:upgrade -eq "true") {
+  $uvArgs += "--upgrade"
+}
+uv sync @uvArgs --project py-polars-expressions-testing --group dev
+if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+```
+
+### test
+
+> Run tests for `py-polars-expressions-testing`.
+
+#### unit
+
+> Run `py-polars-expressions-testing` unit tests, matching `.github/workflows/test-py-polars-unit.yml`.
+
+**OPTIONS**
+* resolution
+    * flags: -r --resolution
+    * type: string
+    * desc: Dependency resolution strategy for uv (highest, lowest, lowest-direct)
+* upgrade
+    * flags: -U --upgrade
+    * desc: Allow package upgrades, ignoring pinned versions in uv.lock
+
+```bash
+set -euo pipefail
+uv_args=()
+if [ -n "${resolution:-}" ]; then
+  uv_args+=(--resolution "$resolution")
+fi
+if [ "${upgrade:-}" = "true" ]; then
+  uv_args+=(--upgrade)
+fi
+uv run "${uv_args[@]}" --project py-polars-expressions-testing --group test pytest -n auto py-polars-expressions-testing/tests/unit
+```
+
+```powershell
+$ErrorActionPreference = "Stop"
+$uvArgs = @()
+if ($env:resolution) {
+  $uvArgs += @("--resolution", $env:resolution)
+}
+if ($env:upgrade -eq "true") {
+  $uvArgs += "--upgrade"
+}
+uv run @uvArgs --project py-polars-expressions-testing --group test pytest -n auto py-polars-expressions-testing/tests/unit
+if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+```
+
 ## docs
 
 > Commands relating to the documentation (`mkdocs.yml`).
@@ -425,7 +509,7 @@ if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
 ### unit
 
-> Run all unit tests (`rust-arrow-bigquery`, `py-arrow-bigquery`, and `py-polars-bigquery`).
+> Run all unit tests (`rust-arrow-bigquery`, `py-arrow-bigquery`, `py-polars-expressions-testing`, and `py-polars-bigquery`).
 
 **OPTIONS**
 * resolution
@@ -447,6 +531,7 @@ if [ "${upgrade:-}" = "true" ]; then
 fi
 $MASK rust-arrow-bigquery test unit
 $MASK py-arrow-bigquery test unit "${mask_args[@]}"
+$MASK py-polars-expressions-testing test unit "${mask_args[@]}"
 $MASK py-polars-bigquery test unit "${mask_args[@]}"
 ```
 
@@ -462,6 +547,8 @@ if ($env:upgrade -eq "true") {
 & $env:MASK rust-arrow-bigquery test unit
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 & $env:MASK py-arrow-bigquery test unit @maskArgs
+if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+& $env:MASK py-polars-expressions-testing test unit @maskArgs
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 & $env:MASK py-polars-bigquery test unit @maskArgs
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }

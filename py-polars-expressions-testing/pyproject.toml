@@ -1,0 +1,45 @@
+[build-system]
+requires = ["maturin>=1.0,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "polars-expressions-testing"
+version = "0.1.0"
+requires-python = ">=3.10"
+classifiers = [
+  "Programming Language :: Rust",
+  "Programming Language :: Python :: Implementation :: CPython",
+  "Programming Language :: Python :: Implementation :: PyPy",
+]
+dependencies = [
+    "polars >= 1.43.0, < 3.0.0",
+]
+
+[dependency-groups]
+dev = [
+    "maturin>=1.13.1; platform_system != 'Linux'",
+    "maturin[patchelf]>=1.13.1; platform_system == 'Linux'",
+    "pytest>=8.4.1",
+    "pytest-xdist>=3.8.0",
+    "ruff>=0.15.10",
+]
+test = [
+    "maturin>=1.13.1; platform_system != 'Linux'",
+    "maturin[patchelf]>=1.13.1; platform_system == 'Linux'",
+    "pytest>=8.4.1",
+    "pytest-xdist>=3.8.0",
+]
+
+[tool.maturin]
+profile = "release"
+# Allow cargo test without failing on linking to Python.
+# https://github.com/PyO3/pyo3/discussions/2271#discussioncomment-2497276
+features = ["extension-module"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests/unit"]
+
+[tool.uv]
+# https://github.com/PyO3/maturin/issues/2314#issuecomment-2488542771
+# Rebuild package when any rust files change
+cache-keys = [{file = "pyproject.toml"}, {file = "Cargo.toml"}, {file = "**/*.rs"}]

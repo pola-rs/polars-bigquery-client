@@ -78,13 +78,15 @@ COPY --from=planner /tmp/warmup/recipe.json recipe.json
 RUN cargo chef cook --locked --package arrow-bigquery --tests --benches --all-features --recipe-path recipe.json \
     && cargo chef cook --locked --release --package arrow-bigquery --benches --all-features --recipe-path recipe.json \
     && cargo chef cook --locked --release --package py-arrow-bigquery --features extension-module --recipe-path recipe.json \
-    && cargo clean -p arrow-bigquery -p py-arrow-bigquery \
-    && cargo clean --release -p arrow-bigquery -p py-arrow-bigquery
+    && cargo chef cook --locked --release --package py-polars-expressions-testing --features extension-module --recipe-path recipe.json \
+    && cargo clean -p arrow-bigquery -p py-arrow-bigquery -p py-polars-expressions-testing \
+    && cargo clean --release -p arrow-bigquery -p py-arrow-bigquery -p py-polars-expressions-testing
 
 # 2. Pre-warm uv cache across all workspace packages and dependency groups (including maturin/patchelf)
 COPY pyproject.toml uv.lock ./
 COPY py-arrow-bigquery/pyproject.toml py-arrow-bigquery/pyproject.toml
 COPY py-polars-bigquery/pyproject.toml py-polars-bigquery/pyproject.toml
+COPY py-polars-expressions-testing/pyproject.toml py-polars-expressions-testing/pyproject.toml
 RUN uv sync --locked --all-packages --all-groups --no-install-workspace \
     && rm -rf /tmp/warmup
 

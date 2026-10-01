@@ -13,6 +13,7 @@ members = [
     "arrow-bigquery",
     "polars-bigquery",
     "polars-bigquery-workspace",
+    "polars-expressions-testing",
 ]
 
 [[package]]
@@ -697,6 +698,7 @@ dependencies = [
 [package.dev-dependencies]
 dev = [
     { name = "freezegun" },
+    { name = "polars-expressions-testing" },
     { name = "pre-commit" },
     { name = "pyparsing" },
     { name = "pytest" },
@@ -706,6 +708,7 @@ dev = [
 ]
 test = [
     { name = "freezegun" },
+    { name = "polars-expressions-testing" },
     { name = "pre-commit" },
     { name = "pytest" },
     { name = "pytest-benchmark" },
@@ -723,6 +726,7 @@ requires-dist = [
 [package.metadata.requires-dev]
 dev = [
     { name = "freezegun", specifier = ">=1.5.5" },
+    { name = "polars-expressions-testing", editable = "py-polars-expressions-testing" },
     { name = "pre-commit", specifier = ">=4.3.0" },
     { name = "pyparsing", specifier = ">=2.4.7" },
     { name = "pytest", specifier = ">=8.4.1" },
@@ -732,6 +736,7 @@ dev = [
 ]
 test = [
     { name = "freezegun", specifier = ">=1.5.5" },
+    { name = "polars-expressions-testing", editable = "py-polars-expressions-testing" },
     { name = "pre-commit", specifier = ">=4.3.0" },
     { name = "pytest", specifier = ">=8.4.1" },
     { name = "pytest-benchmark", specifier = ">=5.1.0" },
@@ -742,6 +747,47 @@ test = [
 name = "polars-bigquery-workspace"
 version = "0.1.0"
 source = { virtual = "." }
+
+[[package]]
+name = "polars-expressions-testing"
+version = "0.1.0"
+source = { editable = "py-polars-expressions-testing" }
+dependencies = [
+    { name = "polars" },
+]
+
+[package.dev-dependencies]
+dev = [
+    { name = "maturin" },
+    { name = "maturin", extra = ["patchelf"], marker = "sys_platform == 'linux'" },
+    { name = "pytest" },
+    { name = "pytest-xdist" },
+    { name = "ruff" },
+]
+test = [
+    { name = "maturin" },
+    { name = "maturin", extra = ["patchelf"], marker = "sys_platform == 'linux'" },
+    { name = "pytest" },
+    { name = "pytest-xdist" },
+]
+
+[package.metadata]
+requires-dist = [{ name = "polars", specifier = ">=1.43.0,<3.0.0" }]
+
+[package.metadata.requires-dev]
+dev = [
+    { name = "maturin", marker = "sys_platform != 'linux'", specifier = ">=1.13.1" },
+    { name = "maturin", extras = ["patchelf"], marker = "sys_platform == 'linux'", specifier = ">=1.13.1" },
+    { name = "pytest", specifier = ">=8.4.1" },
+    { name = "pytest-xdist", specifier = ">=3.8.0" },
+    { name = "ruff", specifier = ">=0.15.10" },
+]
+test = [
+    { name = "maturin", marker = "sys_platform != 'linux'", specifier = ">=1.13.1" },
+    { name = "maturin", extras = ["patchelf"], marker = "sys_platform == 'linux'", specifier = ">=1.13.1" },
+    { name = "pytest", specifier = ">=8.4.1" },
+    { name = "pytest-xdist", specifier = ">=3.8.0" },
+]
 
 [[package]]
 name = "polars-runtime-32"
