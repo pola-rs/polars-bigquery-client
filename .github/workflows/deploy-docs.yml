@@ -8,6 +8,7 @@ on:
       - docs/**
       - maskfile.md
       - mkdocs.yml
+      - py-polars-bigquery/polars_bigquery/**
       - .github/workflows/deploy-docs.yml
   repository_dispatch:
     types:

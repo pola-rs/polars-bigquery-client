@@ -6,6 +6,7 @@ on:
       - docs/**
       - maskfile.md
       - mkdocs.yml
+      - py-polars-bigquery/polars_bigquery/**
       - .github/workflows/docs-global.yml
       - .github/workflows/deploy-docs.yml
   push:
@@ -15,6 +16,7 @@ on:
       - docs/**
       - maskfile.md
       - mkdocs.yml
+      - py-polars-bigquery/polars_bigquery/**
       - .github/workflows/docs-global.yml
       - .github/workflows/deploy-docs.yml
 

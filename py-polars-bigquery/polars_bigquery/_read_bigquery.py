@@ -23,9 +23,26 @@ def _get_user_agent(user_agent: str | None) -> str:
 
 
 class Client:
-    """Client for reading data from BigQuery into Polars.
+    """Client for reading data from Google BigQuery into Polars.
 
-    Wraps an arrow_bigquery Client to keep connections open and reuse credentials across operations.
+    Wraps an `arrow_bigquery.Client` and a REST session to keep connections open
+    and reuse credentials across multiple operations. Can be used as a context
+    manager to automatically close the underlying REST session on exit.
+
+    Examples
+    --------
+    ```python
+    import polars as pl
+    import polars_bigquery
+
+    with polars_bigquery.Client(quota_project_id="my-project") as client:
+        lf = client.scan_table("bigquery-public-data.usa_names.usa_1910_2013")
+        df = (
+            lf.filter((pl.col("state") == "WA") & (pl.col("year") >= 2000))
+            .select(["name", "year", "number"])
+            .collect()
+        )
+    ```
     """
 
     def __init__(
@@ -35,6 +52,21 @@ class Client:
         credentials_provider: pl.CredentialProviderGCP | None = None,
         user_agent: str | None = None,
     ) -> None:
+        """Initialize a BigQuery client.
+
+        Parameters
+        ----------
+        quota_project_id
+            Google Cloud project ID used for quota and billing of BigQuery API
+            requests and query jobs.
+        credentials_provider
+            Polars GCP credential provider used to obtain OAuth2 bearer tokens.
+            If `None`, a default `polars.CredentialProviderGCP(quota_project_id=quota_project_id)`
+            instance is created using Application Default Credentials (ADC).
+        user_agent
+            Optional custom user-agent suffix appended to the client's default
+            `polars-bigquery/<version>` user-agent header.
+        """
         if credentials_provider is None:
             credentials_provider = pl.CredentialProviderGCP(
                 quota_project_id=quota_project_id
@@ -65,10 +97,12 @@ class Client:
 
     @property
     def credentials_provider(self) -> pl.CredentialProviderGCP:
+        """The `polars.CredentialProviderGCP` used to authenticate requests."""
         return self._credentials_provider
 
     @property
     def quota_project_id(self) -> str:
+        """The Google Cloud project ID used for quota and billing."""
         return self._quota_project_id
 
     def read_table(
@@ -77,6 +111,34 @@ class Client:
         *,
         maintain_order: bool = False,
     ) -> pl.DataFrame:
+        """Eagerly read a BigQuery table into a Polars `DataFrame`.
+
+        Reads the entire table directly via the BigQuery Storage Read API. For
+        projection and filter pushdown, prefer [`Client.scan_table`][polars_bigquery.Client.scan_table].
+
+        Parameters
+        ----------
+        table
+            The BigQuery table to read. Accepts a `"project.dataset.table"`
+            string, an `arrow_bigquery.BigQueryTableId`, or any object with
+            `project` (or `project_id`), `dataset_id`, and `table_id` attributes
+            (such as `google.cloud.bigquery.TableReference`).
+        maintain_order
+            Whether to preserve table row order by reading from a single
+            Storage Read API stream. Defaults to `False`, which enables parallel
+            multi-stream reads for higher throughput.
+
+        Returns
+        -------
+        pl.DataFrame
+            A Polars `DataFrame` containing the table data.
+
+        Examples
+        --------
+        ```python
+        df = client.read_table("bigquery-public-data.utility_us.country_code_iso")
+        ```
+        """
         table_ref = arrow_bigquery.api.resources.parse_table_id(table)
         arrow_stream_exporter = self._arrow_client.read_table(
             table_ref,
@@ -90,6 +152,46 @@ class Client:
         *,
         maintain_order: bool = False,
     ) -> pl.DataFrame:
+        """Execute a GoogleSQL query and read the result into a Polars `DataFrame`.
+
+        Submits a query job via the BigQuery Jobs REST API, waits for job
+        completion, and streams the destination table via the BigQuery Storage
+        Read API.
+
+        Parameters
+        ----------
+        query
+            GoogleSQL query string to execute in BigQuery.
+        maintain_order
+            Whether to preserve the row order produced by an `ORDER BY` clause
+            by reading from a single Storage Read API stream. Defaults to
+            `False`, which enables parallel multi-stream reads.
+
+        Returns
+        -------
+        pl.DataFrame
+            A Polars `DataFrame` containing the query results.
+
+        Raises
+        ------
+        polars_bigquery.exceptions.BigQueryError
+            If the BigQuery query job fails or times out.
+
+        Examples
+        --------
+        ```python
+        df = client.read_query(
+            \"\"\"
+            SELECT name, SUM(number) AS total_born
+            FROM `bigquery-public-data.usa_names.usa_1910_2013`
+            GROUP BY name
+            ORDER BY total_born DESC
+            LIMIT 100
+            \"\"\",
+            maintain_order=True,
+        )
+        ```
+        """
         table = self._rest_client.run_query(query)
         table_ref = arrow_bigquery.api.resources.parse_table_id(table)
         arrow_stream_exporter = self._arrow_client.read_table(
@@ -102,6 +204,55 @@ class Client:
         self,
         table: Any,
     ) -> pl.LazyFrame:
+        """Lazily scan a BigQuery table into a Polars `LazyFrame`.
+
+        Fetches table schema and partitioning metadata via the BigQuery REST API
+        when constructing the `LazyFrame`, and defers reading rows from the
+        BigQuery Storage Read API until query execution (`.collect()` or
+        `.collect_batches()`).
+
+        Supports both **projection pushdown** (only reading referenced columns)
+        and **row predicate pushdown** (translating `.filter()` expressions into
+        BigQuery Storage Read API `row_restriction` SQL clauses). See the
+        [Row predicate pushdown](predicate-pushdown.md) page for the complete
+        list of supported Polars expressions and data types.
+
+        For ingestion-time partitioned tables, `_PARTITIONDATE` (`pl.Date`) and
+        `_PARTITIONTIME` (`pl.Datetime("us", "utc")`) pseudo-columns are
+        automatically added to the `LazyFrame` schema so partition pruning
+        filters can be pushed down.
+
+        Parameters
+        ----------
+        table
+            The BigQuery table to scan. Accepts a `"project.dataset.table"`
+            string, an `arrow_bigquery.BigQueryTableId`, or any object with
+            `project` (or `project_id`), `dataset_id`, and `table_id` attributes
+            (such as `google.cloud.bigquery.TableReference`).
+
+        Returns
+        -------
+        pl.LazyFrame
+            A Polars `LazyFrame` backed by the BigQuery Storage Read API.
+
+        Raises
+        ------
+        polars_bigquery.exceptions.BigQueryError
+            If fetching the table metadata from the BigQuery REST API fails.
+
+        Examples
+        --------
+        ```python
+        import polars as pl
+
+        lf = client.scan_table("bigquery-public-data.usa_names.usa_1910_2013")
+        df = (
+            lf.filter(pl.col("name").str.starts_with("A") & (pl.col("year") >= 2010))
+            .select(["name", "state", "year", "number"])
+            .collect()
+        )
+        ```
+        """
         table_ref = arrow_bigquery.api.resources.parse_table_id(table)
         table_metadata = self._rest_client.get_table_metadata(table_ref)
         schema = polars_bigquery.core.schema.extract_polars_schema(table_metadata)

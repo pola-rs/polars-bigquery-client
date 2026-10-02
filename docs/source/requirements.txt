@@ -1,2 +1,4 @@
 mkdocs-material==9.6.20
 markdown-exec[ansi]==1.10.0
+mkdocstrings[python]==1.0.6
+mkdocstrings-python==2.0.9

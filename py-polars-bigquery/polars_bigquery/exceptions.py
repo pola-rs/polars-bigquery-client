@@ -1,2 +1,5 @@
+"""Exceptions raised by `polars_bigquery`."""
+
+
 class BigQueryError(Exception):
-    """Error raised by the BigQuery API."""
+    """Error raised when a BigQuery REST API request or query job fails or times out."""
