@@ -15,6 +15,7 @@ from polars_bigquery.core.compiler.ir.base import (
     Expr,
     Literal,
     NullLiteral,
+    TernaryExpr,
     UnaryExpr,
     Unsupported,
 )
@@ -25,6 +26,7 @@ from polars_bigquery.core.compiler.ir.boolean import (
     IsNull,
     Not,
     Or,
+    When,
 )
 from polars_bigquery.core.compiler.ir.comparison import (
     Eq,
@@ -89,11 +91,13 @@ __all__ = [
     "Or",
     "StartsWith",
     "StringLiteral",
+    "TernaryExpr",
     "TimestampLiteral",
     "TimestampUnit",
     "UnaryExpr",
     "Unsupported",
     "Uppercase",
+    "When",
     "base",
     "boolean",
     "comparison",
