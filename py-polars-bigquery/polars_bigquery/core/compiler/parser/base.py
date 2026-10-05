@@ -16,6 +16,7 @@ from polars_bigquery.core.compiler.ir.base import (
     NullLiteral,
     UnaryExpr,
     Unsupported,
+    VariadicExpr,
 )
 from polars_bigquery.core.compiler.ir.list_ import ListLiteral
 
@@ -606,6 +607,21 @@ def parse_binary_function(
     if inputs is None or len(inputs) != 2:
         return UNSUPPORTED_RECORD
     return ParseRecord("Binary", binary_cls, (inputs[0], inputs[1]))
+
+
+def parse_variadic_function(
+    expr_json: Any,
+    variadic_cls: type[VariadicExpr],
+    *,
+    func_spec: Any = None,
+) -> ParseRecord:
+    """Build a Variadic `ParseRecord` for `variadic_cls` from a `Function` JSON node."""
+    if not _is_valid_unit_spec(func_spec):
+        return UNSUPPORTED_RECORD
+    inputs = extract_function_inputs(expr_json, require_unit_leaf=True)
+    if inputs is None or not inputs:
+        return UNSUPPORTED_RECORD
+    return ParseRecord("Variadic", variadic_cls, tuple(inputs))
 
 
 @register_parser("$.Literal..Null")

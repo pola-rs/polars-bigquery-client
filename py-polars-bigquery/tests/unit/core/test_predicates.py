@@ -786,6 +786,7 @@ def test_json_path_parser_registration_and_dispatch() -> None:
         "$.Function.function.Boolean.IsInfinite",
         "$.Function.function.Boolean.IsFinite",
         "$.Function.function.Boolean.IsIn",
+        "$.Function.function.Coalesce",
         "$.Function.function.StringExpr.Uppercase",
         "$.Function.function.StringExpr.Lowercase",
         "$.Function.function.StringExpr.StartsWith",
@@ -1646,6 +1647,20 @@ def test_rewriter_deep_expression_avoids_stack_overflow() -> None:
             id="binary_new_children",
         ),
         pytest.param(
+            coalesce_ab := compiler.ir.Coalesce(operands=(col_a, col_b)),
+            (col_a, col_b),
+            coalesce_ab,
+            True,
+            id="variadic_same_operands_identity",
+        ),
+        pytest.param(
+            coalesce_ab,
+            (col_b, col_a),
+            compiler.ir.Coalesce(operands=(col_b, col_a)),
+            False,
+            id="variadic_new_operands",
+        ),
+        pytest.param(
             unsupported_ab := compiler.ir.Unsupported(operands=(col_a, col_b)),
             (col_a, col_b),
             unsupported_ab,
@@ -1701,6 +1716,15 @@ def test_rewriter_replace_children_replaces_or_preserves_identity(
             "BinaryExpr requires exactly 2 children",
             id="binary_wrong_arity",
         ),
+        pytest.param(
+            compiler.ir.Coalesce(
+                operands=(compiler.ir.Column("a"), compiler.ir.Column("b"))
+            ),
+            (),
+            ValueError,
+            "VariadicExpr requires at least 1 child",
+            id="variadic_empty_children",
+        ),
     ],
 )
 def test_rewriter_replace_children_rejects_invalid_arity(
@@ -1712,3 +1736,218 @@ def test_rewriter_replace_children_rejects_invalid_arity(
     # Arrange, Act & Assert
     with pytest.raises(exc_type, match=match):
         compiler.rewriter.base.replace_children(node, invalid_children)
+
+
+@pytest.mark.parametrize(
+    ("expr", "expected_sql"),
+    [
+        pytest.param(
+            pl.coalesce("a", "b") == 1,
+            "(COALESCE(`a`, `b`) = 1)",
+            id="two_column_names",
+        ),
+        pytest.param(
+            pl.coalesce(["a", "b"]) == 1,
+            "(COALESCE(`a`, `b`) = 1)",
+            id="column_name_list",
+        ),
+        pytest.param(
+            pl.coalesce(pl.col("a"), pl.col("b"), 0) > 10,
+            "(COALESCE(`a`, `b`, 0) > 10)",
+            id="columns_with_integer_default",
+        ),
+        pytest.param(
+            pl.coalesce("a") == 1,
+            "(COALESCE(`a`) = 1)",
+            id="single_column",
+        ),
+        pytest.param(
+            pl.coalesce(pl.col("flag1"), pl.col("flag2"), False),
+            "COALESCE(`flag1`, `flag2`, FALSE)",
+            id="top_level_boolean_coalesce",
+        ),
+        pytest.param(
+            pl.coalesce(
+                pl.col("a").str.to_lowercase(),
+                pl.col("b").str.to_uppercase(),
+                pl.lit("fallback"),
+            )
+            == "abc",
+            "(COALESCE(LOWER(`a`), UPPER(`b`), 'fallback') = 'abc')",
+            id="nested_string_functions_in_coalesce",
+        ),
+        pytest.param(
+            pl.coalesce(pl.coalesce("a", "b"), "c", 0) == 5,
+            "(COALESCE(COALESCE(`a`, `b`), `c`, 0) = 5)",
+            id="nested_coalesce",
+        ),
+        pytest.param(
+            (pl.coalesce("a", "b", 0) > 5) & (unsupported(pl.col("c")) == 1),
+            "(COALESCE(`a`, `b`, 0) > 5)",
+            id="coalesce_in_conjunction_with_unsupported_sibling",
+        ),
+        pytest.param(
+            pl.coalesce(~((pl.col("a") == 1) | (pl.col("b") == 2)), pl.col("c")),
+            "COALESCE(((NOT (`a` = 1)) AND (NOT (`b` = 2))), `c`)",
+            id="de_morgan_rewrite_inside_coalesce_operand",
+        ),
+        pytest.param(
+            pl.col("x").is_in(
+                pl.coalesce(
+                    pl.Series("a", [None, 2, None]),
+                    pl.Series("b", [1, None, 3]),
+                    eager=True,
+                )
+            ),
+            "(`x` IN (1, 2, 3))",
+            id="eager_coalesce_series_in_is_in",
+        ),
+    ],
+)
+def test_coalesce_expression_pushdown(
+    expr: pl.Expr,
+    expected_sql: str,
+) -> None:
+    # Arrange & Act
+    actual_sql = compiler.predicate_to_row_restriction(expr)
+
+    # Assert
+    assert actual_sql == expected_sql
+
+
+@pytest.mark.parametrize(
+    ("expr", "expected_sql"),
+    [
+        pytest.param(
+            pl.coalesce(unsupported(pl.col("a")), pl.col("b")) == 1,
+            "",
+            id="unsupported_first_operand",
+        ),
+        pytest.param(
+            pl.coalesce(pl.col("a"), unsupported(pl.col("b"))) == 1,
+            "",
+            id="unsupported_second_operand",
+        ),
+        pytest.param(
+            (pl.coalesce(unsupported(pl.col("a")), pl.col("b")) == 1)
+            & (pl.col("c") == 2),
+            "(`c` = 2)",
+            id="unsupported_coalesce_operand_preserves_sibling_and_branch",
+        ),
+        pytest.param(
+            pl.coalesce(
+                (pl.col("a") == 1) & (unsupported(pl.col("b")) == 2),
+                pl.col("c") == 3,
+            ),
+            "",
+            id="inexact_conjunction_operand_degrades_coalesce",
+        ),
+        pytest.param(
+            pl.coalesce(
+                ~((pl.col("a") == 1) | (unsupported(pl.col("b")) == 2)),
+                pl.col("c") == 3,
+            )
+            & (pl.col("d") == 4),
+            "(`d` = 4)",
+            id="inexact_de_morgan_operand_inside_coalesce_preserves_outer_and",
+        ),
+        pytest.param(
+            pl.coalesce(pl.lit(None), pl.col("a"), pl.lit("default")) == "x",
+            "",
+            id="null_literal_operand",
+        ),
+        pytest.param(
+            pl.coalesce(pl.lit(None), pl.lit(None)) == 1,
+            "",
+            id="all_null_literal_operands",
+        ),
+        pytest.param(
+            pl.coalesce(pl.lit([1, 2]), pl.col("a")) == 1,
+            "",
+            id="list_literal_operand",
+        ),
+        pytest.param(
+            pl.coalesce(pl.Series("a", [1, 2]), pl.Series("b", [3, 4])) == 1,
+            "",
+            id="series_literal_operands",
+        ),
+    ],
+)
+def test_coalesce_unsupported_and_degraded_cases(
+    expr: pl.Expr,
+    expected_sql: str,
+) -> None:
+    # Arrange & Act
+    actual_sql = compiler.predicate_to_row_restriction(expr)
+
+    # Assert
+    assert actual_sql == expected_sql
+
+
+@pytest.mark.parametrize(
+    ("spec", "expr_json"),
+    [
+        pytest.param(
+            {"unexpected": True},
+            {"input": [{"Column": "a"}]},
+            id="parameterized_spec",
+        ),
+        pytest.param(
+            "Coalesce",
+            {"input": []},
+            id="empty_inputs",
+        ),
+        pytest.param(
+            "Coalesce",
+            {"input": "not-a-list"},
+            id="invalid_inputs_type",
+        ),
+    ],
+)
+def test_parse_coalesce_rejects_invalid_inputs(
+    spec: Any,
+    expr_json: Any,
+) -> None:
+    # Arrange & Act
+    actual = compiler.parser.boolean.parse_coalesce(spec, expr_json)
+
+    # Assert
+    assert actual == compiler.parser.base.UNSUPPORTED_RECORD
+
+
+@pytest.mark.parametrize(
+    ("node", "child_results"),
+    [
+        pytest.param(
+            compiler.ir.Coalesce(operands=()),
+            [],
+            id="empty_operands",
+        ),
+        pytest.param(
+            compiler.ir.Coalesce(
+                operands=(
+                    compiler.ir.ListLiteral(values=(compiler.ir.IntLiteral(1),)),
+                    compiler.ir.Column("a"),
+                )
+            ),
+            [("(1)", True), ("`a`", True)],
+            id="list_literal_operand",
+        ),
+        pytest.param(
+            compiler.ir.Coalesce(
+                operands=(compiler.ir.NullLiteral(), compiler.ir.Column("a"))
+            ),
+            [("NULL", True), ("`a`", True)],
+            id="null_literal_operand",
+        ),
+    ],
+)
+def test_emit_coalesce_sql_rejects_invalid_inputs(
+    node: compiler.ir.Coalesce,
+    child_results: list[tuple[str | None, bool]],
+) -> None:
+    # Arrange & Act
+    actual = compiler.sql.emit_node_sql(node, child_results)
+
+    # Assert
+    assert actual == (None, False)
