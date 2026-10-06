@@ -1,25 +1,21 @@
-mod bigquery_read_retry;
 mod bigquery_read_stream;
 pub mod client_builder;
 mod error;
 
 use std::io::Cursor;
 use std::sync::Arc;
-use std::time::SystemTime;
 
 pub use client_builder::*;
 pub use error::BigQueryError;
-use gcloud_sdk::google::cloud::bigquery::storage::v1::big_query_read_client::BigQueryReadClient;
-use gcloud_sdk::google::cloud::bigquery::storage::v1::{
+use google_cloud_bigquery::model::{
     arrow_serialization_options, read_session, ArrowSerializationOptions, CreateReadSessionRequest,
     DataFormat, ReadSession,
 };
-use gcloud_sdk::prost_types::Timestamp;
-use gcloud_sdk::{GoogleApiClient, GoogleAuthMiddleware};
+use google_cloud_gax::options::RequestOptionsBuilder;
+use google_cloud_wkt::Timestamp;
 use polars_arrow::datatypes::ArrowSchemaRef;
 use polars_arrow::io::ipc::read::read_stream_metadata;
 use polars_arrow::record_batch::RecordBatch;
-use tower::ServiceExt;
 use winnow::combinator::{eof, opt, separated, terminated};
 use winnow::token::take_while;
 use winnow::Parser;
@@ -136,34 +132,28 @@ pub struct ReadOptions {
 
 impl ReadOptions {
     fn build_request(self, table_path: String, quota_project_id: &str) -> CreateReadSessionRequest {
-        let arrow_options = ArrowSerializationOptions {
-            buffer_compression: match self.arrow_buffer_compression {
-                Some(buffer_compression) => buffer_compression.into(),
-                None => DEFAULT_COMPRESSION.into(),
-            },
-            ..Default::default()
-        };
-        let table_modifiers = read_session::TableModifiers {
-            snapshot_time: self
-                .snapshot_time
-                .map(|snapshot_time| Timestamp::from(SystemTime::from(snapshot_time))),
-        };
-        let read_options = read_session::TableReadOptions {
-            output_format_serialization_options: Some(
-                read_session::table_read_options::OutputFormatSerializationOptions::ArrowSerializationOptions(arrow_options)
-            ),
-            selected_fields: self.selected_fields,
-            row_restriction: self.row_restriction,
-            sample_percentage: self.sample_percentage,
-            ..Default::default()
-        };
-        let read_session = ReadSession {
-            data_format: DataFormat::Arrow as i32,
-            table: table_path,
-            table_modifiers: Some(table_modifiers),
-            read_options: Some(read_options),
-            ..Default::default()
-        };
+        let arrow_options = ArrowSerializationOptions::new().set_buffer_compression(
+            self.arrow_buffer_compression
+                .unwrap_or(DEFAULT_COMPRESSION),
+        );
+        let table_modifiers = read_session::TableModifiers::new().set_or_clear_snapshot_time(
+            self.snapshot_time.map(|snapshot_time| {
+                Timestamp::clamp(
+                    snapshot_time.timestamp(),
+                    snapshot_time.timestamp_subsec_nanos() as i32,
+                )
+            }),
+        );
+        let read_options = read_session::TableReadOptions::new()
+            .set_arrow_serialization_options(arrow_options)
+            .set_selected_fields(self.selected_fields)
+            .set_row_restriction(self.row_restriction)
+            .set_or_clear_sample_percentage(self.sample_percentage);
+        let read_session = ReadSession::new()
+            .set_data_format(DataFormat::Arrow)
+            .set_table(table_path)
+            .set_table_modifiers(table_modifiers)
+            .set_read_options(read_options);
         let max_stream_count = if self.maintain_order {
             // If you are reading from a query results table where order matters,
             // limit this to a single stream.
@@ -176,12 +166,10 @@ impl ReadOptions {
                 })
         };
 
-        CreateReadSessionRequest {
-            parent: format!("projects/{}", quota_project_id),
-            max_stream_count,
-            read_session: Some(read_session),
-            ..Default::default()
-        }
+        CreateReadSessionRequest::new()
+            .set_parent(format!("projects/{}", quota_project_id))
+            .set_max_stream_count(max_stream_count)
+            .set_read_session(read_session)
     }
 }
 
@@ -241,30 +229,32 @@ impl From<InvalidTableId> for BigQueryError {
     }
 }
 
-pub type BigQueryClient =
-    GoogleApiClient<BQStorageGoogleApiClientBuilder, BigQueryReadClient<GoogleAuthMiddleware>>;
+pub type BigQueryClient = google_cloud_bigquery::client::Read;
 
 /// A BigQuery client for reading tables using the Storage Read API.
 ///
 /// Keeps the gRPC channel open across multiple read operations.
 #[derive(Clone)]
 pub struct Client {
-    client: Arc<BigQueryClient>,
+    client: BigQueryClient,
     quota_project_id: String,
+    user_agent: Option<String>,
 }
 
 impl Client {
     pub fn new(client: BigQueryClient, quota_project_id: String) -> Self {
         Self {
-            client: Arc::new(client),
+            client,
             quota_project_id,
+            user_agent: None,
         }
     }
 
     pub fn from_arc(client: Arc<BigQueryClient>, quota_project_id: String) -> Self {
         Self {
-            client,
+            client: (*client).clone(),
             quota_project_id,
+            user_agent: None,
         }
     }
 
@@ -279,8 +269,13 @@ impl Client {
             .quota_project_id
             .clone()
             .ok_or_else(|| "quota_project_id is required".to_string())?;
+        let user_agent = builder.user_agent.clone();
         let client = builder.build().await?;
-        Ok(Self::new(client, quota_project_id))
+        Ok(Self {
+            client,
+            quota_project_id,
+            user_agent,
+        })
     }
 
     pub async fn read_table(
@@ -289,16 +284,16 @@ impl Client {
         options: ReadOptions,
     ) -> Result<(ArrowSchemaRef, BigQueryRecordBatchReceiver), BigQueryError> {
         let request = options.build_request(table.to_table_path(), &self.quota_project_id);
-        let policy = bigquery_read_retry::RetryPolicy::create_read_session_policy();
-        let service_client = self.client.clone();
-        let service = tower::service_fn(move |req: CreateReadSessionRequest| {
-            let mut client = service_client.get();
-            async move { client.create_read_session(req).await }
-        });
-        let read_session = tower::retry::Retry::new(policy, service)
-            .oneshot(request)
-            .await?
-            .into_inner();
+        let mut create_session = self
+            .client
+            .create_read_session()
+            .with_request(request)
+            .with_idempotency(true)
+            .with_quota_project(&self.quota_project_id);
+        if let Some(ref user_agent) = self.user_agent {
+            create_session = create_session.with_user_agent(user_agent);
+        }
+        let read_session = create_session.send().await?;
         let schema = match read_session.schema {
             Some(read_session::Schema::ArrowSchema(value)) => value.serialized_schema,
             _ => {
@@ -317,15 +312,21 @@ impl Client {
             Err(_) => 2,
         };
         let (tx, rx) = tokio::sync::mpsc::channel(channel_size);
-        let shared_schema = Arc::new(schema);
         let mut handles = Vec::new();
 
         for stream in read_session.streams {
-            let stream_name = stream.name;
+            let mut read_rows = self
+                .client
+                .read_rows()
+                .set_read_stream(stream.name)
+                .with_quota_project(&self.quota_project_id);
+            if let Some(ref user_agent) = self.user_agent {
+                read_rows = read_rows.with_user_agent(user_agent);
+            }
+            let reader = read_rows.into_reader();
             let handle = tokio::task::spawn(bigquery_read_stream::read_stream(
-                self.client.clone(),
-                shared_schema.clone(),
-                stream_name,
+                reader,
+                schema.clone(),
                 tx.clone(),
             ));
             handles.push(handle);
@@ -481,7 +482,7 @@ mod tests {
         let session = request
             .read_session
             .expect("read_session should be present");
-        assert_eq!(session.data_format, DataFormat::Arrow as i32);
+        assert_eq!(session.data_format, DataFormat::Arrow);
         assert_eq!(
             session.table,
             "projects/test-project/datasets/test_dataset/tables/test_table"
@@ -507,7 +508,7 @@ mod tests {
             ) => {
                 assert_eq!(
                     arrow_opts.buffer_compression,
-                    arrow_serialization_options::CompressionCodec::Lz4Frame as i32
+                    arrow_serialization_options::CompressionCodec::Lz4Frame
                 );
             },
             other => panic!("expected ArrowSerializationOptions, got {:?}", other),
@@ -518,7 +519,10 @@ mod tests {
     fn test_read_options_all_fields_plumbed() {
         let snapshot_dt =
             chrono::DateTime::from_timestamp(1_700_000_000, 500_000_000).expect("valid timestamp");
-        let expected_timestamp = Timestamp::from(SystemTime::from(snapshot_dt));
+        let expected_timestamp = Timestamp::clamp(
+            snapshot_dt.timestamp(),
+            snapshot_dt.timestamp_subsec_nanos() as i32,
+        );
 
         let options = ReadOptions {
             maintain_order: false,
@@ -539,7 +543,7 @@ mod tests {
         let session = request
             .read_session
             .expect("read_session should be present");
-        assert_eq!(session.data_format, DataFormat::Arrow as i32);
+        assert_eq!(session.data_format, DataFormat::Arrow);
         assert_eq!(session.table, "projects/p/datasets/d/tables/t");
 
         let table_modifiers = session
@@ -562,7 +566,7 @@ mod tests {
             ) => {
                 assert_eq!(
                     arrow_opts.buffer_compression,
-                    arrow_serialization_options::CompressionCodec::Zstd as i32
+                    arrow_serialization_options::CompressionCodec::Zstd
                 );
             },
             other => panic!("expected ArrowSerializationOptions, got {:?}", other),
@@ -592,19 +596,19 @@ mod tests {
         let codecs = [
             (
                 None,
-                arrow_serialization_options::CompressionCodec::Lz4Frame as i32,
+                arrow_serialization_options::CompressionCodec::Lz4Frame,
             ),
             (
                 Some(arrow_serialization_options::CompressionCodec::Lz4Frame),
-                arrow_serialization_options::CompressionCodec::Lz4Frame as i32,
+                arrow_serialization_options::CompressionCodec::Lz4Frame,
             ),
             (
                 Some(arrow_serialization_options::CompressionCodec::Zstd),
-                arrow_serialization_options::CompressionCodec::Zstd as i32,
+                arrow_serialization_options::CompressionCodec::Zstd,
             ),
             (
                 Some(arrow_serialization_options::CompressionCodec::CompressionUnspecified),
-                arrow_serialization_options::CompressionCodec::CompressionUnspecified as i32,
+                arrow_serialization_options::CompressionCodec::CompressionUnspecified,
             ),
         ];
 

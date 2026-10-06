@@ -1,8 +1,6 @@
-use gcloud_sdk::tonic;
-
 #[derive(Debug)]
 pub enum BigQueryError {
-    Grpc(tonic::Status),
+    Grpc(google_cloud_bigquery::Error),
     Arrow(polars_error::PolarsError),
     Protocol(String),
     Other(Box<dyn std::error::Error + Send + Sync>),
@@ -30,8 +28,8 @@ impl std::error::Error for BigQueryError {
     }
 }
 
-impl From<tonic::Status> for BigQueryError {
-    fn from(s: tonic::Status) -> Self {
+impl From<google_cloud_bigquery::Error> for BigQueryError {
+    fn from(s: google_cloud_bigquery::Error) -> Self {
         Self::Grpc(s)
     }
 }
