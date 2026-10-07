@@ -35,6 +35,16 @@ class BinaryExpr(Expr):
 
 
 @dataclasses.dataclass(frozen=True)
+class VariadicExpr(Expr):
+    """Base class for variadic operation IR nodes."""
+
+    operands: tuple[Expr, ...] = ()
+
+    def children(self) -> tuple[Expr, ...]:
+        return self.operands
+
+
+@dataclasses.dataclass(frozen=True)
 class Unsupported(Expr):
     """IR node representing an unsupported or unknown expression."""
 

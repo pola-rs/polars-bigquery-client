@@ -3,6 +3,7 @@ from __future__ import annotations
 from polars_bigquery.core.compiler.ir.boolean import (
     And,
     BoolLiteral,
+    Coalesce,
     IsNotNull,
     IsNull,
     Not,
@@ -34,6 +35,13 @@ def format_is_null(_node: IsNull, operand: str) -> str:
 @format_operator_sql.register
 def format_is_not_null(_node: IsNotNull, operand: str) -> str:
     return f"({operand} IS NOT NULL)"
+
+
+@format_operator_sql.register
+def format_coalesce(_node: Coalesce, *operands: str) -> str | None:
+    if not operands:
+        return None
+    return f"COALESCE({', '.join(operands)})"
 
 
 @emit_node_sql.register

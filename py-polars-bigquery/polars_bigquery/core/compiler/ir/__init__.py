@@ -17,10 +17,12 @@ from polars_bigquery.core.compiler.ir.base import (
     NullLiteral,
     UnaryExpr,
     Unsupported,
+    VariadicExpr,
 )
 from polars_bigquery.core.compiler.ir.boolean import (
     And,
     BoolLiteral,
+    Coalesce,
     IsNotNull,
     IsNull,
     Not,
@@ -61,6 +63,7 @@ __all__ = [
     "And",
     "BinaryExpr",
     "BoolLiteral",
+    "Coalesce",
     "Column",
     "Contains",
     "DateLiteral",
@@ -94,6 +97,7 @@ __all__ = [
     "UnaryExpr",
     "Unsupported",
     "Uppercase",
+    "VariadicExpr",
     "base",
     "boolean",
     "comparison",

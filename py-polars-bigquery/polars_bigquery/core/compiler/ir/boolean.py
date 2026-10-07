@@ -6,6 +6,7 @@ from polars_bigquery.core.compiler.ir.base import (
     BinaryExpr,
     Literal,
     UnaryExpr,
+    VariadicExpr,
 )
 
 
@@ -39,3 +40,8 @@ class IsNull(UnaryExpr):
 @dataclasses.dataclass(frozen=True)
 class IsNotNull(UnaryExpr):
     """IR node representing an IS NOT NULL check."""
+
+
+@dataclasses.dataclass(frozen=True)
+class Coalesce(VariadicExpr):
+    """IR node representing a COALESCE expression."""
