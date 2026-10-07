@@ -11,7 +11,11 @@ use google_cloud_bigquery::model::{
     arrow_serialization_options, read_session, ArrowSerializationOptions, CreateReadSessionRequest,
     DataFormat, ReadSession,
 };
+use google_cloud_bigquery::read::Reader;
+use google_cloud_gax::backoff_policy::BackoffPolicy;
 use google_cloud_gax::options::RequestOptionsBuilder;
+use google_cloud_gax::retry_policy::RetryPolicy;
+use google_cloud_gax::retry_throttler::SharedRetryThrottler;
 use google_cloud_wkt::Timestamp;
 use polars_arrow::datatypes::ArrowSchemaRef;
 use polars_arrow::io::ipc::read::read_stream_metadata;
@@ -132,10 +136,8 @@ pub struct ReadOptions {
 
 impl ReadOptions {
     fn build_request(self, table_path: String, quota_project_id: &str) -> CreateReadSessionRequest {
-        let arrow_options = ArrowSerializationOptions::new().set_buffer_compression(
-            self.arrow_buffer_compression
-                .unwrap_or(DEFAULT_COMPRESSION),
-        );
+        let arrow_options = ArrowSerializationOptions::new()
+            .set_buffer_compression(self.arrow_buffer_compression.unwrap_or(DEFAULT_COMPRESSION));
         let table_modifiers = read_session::TableModifiers::new().set_or_clear_snapshot_time(
             self.snapshot_time.map(|snapshot_time| {
                 Timestamp::clamp(
@@ -239,22 +241,39 @@ pub struct Client {
     client: BigQueryClient,
     quota_project_id: String,
     user_agent: Option<String>,
+    retry_policy: Option<Arc<dyn RetryPolicy>>,
+    backoff_policy: Option<Arc<dyn BackoffPolicy>>,
+    retry_throttler: Option<SharedRetryThrottler>,
 }
 
 impl Client {
+    pub fn builder() -> ServiceConfigBuilder {
+        ServiceConfigBuilder::new()
+    }
+
     pub fn new(client: BigQueryClient, quota_project_id: String) -> Self {
-        Self {
-            client,
-            quota_project_id,
-            user_agent: None,
-        }
+        Self::from_parts(client, quota_project_id, None, None, None, None)
     }
 
     pub fn from_arc(client: Arc<BigQueryClient>, quota_project_id: String) -> Self {
+        Self::new((*client).clone(), quota_project_id)
+    }
+
+    pub(crate) fn from_parts(
+        client: BigQueryClient,
+        quota_project_id: String,
+        user_agent: Option<String>,
+        retry_policy: Option<Arc<dyn RetryPolicy>>,
+        backoff_policy: Option<Arc<dyn BackoffPolicy>>,
+        retry_throttler: Option<SharedRetryThrottler>,
+    ) -> Self {
         Self {
-            client: (*client).clone(),
+            client,
             quota_project_id,
-            user_agent: None,
+            user_agent,
+            retry_policy,
+            backoff_policy,
+            retry_throttler,
         }
     }
 
@@ -262,20 +281,29 @@ impl Client {
         &self.quota_project_id
     }
 
-    pub async fn from_builder(
-        builder: ServiceConfigBuilder,
-    ) -> Result<Self, Box<dyn std::error::Error>> {
-        let quota_project_id = builder
-            .quota_project_id
-            .clone()
-            .ok_or_else(|| "quota_project_id is required".to_string())?;
-        let user_agent = builder.user_agent.clone();
-        let client = builder.build().await?;
-        Ok(Self {
-            client,
-            quota_project_id,
-            user_agent,
-        })
+    pub async fn from_builder(builder: ServiceConfigBuilder) -> Result<Self, BigQueryError> {
+        builder.build().await
+    }
+
+    fn apply_request_options<B: RequestOptionsBuilder>(&self, builder: B) -> B {
+        let builder = builder.with_quota_project(&self.quota_project_id);
+        match &self.user_agent {
+            Some(user_agent) => builder.with_user_agent(user_agent),
+            None => builder,
+        }
+    }
+
+    fn configure_reader(&self, mut reader: Reader) -> Reader {
+        if let Some(ref retry_policy) = self.retry_policy {
+            reader = reader.with_retry_policy(retry_policy.clone());
+        }
+        if let Some(ref backoff_policy) = self.backoff_policy {
+            reader = reader.with_backoff_policy(backoff_policy.clone());
+        }
+        if let Some(ref retry_throttler) = self.retry_throttler {
+            reader = reader.with_retry_throttler(retry_throttler.clone());
+        }
+        reader
     }
 
     pub async fn read_table(
@@ -284,15 +312,12 @@ impl Client {
         options: ReadOptions,
     ) -> Result<(ArrowSchemaRef, BigQueryRecordBatchReceiver), BigQueryError> {
         let request = options.build_request(table.to_table_path(), &self.quota_project_id);
-        let mut create_session = self
-            .client
-            .create_read_session()
-            .with_request(request)
-            .with_idempotency(true)
-            .with_quota_project(&self.quota_project_id);
-        if let Some(ref user_agent) = self.user_agent {
-            create_session = create_session.with_user_agent(user_agent);
-        }
+        let create_session = self.apply_request_options(
+            self.client
+                .create_read_session()
+                .with_request(request)
+                .with_idempotency(true),
+        );
         let read_session = create_session.send().await?;
         let schema = match read_session.schema {
             Some(read_session::Schema::ArrowSchema(value)) => value.serialized_schema,
@@ -315,15 +340,9 @@ impl Client {
         let mut handles = Vec::new();
 
         for stream in read_session.streams {
-            let mut read_rows = self
-                .client
-                .read_rows()
-                .set_read_stream(stream.name)
-                .with_quota_project(&self.quota_project_id);
-            if let Some(ref user_agent) = self.user_agent {
-                read_rows = read_rows.with_user_agent(user_agent);
-            }
-            let reader = read_rows.into_reader();
+            let read_rows =
+                self.apply_request_options(self.client.read_rows().set_read_stream(stream.name));
+            let reader = self.configure_reader(read_rows.into_reader());
             let handle = tokio::task::spawn(bigquery_read_stream::read_stream(
                 reader,
                 schema.clone(),
@@ -635,5 +654,176 @@ mod tests {
                 other => panic!("expected ArrowSerializationOptions, got {:?}", other),
             }
         }
+    }
+
+    fn empty_arrow_schema_bytes() -> Vec<u8> {
+        use polars_arrow::datatypes::{ArrowDataType, ArrowSchema, Field};
+        use polars_arrow::io::ipc::write::{StreamWriter, WriteOptions};
+
+        let schema =
+            ArrowSchema::from_iter(vec![Field::new("col1".into(), ArrowDataType::Int32, false)]);
+        let mut bytes = Vec::new();
+        let mut writer = StreamWriter::new(&mut bytes, WriteOptions { compression: None });
+        writer.start(&schema, None).unwrap();
+        bytes
+    }
+
+    #[tokio::test]
+    async fn test_client_read_table_applies_options_and_forwards_retry_config() {
+        use std::sync::Mutex;
+        use std::time::Duration;
+
+        use google_cloud_bigquery::client::Read;
+        use google_cloud_bigquery::model::{
+            ArrowSchema as BqArrowSchema, ReadRowsRequest, ReadRowsResponse, ReadStream,
+        };
+        use google_cloud_bigquery::read::retry_policy::RetryableErrors;
+        use google_cloud_gax::error::rpc::{Code, Status};
+        use google_cloud_gax::error::Error as GaxError;
+        use google_cloud_gax::options::RequestOptions;
+        use google_cloud_gax::response::Response;
+        use google_cloud_gax::retry_policy::RetryPolicyExt;
+        use google_cloud_gax::retry_state::RetryState;
+        use google_cloud_gax::streaming::ResponseStream;
+
+        #[derive(Debug, Default)]
+        struct NoBackoff;
+        impl BackoffPolicy for NoBackoff {
+            fn on_failure(&self, _state: &RetryState) -> Duration {
+                Duration::ZERO
+            }
+        }
+
+        #[derive(Debug, Default)]
+        struct RecordedOptions {
+            create_quota_project: Option<String>,
+            create_user_agent: Option<String>,
+            read_rows_calls: usize,
+            read_rows_quota_project: Option<String>,
+            read_rows_user_agent: Option<String>,
+        }
+
+        #[derive(Debug)]
+        struct MockReadStub {
+            recorded: Arc<Mutex<RecordedOptions>>,
+        }
+
+        impl google_cloud_bigquery::stub::Read for MockReadStub {
+            async fn create_read_session(
+                &self,
+                _req: CreateReadSessionRequest,
+                options: RequestOptions,
+            ) -> google_cloud_bigquery::Result<Response<ReadSession>> {
+                {
+                    let mut rec = self.recorded.lock().unwrap();
+                    rec.create_quota_project = options.quota_project().clone();
+                    rec.create_user_agent = options.user_agent().clone();
+                }
+                let session = ReadSession::new()
+                    .set_arrow_schema(
+                        BqArrowSchema::new().set_serialized_schema(empty_arrow_schema_bytes()),
+                    )
+                    .set_streams(vec![ReadStream::new().set_name("streams/s1")]);
+                Ok(Response::from(session))
+            }
+
+            async fn read_rows(
+                &self,
+                _req: ReadRowsRequest,
+                options: RequestOptions,
+            ) -> google_cloud_bigquery::Result<ResponseStream<ReadRowsResponse>> {
+                let mut rec = self.recorded.lock().unwrap();
+                rec.read_rows_calls += 1;
+                rec.read_rows_quota_project = options.quota_project().clone();
+                rec.read_rows_user_agent = options.user_agent().clone();
+                Err(GaxError::service(
+                    Status::default()
+                        .set_code(Code::Unavailable)
+                        .set_message("transient failure"),
+                ))
+            }
+        }
+
+        let recorded = Arc::new(Mutex::new(RecordedOptions::default()));
+        let stub = MockReadStub {
+            recorded: recorded.clone(),
+        };
+        // Configure attempt_limit(1) so Reader performs 0 retries (proving Client's retry_policy
+        // is forwarded to Reader rather than discarded in favor of Reader's 10-attempt default).
+        let client = Client::from_parts(
+            Read::from_stub(stub),
+            "test-quota-proj".to_string(),
+            Some("custom-ua/2.0".to_string()),
+            Some(Arc::new(RetryableErrors.with_attempt_limit(1))),
+            Some(Arc::new(NoBackoff)),
+            None,
+        );
+
+        let table: BigQueryTableId = "proj.ds.tbl".parse().unwrap();
+        let (_, mut rx) = client
+            .read_table(&table, ReadOptions::default())
+            .await
+            .unwrap();
+
+        let err = rx.recv().await.unwrap().unwrap_err();
+        assert!(matches!(err, BigQueryError::Grpc(_)));
+
+        let rec = recorded.lock().unwrap();
+        assert_eq!(rec.create_quota_project.as_deref(), Some("test-quota-proj"));
+        assert_eq!(rec.create_user_agent.as_deref(), Some("custom-ua/2.0"));
+        assert_eq!(
+            rec.read_rows_quota_project.as_deref(),
+            Some("test-quota-proj")
+        );
+        assert_eq!(rec.read_rows_user_agent.as_deref(), Some("custom-ua/2.0"));
+        assert_eq!(
+            rec.read_rows_calls, 1,
+            "Reader should respect Client's attempt_limit(1) instead of discarding it"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_client_read_table_preserves_causal_error_chain() {
+        use std::error::Error as _;
+
+        use google_cloud_auth::errors::CredentialsError;
+        use google_cloud_bigquery::client::Read;
+        use google_cloud_gax::error::Error as GaxError;
+        use google_cloud_gax::options::RequestOptions;
+        use google_cloud_gax::response::Response;
+
+        #[derive(Debug)]
+        struct FailingAuthStub;
+
+        impl google_cloud_bigquery::stub::Read for FailingAuthStub {
+            async fn create_read_session(
+                &self,
+                _req: CreateReadSessionRequest,
+                _options: RequestOptions,
+            ) -> google_cloud_bigquery::Result<Response<ReadSession>> {
+                let io_err = std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "socket permission denied",
+                );
+                let cred_err = CredentialsError::new(false, "custom auth provider failed", io_err);
+                Err(GaxError::authentication(cred_err))
+            }
+        }
+
+        let client = Client::new(Read::from_stub(FailingAuthStub), "quota-proj".to_string());
+        let table: BigQueryTableId = "proj.ds.tbl".parse().unwrap();
+        let err = match client.read_table(&table, ReadOptions::default()).await {
+            Err(e) => e,
+            Ok(_) => panic!("expected read_table to fail"),
+        };
+
+        let s1 = err.source().expect("GaxError");
+        let s2 = s1.source().expect("CredentialsError");
+        let s3 = s2.source().expect("io::Error");
+        assert!(s3.to_string().contains("socket permission denied"));
+
+        let chain = err.format_causal_chain();
+        assert!(chain.contains("custom auth provider failed"));
+        assert!(chain.contains("caused by: socket permission denied"));
     }
 }

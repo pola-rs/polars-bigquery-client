@@ -3279,12 +3279,12 @@ dependencies = [
  "chrono",
  "google-cloud-auth",
  "google-cloud-bigquery",
+ "google-cloud-gax",
  "http",
  "polars-arrow",
  "pyo3",
  "pyo3-async-runtimes",
  "pyo3-polars",
- "rustls",
  "tokio",
 ]
 
