@@ -4,7 +4,7 @@ use google_cloud_auth::credentials::Credentials;
 use google_cloud_bigquery::client::Read;
 use google_cloud_gax::backoff_policy::{BackoffPolicy, BackoffPolicyArg};
 use google_cloud_gax::retry_policy::{RetryPolicy, RetryPolicyArg};
-use google_cloud_gax::retry_throttler::{RetryThrottlerArg, SharedRetryThrottler};
+use google_cloud_gax::retry_throttler::{AdaptiveThrottler, RetryThrottlerArg, SharedRetryThrottler};
 
 use crate::{BigQueryError, Client};
 
@@ -17,6 +17,16 @@ fn init_crypto() {
     });
 }
 
+pub(crate) fn default_retry_throttler() -> SharedRetryThrottler {
+    RetryThrottlerArg::from(AdaptiveThrottler::default()).into()
+}
+
+pub(crate) fn default_grpc_subchannel_count() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get().clamp(1, 8))
+        .unwrap_or(1)
+}
+
 #[derive(Default)]
 pub struct ServiceConfigBuilder {
     cred: Option<Credentials>,
@@ -26,6 +36,7 @@ pub struct ServiceConfigBuilder {
     retry_policy: Option<Arc<dyn RetryPolicy>>,
     backoff_policy: Option<Arc<dyn BackoffPolicy>>,
     retry_throttler: Option<SharedRetryThrottler>,
+    grpc_subchannel_count: Option<usize>,
 }
 
 impl ServiceConfigBuilder {
@@ -68,6 +79,14 @@ impl ServiceConfigBuilder {
         self
     }
 
+    /// Sets the number of independent gRPC channels (HTTP/2 connections) pooled by the client.
+    ///
+    /// Defaults to `available_parallelism().clamp(1, 8)`. Values of `0` are clamped to `1`.
+    pub fn with_grpc_subchannel_count(mut self, count: usize) -> Self {
+        self.grpc_subchannel_count = Some(count.max(1));
+        self
+    }
+
     pub fn quota_project_id(&self) -> Option<&str> {
         self.quota_project_id.as_deref()
     }
@@ -80,44 +99,64 @@ impl ServiceConfigBuilder {
         self.user_agent.as_deref()
     }
 
+    pub fn grpc_subchannel_count(&self) -> Option<usize> {
+        self.grpc_subchannel_count
+    }
+
     pub async fn build(self) -> Result<Client, BigQueryError> {
         let quota_project_id = self
             .quota_project_id
+            .filter(|s| !s.trim().is_empty())
             .ok_or_else(|| BigQueryError::InvalidConfig("quota_project_id is required".into()))?;
 
         init_crypto();
 
-        let mut builder = Read::builder();
+        let subchannel_count = self
+            .grpc_subchannel_count
+            .unwrap_or_else(default_grpc_subchannel_count)
+            .max(1);
 
-        if let Some(endpoint) = self.endpoint {
-            builder = builder.with_endpoint(endpoint);
+        // Resolve credentials and the shared retry throttler once so all pooled gRPC channels
+        // and stream readers share a single token cache and adaptive retry budget.
+        let cred = match self.cred {
+            Some(cred) => cred,
+            None => google_cloud_auth::credentials::Builder::default()
+                .build()
+                .map_err(google_cloud_gax::client_builder::Error::cred)?,
+        };
+
+        let retry_throttler = self
+            .retry_throttler
+            .unwrap_or_else(default_retry_throttler);
+
+        let mut clients = Vec::with_capacity(subchannel_count);
+        for _ in 0..subchannel_count {
+            let mut builder = Read::builder()
+                .with_credentials(cred.clone())
+                .with_retry_throttler(retry_throttler.clone());
+
+            if let Some(ref endpoint) = self.endpoint {
+                builder = builder.with_endpoint(endpoint.clone());
+            }
+
+            if let Some(ref retry_policy) = self.retry_policy {
+                builder = builder.with_retry_policy(retry_policy.clone());
+            }
+
+            if let Some(ref backoff_policy) = self.backoff_policy {
+                builder = builder.with_backoff_policy(backoff_policy.clone());
+            }
+
+            clients.push(builder.build().await?);
         }
-
-        if let Some(cred) = self.cred {
-            builder = builder.with_credentials(cred);
-        }
-
-        if let Some(ref retry_policy) = self.retry_policy {
-            builder = builder.with_retry_policy(retry_policy.clone());
-        }
-
-        if let Some(ref backoff_policy) = self.backoff_policy {
-            builder = builder.with_backoff_policy(backoff_policy.clone());
-        }
-
-        if let Some(ref retry_throttler) = self.retry_throttler {
-            builder = builder.with_retry_throttler(retry_throttler.clone());
-        }
-
-        let client = builder.build().await?;
 
         Ok(Client::from_parts(
-            client,
+            clients,
             quota_project_id,
             self.user_agent,
             self.retry_policy,
             self.backoff_policy,
-            self.retry_throttler,
+            retry_throttler,
         ))
     }
 }
@@ -141,6 +180,7 @@ mod tests {
         assert!(builder.retry_policy.is_none());
         assert!(builder.backoff_policy.is_none());
         assert!(builder.retry_throttler.is_none());
+        assert!(builder.grpc_subchannel_count.is_none());
     }
 
     #[test]
@@ -153,7 +193,8 @@ mod tests {
             .with_quota_project_id(Some("custom-project".to_string()))
             .with_retry_policy(RetryableErrors.with_attempt_limit(3))
             .with_backoff_policy(ExponentialBackoff::default())
-            .with_retry_throttler(AdaptiveThrottler::default());
+            .with_retry_throttler(AdaptiveThrottler::default())
+            .with_grpc_subchannel_count(4);
 
         assert_eq!(builder.endpoint(), Some("https://custom.endpoint.com"));
         assert!(builder.cred.is_some());
@@ -162,17 +203,45 @@ mod tests {
         assert!(builder.retry_policy.is_some());
         assert!(builder.backoff_policy.is_some());
         assert!(builder.retry_throttler.is_some());
+        assert_eq!(builder.grpc_subchannel_count(), Some(4));
+
+        let zero_clamped = ServiceConfigBuilder::new().with_grpc_subchannel_count(0);
+        assert_eq!(zero_clamped.grpc_subchannel_count(), Some(1));
     }
 
     #[tokio::test]
-    async fn test_service_config_builder_missing_quota_project_id() {
+    async fn test_service_config_builder_missing_or_empty_quota_project_id() {
         let cred = google_cloud_auth::credentials::anonymous::Builder::new().build();
-        let result = ServiceConfigBuilder::new().with_cred(cred).build().await;
+        let result = ServiceConfigBuilder::new()
+            .with_cred(cred.clone())
+            .build()
+            .await;
         match result {
             Err(BigQueryError::InvalidConfig(msg)) => {
                 assert!(msg.contains("quota_project_id is required"));
             },
             other => panic!("expected InvalidConfig error, got {:?}", other.err()),
         }
+
+        let empty_result = ServiceConfigBuilder::new()
+            .with_cred(cred)
+            .with_quota_project_id(Some("   ".to_string()))
+            .build()
+            .await;
+        assert!(matches!(empty_result, Err(BigQueryError::InvalidConfig(_))));
+    }
+
+    #[tokio::test]
+    async fn test_service_config_builder_builds_subchannel_pool() {
+        let cred = google_cloud_auth::credentials::anonymous::Builder::new().build();
+        let client = ServiceConfigBuilder::new()
+            .with_cred(cred)
+            .with_quota_project_id(Some("test-project".to_string()))
+            .with_grpc_subchannel_count(3)
+            .build()
+            .await
+            .expect("client should build");
+
+        assert_eq!(client.grpc_subchannel_count(), 3);
     }
 }

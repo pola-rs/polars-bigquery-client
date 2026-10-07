@@ -18,10 +18,12 @@ pyo3-async-runtimes = { version = "0.27", features = ["attributes", "tokio-runti
 pyo3-polars = { version = "0.26.0", features = ["derive", "lazy"] }
 polars-arrow = { version = "0.53.0", default-features = false }
 tokio = { version = "1.51.0", features = ["rt", "sync", "time"] }
+tracing = "0.1"
 
 [features]
 extension-module = ["pyo3/extension-module"]
-default = []
+testing = ["arrow-bigquery-lib/testing"]
+default = ["testing"]
 
 [dev-dependencies]
 google-cloud-gax = { git = "https://github.com/tswast/google-cloud-rust.git", branch = "tswast-bq-storage-reader" }

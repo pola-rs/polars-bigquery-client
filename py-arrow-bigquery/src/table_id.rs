@@ -1,7 +1,22 @@
+use pyo3::exceptions::{PyAttributeError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
 
-/// A Python-exposed representation of a BigQuery table identifier.
-#[pyclass(name = "BigQueryTableId")]
+/// Helper that extracts an optional string attribute from a Python object:
+/// - Returns `Ok(None)` only when the attribute does not exist (`AttributeError`) or is `None`.
+/// - Propagates any exception raised inside a property getter (e.g., `RuntimeError`, `KeyboardInterrupt`)
+///   instead of silently swallowing it.
+fn get_optional_string_attr(obj: &Bound<'_, PyAny>, attr: &str) -> PyResult<Option<String>> {
+    let py = obj.py();
+    match obj.getattr(attr) {
+        Ok(val) if val.is_none() => Ok(None),
+        Ok(val) => val.extract::<String>().map(Some),
+        Err(err) if err.is_instance_of::<PyAttributeError>(py) => Ok(None),
+        Err(err) => Err(err),
+    }
+}
+
+/// A Python-exposed representation of an immutable BigQuery table identifier.
+#[pyclass(name = "BigQueryTableId", frozen, eq, hash)]
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct BigQueryTableId {
     pub inner: arrow_bigquery_lib::BigQueryTableId,
@@ -13,19 +28,15 @@ impl BigQueryTableId {
     #[pyo3(signature = (project_id, dataset_id, table_id))]
     pub fn new(project_id: String, dataset_id: String, table_id: String) -> Self {
         Self {
-            inner: arrow_bigquery_lib::BigQueryTableId {
-                project_id,
-                dataset_id,
-                table_id,
-            },
+            inner: arrow_bigquery_lib::BigQueryTableId::new(project_id, dataset_id, table_id),
         }
     }
 
     #[staticmethod]
     pub fn from_string(s: &str) -> PyResult<Self> {
-        let inner: arrow_bigquery_lib::BigQueryTableId = s.parse().map_err(|_| {
-            pyo3::exceptions::PyValueError::new_err(format!("Invalid table ID: {s}"))
-        })?;
+        let inner: arrow_bigquery_lib::BigQueryTableId = s
+            .parse()
+            .map_err(|_| PyValueError::new_err(format!("Invalid table ID: {s}")))?;
         Ok(Self { inner })
     }
 
@@ -40,39 +51,25 @@ impl BigQueryTableId {
     #[staticmethod]
     pub fn parse(table_id: &Bound<'_, PyAny>) -> PyResult<Self> {
         if let Ok(existing) = table_id.cast::<BigQueryTableId>() {
-            return Ok(existing.borrow().clone());
+            return Ok(existing.get().clone());
         }
 
         if let Ok(s) = table_id.extract::<&str>() {
             return Self::from_string(s);
         }
 
-        let project = table_id
-            .getattr("project")
-            .ok()
-            .and_then(|p| p.extract::<String>().ok())
-            .or_else(|| {
-                table_id
-                    .getattr("project_id")
-                    .ok()
-                    .and_then(|p| p.extract::<String>().ok())
-            });
-
-        let dataset = table_id
-            .getattr("dataset_id")
-            .ok()
-            .and_then(|d| d.extract::<String>().ok());
-
-        let table = table_id
-            .getattr("table_id")
-            .ok()
-            .and_then(|t| t.extract::<String>().ok());
+        let project = match get_optional_string_attr(table_id, "project")? {
+            Some(p) => Some(p),
+            None => get_optional_string_attr(table_id, "project_id")?,
+        };
+        let dataset = get_optional_string_attr(table_id, "dataset_id")?;
+        let table = get_optional_string_attr(table_id, "table_id")?;
 
         if let (Some(project), Some(dataset), Some(table)) = (project, dataset, table) {
             return Ok(Self::new(project, dataset, table));
         }
 
-        Err(pyo3::exceptions::PyTypeError::new_err(format!(
+        Err(PyTypeError::new_err(format!(
             "Expected table_id to be a string or BigQuery table object, got {}",
             table_id.get_type()
         )))
@@ -83,29 +80,14 @@ impl BigQueryTableId {
         &self.inner.project_id
     }
 
-    #[setter]
-    pub fn set_project_id(&mut self, value: String) {
-        self.inner.project_id = value;
-    }
-
     #[getter]
     pub fn dataset_id(&self) -> &str {
         &self.inner.dataset_id
     }
 
-    #[setter]
-    pub fn set_dataset_id(&mut self, value: String) {
-        self.inner.dataset_id = value;
-    }
-
     #[getter]
     pub fn table_id(&self) -> &str {
         &self.inner.table_id
-    }
-
-    #[setter]
-    pub fn set_table_id(&mut self, value: String) {
-        self.inner.table_id = value;
     }
 
     #[getter]
@@ -125,21 +107,6 @@ impl BigQueryTableId {
             "{}.{}.{}",
             self.inner.project_id, self.inner.dataset_id, self.inner.table_id
         )
-    }
-
-    fn __richcmp__(&self, other: &Self, op: pyo3::pyclass::CompareOp) -> bool {
-        match op {
-            pyo3::pyclass::CompareOp::Eq => self.inner == other.inner,
-            pyo3::pyclass::CompareOp::Ne => self.inner != other.inner,
-            _ => false,
-        }
-    }
-
-    fn __hash__(&self) -> u64 {
-        use std::hash::{Hash, Hasher};
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        self.inner.hash(&mut hasher);
-        hasher.finish()
     }
 }
 
@@ -167,5 +134,37 @@ impl std::str::FromStr for BigQueryTableId {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         let inner = s.parse()?;
         Ok(Self { inner })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use pyo3::exceptions::PyRuntimeError;
+    use pyo3::types::PyDict;
+
+    use super::*;
+
+    #[test]
+    fn test_bigquery_table_id_parse_propagates_property_exceptions() {
+        Python::initialize();
+        Python::attach(|py| {
+            let locals = PyDict::new(py);
+            py.run(
+                c"
+class BrokenTable:
+    @property
+    def project(self):
+        raise RuntimeError('custom property failure')
+obj = BrokenTable()
+",
+                None,
+                Some(&locals),
+            )
+            .unwrap();
+            let obj = locals.get_item("obj").unwrap().unwrap();
+            let err = BigQueryTableId::parse(&obj).unwrap_err();
+            assert!(err.is_instance_of::<PyRuntimeError>(py));
+            assert!(err.to_string().contains("custom property failure"));
+        });
     }
 }

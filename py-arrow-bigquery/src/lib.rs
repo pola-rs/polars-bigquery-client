@@ -2,6 +2,7 @@ mod auth;
 mod error;
 mod stream;
 mod table_id;
+#[cfg(feature = "testing")]
 mod testing;
 
 use google_cloud_auth::credentials::Credentials;
@@ -11,7 +12,6 @@ use pyo3::prelude::*;
 use pyo3::types::PyDateTime;
 pub use stream::ArrowStreamExporter;
 pub use table_id::BigQueryTableId;
-pub use testing::{_create_test_exporter, _test_create_exporter_with_drop_flag, DropFlag};
 
 /// A Python-exposed client that keeps the BigQuery Storage Read API gRPC channel
 /// open across multiple table read operations, caching the OAuth2 token in Rust.
@@ -145,11 +145,17 @@ fn parse_read_options(
 #[pymodule]
 #[pyo3(name = "_native")]
 fn polars_bigquery(m: &Bound<PyModule>) -> PyResult<()> {
+    m.add("BigQueryError", m.py().get_type::<error::BigQueryError>())?;
     m.add_class::<Client>()?;
     m.add_class::<BigQueryTableId>()?;
-    m.add_wrapped(wrap_pyfunction!(_create_test_exporter))?;
-    m.add_wrapped(wrap_pyfunction!(_test_create_exporter_with_drop_flag))?;
-    m.add_class::<DropFlag>()?;
+    #[cfg(feature = "testing")]
+    {
+        m.add_wrapped(wrap_pyfunction!(testing::_create_test_exporter))?;
+        m.add_wrapped(wrap_pyfunction!(
+            testing::_test_create_exporter_with_drop_flag
+        ))?;
+        m.add_class::<testing::DropFlag>()?;
+    }
 
     Ok(())
 }
@@ -408,6 +414,7 @@ mod tests {
                 Ok(_) => panic!("expected read_table to fail"),
             };
 
+            assert!(err.is_instance_of::<error::BigQueryError>(py));
             let msg = err.to_string();
             assert!(msg.contains("Python credentials provider failed"));
             assert!(msg.contains("caused by: ValueError: underlying python token generator broke"));

@@ -1,14 +1,27 @@
 use std::error::Error as StdError;
 
-use arrow_bigquery_lib::BigQueryError;
-use pyo3::exceptions::PyRuntimeError;
+use arrow_bigquery_lib::BigQueryError as LibBigQueryError;
+use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 
-/// Converts a [`BigQueryError`] into a [`PyErr`] while preserving the full causal chain:
-/// - The top-level [`PyRuntimeError`] message includes [`BigQueryError::format_causal_chain`].
+pyo3::create_exception!(
+    arrow_bigquery.exceptions,
+    BigQueryError,
+    PyRuntimeError,
+    "Error raised by the BigQuery API."
+);
+
+/// Converts a [`LibBigQueryError`] into a [`PyErr`] while preserving the full causal chain:
+/// - Configuration/validation errors ([`LibBigQueryError::InvalidConfig`]) raise [`PyValueError`].
+/// - All other BigQuery errors raise [`BigQueryError`] (which subclasses [`PyRuntimeError`]),
+///   with the top-level message formatted via [`LibBigQueryError::format_causal_chain`].
 /// - Every underlying [`StdError::source`] is attached via Python's `__cause__` (`raise ... from ...`),
 ///   recovering any original [`PyErr`] instances (such as exceptions raised by a Python credentials provider).
-pub(crate) fn to_py_err(py: Python<'_>, err: BigQueryError) -> PyErr {
+pub(crate) fn to_py_err(py: Python<'_>, err: LibBigQueryError) -> PyErr {
+    if matches!(err, LibBigQueryError::InvalidConfig(_)) {
+        return PyValueError::new_err(err.format_causal_chain());
+    }
+
     let mut sources: Vec<&(dyn StdError + 'static)> = Vec::new();
     let mut current = err.source();
     while let Some(src) = current {
@@ -25,7 +38,7 @@ pub(crate) fn to_py_err(py: Python<'_>, err: BigQueryError) -> PyErr {
             }
             cause = Some(cloned);
         } else {
-            let layer_err = PyRuntimeError::new_err(src.to_string());
+            let layer_err = BigQueryError::new_err(src.to_string());
             if let Some(prev_cause) = cause.take() {
                 layer_err.set_cause(py, Some(prev_cause));
             }
@@ -33,7 +46,7 @@ pub(crate) fn to_py_err(py: Python<'_>, err: BigQueryError) -> PyErr {
         }
     }
 
-    let top_err = PyRuntimeError::new_err(err.format_causal_chain());
+    let top_err = BigQueryError::new_err(err.format_causal_chain());
     if let Some(inner_cause) = cause {
         top_err.set_cause(py, Some(inner_cause));
     }
@@ -45,7 +58,6 @@ mod tests {
     use google_cloud_auth::errors::CredentialsError;
     use google_cloud_bigquery::Error as GaxError;
     use google_cloud_gax::client_builder::Error as ClientBuilderError;
-    use pyo3::exceptions::PyValueError;
 
     use super::*;
 
@@ -58,10 +70,12 @@ mod tests {
         );
         let cred_err = CredentialsError::from_source(false, io_err);
         let builder_err = ClientBuilderError::cred(cred_err);
-        let bq_err = BigQueryError::from(builder_err);
+        let bq_err = LibBigQueryError::from(builder_err);
 
         Python::attach(|py| {
             let py_err = to_py_err(py, bq_err);
+            assert!(py_err.is_instance_of::<BigQueryError>(py));
+            assert!(py_err.is_instance_of::<PyRuntimeError>(py));
             let top_msg = py_err.to_string();
             assert!(top_msg.contains("could not create default credentials"));
             assert!(top_msg.contains("missing /etc/gcp/credentials.json"));
@@ -84,6 +98,17 @@ mod tests {
     }
 
     #[test]
+    fn test_to_py_err_invalid_config_maps_to_value_error() {
+        Python::initialize();
+        Python::attach(|py| {
+            let bq_err = LibBigQueryError::InvalidConfig("quota_project_id is required".into());
+            let py_err = to_py_err(py, bq_err);
+            assert!(py_err.is_instance_of::<PyValueError>(py));
+            assert!(py_err.to_string().contains("quota_project_id is required"));
+        });
+    }
+
+    #[test]
     fn test_to_py_err_recovers_original_python_exception_in_cause_chain() {
         Python::initialize();
         Python::attach(|py| {
@@ -91,9 +116,10 @@ mod tests {
             let cred_err =
                 CredentialsError::new(false, "Python credentials provider failed", orig_py_err);
             let gax_err = GaxError::authentication(cred_err);
-            let bq_err = BigQueryError::from(gax_err);
+            let bq_err = LibBigQueryError::from(gax_err);
 
             let py_err = to_py_err(py, bq_err);
+            assert!(py_err.is_instance_of::<BigQueryError>(py));
             assert!(py_err.to_string().contains("custom python token failure"));
 
             // Walk down to the root __cause__ and verify it is the exact PyValueError

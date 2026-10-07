@@ -12,11 +12,16 @@ google-cloud-gax = { git = "https://github.com/tswast/google-cloud-rust.git", br
 google-cloud-wkt = { git = "https://github.com/tswast/google-cloud-rust.git", branch = "tswast-bq-storage-reader" }
 polars-arrow = { version = "0.53.0", default-features = false, features = ["io_ipc", "io_ipc_compression"] }
 polars-error = "0.53.0"
+rayon = "1.12"
 rustls = { version = "0.23.37", features = ["aws_lc_rs"] }
-tokio = "1.51.0"
+tokio = { version = "1.51.0", features = ["macros", "rt", "sync"] }
 tracing = "0.1"
 tracing-subscriber = { version ="0.3", features = ["env-filter"] }
 winnow = "1.0.4"
+
+[features]
+default = []
+testing = []
 
 [lib]
 bench = false

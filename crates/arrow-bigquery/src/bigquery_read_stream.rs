@@ -5,6 +5,7 @@
 
 use std::io::Cursor;
 use std::iter::Iterator;
+use std::sync::{Arc, LazyLock};
 
 use google_cloud_bigquery::model::{read_rows_response, ReadRowsResponse};
 use google_cloud_bigquery::read::Reader;
@@ -12,6 +13,24 @@ use polars_arrow::io::ipc::read::{read_stream_metadata, StreamReader, StreamStat
 use polars_arrow::record_batch::RecordBatch;
 
 use crate::BigQueryError;
+
+static DEFAULT_DECODE_POOL: LazyLock<Arc<rayon::ThreadPool>> = LazyLock::new(|| {
+    let num_threads = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(num_threads)
+        .thread_name(|i| format!("arrow-bq-decode-{i}"))
+        .build()
+        .expect("failed to build Arrow IPC decode thread pool");
+    Arc::new(pool)
+});
+
+/// Returns a handle to the shared bounded thread pool used for CPU-bound
+/// Arrow IPC (LZ4/ZSTD) decompression.
+pub(crate) fn default_decode_pool() -> Arc<rayon::ThreadPool> {
+    Arc::clone(&DEFAULT_DECODE_POOL)
+}
 
 /// Convert a ReadRowsResponse into an Arrow record batch + stream offset.
 ///
@@ -80,33 +99,93 @@ fn read_rows_response_to_record_batch(
     }
 }
 
-pub async fn read_stream(
+async fn decode_response_on_pool(
+    decode_pool: &rayon::ThreadPool,
+    response: ReadRowsResponse,
+    schema: bytes::Bytes,
+) -> Result<Option<(RecordBatch, i64)>, BigQueryError> {
+    // Fast-path empty heartbeat responses without dispatching to the thread pool.
+    if response.row_count == 0 {
+        match &response.rows {
+            None => return Ok(None),
+            Some(read_rows_response::Rows::ArrowRecordBatch(b))
+                if b.serialized_record_batch.is_empty() =>
+            {
+                return Ok(None);
+            },
+            _ => {},
+        }
+    }
+
+    let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+    decode_pool.spawn(move || {
+        // If the stream task was cancelled while this job was queued in the pool,
+        // skip decompression immediately.
+        if done_tx.is_closed() {
+            return;
+        }
+        let res = read_rows_response_to_record_batch(response, &schema);
+        let _ = done_tx.send(res);
+    });
+
+    done_rx.await.map_err(|_| {
+        BigQueryError::Other("Arrow IPC decode worker terminated unexpectedly".into())
+    })?
+}
+
+pub(crate) async fn read_stream(
     mut reader: Reader,
     schema: bytes::Bytes,
     tx: tokio::sync::mpsc::Sender<Result<RecordBatch, BigQueryError>>,
+    decode_pool: Arc<rayon::ThreadPool>,
+    cancel_tx: Arc<tokio::sync::watch::Sender<bool>>,
+    mut cancel_rx: tokio::sync::watch::Receiver<bool>,
 ) {
-    while let Some(res) = reader.next().await {
+    loop {
+        if *cancel_rx.borrow_and_update() {
+            break;
+        }
+
+        let res = tokio::select! {
+            biased;
+            _ = cancel_rx.changed() => break,
+            next_item = reader.next() => match next_item {
+                Some(res) => res,
+                None => break,
+            },
+        };
+
         match res {
-            Ok(value) => match read_rows_response_to_record_batch(value, &schema) {
-                Ok(Some((batch, _row_count))) => {
-                    if tx.send(Ok(batch)).await.is_err() {
-                        // `tx.send` returns `Err` strictly when all `Receiver` handles (`rx`) have been
-                        // dropped. This happens when either:
-                        // 1) The consumer aborted reading early (e.g. stopped iteration or dropped receiver), or
-                        // 2) Another concurrent stream sent an `Err(...)` over `tx`, prompting the consumer
-                        //    to raise an exception and drop `rx`.
-                        // In either case, the consumer closed the channel and cannot receive more batches,
-                        // so terminating this stream cleanly prevents orphan background tasks.
+            Ok(value) => {
+                let decoded = tokio::select! {
+                    biased;
+                    _ = cancel_rx.changed() => break,
+                    res = decode_response_on_pool(&decode_pool, value, schema.clone()) => res,
+                };
+                match decoded {
+                    Ok(Some((batch, _row_count))) => {
+                        tokio::select! {
+                            biased;
+                            _ = cancel_rx.changed() => break,
+                            send_res = tx.send(Ok(batch)) => {
+                                if send_res.is_err() {
+                                    // `tx.send` returns `Err` strictly when all `Receiver` handles (`rx`) have been
+                                    // dropped or closed. Terminating this stream cleanly prevents orphan background tasks.
+                                    break;
+                                }
+                            }
+                        }
+                    },
+                    Ok(None) => {},
+                    Err(err) => {
+                        let _ = cancel_tx.send_replace(true);
+                        let _ = tx.send(Err(err)).await;
                         break;
-                    }
-                },
-                Ok(None) => {},
-                Err(err) => {
-                    let _ = tx.send(Err(err)).await;
-                    break;
-                },
+                    },
+                }
             },
             Err(err) => {
+                let _ = cancel_tx.send_replace(true);
                 let _ = tx.send(Err(BigQueryError::Grpc(err))).await;
                 break;
             },
@@ -305,7 +384,16 @@ mod tests {
             .with_backoff_policy(NoBackoff);
 
         let (tx, mut rx) = tokio::sync::mpsc::channel(10);
-        read_stream(reader, bytes::Bytes::from(schema_bytes), tx).await;
+        let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+        read_stream(
+            reader,
+            bytes::Bytes::from(schema_bytes),
+            tx,
+            default_decode_pool(),
+            Arc::new(cancel_tx),
+            cancel_rx,
+        )
+        .await;
 
         let batch1 = rx.recv().await.unwrap().unwrap();
         assert_eq!(batch1.len(), 3);
@@ -353,9 +441,73 @@ mod tests {
             .with_backoff_policy(NoBackoff);
 
         let (tx, mut rx) = tokio::sync::mpsc::channel(1);
-        read_stream(reader, bytes::Bytes::new(), tx).await;
+        let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+        let cancel_tx = Arc::new(cancel_tx);
+        read_stream(
+            reader,
+            bytes::Bytes::new(),
+            tx,
+            default_decode_pool(),
+            Arc::clone(&cancel_tx),
+            cancel_rx,
+        )
+        .await;
 
         let result = rx.recv().await.unwrap();
         assert!(matches!(result, Err(BigQueryError::Grpc(_))));
+        assert!(
+            *cancel_tx.borrow(),
+            "fatal stream error should signal sibling cancellation"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_stream_cancellation_terminates_blocked_sibling() {
+        #[derive(Debug)]
+        struct HangingClient {
+            _hold_tx: Arc<Mutex<Option<tokio::sync::mpsc::Sender<google_cloud_bigquery::Result<ReadRowsResponse>>>>>,
+        }
+
+        impl google_cloud_bigquery::stub::Read for HangingClient {
+            async fn read_rows(
+                &self,
+                _req: ReadRowsRequest,
+                _options: RequestOptions,
+            ) -> google_cloud_bigquery::Result<ResponseStream<ReadRowsResponse>> {
+                let (tx, rx) = tokio::sync::mpsc::channel(1);
+                *self._hold_tx.lock().unwrap() = Some(tx);
+                Ok(ResponseStream::from(rx))
+            }
+        }
+
+        let hold_tx = Arc::new(Mutex::new(None));
+        let client = Read::from_stub(HangingClient {
+            _hold_tx: Arc::clone(&hold_tx),
+        });
+        let reader = client
+            .read_rows()
+            .set_read_stream("hanging_stream")
+            .into_reader();
+
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+        let cancel_tx = Arc::new(cancel_tx);
+
+        let task = tokio::spawn(read_stream(
+            reader,
+            bytes::Bytes::new(),
+            tx,
+            default_decode_pool(),
+            Arc::clone(&cancel_tx),
+            cancel_rx,
+        ));
+
+        // Signal cancellation as a sibling stream would upon fatal error.
+        let _ = cancel_tx.send_replace(true);
+
+        tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .expect("cancelled stream should exit promptly")
+            .expect("task should not panic");
     }
 }

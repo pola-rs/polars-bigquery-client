@@ -34,7 +34,9 @@ impl ArrowStreamExporter {
 /// Each iteration blocks on the Tokio runtime to receive the next batch.
 struct ReceiverIterator {
     /// The receiver yielding record batches from the BigQuery Storage Read API.
-    rx: arrow_bigquery_lib::BigQueryRecordBatchReceiver,
+    /// Held in an `Option` so it can be dropped immediately upon fatal error or interrupt
+    /// to abort sibling background stream tasks without waiting for iterator GC.
+    rx: Option<arrow_bigquery_lib::BigQueryRecordBatchReceiver>,
     /// The Arrow datatype (specifically a `Struct` type) matching the schema of the batches.
     dtype: polars_arrow::datatypes::ArrowDataType,
 }
@@ -45,27 +47,37 @@ impl Iterator for ReceiverIterator {
 
     fn next(&mut self) -> Option<Self::Item> {
         let rt = pyo3_async_runtimes::tokio::get_runtime();
+        let timeout_duration = std::time::Duration::from_millis(100);
 
         loop {
-            // We need to be able to stop if the Python side decides to, so
-            // occasionally check to see if there were any interrupts.
-            if let Err(py_err) = Python::attach(|py| py.check_signals()) {
-                Python::attach(|py| py_err.restore(py));
-                return Some(Err(
-                    pyo3_polars::export::polars_error::PolarsError::ComputeError(
-                        "Python interrupt".into(),
-                    ),
-                ));
-            }
+            let rx = self.rx.as_mut()?;
 
-            let timeout_duration = std::time::Duration::from_millis(100);
-            let result = Python::attach(|py| {
-                py.detach(|| {
+            let step = Python::attach(|py| {
+                // We need to be able to stop if the Python side decides to, so
+                // occasionally check to see if there were any interrupts.
+                if let Err(py_err) = py.check_signals() {
+                    py_err.restore(py);
+                    return Err(());
+                }
+
+                Ok(py.detach(|| {
                     rt.block_on(async {
-                        tokio::time::timeout(timeout_duration, self.rx.recv()).await
+                        tokio::time::timeout(timeout_duration, rx.recv()).await
                     })
-                })
+                }))
             });
+
+            let result = match step {
+                Ok(res) => res,
+                Err(()) => {
+                    self.rx = None;
+                    return Some(Err(
+                        pyo3_polars::export::polars_error::PolarsError::ComputeError(
+                            "Python interrupt".into(),
+                        ),
+                    ));
+                },
+            };
 
             match result {
                 Ok(Some(Ok(batch))) => {
@@ -82,7 +94,8 @@ impl Iterator for ReceiverIterator {
                     ));
                 },
                 Ok(Some(Err(err))) => {
-                    // Stream failed: bubble up exception immediately with full causal chain.
+                    // Drop the receiver immediately so sibling background streams are aborted now.
+                    self.rx = None;
                     return Some(Err(
                         pyo3_polars::export::polars_error::PolarsError::ComputeError(
                             format!(
@@ -95,6 +108,7 @@ impl Iterator for ReceiverIterator {
                 },
                 Ok(None) => {
                     // Stream finished
+                    self.rx = None;
                     return None;
                 },
                 Err(_) => {
@@ -127,7 +141,7 @@ impl ArrowStreamExporter {
         let dtype = polars_arrow::datatypes::ArrowDataType::Struct(fields);
 
         let iter = ReceiverIterator {
-            rx,
+            rx: Some(rx),
             dtype: dtype.clone(),
         };
         let box_iter = Box::new(iter)

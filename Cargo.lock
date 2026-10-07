@@ -173,6 +173,7 @@ dependencies = [
  "google-cloud-wkt",
  "polars-arrow",
  "polars-error",
+ "rayon",
  "rustls",
  "tokio",
  "tracing",
@@ -3286,6 +3287,7 @@ dependencies = [
  "pyo3-async-runtimes",
  "pyo3-polars",
  "tokio",
+ "tracing",
 ]
 
 [[package]]
