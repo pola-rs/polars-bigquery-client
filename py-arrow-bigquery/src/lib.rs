@@ -1,8 +1,11 @@
 use std::sync::{Mutex, Once};
 
-use async_trait::async_trait;
 use chrono::Utc;
-use gcloud_sdk::google::cloud::bigquery::storage::v1::arrow_serialization_options::CompressionCodec;
+use google_cloud_auth::credentials::{
+    CacheableResource, Credentials, CredentialsProvider, EntityTag,
+};
+use google_cloud_auth::errors::CredentialsError;
+use google_cloud_bigquery::model::arrow_serialization_options::CompressionCodec;
 use polars_arrow::datatypes::ArrowSchemaRef;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
@@ -11,93 +14,160 @@ use pyo3::types::*;
 
 static INIT_CRYPTO: Once = Once::new();
 
+struct CachedToken {
+    headers: http::HeaderMap,
+    expiry: Option<chrono::DateTime<Utc>>,
+    entity_tag: EntityTag,
+}
+
 /// A token source that delegates authentication to a Python callable.
 ///
-/// This struct implements the [`gcloud_sdk::Source`] trait, allowing the Rust
+/// This struct implements the [`CredentialsProvider`] trait, allowing the Rust
 /// Google Cloud SDK to retrieve OAuth2 tokens by calling back into Python code
 /// (e.g., using `google-auth`). It includes a thread-safe cache to avoid
 /// the overhead of calling into Python on every request if the token is still valid.
 struct PythonTokenSource {
     /// The Python callable (e.g., a function or method) that returns a tuple of
-    /// `(token_bytes, expiration_timestamp_float)`.
+    /// `(token_data, expiration_timestamp_float_or_none)`.
     provider: Py<PyAny>,
-    /// A thread-safe cache for the retrieved token.
-    cache: Mutex<Option<gcloud_sdk::Token>>,
+    /// A thread-safe cache for the retrieved token headers.
+    cache: Mutex<Option<CachedToken>>,
 }
 
-#[async_trait]
-impl gcloud_sdk::Source for PythonTokenSource {
-    async fn token(&self) -> Result<gcloud_sdk::Token, gcloud_sdk::error::Error> {
+impl std::fmt::Debug for PythonTokenSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PythonTokenSource")
+            .field("provider", &"<python_callable>")
+            .finish()
+    }
+}
+
+impl CredentialsProvider for PythonTokenSource {
+    async fn headers(
+        &self,
+        extensions: http::Extensions,
+    ) -> Result<CacheableResource<http::HeaderMap>, CredentialsError> {
         {
             let cache = self.cache.lock().unwrap();
-            if let Some(token) = cache.as_ref() {
-                if token.expiry > Utc::now() + chrono::Duration::seconds(60) {
-                    return Ok(token.clone());
+            if let Some(cached) = cache.as_ref() {
+                let is_valid = match cached.expiry {
+                    Some(expiry) => expiry > Utc::now() + chrono::Duration::seconds(60),
+                    None => true,
+                };
+                if is_valid {
+                    return match extensions.get::<EntityTag>() {
+                        Some(tag) if cached.entity_tag == *tag => {
+                            Ok(CacheableResource::NotModified)
+                        },
+                        _ => Ok(CacheableResource::New {
+                            entity_tag: cached.entity_tag.clone(),
+                            data: cached.headers.clone(),
+                        }),
+                    };
                 }
             }
         }
 
-        let token = Python::attach(
-            |py| -> Result<gcloud_sdk::Token, gcloud_sdk::error::Error> {
-                let provider = self.provider.bind(py);
-                let result = provider.call0().map_err(|_| {
-                    gcloud_sdk::error::Error::from(gcloud_sdk::error::ErrorKind::TokenSource)
-                })?;
-
-                // result is (token_data, expiration)
-                let tuple = result.cast::<pyo3::types::PyTuple>().map_err(|_| {
-                    gcloud_sdk::error::Error::from(gcloud_sdk::error::ErrorKind::TokenSource)
-                })?;
-
-                let token_data = tuple.get_item(0).map_err(|_| {
-                    gcloud_sdk::error::Error::from(gcloud_sdk::error::ErrorKind::TokenSource)
-                })?;
-
-                let expiration = tuple.get_item(1).map_err(|_| {
-                    gcloud_sdk::error::Error::from(gcloud_sdk::error::ErrorKind::TokenSource)
-                })?;
-
-                let bearer_token: String = token_data
-                    .get_item("bearer_token")
-                    .map_err(|_| {
-                        gcloud_sdk::error::Error::from(gcloud_sdk::error::ErrorKind::TokenSource)
-                    })?
-                    .cast::<pyo3::types::PyString>()
-                    .map_err(|_| {
-                        gcloud_sdk::error::Error::from(gcloud_sdk::error::ErrorKind::TokenSource)
-                    })?
-                    .to_str()
-                    .map_err(|_| {
-                        gcloud_sdk::error::Error::from(gcloud_sdk::error::ErrorKind::TokenSource)
-                    })?
-                    .to_string();
-
-                // expiration is a float (timestamp)
-                let expiry_f: f64 = expiration.extract().map_err(|_| {
-                    gcloud_sdk::error::Error::from(gcloud_sdk::error::ErrorKind::TokenSource)
-                })?;
-
-                let expiry = chrono::DateTime::from_timestamp(
-                    expiry_f as i64,
-                    ((expiry_f % 1.0) * 1_000_000_000.0) as u32,
+        let cached = Python::attach(|py| -> Result<CachedToken, CredentialsError> {
+            let provider = self.provider.bind(py);
+            let result = provider.call0().map_err(|err| {
+                CredentialsError::from_msg(
+                    false,
+                    format!("Python credentials provider failed: {err}"),
                 )
-                .ok_or_else(|| {
-                    gcloud_sdk::error::Error::from(gcloud_sdk::error::ErrorKind::TokenSource)
+            })?;
+
+            // result is (token_data, expiration)
+            let tuple = result.cast::<pyo3::types::PyTuple>().map_err(|_| {
+                CredentialsError::from_msg(
+                    false,
+                    "Python credentials provider must return a 2-tuple (token_data, expiration)",
+                )
+            })?;
+
+            let token_data = tuple.get_item(0).map_err(|_| {
+                CredentialsError::from_msg(
+                    false,
+                    "Python credentials provider tuple missing token_data at index 0",
+                )
+            })?;
+
+            let expiration = tuple.get_item(1).map_err(|_| {
+                CredentialsError::from_msg(
+                    false,
+                    "Python credentials provider tuple missing expiration at index 1",
+                )
+            })?;
+
+            let bearer_token: String = token_data
+                .get_item("bearer_token")
+                .map_err(|_| {
+                    CredentialsError::from_msg(false, "token_data missing 'bearer_token' key")
+                })?
+                .cast::<pyo3::types::PyString>()
+                .map_err(|_| CredentialsError::from_msg(false, "'bearer_token' must be a string"))?
+                .to_str()
+                .map_err(|_| {
+                    CredentialsError::from_msg(false, "'bearer_token' is not valid UTF-8")
+                })?
+                .to_string();
+
+            // expiration is a float/int (timestamp) or None
+            let expiry = if expiration.is_none() {
+                None
+            } else {
+                let expiry_f: f64 = expiration.extract().map_err(|_| {
+                    CredentialsError::from_msg(
+                        false,
+                        "expiration must be a float/int timestamp or None",
+                    )
                 })?;
 
-                Ok(gcloud_sdk::Token {
-                    token: bearer_token.into(),
-                    token_type: "Bearer".to_string(),
-                    expiry,
-                })
-            },
-        )?;
+                if !expiry_f.is_finite() || expiry_f < 0.0 {
+                    return Err(CredentialsError::from_msg(
+                        false,
+                        "expiration timestamp is out of range",
+                    ));
+                }
+
+                let secs = expiry_f.trunc() as i64;
+                let nsecs = (expiry_f.fract() * 1_000_000_000.0) as u32;
+                let dt = chrono::DateTime::from_timestamp(secs, nsecs).ok_or_else(|| {
+                    CredentialsError::from_msg(false, "expiration timestamp is out of range")
+                })?;
+                Some(dt)
+            };
+
+            let mut header_value =
+                http::header::HeaderValue::from_str(&format!("Bearer {bearer_token}"))
+                    .map_err(|err| CredentialsError::from_source(false, err))?;
+            header_value.set_sensitive(true);
+
+            let mut headers = http::HeaderMap::new();
+            headers.insert(http::header::AUTHORIZATION, header_value);
+
+            Ok(CachedToken {
+                headers,
+                expiry,
+                entity_tag: EntityTag::new(),
+            })
+        })?;
+
+        let response = CacheableResource::New {
+            entity_tag: cached.entity_tag.clone(),
+            data: cached.headers.clone(),
+        };
 
         {
             let mut cache = self.cache.lock().unwrap();
-            *cache = Some(token.clone());
+            *cache = Some(cached);
         }
-        Ok(token)
+
+        Ok(response)
+    }
+
+    async fn universe_domain(&self) -> Option<String> {
+        None
     }
 }
 
@@ -421,35 +491,42 @@ impl Client {
             // ignore if another crate already set the default provider.
         });
 
-        let token_source_type = match credentials_provider {
+        let cred = match credentials_provider {
             Some(provider) => {
                 let is_none = Python::attach(|py| provider.is_none(py));
                 if is_none {
-                    gcloud_sdk::TokenSourceType::Default
+                    None
                 } else {
                     let token_source = PythonTokenSource {
                         provider,
                         cache: Mutex::new(None),
                     };
-                    gcloud_sdk::TokenSourceType::ExternalSource(Box::new(token_source))
+                    Some(Credentials::from(token_source))
                 }
             },
-            None => gcloud_sdk::TokenSourceType::Default,
+            None => None,
         };
 
         let rt = pyo3_async_runtimes::tokio::get_runtime();
-        let client = rt.block_on(async {
-            use arrow_bigquery_lib::BigQueryReadClientBuilder;
+        let client = Python::attach(|py| {
+            py.detach(|| {
+                rt.block_on(async {
+                    use arrow_bigquery_lib::BigQueryReadClientBuilder;
 
-            let builder = arrow_bigquery_lib::ServiceConfigBuilder::new()
-                .with_cred(token_source_type)
-                .with_user_agent(user_agent)
-                .with_quota_project_id(Some(quota_project_id));
+                    let mut builder = arrow_bigquery_lib::ServiceConfigBuilder::new()
+                        .with_user_agent(user_agent)
+                        .with_quota_project_id(Some(quota_project_id));
+                    if let Some(cred) = cred {
+                        builder = builder.with_cred(cred);
+                    }
 
-            arrow_bigquery_lib::Client::from_builder(builder)
-                .await
-                .map_err(|err| pyo3::exceptions::PyRuntimeError::new_err(err.to_string()))
-        })?;
+                    arrow_bigquery_lib::Client::from_builder(builder)
+                        .await
+                        .map_err(|err| err.to_string())
+                })
+            })
+        })
+        .map_err(pyo3::exceptions::PyRuntimeError::new_err)?;
 
         Ok(Self { client })
     }
@@ -491,11 +568,15 @@ impl Client {
         let rt = pyo3_async_runtimes::tokio::get_runtime();
         let client = self.client.clone();
         let table = table.inner.clone();
-        let result = rt.block_on(async move {
-            client
-                .read_table(&table, read_options)
-                .await
-                .map_err(|err| pyo3::exceptions::PyRuntimeError::new_err(err.to_string()))
+        let result = Python::attach(|py| {
+            py.detach(|| {
+                rt.block_on(async move {
+                    client
+                        .read_table(&table, read_options)
+                        .await
+                        .map_err(|err| err.to_string())
+                })
+            })
         });
 
         match result {
@@ -503,7 +584,7 @@ impl Client {
                 schema,
                 receiver: std::sync::Mutex::new(Some(receiver)),
             }),
-            Err(err) => Err(err),
+            Err(err) => Err(pyo3::exceptions::PyRuntimeError::new_err(err)),
         }
     }
 }
@@ -804,5 +885,270 @@ mod tests {
             assert!(err.is_instance_of::<PyValueError>(py));
             assert!(err.to_string().contains("failed to extract snapshot_time"));
         });
+    }
+
+    #[test]
+    fn test_python_token_source_caches_and_not_modified() {
+        Python::initialize();
+        let (provider, counter) = Python::attach(|py| {
+            let locals = PyDict::new(py);
+            let future_ts = (Utc::now() + chrono::Duration::seconds(3600)).timestamp() as f64;
+            locals.set_item("future_ts", future_ts).unwrap();
+            py.run(
+                c"
+class Counter:
+    def __init__(self):
+        self.count = 0
+    def __call__(self):
+        self.count += 1
+        return ({'bearer_token': f'secret-token-{self.count}'}, future_ts)
+counter = Counter()
+",
+                Some(&locals),
+                Some(&locals),
+            )
+            .unwrap();
+            let c = locals.get_item("counter").unwrap().unwrap().unbind();
+            let c_clone = c.clone_ref(py);
+            (c, c_clone)
+        });
+
+        let source = PythonTokenSource {
+            provider,
+            cache: Mutex::new(None),
+        };
+
+        let rt = pyo3_async_runtimes::tokio::get_runtime();
+        rt.block_on(async {
+            assert_eq!(source.universe_domain().await, None);
+
+            let res1 = source.headers(http::Extensions::new()).await.unwrap();
+            let (tag1, headers1) = match res1 {
+                CacheableResource::New { entity_tag, data } => (entity_tag, data),
+                CacheableResource::NotModified => panic!("expected New"),
+            };
+            let auth_val = headers1.get(http::header::AUTHORIZATION).unwrap();
+            assert_eq!(auth_val.to_str().unwrap(), "Bearer secret-token-1");
+            assert!(auth_val.is_sensitive());
+
+            // Debug output must not leak token
+            let debug_str = format!("{source:?}");
+            assert!(!debug_str.contains("secret-token-1"));
+
+            // Second call without EntityTag should return cached headers without calling Python again
+            let res2 = source.headers(http::Extensions::new()).await.unwrap();
+            let (tag2, headers2) = match res2 {
+                CacheableResource::New { entity_tag, data } => (entity_tag, data),
+                CacheableResource::NotModified => panic!("expected New"),
+            };
+            assert_eq!(tag1, tag2);
+            assert_eq!(
+                headers2
+                    .get(http::header::AUTHORIZATION)
+                    .unwrap()
+                    .to_str()
+                    .unwrap(),
+                "Bearer secret-token-1"
+            );
+
+            // Call with matching EntityTag should return NotModified
+            let mut ext = http::Extensions::new();
+            ext.insert(tag1);
+            let res3 = source.headers(ext).await.unwrap();
+            assert!(matches!(res3, CacheableResource::NotModified));
+        });
+
+        let count: i32 = Python::attach(|py| {
+            counter
+                .bind(py)
+                .getattr("count")
+                .unwrap()
+                .extract()
+                .unwrap()
+        });
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn test_python_token_source_refreshes_when_expiring_soon() {
+        Python::initialize();
+        let provider = Python::attach(|py| {
+            let locals = PyDict::new(py);
+            // First token expires in 30s (within the 60s refresh window), second in 3600s
+            let expiring_soon = (Utc::now() + chrono::Duration::seconds(30)).timestamp() as f64;
+            let future_ts = (Utc::now() + chrono::Duration::seconds(3600)).timestamp() as f64;
+            locals.set_item("expiring_soon", expiring_soon).unwrap();
+            locals.set_item("future_ts", future_ts).unwrap();
+            py.run(
+                c"
+class ExpiringProvider:
+    def __init__(self):
+        self.count = 0
+    def __call__(self):
+        self.count += 1
+        ts = expiring_soon if self.count == 1 else future_ts
+        return ({'bearer_token': f'token-{self.count}'}, ts)
+provider = ExpiringProvider()
+",
+                Some(&locals),
+                Some(&locals),
+            )
+            .unwrap();
+            locals.get_item("provider").unwrap().unwrap().unbind()
+        });
+
+        let source = PythonTokenSource {
+            provider,
+            cache: Mutex::new(None),
+        };
+
+        let rt = pyo3_async_runtimes::tokio::get_runtime();
+        rt.block_on(async {
+            let res1 = source.headers(http::Extensions::new()).await.unwrap();
+            let tag1 = match res1 {
+                CacheableResource::New { entity_tag, data } => {
+                    assert_eq!(
+                        data.get(http::header::AUTHORIZATION)
+                            .unwrap()
+                            .to_str()
+                            .unwrap(),
+                        "Bearer token-1"
+                    );
+                    entity_tag
+                },
+                CacheableResource::NotModified => panic!("expected New"),
+            };
+
+            // Since token-1 expires in <60s, the next call should refresh and produce token-2
+            let res2 = source.headers(http::Extensions::new()).await.unwrap();
+            match res2 {
+                CacheableResource::New { entity_tag, data } => {
+                    assert_ne!(entity_tag, tag1);
+                    assert_eq!(
+                        data.get(http::header::AUTHORIZATION)
+                            .unwrap()
+                            .to_str()
+                            .unwrap(),
+                        "Bearer token-2"
+                    );
+                },
+                CacheableResource::NotModified => panic!("expected New"),
+            }
+        });
+    }
+
+    #[test]
+    fn test_python_token_source_none_expiration() {
+        Python::initialize();
+        let (provider, counter) = Python::attach(|py| {
+            let locals = PyDict::new(py);
+            py.run(
+                c"
+class NonExpiringProvider:
+    def __init__(self):
+        self.count = 0
+    def __call__(self):
+        self.count += 1
+        return ({'bearer_token': 'forever-token'}, None)
+provider = NonExpiringProvider()
+",
+                None,
+                Some(&locals),
+            )
+            .unwrap();
+            let p = locals.get_item("provider").unwrap().unwrap().unbind();
+            let p_clone = p.clone_ref(py);
+            (p, p_clone)
+        });
+
+        let source = PythonTokenSource {
+            provider,
+            cache: Mutex::new(None),
+        };
+
+        let rt = pyo3_async_runtimes::tokio::get_runtime();
+        rt.block_on(async {
+            let res1 = source.headers(http::Extensions::new()).await.unwrap();
+            match res1 {
+                CacheableResource::New { data, .. } => {
+                    assert_eq!(
+                        data.get(http::header::AUTHORIZATION)
+                            .unwrap()
+                            .to_str()
+                            .unwrap(),
+                        "Bearer forever-token"
+                    );
+                },
+                CacheableResource::NotModified => panic!("expected New"),
+            }
+
+            let _ = source.headers(http::Extensions::new()).await.unwrap();
+        });
+
+        let count: i32 = Python::attach(|py| {
+            counter
+                .bind(py)
+                .getattr("count")
+                .unwrap()
+                .extract()
+                .unwrap()
+        });
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn test_python_token_source_errors() {
+        Python::initialize();
+        let cases = [
+            ("def p(): raise RuntimeError('auth failed')", "auth failed"),
+            ("def p(): return 'not-a-tuple'", "2-tuple"),
+            ("def p(): return ({}, 1700000000.0)", "bearer_token"),
+        ];
+
+        let rt = pyo3_async_runtimes::tokio::get_runtime();
+        for (code, expected_msg) in cases {
+            let provider = Python::attach(|py| {
+                let locals = PyDict::new(py);
+                let c_code = std::ffi::CString::new(code).unwrap();
+                py.run(&c_code, None, Some(&locals)).unwrap();
+                locals.get_item("p").unwrap().unwrap().unbind()
+            });
+            let source = PythonTokenSource {
+                provider,
+                cache: Mutex::new(None),
+            };
+            rt.block_on(async {
+                let err = source.headers(http::Extensions::new()).await.unwrap_err();
+                assert!(!err.is_transient());
+                assert!(
+                    err.to_string().contains(expected_msg),
+                    "expected '{}' in '{}'",
+                    expected_msg,
+                    err
+                );
+            });
+        }
+    }
+
+    #[test]
+    fn test_client_new_with_credentials_provider() {
+        Python::initialize();
+        let provider = Python::attach(|py| {
+            let locals = PyDict::new(py);
+            py.run(
+                c"def p(): return ({'bearer_token': 'tok'}, None)",
+                None,
+                Some(&locals),
+            )
+            .unwrap();
+            locals.get_item("p").unwrap().unwrap().unbind()
+        });
+
+        let client = Client::new(
+            "test-project".to_string(),
+            Some(provider),
+            Some("test-agent/1.0".to_string()),
+        );
+        assert!(client.is_ok());
     }
 }

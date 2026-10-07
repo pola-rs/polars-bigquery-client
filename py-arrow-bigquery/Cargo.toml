@@ -8,20 +8,16 @@ name = "arrow_bigquery"
 crate-type= ["cdylib"]
 
 [dependencies]
-async-trait = "0.1"
 chrono = "0.4"
-# Using `default-features = false` and `tls-webpki-roots` forces gcloud-sdk to use rustls instead of native-tls.
-# This prevents openssl-sys from trying to link against a system OpenSSL library, which is notoriously
-# problematic when building musllinux wheels. rustls is a pure-Rust implementation, which compiles
-# easily for musl targets.
+google-cloud-auth = { git = "https://github.com/tswast/google-cloud-rust.git", branch = "tswast-bq-storage-reader" }
 google-cloud-bigquery = { git = "https://github.com/tswast/google-cloud-rust.git", branch = "tswast-bq-storage-reader" }
+http = "1.0"
 arrow-bigquery-lib = { package = "arrow-bigquery", path = "../crates/arrow-bigquery" }
 pyo3 = { version = "0.27", features = ["abi3-py310", "chrono"] }
 pyo3-async-runtimes = { version = "0.27", features = ["attributes", "tokio-runtime"] }
 pyo3-polars = { version = "0.26.0", features = ["derive", "lazy"] }
 polars-arrow = { version = "0.53.0", default-features = false }
 rustls = { version = "0.23.37", features = ["aws_lc_rs"] }
-secret-vault-value = "1.0"
 tokio = { version = "1.51.0", features = ["time"] }
 
 [features]
