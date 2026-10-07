@@ -6,6 +6,7 @@ from polars_bigquery.core.compiler.ir.base import Expr, Unsupported
 from polars_bigquery.core.compiler.ir.boolean import (
     And,
     BoolLiteral,
+    Coalesce,
     IsNotNull,
     IsNull,
     Not,
@@ -15,6 +16,7 @@ from polars_bigquery.core.compiler.parser.base import (
     ParseRecord,
     parse_binary_op,
     parse_unary_function,
+    parse_variadic_function,
     register_parser,
 )
 
@@ -55,3 +57,9 @@ def parse_is_null(spec: Any, expr_json: Any) -> ParseRecord:
 def parse_is_not_null(spec: Any, expr_json: Any) -> ParseRecord:
     """Parse a Polars `IsNotNull` BooleanFunction node into an IR `IsNotNull` record."""
     return parse_unary_function(expr_json, IsNotNull, func_spec=spec)
+
+
+@register_parser("$.Function.function.Coalesce")
+def parse_coalesce(spec: Any, expr_json: Any) -> ParseRecord:
+    """Parse a Polars `Coalesce` Function node into an IR `Coalesce` record."""
+    return parse_variadic_function(expr_json, Coalesce, func_spec=spec)

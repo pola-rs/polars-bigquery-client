@@ -35,12 +35,13 @@ All comparison operators require both operands to be exact, supported expression
 | `a \| b` | `Or` (`\|`) | `(`a` OR `b`)` | Pushed down when both branches are supported and exact. |
 | `~a` | `Expr.not_` (`~`) | `(NOT `a`)` | Pushed down when the inner expression is exact. Negated disjunctions `~(a \| b)` are automatically rewritten via De Morgan's Law into `(~a) & (~b)` so supported branches can still be pushed down. |
 
-### Null Checks
+### Null Checks and Handling
 
 | Polars Expression | BigQuery SQL Translation |
 | --- | --- |
 | `expr.is_null()` | `(`expr` IS NULL)` |
 | `expr.is_not_null()` | `(`expr` IS NOT NULL)` |
+| `pl.coalesce(a, b, ...)` | `COALESCE(`a`, `b`, ...)` |
 
 ### Numeric Predicates
 

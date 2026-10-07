@@ -10,6 +10,7 @@ from polars_bigquery.core.compiler.ir.base import (
     Expr,
     UnaryExpr,
     Unsupported,
+    VariadicExpr,
 )
 
 NodeRewriterFunc = Callable[[Expr], Expr]
@@ -45,6 +46,19 @@ def replace_binary_children(node: BinaryExpr, children: tuple[Expr, ...]) -> Exp
     if children[0] is node.left and children[1] is node.right:
         return node
     return dataclasses.replace(node, left=children[0], right=children[1])
+
+
+@replace_children.register
+def replace_variadic_children(node: VariadicExpr, children: tuple[Expr, ...]) -> Expr:
+    """Return a copy of a `VariadicExpr` node with its operands replaced."""
+    if not children:
+        msg = "VariadicExpr requires at least 1 child, got 0"
+        raise ValueError(msg)
+    if len(children) == len(node.operands) and all(
+        new_c is old_c for new_c, old_c in zip(children, node.operands, strict=False)
+    ):
+        return node
+    return dataclasses.replace(node, operands=children)
 
 
 @replace_children.register
