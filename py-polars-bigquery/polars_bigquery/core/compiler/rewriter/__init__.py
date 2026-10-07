@@ -5,9 +5,12 @@ from __future__ import annotations
 from polars_bigquery.core.compiler.ir.base import Expr
 from polars_bigquery.core.compiler.rewriter import base, boolean
 from polars_bigquery.core.compiler.rewriter.base import RewriterFunc
-from polars_bigquery.core.compiler.rewriter.boolean import rewrite_de_morgan
+from polars_bigquery.core.compiler.rewriter.boolean import (
+    rewrite_de_morgan,
+    rewrite_when,
+)
 
-_REWRITERS: tuple[RewriterFunc, ...] = (rewrite_de_morgan,)
+_REWRITERS: tuple[RewriterFunc, ...] = (rewrite_when, rewrite_de_morgan)
 
 
 def rewrite_ir(root: Expr) -> Expr:

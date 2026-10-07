@@ -49,5 +49,15 @@ class Coalesce(VariadicExpr):
 
 
 @dataclasses.dataclass(frozen=True)
-class When(TernaryExpr):
-    """IR node representing a conditional expression (WHEN / THEN / OTHERWISE)."""
+class Ternary(TernaryExpr):
+    """IR node representing a single 3-operand conditional expression (IF)."""
+
+
+@dataclasses.dataclass(frozen=True)
+class When(VariadicExpr):
+    """IR node representing a multi-clause conditional expression (CASE WHEN).
+
+    `operands` stores one or more `(predicate, truthy)` pairs followed by the
+    trailing `falsy` (`otherwise`) expression:
+    `(predicate_1, truthy_1, ..., predicate_n, truthy_n, falsy)`.
+    """

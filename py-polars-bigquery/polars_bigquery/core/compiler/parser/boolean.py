@@ -12,7 +12,7 @@ from polars_bigquery.core.compiler.ir.boolean import (
     IsNull,
     Not,
     Or,
-    When,
+    Ternary,
 )
 from polars_bigquery.core.compiler.parser.base import (
     UNSUPPORTED_RECORD,
@@ -93,6 +93,6 @@ def parse_coalesce(spec: Any, expr_json: Any) -> ParseRecord:
 
 
 @register_parser("$.Ternary")
-def parse_when(ternary_json: Any) -> ParseRecord:
-    """Parse a Polars `Ternary` node into an IR `When` record."""
-    return parse_ternary_op(ternary_json, When)
+def parse_ternary(ternary_json: Any) -> ParseRecord:
+    """Parse a Polars `Ternary` node into an IR `Ternary` record."""
+    return parse_ternary_op(ternary_json, Ternary)
