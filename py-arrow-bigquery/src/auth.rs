@@ -214,6 +214,13 @@ impl PythonTokenSourceInner {
                 })?
                 .to_string();
 
+            if bearer_token.is_empty() {
+                return Err(CredentialsError::from_msg(
+                    false,
+                    "invalid bearer token header value",
+                ));
+            }
+
             // expiration is a float/int (timestamp) or None
             let deadlines = if expiration.is_none() {
                 None
@@ -270,7 +277,7 @@ impl PythonTokenSourceInner {
     ///   freshly minted token into `self.cache`, preventing both concurrent Python invocations
     ///   and lost token updates.
     /// - If the Python callable hangs longer than `self.refresh_timeout`, the timeout branch sets
-    ///   `cancelled = true` (preventing a late completion from overwriting newer tokens), releases
+    ///   `timed_out = true` (preventing a late completion from overwriting newer tokens), releases
     ///   `guard` so subsequent callers are not deadlocked, and returns a transient `CredentialsError`.
     async fn refresh_token_with_guard(
         self: &Arc<Self>,
@@ -669,7 +676,7 @@ provider = SoftExpiringProvider()
             (p, p_clone)
         });
 
-        // Configure a 80ms base cooldown so we can test both cooldown throttling and recovery
+        // Configure an 80ms base cooldown so we can test both cooldown throttling and recovery
         let source = PythonTokenSource::new_with_config(
             provider,
             Duration::from_secs(5),
@@ -1075,6 +1082,24 @@ provider = NonExpiringProvider()
                 "bearer_token",
                 false,
                 true,
+            ),
+            (
+                "def p(): return ({'bearer_token': ''}, 1700000000.0)",
+                "invalid bearer token",
+                false,
+                false,
+            ),
+            (
+                "def p(): return ({'bearer_token': 'bad\\ntoken'}, 1700000000.0)",
+                "invalid bearer token",
+                false,
+                true,
+            ),
+            (
+                "def p(): return ({'bearer_token': 'tok'}, -1.0)",
+                "out of range",
+                false,
+                false,
             ),
         ];
 
