@@ -1,7 +1,7 @@
-use std::sync::{Mutex, Once};
+mod auth;
 
-use async_trait::async_trait;
-use chrono::Utc;
+use std::sync::Once;
+
 use gcloud_sdk::google::cloud::bigquery::storage::v1::arrow_serialization_options::CompressionCodec;
 use polars_arrow::datatypes::ArrowSchemaRef;
 use pyo3::exceptions::PyValueError;
@@ -10,96 +10,6 @@ use pyo3::pyfunction;
 use pyo3::types::*;
 
 static INIT_CRYPTO: Once = Once::new();
-
-/// A token source that delegates authentication to a Python callable.
-///
-/// This struct implements the [`gcloud_sdk::Source`] trait, allowing the Rust
-/// Google Cloud SDK to retrieve OAuth2 tokens by calling back into Python code
-/// (e.g., using `google-auth`). It includes a thread-safe cache to avoid
-/// the overhead of calling into Python on every request if the token is still valid.
-struct PythonTokenSource {
-    /// The Python callable (e.g., a function or method) that returns a tuple of
-    /// `(token_bytes, expiration_timestamp_float)`.
-    provider: Py<PyAny>,
-    /// A thread-safe cache for the retrieved token.
-    cache: Mutex<Option<gcloud_sdk::Token>>,
-}
-
-#[async_trait]
-impl gcloud_sdk::Source for PythonTokenSource {
-    async fn token(&self) -> Result<gcloud_sdk::Token, gcloud_sdk::error::Error> {
-        {
-            let cache = self.cache.lock().unwrap();
-            if let Some(token) = cache.as_ref() {
-                if token.expiry > Utc::now() + chrono::Duration::seconds(60) {
-                    return Ok(token.clone());
-                }
-            }
-        }
-
-        let token = Python::attach(
-            |py| -> Result<gcloud_sdk::Token, gcloud_sdk::error::Error> {
-                let provider = self.provider.bind(py);
-                let result = provider.call0().map_err(|_| {
-                    gcloud_sdk::error::Error::from(gcloud_sdk::error::ErrorKind::TokenSource)
-                })?;
-
-                // result is (token_data, expiration)
-                let tuple = result.cast::<pyo3::types::PyTuple>().map_err(|_| {
-                    gcloud_sdk::error::Error::from(gcloud_sdk::error::ErrorKind::TokenSource)
-                })?;
-
-                let token_data = tuple.get_item(0).map_err(|_| {
-                    gcloud_sdk::error::Error::from(gcloud_sdk::error::ErrorKind::TokenSource)
-                })?;
-
-                let expiration = tuple.get_item(1).map_err(|_| {
-                    gcloud_sdk::error::Error::from(gcloud_sdk::error::ErrorKind::TokenSource)
-                })?;
-
-                let bearer_token: String = token_data
-                    .get_item("bearer_token")
-                    .map_err(|_| {
-                        gcloud_sdk::error::Error::from(gcloud_sdk::error::ErrorKind::TokenSource)
-                    })?
-                    .cast::<pyo3::types::PyString>()
-                    .map_err(|_| {
-                        gcloud_sdk::error::Error::from(gcloud_sdk::error::ErrorKind::TokenSource)
-                    })?
-                    .to_str()
-                    .map_err(|_| {
-                        gcloud_sdk::error::Error::from(gcloud_sdk::error::ErrorKind::TokenSource)
-                    })?
-                    .to_string();
-
-                // expiration is a float (timestamp)
-                let expiry_f: f64 = expiration.extract().map_err(|_| {
-                    gcloud_sdk::error::Error::from(gcloud_sdk::error::ErrorKind::TokenSource)
-                })?;
-
-                let expiry = chrono::DateTime::from_timestamp(
-                    expiry_f as i64,
-                    ((expiry_f % 1.0) * 1_000_000_000.0) as u32,
-                )
-                .ok_or_else(|| {
-                    gcloud_sdk::error::Error::from(gcloud_sdk::error::ErrorKind::TokenSource)
-                })?;
-
-                Ok(gcloud_sdk::Token {
-                    token: bearer_token.into(),
-                    token_type: "Bearer".to_string(),
-                    expiry,
-                })
-            },
-        )?;
-
-        {
-            let mut cache = self.cache.lock().unwrap();
-            *cache = Some(token.clone());
-        }
-        Ok(token)
-    }
-}
 
 /// A Python-exposed class that implements the Arrow C Stream interface.
 ///
@@ -427,10 +337,7 @@ impl Client {
                 if is_none {
                     gcloud_sdk::TokenSourceType::Default
                 } else {
-                    let token_source = PythonTokenSource {
-                        provider,
-                        cache: Mutex::new(None),
-                    };
+                    let token_source = auth::PythonTokenSource::new(provider);
                     gcloud_sdk::TokenSourceType::ExternalSource(Box::new(token_source))
                 }
             },
@@ -438,18 +345,23 @@ impl Client {
         };
 
         let rt = pyo3_async_runtimes::tokio::get_runtime();
-        let client = rt.block_on(async {
-            use arrow_bigquery_lib::BigQueryReadClientBuilder;
+        let client = Python::attach(|py| {
+            py.detach(|| {
+                rt.block_on(async {
+                    use arrow_bigquery_lib::BigQueryReadClientBuilder;
 
-            let builder = arrow_bigquery_lib::ServiceConfigBuilder::new()
-                .with_cred(token_source_type)
-                .with_user_agent(user_agent)
-                .with_quota_project_id(Some(quota_project_id));
+                    let builder = arrow_bigquery_lib::ServiceConfigBuilder::new()
+                        .with_cred(token_source_type)
+                        .with_user_agent(user_agent)
+                        .with_quota_project_id(Some(quota_project_id));
 
-            arrow_bigquery_lib::Client::from_builder(builder)
-                .await
-                .map_err(|err| pyo3::exceptions::PyRuntimeError::new_err(err.to_string()))
-        })?;
+                    arrow_bigquery_lib::Client::from_builder(builder)
+                        .await
+                        .map_err(|err| err.to_string())
+                })
+            })
+        })
+        .map_err(pyo3::exceptions::PyRuntimeError::new_err)?;
 
         Ok(Self { client })
     }
@@ -491,12 +403,17 @@ impl Client {
         let rt = pyo3_async_runtimes::tokio::get_runtime();
         let client = self.client.clone();
         let table = table.inner.clone();
-        let result = rt.block_on(async move {
-            client
-                .read_table(&table, read_options)
-                .await
-                .map_err(|err| pyo3::exceptions::PyRuntimeError::new_err(err.to_string()))
-        });
+        let result = Python::attach(|py| {
+            py.detach(|| {
+                rt.block_on(async move {
+                    client
+                        .read_table(&table, read_options)
+                        .await
+                        .map_err(|err| err.to_string())
+                })
+            })
+        })
+        .map_err(pyo3::exceptions::PyRuntimeError::new_err);
 
         match result {
             Ok((schema, receiver)) => Ok(ArrowStreamExporter {

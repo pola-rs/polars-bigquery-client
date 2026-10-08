@@ -1,0 +1,1011 @@
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, RwLock};
+use std::time::{Duration, Instant};
+
+use async_trait::async_trait;
+use chrono::Utc;
+use pyo3::prelude::*;
+
+/// Duration before actual token expiration at which we trigger a non-blocking
+/// background refresh while continuing to serve the cached token (Stale-While-Revalidate).
+///
+/// Set to 120 seconds so it sits well inside `google-auth`'s 225-second refresh threshold,
+/// guaranteeing that Python's `google-auth` issues a fresh token when invoked.
+const SOFT_EXPIRY_BUFFER: Duration = Duration::from_secs(120);
+
+/// Duration before actual token expiration at which the cached token is no longer
+/// served and callers must wait for a synchronous refresh.
+const HARD_EXPIRY_BUFFER: Duration = Duration::from_secs(60);
+
+/// Default upper bound on how long a single Python credentials refresh call may take
+/// before timing out and releasing the refresh lock.
+const DEFAULT_REFRESH_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Initial cooldown before retrying a failed background soft-expiry refresh.
+const DEFAULT_SOFT_REFRESH_BASE_COOLDOWN: Duration = Duration::from_secs(1);
+
+/// Maximum cooldown between failed background soft-expiry refresh attempts.
+const MAX_SOFT_REFRESH_COOLDOWN: Duration = Duration::from_secs(30);
+
+/// Fallback UTC lifetime assigned to [`gcloud_sdk::Token::expiry`] when the Python
+/// credentials callable returns `expiration = None` (non-expiring token).
+const NON_EXPIRING_TOKEN_TTL_DAYS: i64 = 365 * 100;
+
+fn external_creds_error(msg: impl Into<String>) -> gcloud_sdk::error::Error {
+    gcloud_sdk::error::Error::from(gcloud_sdk::error::ErrorKind::ExternalCredsSourceError(
+        msg.into(),
+    ))
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Freshness {
+    /// Token is well within its validity window (`now < soft_expiry` or non-expiring).
+    Fresh,
+    /// Token is still valid for requests (`soft_expiry <= now < hard_expiry`),
+    /// but a background refresh should be triggered.
+    SoftExpired,
+    /// Token is expired or too close to expiring (`now >= hard_expiry`); must refresh before use.
+    HardExpired,
+}
+
+#[derive(Clone, Copy)]
+struct TokenDeadlines {
+    soft_expiry: Instant,
+    hard_expiry: Instant,
+}
+
+impl TokenDeadlines {
+    fn from_utc_expiry(
+        expiry: chrono::DateTime<Utc>,
+        now_utc: chrono::DateTime<Utc>,
+        now_instant: Instant,
+    ) -> Self {
+        let remaining = (expiry - now_utc).to_std().unwrap_or(Duration::ZERO);
+        Self {
+            soft_expiry: now_instant + remaining.saturating_sub(SOFT_EXPIRY_BUFFER),
+            hard_expiry: now_instant + remaining.saturating_sub(HARD_EXPIRY_BUFFER),
+        }
+    }
+
+    fn freshness(&self, now: Instant) -> Freshness {
+        if now < self.soft_expiry {
+            Freshness::Fresh
+        } else if now < self.hard_expiry {
+            Freshness::SoftExpired
+        } else {
+            Freshness::HardExpired
+        }
+    }
+}
+
+#[derive(Clone)]
+struct CachedToken {
+    token: gcloud_sdk::Token,
+    deadlines: Option<TokenDeadlines>,
+}
+
+impl CachedToken {
+    fn freshness(&self, now: Instant) -> Freshness {
+        match &self.deadlines {
+            Some(deadlines) => deadlines.freshness(now),
+            None => Freshness::Fresh,
+        }
+    }
+}
+
+#[derive(Default)]
+struct CacheState {
+    token: Option<CachedToken>,
+    soft_refresh_failures: u32,
+    next_soft_refresh_at: Option<Instant>,
+}
+
+impl CacheState {
+    fn can_attempt_soft_refresh(&self, now: Instant) -> bool {
+        self.next_soft_refresh_at.is_none_or(|t| now >= t)
+    }
+
+    fn record_soft_refresh_failure(&mut self, now: Instant, base_cooldown: Duration) -> Duration {
+        let shift = self.soft_refresh_failures.min(5);
+        self.soft_refresh_failures = self.soft_refresh_failures.saturating_add(1);
+        let cooldown = base_cooldown
+            .saturating_mul(1u32 << shift)
+            .min(MAX_SOFT_REFRESH_COOLDOWN);
+        self.next_soft_refresh_at = Some(now + cooldown);
+        cooldown
+    }
+}
+
+struct PythonTokenSourceInner {
+    /// The Python callable (e.g., a function or method) that returns a tuple of
+    /// `(token_data, expiration_timestamp_float_or_none)`.
+    provider: Py<PyAny>,
+    /// Concurrent read-optimized cache for the retrieved token and soft-refresh backoff state.
+    cache: RwLock<CacheState>,
+    /// Async mutex serializing token refresh calls so concurrent callers coalesce
+    /// onto a single Python invocation instead of triggering a thundering herd.
+    refresh_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Maximum duration a single Python refresh invocation may run before timing out.
+    refresh_timeout: Duration,
+    /// Base cooldown applied after a failed soft-expiry background refresh.
+    soft_refresh_base_cooldown: Duration,
+}
+
+impl PythonTokenSourceInner {
+    fn fetch_from_python(&self) -> Result<CachedToken, gcloud_sdk::error::Error> {
+        Python::attach(|py| -> Result<CachedToken, gcloud_sdk::error::Error> {
+            let provider = self.provider.bind(py);
+            let result = provider.call0().map_err(|err| {
+                external_creds_error(format!("Python credentials provider failed: {err}"))
+            })?;
+
+            // result is (token_data, expiration)
+            let tuple = result.cast::<pyo3::types::PyTuple>().map_err(|_| {
+                external_creds_error(
+                    "Python credentials provider must return a 2-tuple (token_data, expiration)",
+                )
+            })?;
+
+            let token_data = tuple.get_item(0).map_err(|err| {
+                external_creds_error(format!(
+                    "Python credentials provider tuple missing token_data at index 0: {err}"
+                ))
+            })?;
+
+            let expiration = tuple.get_item(1).map_err(|err| {
+                external_creds_error(format!(
+                    "Python credentials provider tuple missing expiration at index 1: {err}"
+                ))
+            })?;
+
+            let bearer_token: String = token_data
+                .get_item("bearer_token")
+                .map_err(|err| {
+                    external_creds_error(format!("token_data missing 'bearer_token' key: {err}"))
+                })?
+                .cast::<pyo3::types::PyString>()
+                .map_err(|_| external_creds_error("'bearer_token' must be a string"))?
+                .to_str()
+                .map_err(|err| {
+                    external_creds_error(format!("'bearer_token' is not valid UTF-8: {err}"))
+                })?
+                .to_string();
+
+            if bearer_token.is_empty()
+                || !bearer_token
+                    .bytes()
+                    .all(|b| (0x20..=0x7e).contains(&b) || b == b'\t')
+            {
+                return Err(external_creds_error("invalid bearer token header value"));
+            }
+
+            let now_utc = Utc::now();
+            let now_instant = Instant::now();
+
+            // expiration is a float/int (timestamp) or None.
+            // Note: `gcloud_sdk::GoogleAuthTokenGenerator` caches `gcloud_sdk::Token` in an outer
+            // `RwLock` and only delegates back to `Source::token()` once `token.expiry <= Utc::now()`.
+            // Setting `token.expiry` to the soft-expiry UTC timestamp (`dt - SOFT_EXPIRY_BUFFER`)
+            // ensures `GoogleAuthTokenGenerator` delegates to `PythonTokenSource` upon entering the
+            // soft-expiry window so Stale-While-Revalidate can refresh the token before it expires.
+            let (expiry, deadlines) = if expiration.is_none() {
+                (
+                    now_utc + chrono::Duration::days(NON_EXPIRING_TOKEN_TTL_DAYS),
+                    None,
+                )
+            } else {
+                let expiry_f: f64 = expiration.extract().map_err(|err| {
+                    external_creds_error(format!(
+                        "expiration must be a float/int timestamp or None: {err}"
+                    ))
+                })?;
+
+                if !expiry_f.is_finite() || expiry_f < 0.0 {
+                    return Err(external_creds_error("expiration timestamp is out of range"));
+                }
+
+                let secs = expiry_f.trunc() as i64;
+                let nsecs = (expiry_f.fract() * 1_000_000_000.0) as u32;
+                let dt = chrono::DateTime::from_timestamp(secs, nsecs)
+                    .ok_or_else(|| external_creds_error("expiration timestamp is out of range"))?;
+
+                let soft_expiry_utc = dt
+                    - chrono::Duration::from_std(SOFT_EXPIRY_BUFFER)
+                        .expect("SOFT_EXPIRY_BUFFER fits in chrono::Duration");
+                (
+                    soft_expiry_utc,
+                    Some(TokenDeadlines::from_utc_expiry(dt, now_utc, now_instant)),
+                )
+            };
+
+            let token = gcloud_sdk::Token {
+                token: bearer_token.into(),
+                token_type: "Bearer".to_string(),
+                expiry,
+            };
+
+            Ok(CachedToken { token, deadlines })
+        })
+    }
+
+    /// Executes a token refresh inside a detached task that owns `guard`.
+    ///
+    /// Cancellation & timeout guarantees:
+    /// - If the caller's `token()` future is cancelled/dropped mid-refresh, the detached task
+    ///   continues holding `guard` until the Python call finishes (or times out) and writes the
+    ///   freshly minted token into `self.cache`, preventing both concurrent Python invocations
+    ///   and lost token updates.
+    /// - If the Python callable hangs longer than `self.refresh_timeout`, the timeout branch sets
+    ///   `timed_out = true` (preventing a late completion from overwriting newer tokens), releases
+    ///   `guard` so subsequent callers are not deadlocked, and returns an error.
+    async fn refresh_token_with_guard(
+        self: &Arc<Self>,
+        guard: tokio::sync::OwnedMutexGuard<()>,
+    ) -> Result<gcloud_sdk::Token, gcloud_sdk::error::Error> {
+        let inner = Arc::clone(self);
+        let refresh_timeout = self.refresh_timeout;
+
+        let detached = tokio::spawn(async move {
+            let _guard = guard;
+            let timed_out = Arc::new(AtomicBool::new(false));
+            let timed_out_for_worker = Arc::clone(&timed_out);
+            let inner_for_worker = Arc::clone(&inner);
+
+            let blocking = tokio::task::spawn_blocking(move || {
+                let cached = inner_for_worker.fetch_from_python()?;
+                if timed_out_for_worker.load(Ordering::Acquire) {
+                    return Err(external_creds_error(
+                        "Python credentials provider refresh completed after timeout",
+                    ));
+                }
+                let token = cached.token.clone();
+                let mut cache = inner_for_worker
+                    .cache
+                    .write()
+                    .map_err(|_| external_creds_error("token cache lock is poisoned"))?;
+                if !timed_out_for_worker.load(Ordering::Acquire) {
+                    cache.token = Some(cached);
+                    cache.soft_refresh_failures = 0;
+                    cache.next_soft_refresh_at = None;
+                }
+                Ok(token)
+            });
+
+            match tokio::time::timeout(refresh_timeout, blocking).await {
+                Ok(join_res) => join_res.map_err(|err| {
+                    external_creds_error(format!("Python token refresh task failed: {err}"))
+                })?,
+                Err(_) => {
+                    timed_out.store(true, Ordering::Release);
+                    Err(external_creds_error(format!(
+                        "Python credentials provider timed out after {}ms",
+                        refresh_timeout.as_millis()
+                    )))
+                },
+            }
+        });
+
+        detached.await.map_err(|err| {
+            external_creds_error(format!(
+                "Python token refresh coordinator task failed: {err}"
+            ))
+        })?
+    }
+}
+
+/// A token source that delegates authentication to a Python callable.
+///
+/// This struct implements the [`gcloud_sdk::Source`] trait, allowing the Rust
+/// Google Cloud SDK to retrieve OAuth2 tokens by calling back into Python code
+/// (e.g., using `google-auth`).
+///
+/// Concurrency and performance characteristics:
+/// - **Happy path**: Uses a shared [`RwLock`] read lock and monotonic [`Instant`] expiry
+///   comparisons, avoiding mutex contention across concurrent BigQuery streams, clock-skew
+///   issues, and Python GIL acquisition.
+/// - **Stale-While-Revalidate**: When a token enters [`SOFT_EXPIRY_BUFFER`] before [`HARD_EXPIRY_BUFFER`],
+///   the cached token is returned immediately while a single background task refreshes the cache,
+///   with exponential backoff on failure to prevent background task storms.
+/// - **Refresh coalescing & cancellation safety**: Concurrent callers on a cold or hard-expired
+///   cache serialize on an async [`tokio::sync::Mutex`] with double-checked locking, run the refresh
+///   in a cancellation-safe detached task with a hard timeout, and execute Python on Tokio's
+///   blocking pool (`spawn_blocking`) so async I/O workers never park on the GIL.
+pub(crate) struct PythonTokenSource {
+    inner: Arc<PythonTokenSourceInner>,
+}
+
+impl PythonTokenSource {
+    pub(crate) fn new(provider: Py<PyAny>) -> Self {
+        Self::new_with_config(
+            provider,
+            DEFAULT_REFRESH_TIMEOUT,
+            DEFAULT_SOFT_REFRESH_BASE_COOLDOWN,
+        )
+    }
+
+    pub(crate) fn new_with_config(
+        provider: Py<PyAny>,
+        refresh_timeout: Duration,
+        soft_refresh_base_cooldown: Duration,
+    ) -> Self {
+        Self {
+            inner: Arc::new(PythonTokenSourceInner {
+                provider,
+                cache: RwLock::new(CacheState::default()),
+                refresh_lock: Arc::new(tokio::sync::Mutex::new(())),
+                refresh_timeout,
+                soft_refresh_base_cooldown,
+            }),
+        }
+    }
+}
+
+impl std::fmt::Debug for PythonTokenSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PythonTokenSource")
+            .field("provider", &"<python_callable>")
+            .finish()
+    }
+}
+
+#[async_trait]
+impl gcloud_sdk::Source for PythonTokenSource {
+    async fn token(&self) -> Result<gcloud_sdk::Token, gcloud_sdk::error::Error> {
+        let now = Instant::now();
+
+        // 1. Happy path: shared read lock on the cache + monotonic Instant check.
+        let (freshness, soft_token, can_attempt_soft_refresh) = {
+            let cache = self
+                .inner
+                .cache
+                .read()
+                .map_err(|_| external_creds_error("token cache lock is poisoned"))?;
+            match cache.token.as_ref() {
+                Some(cached) => match cached.freshness(now) {
+                    Freshness::Fresh => return Ok(cached.token.clone()),
+                    Freshness::SoftExpired => (
+                        Freshness::SoftExpired,
+                        Some(cached.token.clone()),
+                        cache.can_attempt_soft_refresh(now),
+                    ),
+                    Freshness::HardExpired => (Freshness::HardExpired, None, false),
+                },
+                None => (Freshness::HardExpired, None, false),
+            }
+        };
+
+        // 2. Stale-While-Revalidate: return the still-valid cached token immediately
+        //    and spawn at most one non-blocking background refresh if not in failure cooldown.
+        if let (Freshness::SoftExpired, Some(token)) = (freshness, soft_token) {
+            if can_attempt_soft_refresh {
+                if let Ok(guard) = Arc::clone(&self.inner.refresh_lock).try_lock_owned() {
+                    let inner = Arc::clone(&self.inner);
+                    tokio::spawn(async move {
+                        let should_refresh = inner
+                            .cache
+                            .read()
+                            .ok()
+                            .map(|c| {
+                                let now = Instant::now();
+                                c.can_attempt_soft_refresh(now)
+                                    && c.token
+                                        .as_ref()
+                                        .is_some_and(|t| t.freshness(now) != Freshness::Fresh)
+                            })
+                            .unwrap_or(false);
+                        if should_refresh {
+                            if let Err(err) = inner.refresh_token_with_guard(guard).await {
+                                let cooldown = inner
+                                    .cache
+                                    .write()
+                                    .ok()
+                                    .map(|mut c| {
+                                        c.record_soft_refresh_failure(
+                                            Instant::now(),
+                                            inner.soft_refresh_base_cooldown,
+                                        )
+                                    })
+                                    .unwrap_or(inner.soft_refresh_base_cooldown);
+                                tracing::warn!(
+                                    error = %err,
+                                    backoff_ms = cooldown.as_millis() as u64,
+                                    "Background soft-expiry token refresh failed; continuing to serve cached token until hard expiry"
+                                );
+                            }
+                        }
+                    });
+                }
+            }
+            return Ok(token);
+        }
+
+        // 3. Cold or hard-expired path: coalesce concurrent refreshes via async Mutex.
+        let refresh_guard = Arc::clone(&self.inner.refresh_lock).lock_owned().await;
+
+        // Double-checked locking: check if another task refreshed the token while we waited.
+        {
+            let cache = self
+                .inner
+                .cache
+                .read()
+                .map_err(|_| external_creds_error("token cache lock is poisoned"))?;
+            if let Some(cached) = cache.token.as_ref() {
+                if cached.freshness(Instant::now()) != Freshness::HardExpired {
+                    return Ok(cached.token.clone());
+                }
+            }
+        }
+
+        self.inner.refresh_token_with_guard(refresh_guard).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use gcloud_sdk::Source as _;
+    use pyo3::types::PyDict;
+
+    use super::*;
+
+    #[test]
+    fn test_python_token_source_caches_token() {
+        Python::initialize();
+        let (provider, counter) = Python::attach(|py| {
+            let locals = PyDict::new(py);
+            let future_ts = (Utc::now() + chrono::Duration::seconds(3600)).timestamp() as f64;
+            locals.set_item("future_ts", future_ts).unwrap();
+            py.run(
+                c"
+class Counter:
+    def __init__(self):
+        self.count = 0
+    def __call__(self):
+        self.count += 1
+        return ({'bearer_token': f'secret-token-{self.count}'}, future_ts)
+counter = Counter()
+",
+                Some(&locals),
+                Some(&locals),
+            )
+            .unwrap();
+            let c = locals.get_item("counter").unwrap().unwrap().unbind();
+            let c_clone = c.clone_ref(py);
+            (c, c_clone)
+        });
+
+        let source = PythonTokenSource::new(provider);
+
+        let rt = pyo3_async_runtimes::tokio::get_runtime();
+        Python::attach(|py| {
+            py.detach(|| {
+                rt.block_on(async {
+                    let tok1 = source.token().await.unwrap();
+                    assert_eq!(tok1.header_value(), "Bearer secret-token-1");
+
+                    // Debug output must not leak token
+                    let debug_str = format!("{source:?} {tok1:?}");
+                    assert!(!debug_str.contains("secret-token-1"));
+
+                    // Second call should return cached token without calling Python again
+                    let tok2 = source.token().await.unwrap();
+                    assert_eq!(tok2.header_value(), "Bearer secret-token-1");
+                });
+            });
+        });
+
+        let count: i32 = Python::attach(|py| {
+            counter
+                .bind(py)
+                .getattr("count")
+                .unwrap()
+                .extract()
+                .unwrap()
+        });
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn test_python_token_source_refreshes_when_expiring_soon() {
+        Python::initialize();
+        let provider = Python::attach(|py| {
+            let locals = PyDict::new(py);
+            // First token expires in 30s (within the 60s hard expiry window), second in 3600s
+            let expiring_soon = (Utc::now() + chrono::Duration::seconds(30)).timestamp() as f64;
+            let future_ts = (Utc::now() + chrono::Duration::seconds(3600)).timestamp() as f64;
+            locals.set_item("expiring_soon", expiring_soon).unwrap();
+            locals.set_item("future_ts", future_ts).unwrap();
+            py.run(
+                c"
+class ExpiringProvider:
+    def __init__(self):
+        self.count = 0
+    def __call__(self):
+        self.count += 1
+        ts = expiring_soon if self.count == 1 else future_ts
+        return ({'bearer_token': f'token-{self.count}'}, ts)
+provider = ExpiringProvider()
+",
+                Some(&locals),
+                Some(&locals),
+            )
+            .unwrap();
+            locals.get_item("provider").unwrap().unwrap().unbind()
+        });
+
+        let source = PythonTokenSource::new(provider);
+
+        let rt = pyo3_async_runtimes::tokio::get_runtime();
+        Python::attach(|py| {
+            py.detach(|| {
+                rt.block_on(async {
+                    let tok1 = source.token().await.unwrap();
+                    assert_eq!(tok1.header_value(), "Bearer token-1");
+
+                    // Since token-1 expires in <60s (hard-expired), the next call refreshes synchronously
+                    let tok2 = source.token().await.unwrap();
+                    assert_eq!(tok2.header_value(), "Bearer token-2");
+                });
+            });
+        });
+    }
+
+    #[test]
+    fn test_python_token_source_stale_while_revalidate_and_failure_cooldown() {
+        Python::initialize();
+        let (provider, counter) = Python::attach(|py| {
+            let locals = PyDict::new(py);
+            // First token expires in 90s: between HARD_EXPIRY_BUFFER (60s) and SOFT_EXPIRY_BUFFER (120s).
+            let soft_expiring = (Utc::now() + chrono::Duration::seconds(90)).timestamp() as f64;
+            let future_ts = (Utc::now() + chrono::Duration::seconds(3600)).timestamp() as f64;
+            locals.set_item("soft_expiring", soft_expiring).unwrap();
+            locals.set_item("future_ts", future_ts).unwrap();
+            py.run(
+                c"
+class SoftExpiringProvider:
+    def __init__(self):
+        self.count = 0
+        self.fail_next = False
+    def __call__(self):
+        self.count += 1
+        if self.fail_next:
+            raise RuntimeError('transient metadata blip')
+        ts = soft_expiring if self.count == 1 else future_ts
+        return ({'bearer_token': f'token-{self.count}'}, ts)
+provider = SoftExpiringProvider()
+",
+                Some(&locals),
+                Some(&locals),
+            )
+            .unwrap();
+            let p = locals.get_item("provider").unwrap().unwrap().unbind();
+            let p_clone = p.clone_ref(py);
+            (p, p_clone)
+        });
+
+        // Configure an 80ms base cooldown so we can test both cooldown throttling and recovery
+        let source = PythonTokenSource::new_with_config(
+            provider,
+            Duration::from_secs(5),
+            Duration::from_millis(80),
+        );
+
+        let rt = pyo3_async_runtimes::tokio::get_runtime();
+        Python::attach(|py| {
+            py.detach(|| {
+                rt.block_on(async {
+                    // 1. Cold start fetches token-1 (90s TTL -> immediately in soft-expiry window)
+                    let tok1 = source.token().await.unwrap();
+                    assert_eq!(tok1.header_value(), "Bearer token-1");
+
+                    // Inject a transient failure for background refreshes
+                    Python::attach(|py| {
+                        counter.bind(py).setattr("fail_next", true).unwrap();
+                    });
+
+                    // 2. Call in soft-expiry window: returns token-1 immediately and triggers 1 background refresh
+                    let tok2 = source.token().await.unwrap();
+                    assert_eq!(tok2.header_value(), "Bearer token-1");
+
+                    // Wait for the failing background refresh to finish and record its 80ms cooldown
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+
+                    // Multiple calls during the cooldown window must NOT trigger additional Python calls!
+                    for _ in 0..5 {
+                        let _ = source.token().await.unwrap();
+                    }
+                    tokio::time::sleep(Duration::from_millis(15)).await;
+
+                    let count_during_cooldown: i32 = Python::attach(|py| {
+                        counter
+                            .bind(py)
+                            .getattr("count")
+                            .unwrap()
+                            .extract()
+                            .unwrap()
+                    });
+                    assert_eq!(
+                        count_during_cooldown, 2,
+                        "soft-expiry cooldown must suppress background retry storms during cooldown window"
+                    );
+
+                    // Clear the failure and wait for the 80ms cooldown to expire
+                    Python::attach(|py| {
+                        counter.bind(py).setattr("fail_next", false).unwrap();
+                    });
+                    tokio::time::sleep(Duration::from_millis(60)).await;
+
+                    // 3. Next call after cooldown expires triggers a background refresh that succeeds (token-3)
+                    let _ = source.token().await.unwrap();
+
+                    for _ in 0..40 {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                        let tok = source.token().await.unwrap();
+                        if tok.header_value() == "Bearer token-3" {
+                            return;
+                        }
+                    }
+                    panic!("expected background refresh after cooldown to update cache to token-3");
+                });
+            });
+        });
+    }
+
+    #[test]
+    fn test_python_token_source_coalesces_concurrent_refreshes() {
+        Python::initialize();
+        let (provider, counter) = Python::attach(|py| {
+            let locals = PyDict::new(py);
+            let future_ts = (Utc::now() + chrono::Duration::seconds(3600)).timestamp() as f64;
+            locals.set_item("future_ts", future_ts).unwrap();
+            py.run(
+                c"
+import time
+class SlowProvider:
+    def __init__(self):
+        self.count = 0
+    def __call__(self):
+        time.sleep(0.05)
+        self.count += 1
+        return ({'bearer_token': f'coalesced-token-{self.count}'}, future_ts)
+provider = SlowProvider()
+",
+                Some(&locals),
+                Some(&locals),
+            )
+            .unwrap();
+            let p = locals.get_item("provider").unwrap().unwrap().unbind();
+            let p_clone = p.clone_ref(py);
+            (p, p_clone)
+        });
+
+        let source = Arc::new(PythonTokenSource::new(provider));
+
+        let rt = pyo3_async_runtimes::tokio::get_runtime();
+        // Detach the main thread from the GIL while Tokio's blocking pool runs SlowProvider
+        Python::attach(|py| {
+            py.detach(|| {
+                rt.block_on(async {
+                    let mut handles = Vec::new();
+                    for _ in 0..16 {
+                        let src = Arc::clone(&source);
+                        handles.push(tokio::spawn(async move { src.token().await.unwrap() }));
+                    }
+
+                    for h in handles {
+                        let tok = h.await.unwrap();
+                        assert_eq!(tok.header_value(), "Bearer coalesced-token-1");
+                    }
+                });
+            });
+        });
+
+        let count: i32 = Python::attach(|py| {
+            counter
+                .bind(py)
+                .getattr("count")
+                .unwrap()
+                .extract()
+                .unwrap()
+        });
+        assert_eq!(
+            count, 1,
+            "16 concurrent requests on cold cache must coalesce into 1 Python call"
+        );
+    }
+
+    #[test]
+    fn test_python_token_source_cancellation_safety_preserves_inflight_refresh() {
+        Python::initialize();
+        let (provider, counter) = Python::attach(|py| {
+            let locals = PyDict::new(py);
+            let future_ts = (Utc::now() + chrono::Duration::seconds(3600)).timestamp() as f64;
+            locals.set_item("future_ts", future_ts).unwrap();
+            py.run(
+                c"
+import time
+class SlowProvider:
+    def __init__(self):
+        self.count = 0
+    def __call__(self):
+        time.sleep(0.06)
+        self.count += 1
+        return ({'bearer_token': f'saved-token-{self.count}'}, future_ts)
+provider = SlowProvider()
+",
+                Some(&locals),
+                Some(&locals),
+            )
+            .unwrap();
+            let p = locals.get_item("provider").unwrap().unwrap().unbind();
+            let p_clone = p.clone_ref(py);
+            (p, p_clone)
+        });
+
+        let source = Arc::new(PythonTokenSource::new(provider));
+        let rt = pyo3_async_runtimes::tokio::get_runtime();
+
+        Python::attach(|py| {
+            py.detach(|| {
+                rt.block_on(async {
+                    // Caller 1 starts refreshing and is cancelled after 15ms (mid-Python execution)
+                    let src1 = Arc::clone(&source);
+                    let _ = tokio::time::timeout(Duration::from_millis(15), src1.token()).await;
+
+                    // Caller 2 arrives while Caller 1's detached refresh is still in flight;
+                    // it must coalesce onto the same Python invocation and receive saved-token-1!
+                    let tok2 = source.token().await.unwrap();
+                    assert_eq!(tok2.header_value(), "Bearer saved-token-1");
+                });
+            });
+        });
+
+        let count: i32 = Python::attach(|py| {
+            counter
+                .bind(py)
+                .getattr("count")
+                .unwrap()
+                .extract()
+                .unwrap()
+        });
+        assert_eq!(
+            count, 1,
+            "cancelling caller 1 must not lose the in-flight token or trigger a duplicate Python call"
+        );
+    }
+
+    #[test]
+    fn test_python_token_source_refresh_timeout_releases_lock() {
+        Python::initialize();
+        let provider = Python::attach(|py| {
+            let locals = PyDict::new(py);
+            let future_ts = (Utc::now() + chrono::Duration::seconds(3600)).timestamp() as f64;
+            locals.set_item("future_ts", future_ts).unwrap();
+            py.run(
+                c"
+import time
+class HungThenFastProvider:
+    def __init__(self):
+        self.count = 0
+    def __call__(self):
+        self.count += 1
+        if self.count == 1:
+            time.sleep(0.25)
+            return ({'bearer_token': 'stale-timed-out-token'}, future_ts)
+        return ({'bearer_token': 'fresh-recovered-token'}, future_ts)
+provider = HungThenFastProvider()
+",
+                Some(&locals),
+                Some(&locals),
+            )
+            .unwrap();
+            locals.get_item("provider").unwrap().unwrap().unbind()
+        });
+
+        let source = PythonTokenSource::new_with_config(
+            provider,
+            Duration::from_millis(50),
+            Duration::from_secs(1),
+        );
+        let rt = pyo3_async_runtimes::tokio::get_runtime();
+
+        Python::attach(|py| {
+            py.detach(|| {
+                rt.block_on(async {
+                    // First call times out after 50ms
+                    let err = source.token().await.unwrap_err();
+                    assert!(err.to_string().contains("timed out"));
+
+                    // Second call immediately acquires the released lock and succeeds
+                    let tok = source.token().await.unwrap();
+                    assert_eq!(tok.header_value(), "Bearer fresh-recovered-token");
+
+                    // Wait for the hung first call to finish in the background and verify it
+                    // did NOT overwrite fresh-recovered-token.
+                    tokio::time::sleep(Duration::from_millis(230)).await;
+                    let tok_after = source.token().await.unwrap();
+                    assert_eq!(tok_after.header_value(), "Bearer fresh-recovered-token");
+                });
+            });
+        });
+    }
+
+    #[test]
+    fn test_python_token_source_none_expiration() {
+        Python::initialize();
+        let (provider, counter) = Python::attach(|py| {
+            let locals = PyDict::new(py);
+            py.run(
+                c"
+class NonExpiringProvider:
+    def __init__(self):
+        self.count = 0
+    def __call__(self):
+        self.count += 1
+        return ({'bearer_token': 'forever-token'}, None)
+provider = NonExpiringProvider()
+",
+                None,
+                Some(&locals),
+            )
+            .unwrap();
+            let p = locals.get_item("provider").unwrap().unwrap().unbind();
+            let p_clone = p.clone_ref(py);
+            (p, p_clone)
+        });
+
+        let source = PythonTokenSource::new(provider);
+
+        let rt = pyo3_async_runtimes::tokio::get_runtime();
+        Python::attach(|py| {
+            py.detach(|| {
+                rt.block_on(async {
+                    let tok1 = source.token().await.unwrap();
+                    assert_eq!(tok1.header_value(), "Bearer forever-token");
+
+                    let tok2 = source.token().await.unwrap();
+                    assert_eq!(tok2.header_value(), "Bearer forever-token");
+                });
+            });
+        });
+
+        let count: i32 = Python::attach(|py| {
+            counter
+                .bind(py)
+                .getattr("count")
+                .unwrap()
+                .extract()
+                .unwrap()
+        });
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn test_python_token_source_errors() {
+        Python::initialize();
+        let cases = [
+            (
+                "def p(): raise RuntimeError('metadata 503 unavailable')",
+                "metadata 503 unavailable",
+            ),
+            (
+                "def p(): raise ValueError('invalid credentials config')",
+                "invalid credentials config",
+            ),
+            ("def p(): return 'not-a-tuple'", "2-tuple"),
+            ("def p(): return ({}, 1700000000.0)", "bearer_token"),
+            (
+                "def p(): return ({'bearer_token': 'bad\\ntoken'}, 1700000000.0)",
+                "invalid bearer token",
+            ),
+            (
+                "def p(): return ({'bearer_token': 'tok'}, -1.0)",
+                "out of range",
+            ),
+        ];
+
+        let rt = pyo3_async_runtimes::tokio::get_runtime();
+        for (code, expected_msg) in cases {
+            let provider = Python::attach(|py| {
+                let locals = PyDict::new(py);
+                let c_code = std::ffi::CString::new(code).unwrap();
+                py.run(&c_code, None, Some(&locals)).unwrap();
+                locals.get_item("p").unwrap().unwrap().unbind()
+            });
+            let source = PythonTokenSource::new(provider);
+            Python::attach(|py| {
+                py.detach(|| {
+                    rt.block_on(async {
+                        let err = source.token().await.unwrap_err();
+                        assert!(
+                            err.to_string().contains(expected_msg),
+                            "expected '{}' in '{}'",
+                            expected_msg,
+                            err
+                        );
+                    });
+                });
+            });
+        }
+    }
+
+    #[test]
+    fn test_python_token_source_with_gcloud_token_generator() {
+        Python::initialize();
+        let (provider, counter) = Python::attach(|py| {
+            let locals = PyDict::new(py);
+            // Token expires in 90s (inside soft-expiry window [60s, 120s]), so `gcloud_sdk::Token.expiry`
+            // is in the past and `GoogleAuthTokenGenerator` delegates to `PythonTokenSource::token()`,
+            // allowing Stale-While-Revalidate to refresh the token in the background.
+            let soft_expiring = (Utc::now() + chrono::Duration::seconds(90)).timestamp() as f64;
+            let future_ts = (Utc::now() + chrono::Duration::seconds(3600)).timestamp() as f64;
+            locals.set_item("soft_expiring", soft_expiring).unwrap();
+            locals.set_item("future_ts", future_ts).unwrap();
+            py.run(
+                c"
+class SoftExpiringProvider:
+    def __init__(self):
+        self.count = 0
+    def __call__(self):
+        self.count += 1
+        ts = soft_expiring if self.count == 1 else future_ts
+        return ({'bearer_token': f'gen-token-{self.count}'}, ts)
+provider = SoftExpiringProvider()
+",
+                Some(&locals),
+                Some(&locals),
+            )
+            .unwrap();
+            let p = locals.get_item("provider").unwrap().unwrap().unbind();
+            let p_clone = p.clone_ref(py);
+            (p, p_clone)
+        });
+
+        let source = PythonTokenSource::new(provider);
+        let rt = pyo3_async_runtimes::tokio::get_runtime();
+
+        Python::attach(|py| {
+            py.detach(|| {
+                rt.block_on(async {
+                    let generator = gcloud_sdk::GoogleAuthTokenGenerator::new(
+                        gcloud_sdk::TokenSourceType::ExternalSource(Box::new(source)),
+                        vec![],
+                    )
+                    .await
+                    .unwrap();
+
+                    // First call fetches gen-token-1 (90s TTL -> in soft-expiry window)
+                    let tok1 = generator.create_token().await.unwrap();
+                    assert_eq!(tok1.header_value(), "Bearer gen-token-1");
+
+                    // Second call delegates to PythonTokenSource, which serves gen-token-1 immediately
+                    // and triggers a background refresh to gen-token-2
+                    let tok2 = generator.create_token().await.unwrap();
+                    assert_eq!(tok2.header_value(), "Bearer gen-token-1");
+
+                    for _ in 0..40 {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                        let tok = generator.create_token().await.unwrap();
+                        if tok.header_value() == "Bearer gen-token-2" {
+                            // Once refreshed to gen-token-2 (3600s TTL), subsequent calls must hit
+                            // GoogleAuthTokenGenerator's outer cache without calling Python again.
+                            let tok_cached = generator.create_token().await.unwrap();
+                            assert_eq!(tok_cached.header_value(), "Bearer gen-token-2");
+                            return;
+                        }
+                    }
+                    panic!("expected GoogleAuthTokenGenerator + PythonTokenSource to refresh to gen-token-2");
+                });
+            });
+        });
+
+        let count: i32 = Python::attach(|py| {
+            counter
+                .bind(py)
+                .getattr("count")
+                .unwrap()
+                .extract()
+                .unwrap()
+        });
+        assert_eq!(count, 2);
+    }
+}

@@ -22,7 +22,8 @@ pyo3-polars = { version = "0.26.0", features = ["derive", "lazy"] }
 polars-arrow = { version = "0.53.0", default-features = false }
 rustls = { version = "0.23.37", features = ["aws_lc_rs"] }
 secret-vault-value = "1.0"
-tokio = { version = "1.51.0", features = ["time"] }
+tokio = { version = "1.51.0", features = ["rt", "sync", "time"] }
+tracing = "0.1"
 
 [features]
 extension-module = ["pyo3/extension-module"]
