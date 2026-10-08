@@ -129,22 +129,25 @@ impl ServiceConfigBuilder {
             .retry_throttler
             .unwrap_or_else(default_retry_throttler);
 
+        let client_retry_policy = self
+            .retry_policy
+            .clone()
+            .unwrap_or_else(crate::bigquery_read_retry::create_read_session_retry_policy);
+        let client_backoff_policy = self
+            .backoff_policy
+            .clone()
+            .unwrap_or_else(crate::bigquery_read_retry::default_backoff_policy);
+
         let mut clients = Vec::with_capacity(subchannel_count);
         for _ in 0..subchannel_count {
             let mut builder = Read::builder()
                 .with_credentials(cred.clone())
+                .with_retry_policy(client_retry_policy.clone())
+                .with_backoff_policy(client_backoff_policy.clone())
                 .with_retry_throttler(retry_throttler.clone());
 
             if let Some(ref endpoint) = self.endpoint {
                 builder = builder.with_endpoint(endpoint.clone());
-            }
-
-            if let Some(ref retry_policy) = self.retry_policy {
-                builder = builder.with_retry_policy(retry_policy.clone());
-            }
-
-            if let Some(ref backoff_policy) = self.backoff_policy {
-                builder = builder.with_backoff_policy(backoff_policy.clone());
             }
 
             clients.push(builder.build().await?);
@@ -163,12 +166,12 @@ impl ServiceConfigBuilder {
 
 #[cfg(test)]
 mod tests {
-    use google_cloud_bigquery::read::retry_policy::RetryableErrors;
     use google_cloud_gax::exponential_backoff::ExponentialBackoff;
     use google_cloud_gax::retry_policy::RetryPolicyExt;
     use google_cloud_gax::retry_throttler::AdaptiveThrottler;
 
     use super::*;
+    use crate::bigquery_read_retry::RetryableErrors;
 
     #[test]
     fn test_service_config_builder_defaults() {

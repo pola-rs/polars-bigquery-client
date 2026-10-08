@@ -6,15 +6,15 @@ edition = "2021"
 [dependencies]
 bytes = "1.0"
 chrono = "0.4"
-google-cloud-auth = { git = "https://github.com/tswast/google-cloud-rust.git", branch = "tswast-bq-storage-reader" }
-google-cloud-bigquery = { git = "https://github.com/tswast/google-cloud-rust.git", branch = "tswast-bq-storage-reader" }
-google-cloud-gax = { git = "https://github.com/tswast/google-cloud-rust.git", branch = "tswast-bq-storage-reader" }
-google-cloud-wkt = { git = "https://github.com/tswast/google-cloud-rust.git", branch = "tswast-bq-storage-reader" }
+google-cloud-auth = "1.17.0"
+google-cloud-bigquery = "0.18.0"
+google-cloud-gax = "1.15.0"
+google-cloud-wkt = "1.9.0"
 polars-arrow = { version = "0.53.0", default-features = false, features = ["io_ipc", "io_ipc_compression"] }
 polars-error = "0.53.0"
 rayon = "1.12"
 rustls = { version = "0.23.37", features = ["aws_lc_rs"] }
-tokio = { version = "1.51.0", features = ["macros", "rt", "sync"] }
+tokio = { version = "1.51.0", features = ["macros", "rt", "sync", "time"] }
 tracing = "0.1"
 tracing-subscriber = { version ="0.3", features = ["env-filter"] }
 winnow = "1.0.4"
