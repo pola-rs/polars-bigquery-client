@@ -1,7 +1,9 @@
 use std::env;
 use std::sync::Arc;
 
-use arrow_bigquery::{BigQueryTableId, Client, ReadOptions, ServiceConfigBuilder};
+use arrow_bigquery::{
+    BigQueryReadClientBuilder, BigQueryTableId, Client, ReadOptions, ServiceConfigBuilder,
+};
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, SamplingMode};
 use tokio::runtime::Runtime;
 
@@ -11,6 +13,7 @@ async fn setup_client() -> Client {
 
     Client::from_builder(
         ServiceConfigBuilder::new()
+            .with_cred(gcloud_sdk::TokenSourceType::Default)
             .with_user_agent(Some("integration-test/1.0".to_string()))
             .with_quota_project_id(Some(quota_project_id)),
     )
@@ -89,9 +92,8 @@ fn read_table(c: &mut Criterion) {
 
     group.bench_function("sec_quarterly_financials_submission", |b| {
         let client = &client.clone();
-        b.to_async(&rt).iter(|| async move {
-            read_sec_quarterly_financials_table(client, "submission").await
-        });
+        b.to_async(&rt)
+            .iter(|| async move { read_sec_quarterly_financials_table(client, "submission").await });
     });
 
     // The portion of the "numbers" table we are reading is about 5 GB total, so

@@ -1,331 +1,461 @@
-//! Retry and backoff policies for the BigQuery Storage Read API.
+//! Retry policies and backoff session management built on Tower ([`tower::retry`]).
 //!
-//! Adapts the BigQuery Storage Read API retry parameters and reconnection session
-//! tracking to [`google_cloud_gax`] policies (`RetryPolicy`, `BackoffPolicy`,
-//! `SharedRetryThrottler`).
+//! This module separates static **policy configuration** from active **runtime session state**:
+//!
+//! - [`RetryParameters`]: An immutable struct holding retry configuration (min/max delays, custom multiplier `factor`,
+//!   jitter, max attempt limits, and total duration timeouts).
+//! - [`RetryParametersBuilder`]: Builder for validating and constructing [`RetryParameters`].
+//! - [`RetryPolicy`]: Combines [`RetryParameters`] with an error predicate and RNG source. It implements [`tower::retry::Policy`]
+//!   for use with Tower middleware services ([`tower::retry::Retry`]), such as initial RPC calls.
+//! - [`BackoffSession`]: Tracks the mutable runtime state for a single operation attempt (current iteration count,
+//!   start time, multiplier calculation, and sleep generation), initialized from [`RetryParameters`].
+//!
+//! ### Why Custom Multiplier Factor?
+//! Tower's built-in [`tower::retry::backoff::ExponentialBackoff`] hardcodes a binary multiplier of `2.0` ($2^n$).
+//! The BigQuery Storage API Python reference client specifies a multiplier factor of `1.3` (100ms -> 130ms -> 169ms ...),
+//! which ramps up more gently. `RetryPolicy` and `BackoffSession` support configurable multiplier factors while remaining
+//! 100% compatible with Tower's [`tower::retry::Policy`] trait.
 
-use std::sync::Arc;
-use std::time::Duration;
+use std::error::Error;
+use std::fmt::{Debug, Display};
+use std::time::{Duration, Instant};
 
-use google_cloud_gax::backoff_policy::BackoffPolicy;
-use google_cloud_gax::error::rpc::Code;
-use google_cloud_gax::error::Error;
-use google_cloud_gax::exponential_backoff::ExponentialBackoffBuilder;
-use google_cloud_gax::retry_policy::{RetryPolicy, RetryPolicyExt};
-use google_cloud_gax::retry_result::RetryResult;
-use google_cloud_gax::retry_state::RetryState;
-use google_cloud_gax::retry_throttler::SharedRetryThrottler;
-use google_cloud_gax::throttle_result::ThrottleResult;
+use gcloud_sdk::tonic;
+use tower::retry::Policy;
+use tower::util::rng::{HasherRng, Rng};
 
-const INITIAL_DELAY: Duration = Duration::from_millis(100);
-const MAXIMUM_DELAY: Duration = Duration::from_secs(60);
-const SCALING_FACTOR: f64 = 1.3;
-const CREATE_READ_SESSION_TIMEOUT: Duration = Duration::from_secs(600);
-const READ_ROWS_TIMEOUT: Duration = Duration::from_secs(900);
-const STREAM_RECONNECT_MAX_ATTEMPTS: u32 = 10;
-
-/// Follows the RPC retry strategy recommended for the BigQuery Storage Read API.
+/// Common immutable configuration parameters for exponential backoff retries.
 ///
-/// Retries transient network/transport errors, HTTP/2 stream resets, rate-limit
-/// errors (`ResourceExhausted`), and transient server statuses (`DeadlineExceeded`,
-/// `Aborted`, `ResourceExhausted`, `Unavailable`, `Internal`) when the operation
-/// is idempotent.
-///
-/// This policy must be decorated with [`RetryPolicyExt::with_time_limit`] or
-/// [`RetryPolicyExt::with_attempt_limit`] to bound the retry loop.
-#[derive(Clone, Debug, Default)]
-pub(crate) struct RetryableErrors;
+/// Holds static timing parameters and limits (min/max delays, custom multiplier factor,
+/// jitter ratio, attempt count limits, and total duration timeouts) shared across
+/// [`RetryPolicy`] and [`BackoffSession`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RetryParameters {
+    pub min_delay: Duration,
+    pub max_delay: Duration,
+    pub factor: f64,
+    pub jitter: f64,
+    pub max_times: Option<u32>,
+    pub max_total_delay: Option<Duration>,
+}
 
-impl RetryPolicy for RetryableErrors {
-    fn on_error(&self, state: &RetryState, error: Error) -> RetryResult {
-        if is_retryable_error(&error, state.idempotent) {
-            RetryResult::Continue(error)
+impl RetryParameters {
+    /// Creates a new [`RetryParametersBuilder`] to configure and validate retry parameters.
+    pub fn builder(
+        min_delay: Duration,
+        max_delay: Duration,
+    ) -> Result<RetryParametersBuilder, RetryParametersBuilderError> {
+        RetryParametersBuilder::new(min_delay, max_delay)
+    }
+}
+
+#[derive(Debug)]
+pub struct RetryParametersBuilderError {
+    pub message: String,
+}
+
+impl Display for RetryParametersBuilderError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "invalid RetryParametersBuilder: {}", self.message)
+    }
+}
+
+impl Error for RetryParametersBuilderError {}
+
+/// Builder for constructing and validating [`RetryParameters`].
+#[derive(Debug, Clone)]
+pub struct RetryParametersBuilder {
+    min_delay: Duration,
+    max_delay: Duration,
+    factor: f64,
+    jitter: f64,
+    max_times: Option<u32>,
+    max_total_delay: Option<Duration>,
+}
+
+impl RetryParametersBuilder {
+    pub fn new(
+        min_delay: Duration,
+        max_delay: Duration,
+    ) -> Result<Self, RetryParametersBuilderError> {
+        // Note: negative durations aren't representable in the built-in
+        // Duration type.  Subtracting anything from Duration::ZERO results in
+        // an overflow error.
+        if max_delay == Duration::ZERO {
+            return Err(RetryParametersBuilderError {
+                message: "max_delay must by > Duration::ZERO".to_owned(),
+            });
+        }
+        if min_delay > max_delay {
+            return Err(RetryParametersBuilderError {
+                message: "min_delay must be <= max_delay".to_owned(),
+            });
+        }
+        Ok(RetryParametersBuilder {
+            min_delay,
+            max_delay,
+            factor: 1.3,
+            jitter: 0.0,
+            max_times: None,
+            max_total_delay: None,
+        })
+    }
+
+    pub fn with_factor(mut self, factor: f64) -> Result<Self, RetryParametersBuilderError> {
+        if factor <= 0.0 {
+            return Err(RetryParametersBuilderError {
+                message: "factor must by > 0".to_owned(),
+            });
+        }
+        self.factor = factor;
+        Ok(self)
+    }
+
+    pub fn with_jitter(mut self, jitter: f64) -> Result<Self, RetryParametersBuilderError> {
+        if jitter < 0.0 {
+            return Err(RetryParametersBuilderError {
+                message: "jitter must by >= 0".to_owned(),
+            });
+        }
+        self.jitter = jitter;
+        Ok(self)
+    }
+
+    pub fn with_max_times(mut self, max_times: u32) -> Result<Self, RetryParametersBuilderError> {
+        if max_times == 0 {
+            return Err(RetryParametersBuilderError {
+                message: "max_times must be at least 1".to_owned(),
+            });
+        }
+        self.max_times = Some(max_times);
+        Ok(self)
+    }
+
+    pub fn with_max_total_delay(
+        mut self,
+        max_total_delay: Duration,
+    ) -> Result<Self, RetryParametersBuilderError> {
+        if max_total_delay < self.min_delay {
+            return Err(RetryParametersBuilderError {
+                message: "max_total_delay must be at least min_delay".to_owned(),
+            });
+        }
+        self.max_total_delay = Some(max_total_delay);
+        Ok(self)
+    }
+
+    pub fn build(self) -> RetryParameters {
+        RetryParameters {
+            min_delay: self.min_delay,
+            max_delay: self.max_delay,
+            factor: self.factor,
+            jitter: self.jitter,
+            max_times: self.max_times,
+            max_total_delay: self.max_total_delay,
+        }
+    }
+}
+
+/// Tracks active backoff state (attempt count, start time, and sleep generator) for a single operation session.
+///
+/// Created via [`RetryPolicy::make_session`]. Supports configurable exponential growth factor ($min \times factor^{attempts}$).
+#[derive(Debug, Clone)]
+pub struct BackoffSession<R = HasherRng> {
+    parameters: RetryParameters,
+    rng: R,
+    attempts: u32,
+    start_time: Option<Instant>,
+}
+
+impl<R: Rng> BackoffSession<R> {
+    /// Calculate base delay before jitter: min_delay * (factor ^ attempts), capped at max_delay.
+    fn base_delay(&self) -> Duration {
+        let mult = self.parameters.factor.powi(self.attempts as i32);
+        let secs = self.parameters.min_delay.as_secs_f64() * mult;
+        Duration::try_from_secs_f64(secs)
+            .unwrap_or(self.parameters.max_delay)
+            .min(self.parameters.max_delay)
+    }
+
+    /// Calculate random uniform jitter added to base delay.
+    fn jitter_delay(&mut self, base: Duration) -> Duration {
+        if self.parameters.jitter == 0.0 {
+            Duration::ZERO
         } else {
-            RetryResult::Permanent(error)
+            let jitter_factor = self.rng.next_f64() * self.parameters.jitter;
+            let jitter_secs = base.as_secs_f64() * jitter_factor;
+            let remaining = self.parameters.max_delay.saturating_sub(base);
+            Duration::from_secs_f64(jitter_secs).min(remaining)
+        }
+    }
+
+    /// Calculate next backoff duration (base + jitter).
+    fn compute_next_delay(&mut self) -> Duration {
+        let base = self.base_delay();
+        let jitter = self.jitter_delay(base);
+        base + jitter
+    }
+
+    /// Calculate and return the next delay if retries are not exhausted by limits.
+    /// Increments `attempts` and updates session start time if applicable.
+    fn advance_delay(&mut self) -> Option<Duration> {
+        if let Some(max_times) = self.parameters.max_times {
+            if self.attempts >= max_times {
+                return None;
+            }
+        }
+        if let Some(max_total_delay) = self.parameters.max_total_delay {
+            let start = *self.start_time.get_or_insert_with(Instant::now);
+            if start.elapsed() >= max_total_delay {
+                return None;
+            }
+        }
+        let delay = self.compute_next_delay();
+        self.attempts += 1;
+        Some(delay)
+    }
+
+    /// Delay for the next backoff attempt if retries are not exhausted.
+    /// Returns `true` if it slept and can retry, `false` if retries were exhausted.
+    pub async fn next_delay(&mut self) -> bool {
+        if let Some(delay) = self.advance_delay() {
+            tokio::time::sleep(delay).await;
+            true
+        } else {
+            false
         }
     }
 }
 
-pub(crate) fn is_retryable_error(error: &Error, idempotent: bool) -> bool {
-    if error.is_transient_and_before_rpc() {
-        return true;
-    }
-    if !idempotent {
-        return false;
-    }
-    if error.is_io() || error.is_timeout() || error.is_connect() {
-        return true;
-    }
-    if error.is_transport() && error.http_status_code().is_none() {
-        return true;
-    }
-    if let Some(429 | 500 | 502 | 503 | 504) = error.http_status_code() {
-        return true;
-    }
-    if let Some(status) = error.status() {
-        return matches!(
-            status.code,
-            Code::DeadlineExceeded
-                | Code::Aborted
-                | Code::ResourceExhausted
-                // Unavailable includes common transport-level failures such as
-                // Hyper/h2 connection errors and ConnectionReset.
-                | Code::Unavailable
-                // Internal includes common transport-level failures such as
-                // broken pipe / RST_STREAM.
-                | Code::Internal
-        );
-    }
-    false
+/// Immutable configuration blueprint for exponential backoff retries, implementing [`tower::retry::Policy`].
+///
+/// `RetryPolicy` stores static configuration [`RetryParameters`], an RNG source, and an error predicate.
+/// When cloned by `tower::retry::Retry` for a request session, it lazily creates a [`BackoffSession`] to track
+/// attempt counts and elapsed time across retries of that request.
+#[derive(Debug)]
+pub struct RetryPolicy<P, R = HasherRng> {
+    pub parameters: RetryParameters,
+    pub rng: R,
+    pub predicate: P,
+    pub session: Option<BackoffSession<R>>,
 }
 
-/// When to retry `create_read_session` requests.
-///
-/// Inspired by the Python configuration at
-/// https://github.com/googleapis/google-cloud-python/blob/c43caeee34e7c0878766d2806f69016c319697e2/packages/google-cloud-bigquery-storage/google/cloud/bigquery_storage_v1/services/big_query_read/transports/base.py#L154-L157
-#[cfg_attr(not(test), allow(dead_code))]
-pub(crate) fn create_read_session_predicate(err: &Error) -> bool {
-    is_retryable_error(err, true)
-}
-
-/// When to retry `read_rows` requests.
-///
-/// Inspired by the Python configuration at
-/// https://github.com/googleapis/google-cloud-python/blob/c43caeee34e7c0878766d2806f69016c319697e2/packages/google-cloud-bigquery-storage/google/cloud/bigquery_storage_v1/services/big_query_read/transports/base.py#L169-L171
-#[cfg_attr(not(test), allow(dead_code))]
-pub(crate) fn read_rows_predicate(err: &Error) -> bool {
-    is_retryable_error(err, true)
-}
-
-/// When to reconnect/resume an active `read_rows` stream after encountering a gRPC error mid-read.
-///
-/// While currently identical to [`read_rows_predicate`], having a dedicated predicate allows fine-tuning
-/// reconnection behavior separately from initial request establishment.
-pub(crate) fn stream_reconnect_predicate(err: &Error) -> bool {
-    is_retryable_error(err, true)
-}
-
-/// Default exponential backoff policy for BigQuery Storage Read API operations.
-///
-/// - `initial_delay` (100ms): Initial sleep duration before first retry.
-/// - `maximum_delay` (60s): Upper bound cap on any single exponential backoff sleep.
-/// - `scaling` (1.3): Multiplier scaling factor for exponential backoff (matching Python BigQuery Storage client standard).
-pub(crate) fn default_backoff_policy() -> Arc<dyn BackoffPolicy> {
-    Arc::new(
-        ExponentialBackoffBuilder::new()
-            .with_initial_delay(INITIAL_DELAY)
-            .with_maximum_delay(MAXIMUM_DELAY)
-            .with_scaling(SCALING_FACTOR)
-            .build()
-            .expect("hardcoded value guaranteed to be valid"),
-    )
-}
-
-/// Retry policy for `create_read_session` requests.
-///
-/// - `maximum_duration` (600s): Maximum cumulative duration across retries before giving up.
-///
-/// Inspired by the Python configuration at
-/// https://github.com/googleapis/google-cloud-python/blob/c43caeee34e7c0878766d2806f69016c319697e2/packages/google-cloud-bigquery-storage/google/cloud/bigquery_storage_v1/services/big_query_read/transports/base.py#L148-L162
-pub(crate) fn create_read_session_retry_policy() -> Arc<dyn RetryPolicy> {
-    Arc::new(RetryableErrors.with_time_limit(CREATE_READ_SESSION_TIMEOUT))
-}
-
-/// Retry policy for initial `read_rows` stream establishment requests.
-///
-/// - `maximum_duration` (900s): Maximum cumulative duration across retries before giving up.
-///
-/// Inspired by the Python configuration at
-/// https://github.com/googleapis/google-cloud-python/blob/c43caeee34e7c0878766d2806f69016c319697e2/packages/google-cloud-bigquery-storage/google/cloud/bigquery_storage_v1/services/big_query_read/transports/base.py#L163-L176
-pub(crate) fn read_rows_retry_policy() -> Arc<dyn RetryPolicy> {
-    Arc::new(RetryableErrors.with_time_limit(READ_ROWS_TIMEOUT))
-}
-
-/// Retry policy for mid-stream `read_rows` reconnections.
-///
-/// - `maximum_attempts` (10): Limits total consecutive failed reconnection attempts when no data progress is made.
-///
-/// Important! If data progress is made (`current_offset > prev_offset`), the session
-/// must be reset to grant a fresh 10-attempt allowance.
-pub(crate) fn stream_reconnect_retry_policy() -> Arc<dyn RetryPolicy> {
-    Arc::new(RetryableErrors.with_attempt_limit(STREAM_RECONNECT_MAX_ATTEMPTS))
-}
-
-/// Retry and backoff configuration shared across stream tasks.
-#[derive(Clone, Debug)]
-pub(crate) struct StreamRetryConfig {
-    connect_retry_policy: Arc<dyn RetryPolicy>,
-    reconnect_retry_policy: Arc<dyn RetryPolicy>,
-    backoff_policy: Arc<dyn BackoffPolicy>,
-    retry_throttler: SharedRetryThrottler,
-}
-
-impl StreamRetryConfig {
-    pub(crate) fn new(
-        retry_policy: Option<Arc<dyn RetryPolicy>>,
-        backoff_policy: Option<Arc<dyn BackoffPolicy>>,
-        retry_throttler: SharedRetryThrottler,
-    ) -> Self {
-        let connect_retry_policy = retry_policy.clone().unwrap_or_else(read_rows_retry_policy);
-        let reconnect_retry_policy = retry_policy.unwrap_or_else(stream_reconnect_retry_policy);
-        let backoff_policy = backoff_policy.unwrap_or_else(default_backoff_policy);
+impl<P, R> RetryPolicy<P, R> {
+    /// Creates a new [`RetryPolicy`] with the specified parameters, error predicate, and RNG.
+    pub fn new(parameters: RetryParameters, predicate: P, rng: R) -> Self {
         Self {
-            connect_retry_policy,
-            reconnect_retry_policy,
-            backoff_policy,
-            retry_throttler,
+            parameters,
+            rng,
+            predicate,
+            session: None,
         }
-    }
-
-    /// Creates a new [`BackoffSession`] for initial `read_rows` stream establishment (Layer 1).
-    pub(crate) fn make_connect_session(&self) -> BackoffSession {
-        BackoffSession::new(
-            Arc::clone(&self.connect_retry_policy),
-            Arc::clone(&self.backoff_policy),
-            self.retry_throttler.clone(),
-        )
-    }
-
-    /// Creates a new [`BackoffSession`] for mid-stream reconnections (Layer 3).
-    pub(crate) fn make_reconnect_session(&self) -> BackoffSession {
-        BackoffSession::new(
-            Arc::clone(&self.reconnect_retry_policy),
-            Arc::clone(&self.backoff_policy),
-            self.retry_throttler.clone(),
-        )
     }
 }
 
-/// Tracks active retry and backoff state (attempt count, start time, and throttler interaction)
-/// for a single connection or stream reconnection session.
-#[derive(Clone, Debug)]
-pub(crate) struct BackoffSession {
-    retry_policy: Arc<dyn RetryPolicy>,
-    backoff_policy: Arc<dyn BackoffPolicy>,
-    retry_throttler: SharedRetryThrottler,
-    retry_state: RetryState,
-}
-
-impl BackoffSession {
-    pub(crate) fn new(
-        retry_policy: Arc<dyn RetryPolicy>,
-        backoff_policy: Arc<dyn BackoffPolicy>,
-        retry_throttler: SharedRetryThrottler,
-    ) -> Self {
-        Self {
-            retry_policy,
-            backoff_policy,
-            retry_throttler,
-            retry_state: RetryState::new(true),
-        }
-    }
-
-    /// Records a successful RPC or stream message with the shared retry throttler.
-    pub(crate) fn record_success(&self) {
-        self.retry_throttler
-            .lock()
-            .expect("retry throttler lock is poisoned")
-            .on_success();
-    }
-
-    /// Resets the retry attempt count and start time after data progress is made,
-    /// granting future transient errors a fresh retry budget.
-    pub(crate) fn reset(&mut self) {
-        self.record_success();
-        self.retry_state = RetryState::new(true);
-    }
-
-    /// Evaluates `err` against the retry policy, sleeps for the computed backoff delay
-    /// (unless cancelled via `cancel_rx`), and consults the shared retry throttler.
+impl RetryPolicy<fn(&tonic::Status) -> bool, HasherRng> {
+    /// When to retry create_read_session requests.
     ///
-    /// Returns:
-    /// - `Ok(Some(()))` if the caller should proceed with the next retry attempt.
-    /// - `Ok(None)` if cancelled via `cancel_rx` while backing off.
-    /// - `Err(Error)` if the error is non-retryable or the retry policy / throttler is exhausted.
-    pub(crate) async fn next_delay(
-        &mut self,
-        err: Error,
-        cancel_rx: &mut tokio::sync::watch::Receiver<bool>,
-    ) -> Result<Option<()>, Error> {
-        if *cancel_rx.borrow_and_update() {
-            return Ok(None);
-        }
+    /// Inspired by the Python configuration at
+    /// https://github.com/googleapis/google-cloud-python/blob/c43caeee34e7c0878766d2806f69016c319697e2/packages/google-cloud-bigquery-storage/google/cloud/bigquery_storage_v1/services/big_query_read/transports/base.py#L154-L157
+    pub fn create_read_session_predicate(err: &tonic::Status) -> bool {
+        is_retryable_status(err)
+    }
 
-        self.retry_state.attempt_count += 1;
-        let flow = self.retry_policy.on_error(&self.retry_state, err);
-        self.retry_throttler
-            .lock()
-            .expect("retry throttler lock is poisoned")
-            .on_retry_failure(&flow);
+    /// Retry parameters for create_read_session requests.
+    ///
+    /// - `min_delay` (100ms): Initial sleep duration before first retry.
+    /// - `max_delay` (60s): Upper bound cap on any single exponential backoff sleep.
+    /// - `factor` (1.3): Multiplier scaling factor for exponential backoff (matching Python BigQuery Storage client standard).
+    /// - `max_total_delay` (600s): Maximum cumulative duration across retries before giving up.
+    ///
+    /// Inspired by the Python configuration at
+    /// https://github.com/googleapis/google-cloud-python/blob/c43caeee34e7c0878766d2806f69016c319697e2/packages/google-cloud-bigquery-storage/google/cloud/bigquery_storage_v1/services/big_query_read/transports/base.py#L148-L162
+    pub fn create_read_session_parameters() -> RetryParameters {
+        RetryParameters::builder(Duration::from_millis(100), Duration::from_secs(60))
+            .expect("hardcoded value guaranteed to be valid")
+            .with_factor(1.3)
+            .expect("hardcoded value guaranteed to be valid")
+            .with_jitter(0.2)
+            .expect("hardcoded value guaranteed to be valid")
+            .with_max_total_delay(Duration::from_secs(600))
+            .expect("hardcoded value guaranteed to be valid")
+            .build()
+    }
 
-        let mut prev_err = match flow {
-            RetryResult::Permanent(e) | RetryResult::Exhausted(e) => return Err(e),
-            RetryResult::Continue(e) => e,
-        };
+    /// Retry configuration policy for create_read_session.
+    ///
+    /// Inspired by the Python configuration at
+    /// https://github.com/googleapis/google-cloud-python/blob/c43caeee34e7c0878766d2806f69016c319697e2/packages/google-cloud-bigquery-storage/google/cloud/bigquery_storage_v1/services/big_query_read/transports/base.py#L148-L162
+    pub fn create_read_session_policy() -> Self {
+        Self::new(
+            Self::create_read_session_parameters(),
+            Self::create_read_session_predicate,
+            HasherRng::default(),
+        )
+    }
 
-        let mut delay = self.backoff_policy.on_failure(&self.retry_state);
+    /// When to retry read_rows requests.
+    ///
+    /// Inspired by the Python configuration at
+    /// https://github.com/googleapis/google-cloud-python/blob/c43caeee34e7c0878766d2806f69016c319697e2/packages/google-cloud-bigquery-storage/google/cloud/bigquery_storage_v1/services/big_query_read/transports/base.py#L169-L171
+    pub fn read_rows_predicate(err: &tonic::Status) -> bool {
+        is_retryable_status(err)
+    }
 
-        loop {
-            if self
-                .retry_policy
-                .remaining_time(&self.retry_state)
-                .is_some_and(|remaining| remaining <= delay)
-            {
-                return Err(Error::exhausted(prev_err));
-            }
+    /// Retry parameters for initial read_rows requests.
+    ///
+    /// - `min_delay` (100ms): Initial sleep duration before first retry.
+    /// - `max_delay` (60s): Upper bound cap on any single exponential backoff sleep.
+    /// - `factor` (1.3): Multiplier scaling factor for exponential backoff (matching Python BigQuery Storage client standard).
+    /// - `max_total_delay` (900s): Maximum cumulative duration across retries before giving up.
+    ///
+    /// Inspired by the Python configuration at
+    /// https://github.com/googleapis/google-cloud-python/blob/c43caeee34e7c0878766d2806f69016c319697e2/packages/google-cloud-bigquery-storage/google/cloud/bigquery_storage_v1/services/big_query_read/transports/base.py#L163-L176
+    pub fn read_rows_parameters() -> RetryParameters {
+        RetryParameters::builder(Duration::from_millis(100), Duration::from_secs(60))
+            .expect("hardcoded value guaranteed to be valid")
+            .with_factor(1.3)
+            .expect("hardcoded value guaranteed to be valid")
+            .with_jitter(0.2)
+            .expect("hardcoded value guaranteed to be valid")
+            .with_max_total_delay(Duration::from_secs(900))
+            .expect("hardcoded value guaranteed to be valid")
+            .build()
+    }
 
-            tokio::select! {
-                biased;
-                _ = cancel_rx.changed() => return Ok(None),
-                _ = tokio::time::sleep(delay) => {},
-            }
+    /// Retry configuration policy for initial read_rows requests.
+    ///
+    /// Inspired by the Python configuration at
+    /// https://github.com/googleapis/google-cloud-python/blob/c43caeee34e7c0878766d2806f69016c319697e2/packages/google-cloud-bigquery-storage/google/cloud/bigquery_storage_v1/services/big_query_read/transports/base.py#L163-L176
+    pub fn read_rows_policy() -> Self {
+        Self::new(
+            Self::read_rows_parameters(),
+            Self::read_rows_predicate,
+            HasherRng::default(),
+        )
+    }
 
-            if *cancel_rx.borrow_and_update() {
-                return Ok(None);
-            }
+    /// When to reconnect/resume an active read_rows stream after encountering a gRPC error mid-read.
+    ///
+    /// While currently identical to [`read_rows_predicate`], having a dedicated predicate allows fine-tuning
+    /// reconnection behavior separately from initial request establishment.
+    pub fn stream_reconnect_predicate(err: &tonic::Status) -> bool {
+        is_retryable_status(err)
+    }
 
-            let throttled = self
-                .retry_throttler
-                .lock()
-                .expect("retry throttler lock is poisoned")
-                .throttle_retry_attempt();
-            if !throttled {
-                return Ok(Some(()));
-            }
+    /// Retry parameters for mid-stream read_rows reconnections.
+    ///
+    /// - `min_delay` (100ms): Starts with a short initial backoff to quickly recover from brief network blips.
+    /// - `max_delay` (60s): Caps the backoff delay so exponential growth (100ms -> 130ms -> 169ms ...) does not produce excessively long single delays.
+    /// - `factor` (1.3): Multiplier scaling factor for exponential backoff (matching Python BigQuery Storage client standard).
+    /// - `max_times` (10): Limits total consecutive failed reconnection attempts when no data progress is made.
+    pub fn stream_reconnect_parameters() -> RetryParameters {
+        RetryParameters::builder(Duration::from_millis(100), Duration::from_secs(60))
+            .expect("hardcoded value guaranteed to be valid")
+            .with_factor(1.3)
+            .expect("hardcoded value guaranteed to be valid")
+            .with_jitter(0.2)
+            .expect("hardcoded value guaranteed to be valid")
+            .with_max_times(10)
+            .expect("hardcoded value guaranteed to be valid")
+            .build()
+    }
 
-            self.retry_state.attempt_count += 1;
-            prev_err = match self.retry_policy.on_throttle(&self.retry_state, prev_err) {
-                ThrottleResult::Exhausted(e) => return Err(e),
-                ThrottleResult::Continue(e) => e,
-            };
-            delay = self.backoff_policy.on_failure(&self.retry_state);
+    /// Retry configuration policy for mid-stream read_rows reconnections.
+    ///
+    /// Important! If data progress is made (`current_offset > prev_offset`), the session
+    /// must be reset to grant a fresh 10-attempt allowance.
+    pub fn stream_reconnect_policy() -> Self {
+        Self::new(
+            Self::stream_reconnect_parameters(),
+            Self::stream_reconnect_predicate,
+            HasherRng::default(),
+        )
+    }
+}
+
+impl<P, R> RetryPolicy<P, R>
+where
+    R: Rng + Clone,
+{
+    pub fn make_session(&self) -> BackoffSession<R> {
+        BackoffSession {
+            parameters: self.parameters,
+            rng: self.rng.clone(),
+            attempts: 0,
+            start_time: None,
         }
     }
+}
+
+impl<P: Clone, R: Clone> Clone for RetryPolicy<P, R> {
+    fn clone(&self) -> Self {
+        Self {
+            parameters: self.parameters,
+            rng: self.rng.clone(),
+            predicate: self.predicate.clone(),
+            session: None,
+        }
+    }
+}
+
+impl<Req, Res, E, P, R> Policy<Req, Res, E> for RetryPolicy<P, R>
+where
+    Req: Clone,
+    P: Fn(&E) -> bool,
+    R: Rng + Clone,
+{
+    type Future = tokio::time::Sleep;
+
+    fn retry(&mut self, _req: &mut Req, result: &mut Result<Res, E>) -> Option<Self::Future> {
+        match result {
+            Ok(_) => {
+                self.session = None;
+                None
+            },
+            Err(err) => {
+                if !(self.predicate)(err) {
+                    return None;
+                }
+                if self.session.is_none() {
+                    self.session = Some(self.make_session());
+                }
+                let session = self.session.as_mut().unwrap();
+                let delay = session.advance_delay()?;
+                Some(tokio::time::sleep(delay))
+            },
+        }
+    }
+
+    fn clone_request(&mut self, req: &Req) -> Option<Req> {
+        Some(req.clone())
+    }
+}
+
+fn is_retryable_status(err: &tonic::Status) -> bool {
+    matches!(
+        err.code(),
+        tonic::Code::DeadlineExceeded
+            | tonic::Code::Aborted
+            | tonic::Code::ResourceExhausted
+            // Unavailable includes common transport-level failures such as,
+            // - Hyper/h2 connection errors, as seen in
+            //   https://github.com/grpc/grpc-rust/pull/629
+            // - Connection errors, like ConnectionReset, as seen in
+            //   https://github.com/grpc/grpc-rust/blob/230544e31ef9b513e493c273d4076e843478e934/tonic/src/status.rs#L757-L761
+            | tonic::Code::Unavailable
+            // Internal includes common transport-level failures such as,
+            // - broken pipe, as seen in
+            //   https://github.com/grpc/grpc-rust/blob/230544e31ef9b513e493c273d4076e843478e934/tonic/src/status.rs#L753-L756
+            | tonic::Code::Internal
+    )
 }
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::Mutex;
-
-    use google_cloud_gax::error::rpc::Status;
-    use google_cloud_gax::retry_throttler::RetryThrottler;
+    use gcloud_sdk::tonic::{Code, Status};
 
     use super::*;
-    use crate::client_builder::default_retry_throttler;
-
-    #[derive(Debug, Default)]
-    struct NoBackoff;
-
-    impl BackoffPolicy for NoBackoff {
-        fn on_failure(&self, _state: &RetryState) -> Duration {
-            Duration::ZERO
-        }
-    }
-
-    fn status_err(code: Code) -> Error {
-        Error::service(Status::default().set_code(code).set_message("test status"))
-    }
 
     #[test]
     fn test_reconnect_stream_predicate_retryable_codes() {
@@ -338,10 +468,10 @@ mod tests {
         ];
 
         for code in retryable_codes {
-            let err = status_err(code);
+            let status = Status::new(code, "transient stream error");
             assert!(
-                stream_reconnect_predicate(&err),
-                "Expected stream_reconnect_predicate to be true for code {:?}",
+                RetryPolicy::stream_reconnect_predicate(&status),
+                "Expected reconnect_stream_predicate to be true for code {:?}",
                 code
             );
         }
@@ -365,10 +495,10 @@ mod tests {
         ];
 
         for code in non_retryable_codes {
-            let err = status_err(code);
+            let status = Status::new(code, "fatal stream error");
             assert!(
-                !stream_reconnect_predicate(&err),
-                "Expected stream_reconnect_predicate to be false for code {:?}",
+                !RetryPolicy::stream_reconnect_predicate(&status),
+                "Expected reconnect_stream_predicate to be false for code {:?}",
                 code
             );
         }
@@ -376,6 +506,7 @@ mod tests {
 
     #[test]
     fn test_read_rows_predicate_matches_reconnect() {
+        // Ensure initial request predicate and stream reconnection predicate currently match on behavior
         let codes = [
             Code::Unavailable,
             Code::Aborted,
@@ -383,107 +514,114 @@ mod tests {
             Code::InvalidArgument,
         ];
         for code in codes {
-            let err = status_err(code);
-            assert_eq!(read_rows_predicate(&err), stream_reconnect_predicate(&err));
+            let status = Status::new(code, "test");
             assert_eq!(
-                create_read_session_predicate(&err),
-                stream_reconnect_predicate(&err)
+                RetryPolicy::read_rows_predicate(&status),
+                RetryPolicy::stream_reconnect_predicate(&status)
             );
         }
     }
 
     #[tokio::test]
-    async fn test_backoff_session_attempt_limit_and_reset() {
-        use google_cloud_gax::retry_throttler::{CircuitBreaker, RetryThrottlerArg};
+    async fn test_retry_policy_max_times() {
+        let params = RetryParameters::builder(Duration::from_millis(1), Duration::from_millis(1))
+            .expect("hardcoded value guaranteed to be valid")
+            .with_factor(1.3)
+            .expect("hardcoded value guaranteed to be valid")
+            .with_jitter(0.0)
+            .expect("hardcoded value guaranteed to be valid")
+            .with_max_times(2)
+            .expect("hardcoded value guaranteed to be valid")
+            .build();
+        let policy = RetryPolicy::new(params, |_: &Status| true, HasherRng::default());
 
-        let mut session = BackoffSession::new(
-            Arc::new(RetryableErrors.with_attempt_limit(3)),
-            Arc::new(NoBackoff),
-            RetryThrottlerArg::from(CircuitBreaker::default()).into(),
-        );
-        let (_cancel_tx, mut cancel_rx) = tokio::sync::watch::channel(false);
+        let mut session = policy.make_session();
+        assert!(session.next_delay().await);
+        assert!(session.next_delay().await);
+        assert!(!session.next_delay().await);
+    }
 
-        // Attempt 1 -> Continue
-        assert!(session
-            .next_delay(status_err(Code::Unavailable), &mut cancel_rx)
-            .await
-            .unwrap()
-            .is_some());
-        // Attempt 2 -> Continue
-        assert!(session
-            .next_delay(status_err(Code::Unavailable), &mut cancel_rx)
-            .await
-            .unwrap()
-            .is_some());
-        // Attempt 3 -> Exhausted
-        assert!(session
-            .next_delay(status_err(Code::Unavailable), &mut cancel_rx)
-            .await
-            .is_err());
+    #[test]
+    fn test_backoff_factor_growth() {
+        let params = RetryParameters::builder(Duration::from_millis(100), Duration::from_secs(60))
+            .expect("hardcoded value guaranteed to be valid")
+            .with_factor(1.3)
+            .expect("hardcoded value guaranteed to be valid")
+            .with_jitter(0.0) // no jitter for deterministic check
+            .expect("hardcoded value guaranteed to be valid")
+            .build();
+        let policy = RetryPolicy::new(params, |_: &Status| true, HasherRng::default());
+        let mut session = policy.make_session();
+        assert_eq!(session.compute_next_delay(), Duration::from_millis(100)); // 100 * 1.3^0
+        session.attempts += 1;
+        assert_eq!(session.compute_next_delay(), Duration::from_millis(130)); // 100 * 1.3^1
+        session.attempts += 1;
+        assert_eq!(session.compute_next_delay(), Duration::from_millis(169)); // 100 * 1.3^2
+    }
 
-        // Resetting after data progress restores the full retry budget.
-        session.reset();
-        assert!(session
-            .next_delay(status_err(Code::Unavailable), &mut cancel_rx)
-            .await
-            .unwrap()
-            .is_some());
+    #[test]
+    fn test_backoff_overflow_safety() {
+        let params = RetryParameters::builder(Duration::from_millis(100), Duration::from_secs(60))
+            .expect("hardcoded value guaranteed to be valid")
+            .with_factor(1.3)
+            .expect("hardcoded value guaranteed to be valid")
+            .with_jitter(0.0)
+            .expect("hardcoded value guaranteed to be valid")
+            .build();
+        let policy = RetryPolicy::new(params, |_: &Status| true, HasherRng::default());
+        let mut session = policy.make_session();
+        session.attempts = 1000; // 1.3^1000 is infinity in f64
+        assert_eq!(session.compute_next_delay(), Duration::from_secs(60));
     }
 
     #[tokio::test]
-    async fn test_backoff_session_throttling_exhausts_attempt_limit() {
-        #[derive(Debug)]
-        struct AlwaysThrottle {
-            checks: Arc<AtomicUsize>,
-        }
-        impl RetryThrottler for AlwaysThrottle {
-            fn throttle_retry_attempt(&self) -> bool {
-                self.checks.fetch_add(1, Ordering::SeqCst);
-                true
-            }
-            fn on_retry_failure(&mut self, _flow: &RetryResult) {}
-            fn on_success(&mut self) {}
-        }
+    async fn test_retry_policy_session_reset_on_ok() {
+        let params = RetryParameters::builder(Duration::from_millis(1), Duration::from_secs(60))
+            .expect("hardcoded value guaranteed to be valid")
+            .with_factor(1.3)
+            .expect("hardcoded value guaranteed to be valid")
+            .with_jitter(0.0)
+            .expect("hardcoded value guaranteed to be valid")
+            .build();
+        let mut policy = RetryPolicy::new(params, |_: &Status| true, HasherRng::default());
 
-        let checks = Arc::new(AtomicUsize::new(0));
-        let throttler: SharedRetryThrottler = Arc::new(Mutex::new(AlwaysThrottle {
-            checks: Arc::clone(&checks),
-        }));
+        let mut req = ();
+        let mut err_res: Result<(), Status> = Err(Status::unavailable("transient"));
+        assert!(policy.retry(&mut req, &mut err_res).is_some());
+        assert!(policy.session.is_some());
 
-        let mut session = BackoffSession::new(
-            Arc::new(RetryableErrors.with_attempt_limit(3)),
-            Arc::new(NoBackoff),
-            throttler,
-        );
-        let (_cancel_tx, mut cancel_rx) = tokio::sync::watch::channel(false);
-
-        let res = session
-            .next_delay(status_err(Code::Unavailable), &mut cancel_rx)
-            .await;
-        assert!(res.is_err());
-        assert_eq!(checks.load(Ordering::SeqCst), 2);
+        let mut ok_res: Result<(), Status> = Ok(());
+        assert!(policy.retry(&mut req, &mut ok_res).is_none());
+        assert!(policy.session.is_none());
     }
 
-    #[tokio::test]
-    async fn test_backoff_session_cancellation() {
-        let mut session = BackoffSession::new(
-            Arc::new(RetryableErrors.with_attempt_limit(3)),
-            Arc::new(
-                ExponentialBackoffBuilder::new()
-                    .with_initial_delay(Duration::from_secs(60))
-                    .with_maximum_delay(Duration::from_secs(60))
-                    .build()
-                    .unwrap(),
-            ),
-            default_retry_throttler(),
-        );
-        let (cancel_tx, mut cancel_rx) = tokio::sync::watch::channel(false);
-        let _ = cancel_tx.send_replace(true);
+    #[test]
+    fn test_retry_parameters_builder_validation() {
+        // Zero or negative max_delay should fail
+        assert!(RetryParameters::builder(Duration::ZERO, Duration::ZERO,).is_err());
 
-        let res = session
-            .next_delay(status_err(Code::Unavailable), &mut cancel_rx)
-            .await
-            .unwrap();
-        assert!(res.is_none());
+        // min_delay > max_delay should fail at setter
+        assert!(
+            RetryParameters::builder(Duration::from_secs(10), Duration::from_secs(5),).is_err()
+        );
+
+        // Valid configuration succeeds
+        let params = RetryParameters::builder(Duration::from_millis(100), Duration::from_secs(60))
+            .unwrap()
+            .with_factor(1.3)
+            .unwrap()
+            .with_jitter(0.2)
+            .unwrap()
+            .with_max_times(5)
+            .unwrap()
+            .with_max_total_delay(Duration::from_secs(300))
+            .unwrap()
+            .build();
+        assert_eq!(params.min_delay, Duration::from_millis(100));
+        assert_eq!(params.max_delay, Duration::from_secs(60));
+        assert_eq!(params.factor, 1.3);
+        assert_eq!(params.jitter, 0.2);
+        assert_eq!(params.max_times, Some(5));
+        assert_eq!(params.max_total_delay, Some(Duration::from_secs(300)));
     }
 }
