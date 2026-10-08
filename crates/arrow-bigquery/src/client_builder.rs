@@ -1,12 +1,13 @@
-use std::sync::Arc;
+// Client configuration, common to all Google services, inspired by
+// https://github.com/googleapis/google-cloud-rust/blob/b1fab5ff85e2f7d139fb1b1c608cebb4ac91c5ab/src/gax/src/client_builder.rs#L539-L565
+// and
+// https://github.com/googleapis/google-cloud-rust/blob/c2febbabe8f6db5f271aae4dc468b8d95198ce46/src/gax/src/options.rs#L35-L56
 
-use google_cloud_auth::credentials::Credentials;
-use google_cloud_bigquery::client::Read;
-use google_cloud_gax::backoff_policy::{BackoffPolicy, BackoffPolicyArg};
-use google_cloud_gax::retry_policy::{RetryPolicy, RetryPolicyArg};
-use google_cloud_gax::retry_throttler::{AdaptiveThrottler, RetryThrottlerArg, SharedRetryThrottler};
-
-use crate::{BigQueryError, Client};
+use gcloud_sdk::google::cloud::bigquery::storage::v1::big_query_read_client::BigQueryReadClient;
+use gcloud_sdk::tonic::async_trait;
+use gcloud_sdk::{GoogleApiClient, GoogleApiClientBuilder, GoogleAuthMiddleware, TokenSourceType};
+use hyper::header::{HeaderName, HeaderValue, USER_AGENT};
+use hyper::HeaderMap;
 
 static INIT_CRYPTO: std::sync::Once = std::sync::Once::new();
 
@@ -17,40 +18,29 @@ fn init_crypto() {
     });
 }
 
-pub(crate) fn default_retry_throttler() -> SharedRetryThrottler {
-    RetryThrottlerArg::from(AdaptiveThrottler::default()).into()
-}
-
-pub(crate) fn default_grpc_subchannel_count() -> usize {
-    std::thread::available_parallelism()
-        .map(|n| n.get().clamp(1, 8))
-        .unwrap_or(1)
-}
-
-#[derive(Default)]
+const DEFAULT_BQSTORAGE_ENDPOINT: &str = "https://bigquerystorage.googleapis.com";
+const DEFAULT_GCP_SCOPE: &str = "https://www.googleapis.com/auth/cloud-platform";
 pub struct ServiceConfigBuilder {
-    cred: Option<Credentials>,
-    endpoint: Option<String>,
+    cred: TokenSourceType,
+    cred_scopes: Vec<String>,
+    endpoint: String,
     user_agent: Option<String>,
-    quota_project_id: Option<String>,
-    retry_policy: Option<Arc<dyn RetryPolicy>>,
-    backoff_policy: Option<Arc<dyn BackoffPolicy>>,
-    retry_throttler: Option<SharedRetryThrottler>,
-    grpc_subchannel_count: Option<usize>,
+    pub(crate) quota_project_id: Option<String>,
 }
 
 impl ServiceConfigBuilder {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    pub fn with_cred(mut self, cred: Credentials) -> Self {
-        self.cred = Some(cred);
+    pub fn with_cred(mut self, cred: TokenSourceType) -> Self {
+        self.cred = cred;
         self
     }
 
-    pub fn with_endpoint(mut self, endpoint: impl Into<String>) -> Self {
-        self.endpoint = Some(endpoint.into());
+    pub fn with_cred_scopes(mut self, scopes: Vec<String>) -> Self {
+        self.cred_scopes = scopes;
+        self
+    }
+
+    pub fn with_endpoint(mut self, endpoint: String) -> Self {
+        self.endpoint = endpoint;
         self
     }
 
@@ -64,187 +54,112 @@ impl ServiceConfigBuilder {
         self
     }
 
-    pub fn with_retry_policy<V: Into<RetryPolicyArg>>(mut self, retry_policy: V) -> Self {
-        self.retry_policy = Some(retry_policy.into().into());
-        self
-    }
-
-    pub fn with_backoff_policy<V: Into<BackoffPolicyArg>>(mut self, backoff_policy: V) -> Self {
-        self.backoff_policy = Some(backoff_policy.into().into());
-        self
-    }
-
-    pub fn with_retry_throttler<V: Into<RetryThrottlerArg>>(mut self, retry_throttler: V) -> Self {
-        self.retry_throttler = Some(retry_throttler.into().into());
-        self
-    }
-
-    /// Sets the number of independent gRPC channels (HTTP/2 connections) pooled by the client.
-    ///
-    /// Defaults to `available_parallelism().clamp(1, 8)`. Values of `0` are clamped to `1`.
-    pub fn with_grpc_subchannel_count(mut self, count: usize) -> Self {
-        self.grpc_subchannel_count = Some(count.max(1));
-        self
-    }
-
     pub fn quota_project_id(&self) -> Option<&str> {
         self.quota_project_id.as_deref()
     }
+}
 
-    pub fn endpoint(&self) -> Option<&str> {
-        self.endpoint.as_deref()
+#[async_trait]
+pub trait BigQueryReadClientBuilder {
+    fn new() -> Self;
+    async fn build(
+        self,
+    ) -> Result<
+        GoogleApiClient<BQStorageGoogleApiClientBuilder, BigQueryReadClient<GoogleAuthMiddleware>>,
+        Box<dyn std::error::Error>,
+    >;
+}
+
+#[async_trait]
+impl BigQueryReadClientBuilder for ServiceConfigBuilder {
+    fn new() -> Self {
+        ServiceConfigBuilder {
+            cred: TokenSourceType::Default,
+            cred_scopes: vec![DEFAULT_GCP_SCOPE.to_owned()],
+            endpoint: DEFAULT_BQSTORAGE_ENDPOINT.to_owned(),
+            user_agent: None,
+            quota_project_id: None,
+        }
     }
 
-    pub fn user_agent(&self) -> Option<&str> {
-        self.user_agent.as_deref()
-    }
-
-    pub fn grpc_subchannel_count(&self) -> Option<usize> {
-        self.grpc_subchannel_count
-    }
-
-    pub async fn build(self) -> Result<Client, BigQueryError> {
-        let quota_project_id = self
-            .quota_project_id
-            .filter(|s| !s.trim().is_empty())
-            .ok_or_else(|| BigQueryError::InvalidConfig("quota_project_id is required".into()))?;
-
+    async fn build(
+        self,
+    ) -> Result<
+        GoogleApiClient<BQStorageGoogleApiClientBuilder, BigQueryReadClient<GoogleAuthMiddleware>>,
+        Box<dyn std::error::Error>,
+    > {
         init_crypto();
+        let builder = BQStorageGoogleApiClientBuilder {};
 
-        let subchannel_count = self
-            .grpc_subchannel_count
-            .unwrap_or_else(default_grpc_subchannel_count)
-            .max(1);
-
-        // Resolve credentials and the shared retry throttler once so all pooled gRPC channels
-        // and stream readers share a single token cache and adaptive retry budget.
-        let cred = match self.cred {
-            Some(cred) => cred,
-            None => google_cloud_auth::credentials::Builder::default()
-                .build()
-                .map_err(google_cloud_gax::client_builder::Error::cred)?,
-        };
-
-        let retry_throttler = self
-            .retry_throttler
-            .unwrap_or_else(default_retry_throttler);
-
-        let client_retry_policy = self
-            .retry_policy
-            .clone()
-            .unwrap_or_else(crate::bigquery_read_retry::create_read_session_retry_policy);
-        let client_backoff_policy = self
-            .backoff_policy
-            .clone()
-            .unwrap_or_else(crate::bigquery_read_retry::default_backoff_policy);
-
-        let mut clients = Vec::with_capacity(subchannel_count);
-        for _ in 0..subchannel_count {
-            let mut builder = Read::builder()
-                .with_credentials(cred.clone())
-                .with_retry_policy(client_retry_policy.clone())
-                .with_backoff_policy(client_backoff_policy.clone())
-                .with_retry_throttler(retry_throttler.clone());
-
-            if let Some(ref endpoint) = self.endpoint {
-                builder = builder.with_endpoint(endpoint.clone());
-            }
-
-            clients.push(builder.build().await?);
+        let mut headers = HeaderMap::new();
+        if let Some(user_agent) = self.user_agent {
+            headers.insert(USER_AGENT, HeaderValue::from_str(&user_agent)?);
+        }
+        if let Some(quota_project_id) = self.quota_project_id {
+            headers.insert(
+                HeaderName::from_static("x-goog-user-project"),
+                HeaderValue::from_str(&quota_project_id)?,
+            );
         }
 
-        Ok(Client::from_parts(
-            clients,
-            quota_project_id,
-            self.user_agent,
-            self.retry_policy,
-            self.backoff_policy,
-            retry_throttler,
-        ))
+        let client = GoogleApiClient::with_token_source_and_headers(
+            builder,
+            self.endpoint,
+            None, // cloud_resource_prefix
+            self.cred,
+            self.cred_scopes,
+            headers,
+        )
+        .await?;
+
+        Ok(client)
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct BQStorageGoogleApiClientBuilder;
+
+#[async_trait]
+impl GoogleApiClientBuilder<BigQueryReadClient<GoogleAuthMiddleware>>
+    for BQStorageGoogleApiClientBuilder
+{
+    fn create_client(
+        &self,
+        channel: GoogleAuthMiddleware,
+    ) -> BigQueryReadClient<GoogleAuthMiddleware> {
+        BigQueryReadClient::new(channel).max_decoding_message_size(
+            128 * 1024 * 1024, // 128MB, as recommended by the service team
+        )
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use google_cloud_gax::exponential_backoff::ExponentialBackoff;
-    use google_cloud_gax::retry_policy::RetryPolicyExt;
-    use google_cloud_gax::retry_throttler::AdaptiveThrottler;
-
     use super::*;
-    use crate::bigquery_read_retry::RetryableErrors;
 
     #[test]
     fn test_service_config_builder_defaults() {
         let builder = ServiceConfigBuilder::new();
-        assert!(builder.endpoint.is_none());
-        assert!(builder.cred.is_none());
+        assert_eq!(builder.endpoint, DEFAULT_BQSTORAGE_ENDPOINT);
+        assert_eq!(
+            builder.cred_scopes,
+            vec!["https://www.googleapis.com/auth/cloud-platform"]
+        );
         assert!(builder.user_agent.is_none());
         assert!(builder.quota_project_id.is_none());
-        assert!(builder.retry_policy.is_none());
-        assert!(builder.backoff_policy.is_none());
-        assert!(builder.retry_throttler.is_none());
-        assert!(builder.grpc_subchannel_count.is_none());
     }
 
     #[test]
     fn test_service_config_builder_custom() {
-        let cred = google_cloud_auth::credentials::anonymous::Builder::new().build();
         let builder = ServiceConfigBuilder::new()
-            .with_cred(cred)
-            .with_endpoint("https://custom.endpoint.com")
+            .with_endpoint("https://custom.endpoint.com".to_string())
+            .with_cred_scopes(vec!["scope1".to_string(), "scope2".to_string()])
             .with_user_agent(Some("custom-agent/1.0".to_string()))
-            .with_quota_project_id(Some("custom-project".to_string()))
-            .with_retry_policy(RetryableErrors.with_attempt_limit(3))
-            .with_backoff_policy(ExponentialBackoff::default())
-            .with_retry_throttler(AdaptiveThrottler::default())
-            .with_grpc_subchannel_count(4);
+            .with_quota_project_id(Some("custom-project".to_string()));
 
-        assert_eq!(builder.endpoint(), Some("https://custom.endpoint.com"));
-        assert!(builder.cred.is_some());
-        assert_eq!(builder.user_agent(), Some("custom-agent/1.0"));
-        assert_eq!(builder.quota_project_id(), Some("custom-project"));
-        assert!(builder.retry_policy.is_some());
-        assert!(builder.backoff_policy.is_some());
-        assert!(builder.retry_throttler.is_some());
-        assert_eq!(builder.grpc_subchannel_count(), Some(4));
-
-        let zero_clamped = ServiceConfigBuilder::new().with_grpc_subchannel_count(0);
-        assert_eq!(zero_clamped.grpc_subchannel_count(), Some(1));
-    }
-
-    #[tokio::test]
-    async fn test_service_config_builder_missing_or_empty_quota_project_id() {
-        let cred = google_cloud_auth::credentials::anonymous::Builder::new().build();
-        let result = ServiceConfigBuilder::new()
-            .with_cred(cred.clone())
-            .build()
-            .await;
-        match result {
-            Err(BigQueryError::InvalidConfig(msg)) => {
-                assert!(msg.contains("quota_project_id is required"));
-            },
-            other => panic!("expected InvalidConfig error, got {:?}", other.err()),
-        }
-
-        let empty_result = ServiceConfigBuilder::new()
-            .with_cred(cred)
-            .with_quota_project_id(Some("   ".to_string()))
-            .build()
-            .await;
-        assert!(matches!(empty_result, Err(BigQueryError::InvalidConfig(_))));
-    }
-
-    #[tokio::test]
-    async fn test_service_config_builder_builds_subchannel_pool() {
-        let cred = google_cloud_auth::credentials::anonymous::Builder::new().build();
-        let client = ServiceConfigBuilder::new()
-            .with_cred(cred)
-            .with_quota_project_id(Some("test-project".to_string()))
-            .with_grpc_subchannel_count(3)
-            .build()
-            .await
-            .expect("client should build");
-
-        assert_eq!(client.grpc_subchannel_count(), 3);
+        assert_eq!(builder.endpoint, "https://custom.endpoint.com");
+        assert_eq!(builder.cred_scopes, vec!["scope1", "scope2"]);
+        assert_eq!(builder.user_agent, Some("custom-agent/1.0".to_string()));
+        assert_eq!(builder.quota_project_id, Some("custom-project".to_string()));
     }
 }

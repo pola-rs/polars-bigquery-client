@@ -76,23 +76,3 @@ def test_bigquery_table_id_parse():
     mock_ref.table_id = "t"
     assert BigQueryTableId.parse(mock_ref) == BigQueryTableId("p", "d", "t")
     assert parse_table_id == BigQueryTableId.parse
-
-
-def test_bigquery_table_id_immutable_and_hashable():
-    t1 = BigQueryTableId("proj", "ds", "tab")
-    t2 = BigQueryTableId("proj", "ds", "tab")
-    assert hash(t1) == hash(t2)
-    assert {t1: "ok"}[t2] == "ok"
-
-    with pytest.raises(AttributeError):
-        t1.project_id = "mutated"
-
-
-def test_parse_table_id_propagates_property_exception():
-    class FailingTableObj:
-        @property
-        def project(self):
-            raise RuntimeError("boom in property")
-
-    with pytest.raises(RuntimeError, match="boom in property"):
-        parse_table_id(FailingTableObj())

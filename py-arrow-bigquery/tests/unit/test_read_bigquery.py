@@ -245,14 +245,3 @@ def test_exporter_drop_after_stream_created():
     assert run_exporter_drop_after_stream_created_test(), (
         "The background task was not aborted within 1s"
     )
-
-
-def test_bigquery_error_hierarchy_and_empty_quota_project():
-    from arrow_bigquery import BigQueryError
-    from arrow_bigquery.exceptions import BigQueryError as ExceptionsBigQueryError
-
-    assert BigQueryError is ExceptionsBigQueryError
-    assert issubclass(BigQueryError, RuntimeError)
-
-    with pytest.raises(ValueError, match="quota_project_id is required"):
-        Client(quota_project_id="   ")

@@ -9,6 +9,7 @@ async fn test_read_small_public_table() {
 
     let client = Client::from_builder(
         ServiceConfigBuilder::new()
+            .with_cred(gcloud_sdk::TokenSourceType::Default)
             .with_user_agent(Some("integration-test/1.0".to_string()))
             .with_quota_project_id(Some(quota_project_id)),
     )

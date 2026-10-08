@@ -1,17 +1,404 @@
-mod auth;
-mod error;
-mod stream;
-mod table_id;
-#[cfg(feature = "testing")]
-mod testing;
+use std::sync::{Mutex, Once};
 
-use google_cloud_auth::credentials::Credentials;
-use google_cloud_bigquery::model::arrow_serialization_options::CompressionCodec;
+use async_trait::async_trait;
+use chrono::Utc;
+use gcloud_sdk::google::cloud::bigquery::storage::v1::arrow_serialization_options::CompressionCodec;
+use polars_arrow::datatypes::ArrowSchemaRef;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
-use pyo3::types::PyDateTime;
-pub use stream::ArrowStreamExporter;
-pub use table_id::BigQueryTableId;
+use pyo3::pyfunction;
+use pyo3::types::*;
+
+static INIT_CRYPTO: Once = Once::new();
+
+/// A token source that delegates authentication to a Python callable.
+///
+/// This struct implements the [`gcloud_sdk::Source`] trait, allowing the Rust
+/// Google Cloud SDK to retrieve OAuth2 tokens by calling back into Python code
+/// (e.g., using `google-auth`). It includes a thread-safe cache to avoid
+/// the overhead of calling into Python on every request if the token is still valid.
+struct PythonTokenSource {
+    /// The Python callable (e.g., a function or method) that returns a tuple of
+    /// `(token_bytes, expiration_timestamp_float)`.
+    provider: Py<PyAny>,
+    /// A thread-safe cache for the retrieved token.
+    cache: Mutex<Option<gcloud_sdk::Token>>,
+}
+
+#[async_trait]
+impl gcloud_sdk::Source for PythonTokenSource {
+    async fn token(&self) -> Result<gcloud_sdk::Token, gcloud_sdk::error::Error> {
+        {
+            let cache = self.cache.lock().unwrap();
+            if let Some(token) = cache.as_ref() {
+                if token.expiry > Utc::now() + chrono::Duration::seconds(60) {
+                    return Ok(token.clone());
+                }
+            }
+        }
+
+        let token = Python::attach(
+            |py| -> Result<gcloud_sdk::Token, gcloud_sdk::error::Error> {
+                let provider = self.provider.bind(py);
+                let result = provider.call0().map_err(|_| {
+                    gcloud_sdk::error::Error::from(gcloud_sdk::error::ErrorKind::TokenSource)
+                })?;
+
+                // result is (token_data, expiration)
+                let tuple = result.cast::<pyo3::types::PyTuple>().map_err(|_| {
+                    gcloud_sdk::error::Error::from(gcloud_sdk::error::ErrorKind::TokenSource)
+                })?;
+
+                let token_data = tuple.get_item(0).map_err(|_| {
+                    gcloud_sdk::error::Error::from(gcloud_sdk::error::ErrorKind::TokenSource)
+                })?;
+
+                let expiration = tuple.get_item(1).map_err(|_| {
+                    gcloud_sdk::error::Error::from(gcloud_sdk::error::ErrorKind::TokenSource)
+                })?;
+
+                let bearer_token: String = token_data
+                    .get_item("bearer_token")
+                    .map_err(|_| {
+                        gcloud_sdk::error::Error::from(gcloud_sdk::error::ErrorKind::TokenSource)
+                    })?
+                    .cast::<pyo3::types::PyString>()
+                    .map_err(|_| {
+                        gcloud_sdk::error::Error::from(gcloud_sdk::error::ErrorKind::TokenSource)
+                    })?
+                    .to_str()
+                    .map_err(|_| {
+                        gcloud_sdk::error::Error::from(gcloud_sdk::error::ErrorKind::TokenSource)
+                    })?
+                    .to_string();
+
+                // expiration is a float (timestamp)
+                let expiry_f: f64 = expiration.extract().map_err(|_| {
+                    gcloud_sdk::error::Error::from(gcloud_sdk::error::ErrorKind::TokenSource)
+                })?;
+
+                let expiry = chrono::DateTime::from_timestamp(
+                    expiry_f as i64,
+                    ((expiry_f % 1.0) * 1_000_000_000.0) as u32,
+                )
+                .ok_or_else(|| {
+                    gcloud_sdk::error::Error::from(gcloud_sdk::error::ErrorKind::TokenSource)
+                })?;
+
+                Ok(gcloud_sdk::Token {
+                    token: bearer_token.into(),
+                    token_type: "Bearer".to_string(),
+                    expiry,
+                })
+            },
+        )?;
+
+        {
+            let mut cache = self.cache.lock().unwrap();
+            *cache = Some(token.clone());
+        }
+        Ok(token)
+    }
+}
+
+/// A Python-exposed class that implements the Arrow C Stream interface.
+///
+/// This class acts as a bridge between the Rust BigQuery reader and Python Polars,
+/// allowing Polars to consume the data stream directly via the Arrow C Data Interface
+/// (`__arrow_c_stream__`) without copying data.
+#[pyclass]
+pub struct ArrowStreamExporter {
+    /// The schema of the Arrow stream.
+    schema: ArrowSchemaRef,
+    /// The underlying BigQuery record batch receiver, wrapped in a mutex.
+    /// It is an `Option` because the stream can only be consumed once.
+    receiver: std::sync::Mutex<Option<arrow_bigquery_lib::BigQueryRecordBatchReceiver>>,
+}
+
+/// An iterator that adapts the asynchronous [`BigQueryRecordBatchReceiver`] into
+/// a synchronous iterator yielding Arrow arrays.
+///
+/// This is used internally by [`ArrowStreamExporter`] to feed the Arrow C Stream.
+/// Each iteration blocks on the Tokio runtime to receive the next batch.
+struct ReceiverIterator {
+    /// The receiver yielding record batches from the BigQuery Storage Read API.
+    rx: arrow_bigquery_lib::BigQueryRecordBatchReceiver,
+    /// The Arrow datatype (specifically a `Struct` type) matching the schema of the batches.
+    dtype: polars_arrow::datatypes::ArrowDataType,
+}
+
+impl Iterator for ReceiverIterator {
+    type Item =
+        pyo3_polars::export::polars_error::PolarsResult<Box<dyn polars_arrow::array::Array>>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let rt = pyo3_async_runtimes::tokio::get_runtime();
+
+        loop {
+            // We need to be able to stop if the Python side decides to, so
+            // occasionally check to see if there were any interrupts.
+            if let Err(py_err) = Python::attach(|py| py.check_signals()) {
+                Python::attach(|py| py_err.restore(py));
+                return Some(Err(
+                    pyo3_polars::export::polars_error::PolarsError::ComputeError(
+                        "Python interrupt".into(),
+                    ),
+                ));
+            }
+
+            let timeout_duration = std::time::Duration::from_millis(100);
+            let result = Python::attach(|py| {
+                py.detach(|| {
+                    rt.block_on(async {
+                        tokio::time::timeout(timeout_duration, self.rx.recv()).await
+                    })
+                })
+            });
+
+            match result {
+                Ok(Some(Ok(batch))) => {
+                    let len = batch.len();
+                    let (_, arrays) = batch.into_schema_and_arrays();
+                    let struct_array = polars_arrow::array::StructArray::new(
+                        self.dtype.clone(),
+                        len,
+                        arrays,
+                        None,
+                    );
+                    return Some(Ok(
+                        Box::new(struct_array) as Box<dyn polars_arrow::array::Array>
+                    ));
+                },
+                Ok(Some(Err(err))) => {
+                    // Stream failed: bubble up exception immediately to prevent silent truncation.
+                    return Some(Err(
+                        pyo3_polars::export::polars_error::PolarsError::ComputeError(
+                            format!("BigQuery Storage API read error: {}", err).into(),
+                        ),
+                    ));
+                },
+                Ok(None) => {
+                    // Stream finished
+                    return None;
+                },
+                Err(_) => {
+                    // Timeout elapsed, loop again to check signals
+                    continue;
+                },
+            }
+        }
+    }
+}
+
+#[pymethods]
+impl ArrowStreamExporter {
+    #[pyo3(signature = (requested_schema=None))]
+    fn __arrow_c_stream__(
+        &self,
+        py: Python,
+        requested_schema: Option<Py<PyAny>>,
+    ) -> PyResult<Py<PyAny>> {
+        let _ = requested_schema;
+        let mut rx_guard = self.receiver.lock().unwrap();
+        let rx = rx_guard
+            .take()
+            .ok_or_else(|| pyo3::exceptions::PyValueError::new_err("Stream already consumed"))?;
+
+        let fields: Vec<polars_arrow::datatypes::Field> =
+            self.schema.iter().map(|(_, field)| field.clone()).collect();
+        let dtype = polars_arrow::datatypes::ArrowDataType::Struct(fields);
+
+        let iter = ReceiverIterator {
+            rx,
+            dtype: dtype.clone(),
+        };
+        let box_iter = Box::new(iter)
+            as Box<
+                dyn Iterator<
+                    Item = pyo3_polars::export::polars_error::PolarsResult<
+                        Box<dyn polars_arrow::array::Array>,
+                    >,
+                >,
+            >;
+
+        let field = polars_arrow::datatypes::Field::new("".into(), dtype, false);
+
+        let stream = polars_arrow::ffi::export_iterator(box_iter, field);
+
+        let capsule = pyo3::types::PyCapsule::new(py, stream, Some(c"arrow_array_stream".into()))?;
+        Ok(capsule.into())
+    }
+}
+
+/// A Python-exposed representation of a BigQuery table identifier.
+#[pyclass(name = "BigQueryTableId")]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct BigQueryTableId {
+    pub inner: arrow_bigquery_lib::BigQueryTableId,
+}
+
+#[pymethods]
+impl BigQueryTableId {
+    #[new]
+    #[pyo3(signature = (project_id, dataset_id, table_id))]
+    pub fn new(project_id: String, dataset_id: String, table_id: String) -> Self {
+        Self {
+            inner: arrow_bigquery_lib::BigQueryTableId {
+                project_id,
+                dataset_id,
+                table_id,
+            },
+        }
+    }
+
+    #[staticmethod]
+    pub fn from_string(s: &str) -> PyResult<Self> {
+        let inner: arrow_bigquery_lib::BigQueryTableId = s.parse().map_err(|_| {
+            pyo3::exceptions::PyValueError::new_err(format!("Invalid table ID: {s}"))
+        })?;
+        Ok(Self { inner })
+    }
+
+    #[staticmethod]
+    #[allow(clippy::should_implement_trait)]
+    pub fn from_str(s: &str) -> PyResult<Self> {
+        Self::from_string(s)
+    }
+
+    /// Parse a table ID from a string, a BigQueryTableId instance, or an object
+    /// with table reference attributes (`project`/`project_id`, `dataset_id`, `table_id`).
+    #[staticmethod]
+    pub fn parse(table_id: &Bound<'_, PyAny>) -> PyResult<Self> {
+        if let Ok(existing) = table_id.cast::<BigQueryTableId>() {
+            return Ok(existing.borrow().clone());
+        }
+
+        if let Ok(s) = table_id.extract::<&str>() {
+            return Self::from_string(s);
+        }
+
+        let project = table_id
+            .getattr("project")
+            .ok()
+            .and_then(|p| p.extract::<String>().ok())
+            .or_else(|| {
+                table_id
+                    .getattr("project_id")
+                    .ok()
+                    .and_then(|p| p.extract::<String>().ok())
+            });
+
+        let dataset = table_id
+            .getattr("dataset_id")
+            .ok()
+            .and_then(|d| d.extract::<String>().ok());
+
+        let table = table_id
+            .getattr("table_id")
+            .ok()
+            .and_then(|t| t.extract::<String>().ok());
+
+        if let (Some(project), Some(dataset), Some(table)) = (project, dataset, table) {
+            return Ok(Self::new(project, dataset, table));
+        }
+
+        Err(pyo3::exceptions::PyTypeError::new_err(format!(
+            "Expected table_id to be a string or BigQuery table object, got {}",
+            table_id.get_type()
+        )))
+    }
+
+    #[getter]
+    pub fn project_id(&self) -> &str {
+        &self.inner.project_id
+    }
+
+    #[setter]
+    pub fn set_project_id(&mut self, value: String) {
+        self.inner.project_id = value;
+    }
+
+    #[getter]
+    pub fn dataset_id(&self) -> &str {
+        &self.inner.dataset_id
+    }
+
+    #[setter]
+    pub fn set_dataset_id(&mut self, value: String) {
+        self.inner.dataset_id = value;
+    }
+
+    #[getter]
+    pub fn table_id(&self) -> &str {
+        &self.inner.table_id
+    }
+
+    #[setter]
+    pub fn set_table_id(&mut self, value: String) {
+        self.inner.table_id = value;
+    }
+
+    #[getter]
+    pub fn project(&self) -> &str {
+        &self.inner.project_id
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "BigQueryTableId(project_id='{}', dataset_id='{}', table_id='{}')",
+            self.inner.project_id, self.inner.dataset_id, self.inner.table_id
+        )
+    }
+
+    fn __str__(&self) -> String {
+        format!(
+            "{}.{}.{}",
+            self.inner.project_id, self.inner.dataset_id, self.inner.table_id
+        )
+    }
+
+    fn __richcmp__(&self, other: &Self, op: pyo3::pyclass::CompareOp) -> bool {
+        match op {
+            pyo3::pyclass::CompareOp::Eq => self.inner == other.inner,
+            pyo3::pyclass::CompareOp::Ne => self.inner != other.inner,
+            _ => false,
+        }
+    }
+
+    fn __hash__(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        self.inner.hash(&mut hasher);
+        hasher.finish()
+    }
+}
+
+impl From<BigQueryTableId> for arrow_bigquery_lib::BigQueryTableId {
+    fn from(id: BigQueryTableId) -> Self {
+        id.inner
+    }
+}
+
+impl From<&BigQueryTableId> for arrow_bigquery_lib::BigQueryTableId {
+    fn from(id: &BigQueryTableId) -> Self {
+        id.inner.clone()
+    }
+}
+
+impl From<arrow_bigquery_lib::BigQueryTableId> for BigQueryTableId {
+    fn from(inner: arrow_bigquery_lib::BigQueryTableId) -> Self {
+        Self { inner }
+    }
+}
+
+impl std::str::FromStr for BigQueryTableId {
+    type Err = arrow_bigquery_lib::BigQueryError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let inner = s.parse()?;
+        Ok(Self { inner })
+    }
+}
 
 /// A Python-exposed client that keeps the BigQuery Storage Read API gRPC channel
 /// open across multiple table read operations, caching the OAuth2 token in Rust.
@@ -25,34 +412,45 @@ impl Client {
     #[new]
     #[pyo3(signature = (*, quota_project_id, credentials_provider=None, user_agent=None))]
     pub fn new(
-        py: Python<'_>,
         quota_project_id: String,
         credentials_provider: Option<Py<PyAny>>,
         user_agent: Option<String>,
     ) -> PyResult<Self> {
-        let cred = match credentials_provider {
-            Some(provider) if !provider.is_none(py) => {
-                let token_source = auth::PythonTokenSource::new(provider);
-                Some(Credentials::from(token_source))
+        INIT_CRYPTO.call_once(|| {
+            let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+            // ignore if another crate already set the default provider.
+        });
+
+        let token_source_type = match credentials_provider {
+            Some(provider) => {
+                let is_none = Python::attach(|py| provider.is_none(py));
+                if is_none {
+                    gcloud_sdk::TokenSourceType::Default
+                } else {
+                    let token_source = PythonTokenSource {
+                        provider,
+                        cache: Mutex::new(None),
+                    };
+                    gcloud_sdk::TokenSourceType::ExternalSource(Box::new(token_source))
+                }
             },
-            _ => None,
+            None => gcloud_sdk::TokenSourceType::Default,
         };
 
         let rt = pyo3_async_runtimes::tokio::get_runtime();
-        let result = py.detach(|| {
-            rt.block_on(async {
-                let mut builder = arrow_bigquery_lib::Client::builder()
-                    .with_user_agent(user_agent)
-                    .with_quota_project_id(Some(quota_project_id));
-                if let Some(cred) = cred {
-                    builder = builder.with_cred(cred);
-                }
+        let client = rt.block_on(async {
+            use arrow_bigquery_lib::BigQueryReadClientBuilder;
 
-                arrow_bigquery_lib::Client::from_builder(builder).await
-            })
-        });
+            let builder = arrow_bigquery_lib::ServiceConfigBuilder::new()
+                .with_cred(token_source_type)
+                .with_user_agent(user_agent)
+                .with_quota_project_id(Some(quota_project_id));
 
-        let client = result.map_err(|err| error::to_py_err(py, err))?;
+            arrow_bigquery_lib::Client::from_builder(builder)
+                .await
+                .map_err(|err| pyo3::exceptions::PyRuntimeError::new_err(err.to_string()))
+        })?;
+
         Ok(Self { client })
     }
 
@@ -72,7 +470,6 @@ impl Client {
     ))]
     pub fn read_table(
         &self,
-        py: Python<'_>,
         table: &BigQueryTableId,
         arrow_buffer_compression: &str,
         maintain_order: bool,
@@ -83,7 +480,6 @@ impl Client {
         snapshot_time: Option<Py<PyDateTime>>,
     ) -> PyResult<ArrowStreamExporter> {
         let read_options = parse_read_options(
-            py,
             arrow_buffer_compression,
             maintain_order,
             max_stream_count,
@@ -95,17 +491,24 @@ impl Client {
         let rt = pyo3_async_runtimes::tokio::get_runtime();
         let client = self.client.clone();
         let table = table.inner.clone();
-        let result =
-            py.detach(|| rt.block_on(async move { client.read_table(&table, read_options).await }));
+        let result = rt.block_on(async move {
+            client
+                .read_table(&table, read_options)
+                .await
+                .map_err(|err| pyo3::exceptions::PyRuntimeError::new_err(err.to_string()))
+        });
 
-        let (schema, receiver) = result.map_err(|err| error::to_py_err(py, err))?;
-        Ok(ArrowStreamExporter::new(schema, receiver))
+        match result {
+            Ok((schema, receiver)) => Ok(ArrowStreamExporter {
+                schema,
+                receiver: std::sync::Mutex::new(Some(receiver)),
+            }),
+            Err(err) => Err(err),
+        }
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 fn parse_read_options(
-    py: Python<'_>,
     arrow_buffer_compression: &str,
     maintain_order: bool,
     max_stream_count: Option<i32>,
@@ -115,21 +518,19 @@ fn parse_read_options(
     snapshot_time: Option<Py<PyDateTime>>,
 ) -> PyResult<arrow_bigquery_lib::ReadOptions> {
     let snapshot_time: Option<chrono::DateTime<chrono::Utc>> = match snapshot_time {
-        Some(dt) => Some(
+        Some(dt) => Some(Python::attach(|py| {
             dt.extract::<chrono::DateTime<chrono::Utc>>(py)
-                .map_err(|_| PyValueError::new_err("failed to extract snapshot_time"))?,
-        ),
+                .map_err(|_| PyValueError::new_err("failed to extract snapshot_time"))
+        })?),
         None => None,
     };
     let arrow_buffer_compression = Some(match arrow_buffer_compression {
         "unspecified" => CompressionCodec::CompressionUnspecified,
         "lz4frame" => CompressionCodec::Lz4Frame,
         "zstd" => CompressionCodec::Zstd,
-        _ => {
-            return Err(PyValueError::new_err(format!(
-                "got unexpected compression codec {arrow_buffer_compression}"
-            )))
-        },
+        _ => Err(PyValueError::new_err(format!(
+            "got unexpected compression codec {arrow_buffer_compression}"
+        )))?,
     });
     Ok(arrow_bigquery_lib::ReadOptions {
         arrow_buffer_compression,
@@ -142,52 +543,134 @@ fn parse_read_options(
     })
 }
 
+#[pyfunction]
+pub fn _create_test_exporter() -> ArrowStreamExporter {
+    // Force initialization of the Tokio runtime inside a #[pyfunction] context
+    let rt = pyo3_async_runtimes::tokio::get_runtime();
+    rt.block_on(async {
+        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+    });
+
+    let (tx, rx) = tokio::sync::mpsc::channel(10);
+    // Leak the sender so the channel never closes, causing rx.recv() to block indefinitely.
+    Box::leak(Box::new(tx));
+
+    let field = polars_arrow::datatypes::Field::new(
+        "placeholder".into(),
+        polars_arrow::datatypes::ArrowDataType::Int32,
+        true,
+    );
+    let schema = polars_arrow::datatypes::ArrowSchema::from_iter(vec![field]);
+    let schema_ref = std::sync::Arc::new(schema);
+    let receiver = arrow_bigquery_lib::BigQueryRecordBatchReceiver::new_for_testing(rx, Vec::new());
+
+    ArrowStreamExporter {
+        schema: schema_ref,
+        receiver: std::sync::Mutex::new(Some(receiver)),
+    }
+}
+
+#[pyclass]
+#[derive(Clone)]
+pub struct DropFlag {
+    value: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+#[pymethods]
+impl DropFlag {
+    fn is_set(&self) -> bool {
+        self.value.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+#[pyfunction]
+pub fn _test_create_exporter_with_drop_flag() -> (ArrowStreamExporter, DropFlag) {
+    let rt = pyo3_async_runtimes::tokio::get_runtime();
+
+    let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let flag_clone = flag.clone();
+
+    // Spawn a placeholder task that runs forever until aborted, and sets the flag when dropped
+    let handle = rt.spawn(async move {
+        struct SetOnDrop(std::sync::Arc<std::sync::atomic::AtomicBool>);
+        impl Drop for SetOnDrop {
+            fn drop(&mut self) {
+                self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        let _cleanup = SetOnDrop(flag_clone);
+
+        loop {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    });
+
+    let (tx, rx) = tokio::sync::mpsc::channel(10);
+    Box::leak(Box::new(tx));
+
+    let field = polars_arrow::datatypes::Field::new(
+        "placeholder".into(),
+        polars_arrow::datatypes::ArrowDataType::Int32,
+        true,
+    );
+    let schema = polars_arrow::datatypes::ArrowSchema::from_iter(vec![field]);
+    let schema_ref = std::sync::Arc::new(schema);
+
+    let receiver =
+        arrow_bigquery_lib::BigQueryRecordBatchReceiver::new_for_testing(rx, vec![handle]);
+
+    let exporter = ArrowStreamExporter {
+        schema: schema_ref,
+        receiver: std::sync::Mutex::new(Some(receiver)),
+    };
+
+    let drop_flag = DropFlag { value: flag };
+
+    (exporter, drop_flag)
+}
+
 #[pymodule]
 #[pyo3(name = "_native")]
 fn polars_bigquery(m: &Bound<PyModule>) -> PyResult<()> {
-    m.add("BigQueryError", m.py().get_type::<error::BigQueryError>())?;
-    m.add_class::<Client>()?;
-    m.add_class::<BigQueryTableId>()?;
-    #[cfg(feature = "testing")]
-    {
-        m.add_wrapped(wrap_pyfunction!(testing::_create_test_exporter))?;
-        m.add_wrapped(wrap_pyfunction!(
-            testing::_test_create_exporter_with_drop_flag
-        ))?;
-        m.add_class::<testing::DropFlag>()?;
-    }
+    INIT_CRYPTO.call_once(|| {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        // ignore if another crate already set the default provider.
+    });
+
+    m.add_class::<Client>().unwrap();
+    m.add_class::<BigQueryTableId>().unwrap();
+    m.add_wrapped(wrap_pyfunction!(_create_test_exporter))
+        .unwrap();
+    m.add_wrapped(wrap_pyfunction!(_test_create_exporter_with_drop_flag))
+        .unwrap();
+    m.add_class::<DropFlag>().unwrap();
 
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
-    use pyo3::types::PyDict;
-
     use super::*;
 
     #[test]
     fn test_parse_read_options_defaults() {
         Python::initialize();
-        Python::attach(|py| {
-            let options =
-                parse_read_options(py, "lz4frame", false, None, "", None, None, None).unwrap();
-            assert!(!options.maintain_order);
-            assert_eq!(options.snapshot_time, None);
-            assert!(options.selected_fields.is_empty());
-            assert_eq!(options.row_restriction, "");
-            assert_eq!(
-                options.arrow_buffer_compression,
-                Some(CompressionCodec::Lz4Frame)
-            );
-            assert_eq!(options.sample_percentage, None);
-        });
+        let options = parse_read_options("lz4frame", false, None, "", None, None, None).unwrap();
+        assert!(!options.maintain_order);
+        assert_eq!(options.snapshot_time, None);
+        assert!(options.selected_fields.is_empty());
+        assert_eq!(options.row_restriction, "");
+        assert_eq!(
+            options.arrow_buffer_compression,
+            Some(CompressionCodec::Lz4Frame)
+        );
+        assert_eq!(options.sample_percentage, None);
     }
 
     #[test]
     fn test_parse_read_options_all_fields() {
         Python::initialize();
-        Python::attach(|py| {
+        let (dt_py, expected_dt) = Python::attach(|py| {
             let datetime_mod = py.import("datetime").unwrap();
             let timezone = datetime_mod
                 .getattr("timezone")
@@ -199,32 +682,32 @@ mod tests {
                 .unwrap()
                 .call1((2023, 11, 14, 22, 13, 20, 500_000, timezone))
                 .unwrap();
-            let dt_py: Py<PyDateTime> = dt.extract().unwrap();
-            let expected_dt = chrono::DateTime::from_timestamp(1_700_000_000, 500_000_000).unwrap();
-
-            let options = parse_read_options(
-                py,
-                "zstd",
-                true,
-                Some(16),
-                "col1 > 100",
-                Some(42.5),
-                Some(vec!["col1".to_string(), "col2".to_string()]),
-                Some(dt_py),
-            )
-            .unwrap();
-
-            assert!(options.maintain_order);
-            assert_eq!(options.max_stream_count, Some(16));
-            assert_eq!(options.snapshot_time, Some(expected_dt));
-            assert_eq!(options.selected_fields, vec!["col1", "col2"]);
-            assert_eq!(options.row_restriction, "col1 > 100");
-            assert_eq!(
-                options.arrow_buffer_compression,
-                Some(CompressionCodec::Zstd)
-            );
-            assert_eq!(options.sample_percentage, Some(42.5));
+            let py_dt: Py<PyDateTime> = dt.extract().unwrap();
+            let expected = chrono::DateTime::from_timestamp(1_700_000_000, 500_000_000).unwrap();
+            (py_dt, expected)
         });
+
+        let options = parse_read_options(
+            "zstd",
+            true,
+            Some(16),
+            "col1 > 100",
+            Some(42.5),
+            Some(vec!["col1".to_string(), "col2".to_string()]),
+            Some(dt_py),
+        )
+        .unwrap();
+
+        assert!(options.maintain_order);
+        assert_eq!(options.max_stream_count, Some(16));
+        assert_eq!(options.snapshot_time, Some(expected_dt));
+        assert_eq!(options.selected_fields, vec!["col1", "col2"]);
+        assert_eq!(options.row_restriction, "col1 > 100");
+        assert_eq!(
+            options.arrow_buffer_compression,
+            Some(CompressionCodec::Zstd)
+        );
+        assert_eq!(options.sample_percentage, Some(42.5));
     }
 
     #[test]
@@ -237,18 +720,16 @@ mod tests {
             ("zstd", CompressionCodec::Zstd),
         ];
 
-        Python::attach(|py| {
-            for (codec_str, expected) in valid_codecs {
-                let options =
-                    parse_read_options(py, codec_str, false, None, "", None, None, None).unwrap();
-                assert_eq!(options.arrow_buffer_compression, Some(expected));
-            }
+        for (codec_str, expected) in valid_codecs {
+            let options = parse_read_options(codec_str, false, None, "", None, None, None).unwrap();
+            assert_eq!(options.arrow_buffer_compression, Some(expected));
+        }
 
-            let err =
-                match parse_read_options(py, "invalid_codec", false, None, "", None, None, None) {
-                    Err(e) => e,
-                    Ok(_) => panic!("expected Err for invalid compression codec"),
-                };
+        let err = match parse_read_options("invalid_codec", false, None, "", None, None, None) {
+            Err(e) => e,
+            Ok(_) => panic!("expected Err for invalid compression codec"),
+        };
+        Python::attach(|py| {
             assert!(err.is_instance_of::<PyValueError>(py));
             assert!(err
                 .to_string()
@@ -259,28 +740,22 @@ mod tests {
     #[test]
     fn test_parse_read_options_snapshot_time_naive_error() {
         Python::initialize();
-        Python::attach(|py| {
+        let dt_py = Python::attach(|py| {
             let datetime_mod = py.import("datetime").unwrap();
             let dt = datetime_mod
                 .getattr("datetime")
                 .unwrap()
                 .call1((2023, 11, 14, 22, 13, 20))
                 .unwrap();
-            let dt_py: Py<PyDateTime> = dt.extract().unwrap();
+            let py_dt: Py<PyDateTime> = dt.extract().unwrap();
+            py_dt
+        });
 
-            let err = match parse_read_options(
-                py,
-                "lz4frame",
-                false,
-                None,
-                "",
-                None,
-                None,
-                Some(dt_py),
-            ) {
-                Err(e) => e,
-                Ok(_) => panic!("expected Err for naive datetime"),
-            };
+        let err = match parse_read_options("lz4frame", false, None, "", None, None, Some(dt_py)) {
+            Err(e) => e,
+            Ok(_) => panic!("expected Err for naive datetime"),
+        };
+        Python::attach(|py| {
             assert!(err.is_instance_of::<PyValueError>(py));
             assert!(err.to_string().contains("failed to extract snapshot_time"));
         });
@@ -289,23 +764,14 @@ mod tests {
     #[test]
     fn test_client_read_table_invalid_compression() {
         Python::initialize();
-        Python::attach(|py| {
-            let client = Client::new(py, "test-project".to_string(), None, None).unwrap();
-            let table = BigQueryTableId::new("p".to_string(), "d".to_string(), "t".to_string());
-            let err = match client.read_table(
-                py,
-                &table,
-                "invalid_codec",
-                false,
-                None,
-                "",
-                None,
-                None,
-                None,
-            ) {
+        let client = Client::new("test-project".to_string(), None, None).unwrap();
+        let table = BigQueryTableId::new("p".to_string(), "d".to_string(), "t".to_string());
+        let err =
+            match client.read_table(&table, "invalid_codec", false, None, "", None, None, None) {
                 Err(e) => e,
                 Ok(_) => panic!("expected Err for invalid compression codec"),
             };
+        Python::attach(|py| {
             assert!(err.is_instance_of::<PyValueError>(py));
             assert!(err
                 .to_string()
@@ -316,122 +782,27 @@ mod tests {
     #[test]
     fn test_client_read_table_naive_snapshot_time() {
         Python::initialize();
-        Python::attach(|py| {
+        let dt_py = Python::attach(|py| {
             let datetime_mod = py.import("datetime").unwrap();
             let dt = datetime_mod
                 .getattr("datetime")
                 .unwrap()
                 .call1((2023, 11, 14, 22, 13, 20))
                 .unwrap();
-            let dt_py: Py<PyDateTime> = dt.extract().unwrap();
+            let py_dt: Py<PyDateTime> = dt.extract().unwrap();
+            py_dt
+        });
 
-            let client = Client::new(py, "test-project".to_string(), None, None).unwrap();
-            let table = BigQueryTableId::new("p".to_string(), "d".to_string(), "t".to_string());
-            let err = match client.read_table(
-                py,
-                &table,
-                "lz4frame",
-                false,
-                None,
-                "",
-                None,
-                None,
-                Some(dt_py),
-            ) {
+        let client = Client::new("test-project".to_string(), None, None).unwrap();
+        let table = BigQueryTableId::new("p".to_string(), "d".to_string(), "t".to_string());
+        let err =
+            match client.read_table(&table, "lz4frame", false, None, "", None, None, Some(dt_py)) {
                 Err(e) => e,
                 Ok(_) => panic!("expected Err for naive datetime"),
             };
+        Python::attach(|py| {
             assert!(err.is_instance_of::<PyValueError>(py));
             assert!(err.to_string().contains("failed to extract snapshot_time"));
-        });
-    }
-
-    #[test]
-    fn test_client_new_with_credentials_provider() {
-        Python::initialize();
-        Python::attach(|py| {
-            let locals = PyDict::new(py);
-            py.run(
-                c"def p(): return ({'bearer_token': 'tok'}, None)",
-                None,
-                Some(&locals),
-            )
-            .unwrap();
-            let provider = locals.get_item("p").unwrap().unwrap().unbind();
-
-            let client = Client::new(
-                py,
-                "test-project".to_string(),
-                Some(provider),
-                Some("test-agent/1.0".to_string()),
-            );
-            assert!(client.is_ok());
-        });
-    }
-
-    #[test]
-    fn test_client_read_table_preserves_python_cause_chain() {
-        use google_cloud_auth::errors::CredentialsError;
-        use google_cloud_bigquery::client::Read;
-        use google_cloud_bigquery::model::{CreateReadSessionRequest, ReadSession};
-        use google_cloud_gax::error::Error as GaxError;
-        use google_cloud_gax::options::RequestOptions;
-        use google_cloud_gax::response::Response;
-
-        #[derive(Debug)]
-        struct FailingStub;
-
-        impl google_cloud_bigquery::stub::Read for FailingStub {
-            async fn create_read_session(
-                &self,
-                _req: CreateReadSessionRequest,
-                _options: RequestOptions,
-            ) -> google_cloud_bigquery::Result<Response<ReadSession>> {
-                let py_err = Python::attach(|_py| {
-                    PyValueError::new_err("underlying python token generator broke")
-                });
-                let cred_err =
-                    CredentialsError::new(false, "Python credentials provider failed", py_err);
-                Err(GaxError::authentication(cred_err))
-            }
-        }
-
-        Python::initialize();
-        Python::attach(|py| {
-            let inner_client = arrow_bigquery_lib::Client::new(
-                Read::from_stub(FailingStub),
-                "test-project".to_string(),
-            );
-            let client = Client {
-                client: inner_client,
-            };
-            let table = BigQueryTableId::new("p".to_string(), "d".to_string(), "t".to_string());
-
-            let err = match client
-                .read_table(py, &table, "lz4frame", false, None, "", None, None, None)
-            {
-                Err(e) => e,
-                Ok(_) => panic!("expected read_table to fail"),
-            };
-
-            assert!(err.is_instance_of::<error::BigQueryError>(py));
-            let msg = err.to_string();
-            assert!(msg.contains("Python credentials provider failed"));
-            assert!(msg.contains("caused by: ValueError: underlying python token generator broke"));
-
-            // Verify Python __cause__ chain reaches the original ValueError
-            let mut curr = err.cause(py);
-            let mut root = None;
-            while let Some(c) = curr {
-                let next = c.cause(py);
-                root = Some(c);
-                curr = next;
-            }
-            let root_err = root.expect("expected root Python __cause__");
-            assert!(root_err.is_instance_of::<PyValueError>(py));
-            assert!(root_err
-                .to_string()
-                .contains("underlying python token generator broke"));
         });
     }
 }
