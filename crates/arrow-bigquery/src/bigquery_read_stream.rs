@@ -31,7 +31,7 @@
 
 use std::io::Cursor;
 use std::iter::Iterator;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 use gcloud_sdk::google::cloud::bigquery::storage::v1::big_query_read_client::BigQueryReadClient;
 use gcloud_sdk::google::cloud::bigquery::storage::v1::{
@@ -44,6 +44,24 @@ use tower::ServiceExt;
 
 use super::bigquery_read_retry;
 use crate::BigQueryError;
+
+static DEFAULT_DECODE_POOL: LazyLock<Arc<rayon::ThreadPool>> = LazyLock::new(|| {
+    let num_threads = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(num_threads)
+        .thread_name(|i| format!("arrow-bq-decode-{i}"))
+        .build()
+        .expect("failed to build Arrow IPC decode thread pool");
+    Arc::new(pool)
+});
+
+/// Returns a handle to the shared bounded thread pool used for CPU-bound
+/// Arrow IPC (LZ4/ZSTD) decompression.
+pub(crate) fn default_decode_pool() -> Arc<rayon::ThreadPool> {
+    Arc::clone(&DEFAULT_DECODE_POOL)
+}
 
 /// Convert a ReadRowsResponse into an Arrow record batch + stream offset.
 ///
@@ -112,6 +130,40 @@ fn read_rows_response_to_record_batch(
     }
 }
 
+async fn decode_response_on_pool(
+    decode_pool: &rayon::ThreadPool,
+    response: ReadRowsResponse,
+    schema: Arc<Vec<u8>>,
+) -> Result<Option<(RecordBatch, i64)>, BigQueryError> {
+    // Fast-path empty heartbeat responses without dispatching to the thread pool.
+    if response.row_count == 0 {
+        match &response.rows {
+            None => return Ok(None),
+            Some(read_rows_response::Rows::ArrowRecordBatch(b))
+                if b.serialized_record_batch.is_empty() =>
+            {
+                return Ok(None);
+            },
+            _ => {},
+        }
+    }
+
+    let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+    decode_pool.spawn(move || {
+        // If the stream task was cancelled while this job was queued in the pool,
+        // skip decompression immediately.
+        if done_tx.is_closed() {
+            return;
+        }
+        let res = read_rows_response_to_record_batch(response, &schema);
+        let _ = done_tx.send(res);
+    });
+
+    done_rx.await.map_err(|_| {
+        BigQueryError::Other("Arrow IPC decode worker terminated unexpectedly".into())
+    })?
+}
+
 /// Abstraction over a gRPC stream yielding [`ReadRowsResponse`] messages.
 ///
 /// Decoupling the streaming loop from concrete [`gcloud_sdk::tonic::Streaming`] allows unit tests
@@ -170,6 +222,7 @@ pub async fn read_stream<B>(
     schema: Arc<Vec<u8>>,
     stream_name: String,
     tx: tokio::sync::mpsc::Sender<Result<RecordBatch, BigQueryError>>,
+    decode_pool: Arc<rayon::ThreadPool>,
 ) where
     B: GoogleApiClientBuilder<BigQueryReadClient<GoogleAuthMiddleware>> + Send + Sync + 'static,
 {
@@ -179,6 +232,7 @@ pub async fn read_stream<B>(
         stream_name,
         tx,
         bigquery_read_retry::RetryPolicy::stream_reconnect_policy(),
+        decode_pool,
     )
     .await;
 }
@@ -222,32 +276,35 @@ async fn connect_read_rows_stream<C: BigQueryReadClientTrait>(
 /// Processes the next message from an active read stream while in [`ReadStreamState::Running`].
 async fn consume_next_message<S: ReadRowsStreamTrait>(
     stream: &mut S,
-    schema: &[u8],
+    schema: &Arc<Vec<u8>>,
     current_offset: &mut i64,
     tx: &tokio::sync::mpsc::Sender<Result<RecordBatch, BigQueryError>>,
+    decode_pool: &rayon::ThreadPool,
 ) -> ReadStreamState {
     match stream.next_message().await {
-        Ok(Some(value)) => match read_rows_response_to_record_batch(value, schema) {
-            Ok(Some((batch, row_count))) => {
-                *current_offset += row_count;
-                if tx.send(Ok(batch)).await.is_err() {
-                    // `tx.send` returns `Err` strictly when all `Receiver` handles (`rx`) have been
-                    // dropped. This happens when either:
-                    // 1) The consumer aborted reading early (e.g. stopped iteration or dropped receiver), or
-                    // 2) Another concurrent stream sent an `Err(...)` over `tx`, prompting the consumer
-                    //    to raise an exception and drop `rx`.
-                    // In either case, the consumer closed the channel and cannot receive more batches,
-                    // so terminating this stream cleanly prevents orphan background tasks.
+        Ok(Some(value)) => {
+            match decode_response_on_pool(decode_pool, value, Arc::clone(schema)).await {
+                Ok(Some((batch, row_count))) => {
+                    *current_offset += row_count;
+                    if tx.send(Ok(batch)).await.is_err() {
+                        // `tx.send` returns `Err` strictly when all `Receiver` handles (`rx`) have been
+                        // dropped. This happens when either:
+                        // 1) The consumer aborted reading early (e.g. stopped iteration or dropped receiver), or
+                        // 2) Another concurrent stream sent an `Err(...)` over `tx`, prompting the consumer
+                        //    to raise an exception and drop `rx`.
+                        // In either case, the consumer closed the channel and cannot receive more batches,
+                        // so terminating this stream cleanly prevents orphan background tasks.
+                        ReadStreamState::Terminated
+                    } else {
+                        ReadStreamState::Running
+                    }
+                },
+                Ok(None) => ReadStreamState::Running,
+                Err(err) => {
+                    let _ = tx.send(Err(err)).await;
                     ReadStreamState::Terminated
-                } else {
-                    ReadStreamState::Running
-                }
-            },
-            Ok(None) => ReadStreamState::Running,
-            Err(err) => {
-                let _ = tx.send(Err(err)).await;
-                ReadStreamState::Terminated
-            },
+                },
+            }
         },
         Ok(None) => ReadStreamState::Terminated,
         Err(status) => {
@@ -283,6 +340,7 @@ pub(crate) async fn read_stream_inner<C, P, R>(
     stream_name: String,
     tx: tokio::sync::mpsc::Sender<Result<RecordBatch, BigQueryError>>,
     retry_policy: bigquery_read_retry::RetryPolicy<P, R>,
+    decode_pool: Arc<rayon::ThreadPool>,
 ) where
     C: BigQueryReadClientTrait,
     P: Fn(&gcloud_sdk::tonic::Status) -> bool + Clone,
@@ -313,9 +371,14 @@ pub(crate) async fn read_stream_inner<C, P, R>(
                 match stream {
                     Some(ref mut inner_stream) => {
                         let prev_offset = current_offset;
-                        let next_state =
-                            consume_next_message(inner_stream, &schema, &mut current_offset, &tx)
-                                .await;
+                        let next_state = consume_next_message(
+                            inner_stream,
+                            &schema,
+                            &mut current_offset,
+                            &tx,
+                            &decode_pool,
+                        )
+                        .await;
                         // Reset backoff state after making data progress so
                         // future transient errors get a full retry budget.
                         if current_offset > prev_offset {
@@ -573,6 +636,7 @@ mod tests {
             "test_stream".into(),
             tx,
             test_policy(),
+            default_decode_pool(),
         )
         .await;
 
@@ -614,6 +678,7 @@ mod tests {
             "test_stream".into(),
             tx,
             test_policy(),
+            default_decode_pool(),
         )
         .await;
 

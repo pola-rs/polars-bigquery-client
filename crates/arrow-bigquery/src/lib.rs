@@ -251,20 +251,19 @@ pub type BigQueryClient =
 pub struct Client {
     client: Arc<BigQueryClient>,
     quota_project_id: String,
+    decode_pool: Arc<rayon::ThreadPool>,
 }
 
 impl Client {
     pub fn new(client: BigQueryClient, quota_project_id: String) -> Self {
-        Self {
-            client: Arc::new(client),
-            quota_project_id,
-        }
+        Self::from_arc(Arc::new(client), quota_project_id)
     }
 
     pub fn from_arc(client: Arc<BigQueryClient>, quota_project_id: String) -> Self {
         Self {
             client,
             quota_project_id,
+            decode_pool: bigquery_read_stream::default_decode_pool(),
         }
     }
 
@@ -327,6 +326,7 @@ impl Client {
                 shared_schema.clone(),
                 stream_name,
                 tx.clone(),
+                Arc::clone(&self.decode_pool),
             ));
             handles.push(handle);
         }
