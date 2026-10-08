@@ -98,6 +98,7 @@ dependencies = [
  "polars-arrow",
  "polars-error",
  "rand 0.10.2",
+ "rayon",
  "rustls",
  "secret-vault-value",
  "tokio",
