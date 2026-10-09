@@ -419,19 +419,13 @@ mod tests {
             assert!(msg.contains("Python credentials provider failed"));
             assert!(msg.contains("caused by: ValueError: underlying python token generator broke"));
 
-            // Verify Python __cause__ chain reaches the original ValueError
-            let mut curr = err.cause(py);
-            let mut root = None;
-            while let Some(c) = curr {
-                let next = c.cause(py);
-                root = Some(c);
-                curr = next;
-            }
-            let root_err = root.expect("expected root Python __cause__");
-            assert!(root_err.is_instance_of::<PyValueError>(py));
-            assert!(root_err
+            // Verify Python __cause__ is directly the original ValueError
+            let cause = err.cause(py).expect("expected direct Python __cause__");
+            assert!(cause.is_instance_of::<PyValueError>(py));
+            assert!(cause
                 .to_string()
                 .contains("underlying python token generator broke"));
+            assert!(cause.cause(py).is_none());
         });
     }
 }

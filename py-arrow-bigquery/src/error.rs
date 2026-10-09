@@ -15,39 +15,25 @@ pyo3::create_exception!(
 /// - Configuration/validation errors ([`LibBigQueryError::InvalidConfig`]) raise [`PyValueError`].
 /// - All other BigQuery errors raise [`BigQueryError`] (which subclasses [`PyRuntimeError`]),
 ///   with the top-level message formatted via [`LibBigQueryError::format_causal_chain`].
-/// - Every underlying [`StdError::source`] is attached via Python's `__cause__` (`raise ... from ...`),
-///   recovering any original [`PyErr`] instances (such as exceptions raised by a Python credentials provider).
+/// - If any underlying [`StdError::source`] is an original [`PyErr`] (such as an exception raised
+///   by a Python credentials provider), it is attached via Python's `__cause__` (`raise ... from ...`).
 pub(crate) fn to_py_err(py: Python<'_>, err: LibBigQueryError) -> PyErr {
     if matches!(err, LibBigQueryError::InvalidConfig(_)) {
         return PyValueError::new_err(err.format_causal_chain());
     }
 
-    let mut sources: Vec<&(dyn StdError + 'static)> = Vec::new();
     let mut current = err.source();
+    let mut py_cause: Option<PyErr> = None;
     while let Some(src) = current {
-        sources.push(src);
+        if let Some(orig_py_err) = src.downcast_ref::<PyErr>() {
+            py_cause = Some(orig_py_err.clone_ref(py));
+            break;
+        }
         current = src.source();
     }
 
-    let mut cause: Option<PyErr> = None;
-    for src in sources.into_iter().rev() {
-        if let Some(orig_py_err) = src.downcast_ref::<PyErr>() {
-            let cloned = orig_py_err.clone_ref(py);
-            if let Some(prev_cause) = cause.take() {
-                cloned.set_cause(py, Some(prev_cause));
-            }
-            cause = Some(cloned);
-        } else {
-            let layer_err = BigQueryError::new_err(src.to_string());
-            if let Some(prev_cause) = cause.take() {
-                layer_err.set_cause(py, Some(prev_cause));
-            }
-            cause = Some(layer_err);
-        }
-    }
-
     let top_err = BigQueryError::new_err(err.format_causal_chain());
-    if let Some(inner_cause) = cause {
+    if let Some(inner_cause) = py_cause {
         top_err.set_cause(py, Some(inner_cause));
     }
     top_err
@@ -62,7 +48,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_to_py_err_preserves_rust_causal_chain_and_py_cause() {
+    fn test_to_py_err_preserves_rust_causal_chain_without_duplicate_py_causes() {
         Python::initialize();
         let io_err = std::io::Error::new(
             std::io::ErrorKind::NotFound,
@@ -78,22 +64,11 @@ mod tests {
             assert!(py_err.is_instance_of::<PyRuntimeError>(py));
             let top_msg = py_err.to_string();
             assert!(top_msg.contains("could not create default credentials"));
+            assert!(top_msg.contains("cannot create auth headers"));
             assert!(top_msg.contains("missing /etc/gcp/credentials.json"));
 
-            // Walk Python __cause__ chain
-            let cause1 = py_err.cause(py).expect("expected first __cause__");
-            assert!(cause1
-                .to_string()
-                .contains("could not create default credentials"));
-
-            let cause2 = cause1.cause(py).expect("expected second __cause__");
-            assert!(cause2.to_string().contains("cannot create auth headers"));
-
-            let cause3 = cause2.cause(py).expect("expected root __cause__");
-            assert!(cause3
-                .to_string()
-                .contains("missing /etc/gcp/credentials.json"));
-            assert!(cause3.cause(py).is_none());
+            // Pure-Rust error chains should not synthesize duplicate BigQueryError __cause__ layers
+            assert!(py_err.cause(py).is_none());
         });
     }
 
@@ -122,17 +97,11 @@ mod tests {
             assert!(py_err.is_instance_of::<BigQueryError>(py));
             assert!(py_err.to_string().contains("custom python token failure"));
 
-            // Walk down to the root __cause__ and verify it is the exact PyValueError
-            let mut curr = py_err.cause(py);
-            let mut root = None;
-            while let Some(c) = curr {
-                let next = c.cause(py);
-                root = Some(c);
-                curr = next;
-            }
-            let root_err = root.expect("expected root Python cause");
-            assert!(root_err.is_instance_of::<PyValueError>(py));
-            assert!(root_err.to_string().contains("custom python token failure"));
+            // The original PyValueError should be attached directly as __cause__
+            let cause = py_err.cause(py).expect("expected direct Python __cause__");
+            assert!(cause.is_instance_of::<PyValueError>(py));
+            assert!(cause.to_string().contains("custom python token failure"));
+            assert!(cause.cause(py).is_none());
         });
     }
 }
