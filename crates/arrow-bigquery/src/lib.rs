@@ -4,22 +4,23 @@ pub mod client_builder;
 mod error;
 
 use std::io::Cursor;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::SystemTime;
 
 pub use client_builder::*;
 pub use error::BigQueryError;
-use gcloud_sdk::google::cloud::bigquery::storage::v1::big_query_read_client::BigQueryReadClient;
-use gcloud_sdk::google::cloud::bigquery::storage::v1::{
+use google_cloud_bigquery::model::{
     arrow_serialization_options, read_session, ArrowSerializationOptions, CreateReadSessionRequest,
     DataFormat, ReadSession,
 };
-use gcloud_sdk::prost_types::Timestamp;
-use gcloud_sdk::{GoogleApiClient, GoogleAuthMiddleware};
+use google_cloud_gax::backoff_policy::BackoffPolicy;
+use google_cloud_gax::options::RequestOptionsBuilder;
+use google_cloud_gax::retry_policy::RetryPolicy;
+use google_cloud_gax::retry_throttler::SharedRetryThrottler;
+use google_cloud_wkt::Timestamp;
 use polars_arrow::datatypes::ArrowSchemaRef;
 use polars_arrow::io::ipc::read::read_stream_metadata;
 use polars_arrow::record_batch::RecordBatch;
-use tower::ServiceExt;
 use winnow::combinator::{eof, opt, separated, terminated};
 use winnow::token::take_while;
 use winnow::Parser;
@@ -106,7 +107,7 @@ impl std::str::FromStr for BigQueryTableId {
     type Err = BigQueryError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        if s.contains('`') {
+        if s.contains('`') || s.contains('/') {
             return Err(InvalidTableId.into());
         }
 
@@ -136,34 +137,26 @@ pub struct ReadOptions {
 
 impl ReadOptions {
     fn build_request(self, table_path: String, quota_project_id: &str) -> CreateReadSessionRequest {
-        let arrow_options = ArrowSerializationOptions {
-            buffer_compression: match self.arrow_buffer_compression {
-                Some(buffer_compression) => buffer_compression.into(),
-                None => DEFAULT_COMPRESSION.into(),
-            },
-            ..Default::default()
-        };
-        let table_modifiers = read_session::TableModifiers {
-            snapshot_time: self
-                .snapshot_time
-                .map(|snapshot_time| Timestamp::from(SystemTime::from(snapshot_time))),
-        };
-        let read_options = read_session::TableReadOptions {
-            output_format_serialization_options: Some(
-                read_session::table_read_options::OutputFormatSerializationOptions::ArrowSerializationOptions(arrow_options)
-            ),
-            selected_fields: self.selected_fields,
-            row_restriction: self.row_restriction,
-            sample_percentage: self.sample_percentage,
-            ..Default::default()
-        };
-        let read_session = ReadSession {
-            data_format: DataFormat::Arrow as i32,
-            table: table_path,
-            table_modifiers: Some(table_modifiers),
-            read_options: Some(read_options),
-            ..Default::default()
-        };
+        let arrow_options = ArrowSerializationOptions::new()
+            .set_buffer_compression(self.arrow_buffer_compression.unwrap_or(DEFAULT_COMPRESSION));
+        let table_modifiers = read_session::TableModifiers::new().set_or_clear_snapshot_time(
+            self.snapshot_time.map(|snapshot_time| {
+                Timestamp::clamp(
+                    snapshot_time.timestamp(),
+                    snapshot_time.timestamp_subsec_nanos() as i32,
+                )
+            }),
+        );
+        let read_options = read_session::TableReadOptions::new()
+            .set_arrow_serialization_options(arrow_options)
+            .set_selected_fields(self.selected_fields)
+            .set_row_restriction(self.row_restriction)
+            .set_or_clear_sample_percentage(self.sample_percentage);
+        let read_session = ReadSession::new()
+            .set_data_format(DataFormat::Arrow)
+            .set_table(table_path)
+            .set_table_modifiers(table_modifiers)
+            .set_read_options(read_options);
         let max_stream_count = if self.maintain_order {
             // If you are reading from a query results table where order matters,
             // limit this to a single stream.
@@ -176,12 +169,10 @@ impl ReadOptions {
                 })
         };
 
-        CreateReadSessionRequest {
-            parent: format!("projects/{}", quota_project_id),
-            max_stream_count,
-            read_session: Some(read_session),
-            ..Default::default()
-        }
+        CreateReadSessionRequest::new()
+            .set_parent(format!("projects/{}", quota_project_id))
+            .set_max_stream_count(max_stream_count)
+            .set_read_session(read_session)
     }
 }
 
@@ -192,25 +183,46 @@ impl ReadOptions {
 pub struct BigQueryRecordBatchReceiver {
     /// The channel receiver for receiving [`RecordBatch`]es produced by the background tasks.
     rx: tokio::sync::mpsc::Receiver<Result<RecordBatch, BigQueryError>>,
+    /// Cooperative cancellation sender shared across all sibling stream tasks.
+    cancel_tx: Option<Arc<tokio::sync::watch::Sender<bool>>>,
     /// Join handles for the background tasks reading from the BigQuery streams.
     ///
     /// These handles are kept so that the background tasks can be aborted when
-    /// the receiver is dropped, preventing resource leaks from orphan background tasks.
+    /// the receiver is dropped or encounters a fatal error, preventing resource leaks
+    /// from orphan background tasks.
     _handles: Vec<tokio::task::JoinHandle<()>>,
 }
 
 impl BigQueryRecordBatchReceiver {
     pub async fn recv(&mut self) -> Option<Result<RecordBatch, BigQueryError>> {
-        self.rx.recv().await
+        let item = self.rx.recv().await;
+        if matches!(item, None | Some(Err(_))) {
+            self.abort();
+        }
+        item
+    }
+
+    /// Immediately cancels and aborts all background stream tasks owned by this receiver.
+    pub fn abort(&mut self) {
+        if let Some(cancel_tx) = self.cancel_tx.take() {
+            let _ = cancel_tx.send_replace(true);
+        }
+        self.rx.close();
+        for handle in self._handles.drain(..) {
+            handle.abort();
+        }
     }
 
     /// Creates a placeholder receiver for testing purposes.
+    #[cfg(any(test, feature = "testing"))]
+    #[doc(hidden)]
     pub fn new_for_testing(
         rx: tokio::sync::mpsc::Receiver<Result<RecordBatch, BigQueryError>>,
         handles: Vec<tokio::task::JoinHandle<()>>,
     ) -> Self {
         Self {
             rx,
+            cancel_tx: None,
             _handles: handles,
         }
     }
@@ -218,9 +230,7 @@ impl BigQueryRecordBatchReceiver {
 
 impl Drop for BigQueryRecordBatchReceiver {
     fn drop(&mut self) {
-        for handle in &self._handles {
-            handle.abort();
-        }
+        self.abort();
     }
 }
 
@@ -241,28 +251,60 @@ impl From<InvalidTableId> for BigQueryError {
     }
 }
 
-pub type BigQueryClient =
-    GoogleApiClient<BQStorageGoogleApiClientBuilder, BigQueryReadClient<GoogleAuthMiddleware>>;
+pub type BigQueryClient = google_cloud_bigquery::client::Read;
 
 /// A BigQuery client for reading tables using the Storage Read API.
 ///
-/// Keeps the gRPC channel open across multiple read operations.
+/// Keeps the gRPC channel pool open across multiple read operations.
 #[derive(Clone)]
 pub struct Client {
-    client: Arc<BigQueryClient>,
+    clients: Arc<[BigQueryClient]>,
+    next_client: Arc<AtomicUsize>,
     quota_project_id: String,
+    user_agent: Option<String>,
+    retry_policy: Option<Arc<dyn RetryPolicy>>,
+    backoff_policy: Option<Arc<dyn BackoffPolicy>>,
+    retry_throttler: SharedRetryThrottler,
     decode_pool: Arc<rayon::ThreadPool>,
 }
 
 impl Client {
+    pub fn builder() -> ServiceConfigBuilder {
+        ServiceConfigBuilder::new()
+    }
+
     pub fn new(client: BigQueryClient, quota_project_id: String) -> Self {
-        Self::from_arc(Arc::new(client), quota_project_id)
+        Self::from_parts(
+            vec![client],
+            quota_project_id,
+            None,
+            None,
+            None,
+            client_builder::default_retry_throttler(),
+        )
     }
 
     pub fn from_arc(client: Arc<BigQueryClient>, quota_project_id: String) -> Self {
+        Self::new((*client).clone(), quota_project_id)
+    }
+
+    pub(crate) fn from_parts(
+        clients: Vec<BigQueryClient>,
+        quota_project_id: String,
+        user_agent: Option<String>,
+        retry_policy: Option<Arc<dyn RetryPolicy>>,
+        backoff_policy: Option<Arc<dyn BackoffPolicy>>,
+        retry_throttler: SharedRetryThrottler,
+    ) -> Self {
+        debug_assert!(!clients.is_empty(), "Client requires at least one BigQueryClient");
         Self {
-            client,
+            clients: Arc::from(clients.into_boxed_slice()),
+            next_client: Arc::new(AtomicUsize::new(0)),
             quota_project_id,
+            user_agent,
+            retry_policy,
+            backoff_policy,
+            retry_throttler,
             decode_pool: bigquery_read_stream::default_decode_pool(),
         }
     }
@@ -271,15 +313,35 @@ impl Client {
         &self.quota_project_id
     }
 
-    pub async fn from_builder(
-        builder: ServiceConfigBuilder,
-    ) -> Result<Self, Box<dyn std::error::Error>> {
-        let quota_project_id = builder
-            .quota_project_id
-            .clone()
-            .ok_or_else(|| "quota_project_id is required".to_string())?;
-        let client = builder.build().await?;
-        Ok(Self::new(client, quota_project_id))
+    pub fn grpc_subchannel_count(&self) -> usize {
+        self.clients.len()
+    }
+
+    pub async fn from_builder(builder: ServiceConfigBuilder) -> Result<Self, BigQueryError> {
+        builder.build().await
+    }
+
+    fn select_client(&self) -> &BigQueryClient {
+        let idx = self.next_client.fetch_add(1, Ordering::Relaxed);
+        &self.clients[idx % self.clients.len()]
+    }
+
+    fn apply_request_options<B: RequestOptionsBuilder>(&self, builder: B) -> B {
+        let builder = builder.with_quota_project(&self.quota_project_id);
+        match &self.user_agent {
+            Some(user_agent) => builder.with_user_agent(user_agent),
+            None => builder,
+        }
+    }
+
+    fn stream_retry_config(&self) -> bigquery_read_retry::StreamRetryConfig {
+        // Always attach the Client-wide shared retry throttler so all stream readers
+        // share a unified adaptive retry budget instead of isolated per-stream defaults.
+        bigquery_read_retry::StreamRetryConfig::new(
+            self.retry_policy.clone(),
+            self.backoff_policy.clone(),
+            self.retry_throttler.clone(),
+        )
     }
 
     pub async fn read_table(
@@ -288,16 +350,24 @@ impl Client {
         options: ReadOptions,
     ) -> Result<(ArrowSchemaRef, BigQueryRecordBatchReceiver), BigQueryError> {
         let request = options.build_request(table.to_table_path(), &self.quota_project_id);
-        let policy = bigquery_read_retry::RetryPolicy::create_read_session_policy();
-        let service_client = self.client.clone();
-        let service = tower::service_fn(move |req: CreateReadSessionRequest| {
-            let mut client = service_client.get();
-            async move { client.create_read_session(req).await }
-        });
-        let read_session = tower::retry::Retry::new(policy, service)
-            .oneshot(request)
-            .await?
-            .into_inner();
+        let create_session = self.apply_request_options(
+            self.select_client()
+                .create_read_session()
+                .with_request(request)
+                .with_idempotency(true)
+                .with_retry_policy(
+                    self.retry_policy
+                        .clone()
+                        .unwrap_or_else(bigquery_read_retry::create_read_session_retry_policy),
+                )
+                .with_backoff_policy(
+                    self.backoff_policy
+                        .clone()
+                        .unwrap_or_else(bigquery_read_retry::default_backoff_policy),
+                )
+                .with_retry_throttler(self.retry_throttler.clone()),
+        );
+        let read_session = create_session.send().await?;
         let schema = match read_session.schema {
             Some(read_session::Schema::ArrowSchema(value)) => value.serialized_schema,
             _ => {
@@ -316,17 +386,23 @@ impl Client {
             Err(_) => 2,
         };
         let (tx, rx) = tokio::sync::mpsc::channel(channel_size);
-        let shared_schema = Arc::new(schema);
-        let mut handles = Vec::new();
+        let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+        let cancel_tx = Arc::new(cancel_tx);
+        let retry_config = self.stream_retry_config();
+        let mut handles = Vec::with_capacity(read_session.streams.len());
 
-        for stream in read_session.streams {
-            let stream_name = stream.name;
+        for (idx, stream) in read_session.streams.into_iter().enumerate() {
+            let client = &self.clients[idx % self.clients.len()];
+            let read_rows =
+                self.apply_request_options(client.read_rows().set_read_stream(stream.name));
             let handle = tokio::task::spawn(bigquery_read_stream::read_stream(
-                self.client.clone(),
-                shared_schema.clone(),
-                stream_name,
+                read_rows,
+                schema.clone(),
                 tx.clone(),
+                retry_config.clone(),
                 Arc::clone(&self.decode_pool),
+                Arc::clone(&cancel_tx),
+                cancel_rx.clone(),
             ));
             handles.push(handle);
         }
@@ -335,6 +411,7 @@ impl Client {
             schema_ref,
             BigQueryRecordBatchReceiver {
                 rx,
+                cancel_tx: Some(cancel_tx),
                 _handles: handles,
             },
         ))
@@ -481,7 +558,7 @@ mod tests {
         let session = request
             .read_session
             .expect("read_session should be present");
-        assert_eq!(session.data_format, DataFormat::Arrow as i32);
+        assert_eq!(session.data_format, DataFormat::Arrow);
         assert_eq!(
             session.table,
             "projects/test-project/datasets/test_dataset/tables/test_table"
@@ -507,7 +584,7 @@ mod tests {
             ) => {
                 assert_eq!(
                     arrow_opts.buffer_compression,
-                    arrow_serialization_options::CompressionCodec::Lz4Frame as i32
+                    arrow_serialization_options::CompressionCodec::Lz4Frame
                 );
             },
             other => panic!("expected ArrowSerializationOptions, got {:?}", other),
@@ -518,7 +595,10 @@ mod tests {
     fn test_read_options_all_fields_plumbed() {
         let snapshot_dt =
             chrono::DateTime::from_timestamp(1_700_000_000, 500_000_000).expect("valid timestamp");
-        let expected_timestamp = Timestamp::from(SystemTime::from(snapshot_dt));
+        let expected_timestamp = Timestamp::clamp(
+            snapshot_dt.timestamp(),
+            snapshot_dt.timestamp_subsec_nanos() as i32,
+        );
 
         let options = ReadOptions {
             maintain_order: false,
@@ -539,7 +619,7 @@ mod tests {
         let session = request
             .read_session
             .expect("read_session should be present");
-        assert_eq!(session.data_format, DataFormat::Arrow as i32);
+        assert_eq!(session.data_format, DataFormat::Arrow);
         assert_eq!(session.table, "projects/p/datasets/d/tables/t");
 
         let table_modifiers = session
@@ -562,7 +642,7 @@ mod tests {
             ) => {
                 assert_eq!(
                     arrow_opts.buffer_compression,
-                    arrow_serialization_options::CompressionCodec::Zstd as i32
+                    arrow_serialization_options::CompressionCodec::Zstd
                 );
             },
             other => panic!("expected ArrowSerializationOptions, got {:?}", other),
@@ -592,19 +672,19 @@ mod tests {
         let codecs = [
             (
                 None,
-                arrow_serialization_options::CompressionCodec::Lz4Frame as i32,
+                arrow_serialization_options::CompressionCodec::Lz4Frame,
             ),
             (
                 Some(arrow_serialization_options::CompressionCodec::Lz4Frame),
-                arrow_serialization_options::CompressionCodec::Lz4Frame as i32,
+                arrow_serialization_options::CompressionCodec::Lz4Frame,
             ),
             (
                 Some(arrow_serialization_options::CompressionCodec::Zstd),
-                arrow_serialization_options::CompressionCodec::Zstd as i32,
+                arrow_serialization_options::CompressionCodec::Zstd,
             ),
             (
                 Some(arrow_serialization_options::CompressionCodec::CompressionUnspecified),
-                arrow_serialization_options::CompressionCodec::CompressionUnspecified as i32,
+                arrow_serialization_options::CompressionCodec::CompressionUnspecified,
             ),
         ];
 
@@ -631,5 +711,336 @@ mod tests {
                 other => panic!("expected ArrowSerializationOptions, got {:?}", other),
             }
         }
+    }
+
+    fn empty_arrow_schema_bytes() -> Vec<u8> {
+        use polars_arrow::datatypes::{ArrowDataType, ArrowSchema, Field};
+        use polars_arrow::io::ipc::write::{StreamWriter, WriteOptions};
+
+        let schema =
+            ArrowSchema::from_iter(vec![Field::new("col1".into(), ArrowDataType::Int32, false)]);
+        let mut bytes = Vec::new();
+        let mut writer = StreamWriter::new(&mut bytes, WriteOptions { compression: None });
+        writer.start(&schema, None).unwrap();
+        bytes
+    }
+
+    #[tokio::test]
+    async fn test_client_read_table_applies_options_and_forwards_retry_config() {
+        use std::sync::Mutex;
+        use std::time::Duration;
+
+        use google_cloud_bigquery::client::Read;
+        use google_cloud_bigquery::model::{
+            ArrowSchema as BqArrowSchema, ReadRowsRequest, ReadRowsResponse, ReadStream,
+        };
+        use google_cloud_gax::error::rpc::{Code, Status};
+        use google_cloud_gax::error::Error as GaxError;
+        use google_cloud_gax::options::RequestOptions;
+        use google_cloud_gax::response::Response;
+        use google_cloud_gax::retry_policy::RetryPolicyExt;
+        use google_cloud_gax::retry_state::RetryState;
+        use google_cloud_gax::streaming::ResponseStream;
+
+        use crate::bigquery_read_retry::RetryableErrors;
+
+        #[derive(Debug, Default)]
+        struct NoBackoff;
+        impl BackoffPolicy for NoBackoff {
+            fn on_failure(&self, _state: &RetryState) -> Duration {
+                Duration::ZERO
+            }
+        }
+
+        #[derive(Debug, Default)]
+        struct RecordedOptions {
+            create_quota_project: Option<String>,
+            create_user_agent: Option<String>,
+            read_rows_calls: usize,
+            read_rows_quota_project: Option<String>,
+            read_rows_user_agent: Option<String>,
+        }
+
+        #[derive(Debug)]
+        struct MockReadStub {
+            recorded: Arc<Mutex<RecordedOptions>>,
+        }
+
+        impl google_cloud_bigquery::stub::Read for MockReadStub {
+            async fn create_read_session(
+                &self,
+                _req: CreateReadSessionRequest,
+                options: RequestOptions,
+            ) -> google_cloud_bigquery::Result<Response<ReadSession>> {
+                {
+                    let mut rec = self.recorded.lock().unwrap();
+                    rec.create_quota_project = options.quota_project().clone();
+                    rec.create_user_agent = options.user_agent().clone();
+                }
+                let session = ReadSession::new()
+                    .set_arrow_schema(
+                        BqArrowSchema::new().set_serialized_schema(empty_arrow_schema_bytes()),
+                    )
+                    .set_streams(vec![ReadStream::new().set_name("streams/s1")]);
+                Ok(Response::from(session))
+            }
+
+            async fn read_rows(
+                &self,
+                _req: ReadRowsRequest,
+                options: RequestOptions,
+            ) -> google_cloud_bigquery::Result<ResponseStream<ReadRowsResponse>> {
+                let mut rec = self.recorded.lock().unwrap();
+                rec.read_rows_calls += 1;
+                rec.read_rows_quota_project = options.quota_project().clone();
+                rec.read_rows_user_agent = options.user_agent().clone();
+                Err(GaxError::service(
+                    Status::default()
+                        .set_code(Code::Unavailable)
+                        .set_message("transient failure"),
+                ))
+            }
+        }
+
+        let recorded = Arc::new(Mutex::new(RecordedOptions::default()));
+        let stub = MockReadStub {
+            recorded: recorded.clone(),
+        };
+        // Configure attempt_limit(1) so stream reader performs 0 retries (proving Client's retry_policy
+        // is forwarded to the stream retry config rather than discarded in favor of defaults).
+        let client = Client::from_parts(
+            vec![Read::from_stub(stub)],
+            "test-quota-proj".to_string(),
+            Some("custom-ua/2.0".to_string()),
+            Some(Arc::new(RetryableErrors.with_attempt_limit(1))),
+            Some(Arc::new(NoBackoff)),
+            client_builder::default_retry_throttler(),
+        );
+
+        let table: BigQueryTableId = "proj.ds.tbl".parse().unwrap();
+        let (_, mut rx) = client
+            .read_table(&table, ReadOptions::default())
+            .await
+            .unwrap();
+
+        let err = rx.recv().await.unwrap().unwrap_err();
+        assert!(matches!(err, BigQueryError::Grpc(_)));
+
+        let rec = recorded.lock().unwrap();
+        assert_eq!(rec.create_quota_project.as_deref(), Some("test-quota-proj"));
+        assert_eq!(rec.create_user_agent.as_deref(), Some("custom-ua/2.0"));
+        assert_eq!(
+            rec.read_rows_quota_project.as_deref(),
+            Some("test-quota-proj")
+        );
+        assert_eq!(rec.read_rows_user_agent.as_deref(), Some("custom-ua/2.0"));
+        assert_eq!(
+            rec.read_rows_calls, 1,
+            "Stream reader should respect Client's attempt_limit(1) instead of discarding it"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_client_read_table_preserves_causal_error_chain() {
+        use std::error::Error as _;
+
+        use google_cloud_auth::errors::CredentialsError;
+        use google_cloud_bigquery::client::Read;
+        use google_cloud_gax::error::Error as GaxError;
+        use google_cloud_gax::options::RequestOptions;
+        use google_cloud_gax::response::Response;
+
+        #[derive(Debug)]
+        struct FailingAuthStub;
+
+        impl google_cloud_bigquery::stub::Read for FailingAuthStub {
+            async fn create_read_session(
+                &self,
+                _req: CreateReadSessionRequest,
+                _options: RequestOptions,
+            ) -> google_cloud_bigquery::Result<Response<ReadSession>> {
+                let io_err = std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "socket permission denied",
+                );
+                let cred_err = CredentialsError::new(false, "custom auth provider failed", io_err);
+                Err(GaxError::authentication(cred_err))
+            }
+        }
+
+        let client = Client::new(Read::from_stub(FailingAuthStub), "quota-proj".to_string());
+        let table: BigQueryTableId = "proj.ds.tbl".parse().unwrap();
+        let err = match client.read_table(&table, ReadOptions::default()).await {
+            Err(e) => e,
+            Ok(_) => panic!("expected read_table to fail"),
+        };
+
+        let s1 = err.source().expect("GaxError");
+        let s2 = s1.source().expect("CredentialsError");
+        let s3 = s2.source().expect("io::Error");
+        assert!(s3.to_string().contains("socket permission denied"));
+
+        let chain = err.format_causal_chain();
+        assert!(chain.contains("custom auth provider failed"));
+        assert!(chain.contains("caused by: socket permission denied"));
+    }
+
+    #[test]
+    fn test_from_str_slash_rejection() {
+        assert!("proj/inject.ds.tbl".parse::<BigQueryTableId>().is_err());
+    }
+
+    #[tokio::test]
+    async fn test_client_shares_retry_throttler_and_distributes_subchannels() {
+        use std::sync::atomic::AtomicUsize;
+        use std::sync::Mutex;
+        use std::time::Duration;
+
+        use google_cloud_bigquery::client::Read;
+        use google_cloud_bigquery::model::{
+            ArrowSchema as BqArrowSchema, ReadRowsRequest, ReadRowsResponse, ReadStream,
+        };
+        use google_cloud_gax::error::rpc::{Code, Status};
+        use google_cloud_gax::error::Error as GaxError;
+        use google_cloud_gax::options::RequestOptions;
+        use google_cloud_gax::response::Response;
+        use google_cloud_gax::retry_policy::RetryPolicyExt;
+        use google_cloud_gax::retry_state::RetryState;
+        use google_cloud_gax::retry_throttler::RetryThrottler;
+        use google_cloud_gax::streaming::ResponseStream;
+
+        use crate::bigquery_read_retry::RetryableErrors;
+
+        #[derive(Debug, Default)]
+        struct NoBackoff;
+        impl BackoffPolicy for NoBackoff {
+            fn on_failure(&self, _state: &RetryState) -> Duration {
+                Duration::ZERO
+            }
+        }
+
+        #[derive(Debug)]
+        struct CountingThrottler {
+            throttle_checks: Arc<AtomicUsize>,
+        }
+        impl RetryThrottler for CountingThrottler {
+            fn throttle_retry_attempt(&self) -> bool {
+                self.throttle_checks.fetch_add(1, Ordering::SeqCst);
+                true // throttle retries immediately
+            }
+            fn on_retry_failure(&mut self, _flow: &google_cloud_gax::retry_result::RetryResult) {}
+            fn on_success(&mut self) {}
+        }
+
+        #[derive(Debug)]
+        struct SubchannelStub {
+            subchannel_idx: usize,
+            streams_seen: Arc<Mutex<Vec<std::collections::HashSet<String>>>>,
+            started_tx: tokio::sync::watch::Sender<usize>,
+            started_rx: tokio::sync::watch::Receiver<usize>,
+        }
+
+        impl google_cloud_bigquery::stub::Read for SubchannelStub {
+            async fn create_read_session(
+                &self,
+                _req: CreateReadSessionRequest,
+                _options: RequestOptions,
+            ) -> google_cloud_bigquery::Result<Response<ReadSession>> {
+                let streams: Vec<ReadStream> = (0..5)
+                    .map(|i| ReadStream::new().set_name(format!("streams/s{i}")))
+                    .collect();
+                let session = ReadSession::new()
+                    .set_arrow_schema(
+                        BqArrowSchema::new().set_serialized_schema(empty_arrow_schema_bytes()),
+                    )
+                    .set_streams(streams);
+                Ok(Response::from(session))
+            }
+
+            async fn read_rows(
+                &self,
+                req: ReadRowsRequest,
+                _options: RequestOptions,
+            ) -> google_cloud_bigquery::Result<ResponseStream<ReadRowsResponse>> {
+                let total_distinct = {
+                    let mut seen = self.streams_seen.lock().unwrap();
+                    seen[self.subchannel_idx].insert(req.read_stream.clone());
+                    seen.iter().map(|s| s.len()).sum::<usize>()
+                };
+                let _ = self.started_tx.send_replace(total_distinct);
+
+                if req.read_stream == "streams/s4" {
+                    let mut rx_wait = self.started_rx.clone();
+                    while *rx_wait.borrow_and_update() < 5 {
+                        rx_wait.changed().await.unwrap();
+                    }
+                    let (tx, rx) = tokio::sync::mpsc::channel(1);
+                    let _ = tx
+                        .send(Err(GaxError::service(
+                            Status::default()
+                                .set_code(Code::Unavailable)
+                                .set_message("unavailable"),
+                        )))
+                        .await;
+                    Ok(ResponseStream::from(rx))
+                } else {
+                    let (_tx, rx) = tokio::sync::mpsc::channel(1);
+                    Ok(ResponseStream::from(rx))
+                }
+            }
+        }
+
+        let streams_seen = Arc::new(Mutex::new(vec![
+            std::collections::HashSet::new(),
+            std::collections::HashSet::new(),
+            std::collections::HashSet::new(),
+        ]));
+        let (started_tx, started_rx) = tokio::sync::watch::channel(0usize);
+        let stubs: Vec<Read> = (0..3)
+            .map(|i| {
+                Read::from_stub(SubchannelStub {
+                    subchannel_idx: i,
+                    streams_seen: Arc::clone(&streams_seen),
+                    started_tx: started_tx.clone(),
+                    started_rx: started_rx.clone(),
+                })
+            })
+            .collect();
+
+        let throttle_checks = Arc::new(AtomicUsize::new(0));
+        let shared_throttler: SharedRetryThrottler = Arc::new(Mutex::new(CountingThrottler {
+            throttle_checks: Arc::clone(&throttle_checks),
+        }));
+
+        let client = Client::from_parts(
+            stubs,
+            "quota-proj".to_string(),
+            None,
+            Some(Arc::new(RetryableErrors.with_attempt_limit(5))),
+            Some(Arc::new(NoBackoff)),
+            shared_throttler,
+        );
+
+        let table = BigQueryTableId::new("proj", "ds", "tbl");
+        let (_, mut rx) = client
+            .read_table(&table, ReadOptions::default())
+            .await
+            .unwrap();
+
+        let first = rx.recv().await.unwrap();
+        assert!(matches!(first, Err(BigQueryError::Grpc(_))));
+
+        let counts: Vec<usize> = streams_seen
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|s| s.len())
+            .collect();
+        // 5 streams distributed round-robin across 3 subchannels: [2, 2, 1].
+        assert_eq!(counts, vec![2, 2, 1]);
+        assert!(
+            throttle_checks.load(Ordering::SeqCst) >= 1,
+            "shared retry throttler should be consulted by stream readers"
+        );
     }
 }
