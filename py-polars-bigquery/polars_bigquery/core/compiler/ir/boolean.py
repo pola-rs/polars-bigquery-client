@@ -49,6 +49,11 @@ class Coalesce(VariadicExpr):
 
 
 @dataclasses.dataclass(frozen=True)
+class FillNull(BinaryExpr):
+    """IR node representing an IFNULL expression."""
+
+
+@dataclasses.dataclass(frozen=True)
 class Ternary(TernaryExpr):
     """IR node representing a single 3-operand conditional expression (IF)."""
 

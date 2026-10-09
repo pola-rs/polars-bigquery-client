@@ -39,11 +39,13 @@ All comparison operators require both operands to be exact, supported expression
 
 ### Null Checks and Handling
 
-| Polars Expression | BigQuery SQL Translation |
-| --- | --- |
-| `expr.is_null()` | `(`expr` IS NULL)` |
-| `expr.is_not_null()` | `(`expr` IS NOT NULL)` |
-| `pl.coalesce(a, b, ...)` | `COALESCE(`a`, `b`, ...)` |
+| Polars Expression | BigQuery SQL Translation | Notes |
+| --- | --- | --- |
+| `expr.is_null()` | `(`expr` IS NULL)` | — |
+| `expr.is_not_null()` | `(`expr` IS NOT NULL)` | — |
+| `pl.coalesce(a, b, ...)` | `COALESCE(`a`, `b`, ...)` | Pushed down when all operands are supported, exact, and non-`Null`. |
+| `expr.fill_null(value)` | `IFNULL(`expr`, `value`)` | Pushed down when both `expr` and `value` are supported, exact, and non-`Null`. |
+| `expr.fill_null(strategy="zero" \| "one")` | `IFNULL(`expr`, 0)` or `IFNULL(`expr`, 1)` | Analytical and aggregate strategies (`"forward"`, `"backward"`, `"min"`, `"max"`, `"mean"`) are not pushed down. |
 
 ### Numeric Predicates
 
