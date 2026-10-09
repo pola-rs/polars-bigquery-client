@@ -307,12 +307,12 @@ mod tests {
         let (schema_bytes, _) = create_test_arrow_payload(0);
         // Replace empty serialized_record_batch with an Arrow IPC End-Of-Stream marker (8 bytes)
         // so serialized_record_batch is non-empty, but StreamReader::next() returns None.
-        let response = ReadRowsResponse::new()
-            .set_arrow_record_batch(
-                ArrowRecordBatch::new()
-                    .set_serialized_record_batch(vec![0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00]),
-            )
-            .set_row_count(10);
+        let response =
+            ReadRowsResponse::new()
+                .set_arrow_record_batch(ArrowRecordBatch::new().set_serialized_record_batch(vec![
+                    0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00,
+                ]))
+                .set_row_count(10);
         let err = read_rows_response_to_record_batch(response, &schema_bytes).unwrap_err();
         assert!(matches!(err, BigQueryError::Protocol(_)));
     }
@@ -465,7 +465,13 @@ mod tests {
     async fn test_stream_cancellation_terminates_blocked_sibling() {
         #[derive(Debug)]
         struct HangingClient {
-            _hold_tx: Arc<Mutex<Option<tokio::sync::mpsc::Sender<google_cloud_bigquery::Result<ReadRowsResponse>>>>>,
+            _hold_tx: Arc<
+                Mutex<
+                    Option<
+                        tokio::sync::mpsc::Sender<google_cloud_bigquery::Result<ReadRowsResponse>>,
+                    >,
+                >,
+            >,
         }
 
         impl google_cloud_bigquery::stub::Read for HangingClient {
