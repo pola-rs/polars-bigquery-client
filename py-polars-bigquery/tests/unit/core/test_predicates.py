@@ -788,6 +788,8 @@ def test_json_path_parser_registration_and_dispatch() -> None:
         "$.Function.function.Boolean.IsFinite",
         "$.Function.function.Boolean.IsIn",
         "$.Function.function.Coalesce",
+        "$.Function.function.FillNull",
+        "$.Function.function.FillNullWithStrategy",
         "$.Function.function.StringExpr.Uppercase",
         "$.Function.function.StringExpr.Lowercase",
         "$.Function.function.StringExpr.StartsWith",
@@ -2600,3 +2602,234 @@ def test_emit_ternary_and_when_sql_rejects_invalid_inputs(
 
     # Assert
     assert actual == (None, False)
+
+
+@pytest.mark.parametrize(
+    ("expr", "expected_sql"),
+    [
+        pytest.param(
+            pl.col("a").fill_null(0) == 1,
+            "(IFNULL(`a`, 0) = 1)",
+            id="fill_with_int_literal",
+        ),
+        pytest.param(
+            pl.col("a").fill_null("default") == "x",
+            "(IFNULL(`a`, 'default') = 'x')",
+            id="fill_with_string_literal",
+        ),
+        pytest.param(
+            pl.col("a").fill_null(pl.col("b")) > 10,
+            "(IFNULL(`a`, `b`) > 10)",
+            id="fill_with_column_expr",
+        ),
+        pytest.param(
+            pl.col("flag").fill_null(False),
+            "IFNULL(`flag`, FALSE)",
+            id="top_level_boolean_fill_null",
+        ),
+        pytest.param(
+            pl.col("a").fill_null(strategy="zero") == 0,
+            "(IFNULL(`a`, 0) = 0)",
+            id="strategy_zero",
+        ),
+        pytest.param(
+            pl.col("a").fill_null(strategy="one") == 1,
+            "(IFNULL(`a`, 1) = 1)",
+            id="strategy_one",
+        ),
+        pytest.param(
+            pl.col("a").str.to_lowercase().fill_null(pl.col("b").str.to_uppercase())
+            == "abc",
+            "(IFNULL(LOWER(`a`), UPPER(`b`)) = 'abc')",
+            id="nested_string_functions_in_fill_null",
+        ),
+        pytest.param(
+            pl.col("a").fill_null(pl.col("b")).fill_null(0) == 5,
+            "(IFNULL(IFNULL(`a`, `b`), 0) = 5)",
+            id="chained_fill_null",
+        ),
+        pytest.param(
+            (pl.col("a").fill_null(0) > 5) & (unsupported(pl.col("c")) == 1),
+            "(IFNULL(`a`, 0) > 5)",
+            id="fill_null_in_conjunction_with_unsupported_sibling",
+        ),
+        pytest.param(
+            (~((pl.col("a") == 1) | (pl.col("b") == 2))).fill_null(pl.col("c")),
+            "IFNULL(((NOT (`a` = 1)) AND (NOT (`b` = 2))), `c`)",
+            id="de_morgan_rewrite_inside_fill_null_operand",
+        ),
+    ],
+)
+def test_fill_null_expression_pushdown(
+    expr: pl.Expr,
+    expected_sql: str,
+) -> None:
+    # Arrange & Act
+    actual_sql = compiler.predicate_to_row_restriction(expr)
+
+    # Assert
+    assert actual_sql == expected_sql
+
+
+@pytest.mark.parametrize(
+    ("expr", "expected_sql"),
+    [
+        pytest.param(
+            pl.col("a").fill_null(strategy="forward") == 1,
+            "",
+            id="unsupported_strategy_forward",
+        ),
+        pytest.param(
+            pl.col("a").fill_null(strategy="forward", limit=2) == 1,
+            "",
+            id="unsupported_strategy_forward_with_limit",
+        ),
+        pytest.param(
+            pl.col("a").fill_null(strategy="backward") == 1,
+            "",
+            id="unsupported_strategy_backward",
+        ),
+        pytest.param(
+            pl.col("a").fill_null(strategy="min") == 1,
+            "",
+            id="unsupported_strategy_min",
+        ),
+        pytest.param(
+            pl.col("a").fill_null(strategy="max") == 1,
+            "",
+            id="unsupported_strategy_max",
+        ),
+        pytest.param(
+            pl.col("a").fill_null(strategy="mean") == 1,
+            "",
+            id="unsupported_strategy_mean",
+        ),
+        pytest.param(
+            unsupported(pl.col("a")).fill_null(0) == 1,
+            "",
+            id="unsupported_first_operand",
+        ),
+        pytest.param(
+            pl.col("a").fill_null(unsupported(pl.col("b"))) == 1,
+            "",
+            id="unsupported_second_operand",
+        ),
+        pytest.param(
+            unsupported(pl.col("a")).fill_null(strategy="zero") == 0,
+            "",
+            id="unsupported_operand_with_strategy_zero",
+        ),
+        pytest.param(
+            (unsupported(pl.col("a")).fill_null(0) == 1) & (pl.col("c") == 2),
+            "(`c` = 2)",
+            id="unsupported_fill_null_operand_preserves_sibling_and_branch",
+        ),
+        pytest.param(
+            (pl.col("a").fill_null(strategy="forward") == 1) & (pl.col("c") == 2),
+            "(`c` = 2)",
+            id="unsupported_strategy_preserves_sibling_and_branch",
+        ),
+        pytest.param(
+            ((pl.col("a") == 1) & (unsupported(pl.col("b")) == 2)).fill_null(False),
+            "",
+            id="inexact_conjunction_first_operand_degrades_fill_null",
+        ),
+        pytest.param(
+            pl.col("flag").fill_null(
+                (pl.col("a") == 1) & (unsupported(pl.col("b")) == 2)
+            ),
+            "",
+            id="inexact_conjunction_second_operand_degrades_fill_null",
+        ),
+        pytest.param(
+            (~((pl.col("a") == 1) | (unsupported(pl.col("b")) == 2))).fill_null(
+                pl.col("c") == 3
+            )
+            & (pl.col("d") == 4),
+            "(`d` = 4)",
+            id="inexact_de_morgan_operand_inside_fill_null_preserves_outer_and",
+        ),
+        pytest.param(
+            pl.col("a").fill_null(pl.lit(None)) == 1,
+            "",
+            id="null_literal_fill_value",
+        ),
+        pytest.param(
+            pl.lit(None).fill_null(1) == 1,
+            "",
+            id="null_literal_target_expr",
+        ),
+        pytest.param(
+            pl.col("a").fill_null(pl.lit([1, 2])) == 1,
+            "",
+            id="list_literal_fill_value",
+        ),
+        pytest.param(
+            pl.col("a").fill_null(pl.Series("s", [1, 2])) == 1,
+            "",
+            id="series_literal_fill_value",
+        ),
+    ],
+)
+def test_fill_null_unsupported_and_degraded_cases(
+    expr: pl.Expr,
+    expected_sql: str,
+) -> None:
+    # Arrange & Act
+    actual_sql = compiler.predicate_to_row_restriction(expr)
+
+    # Assert
+    assert actual_sql == expected_sql
+
+
+@pytest.mark.parametrize(
+    ("parser_fn", "spec", "expr_json"),
+    [
+        pytest.param(
+            compiler.parser.boolean.parse_fill_null,
+            {"unexpected": True},
+            {"input": [{"Column": "a"}, {"Literal": {"Int64": 0}}]},
+            id="fill_null_parameterized_spec",
+        ),
+        pytest.param(
+            compiler.parser.boolean.parse_fill_null,
+            "FillNull",
+            {"input": [{"Column": "a"}]},
+            id="fill_null_wrong_arity",
+        ),
+        pytest.param(
+            compiler.parser.boolean.parse_fill_null_with_strategy,
+            "Min",
+            {"input": [{"Column": "a"}]},
+            id="strategy_unsupported_name",
+        ),
+        pytest.param(
+            compiler.parser.boolean.parse_fill_null_with_strategy,
+            {"Forward": None},
+            {"input": [{"Column": "a"}]},
+            id="strategy_non_string_spec",
+        ),
+        pytest.param(
+            compiler.parser.boolean.parse_fill_null_with_strategy,
+            "Zero",
+            {"input": []},
+            id="strategy_empty_inputs",
+        ),
+        pytest.param(
+            compiler.parser.boolean.parse_fill_null_with_strategy,
+            "One",
+            {"input": [{"Column": "a"}, {"Column": "b"}]},
+            id="strategy_too_many_inputs",
+        ),
+    ],
+)
+def test_parse_fill_null_rejects_invalid_inputs(
+    parser_fn: Any,
+    spec: Any,
+    expr_json: Any,
+) -> None:
+    # Arrange & Act
+    actual = parser_fn(spec, expr_json)
+
+    # Assert
+    assert actual == compiler.parser.base.UNSUPPORTED_RECORD

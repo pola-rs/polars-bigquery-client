@@ -5,6 +5,7 @@ from polars_bigquery.core.compiler.ir.boolean import (
     And,
     BoolLiteral,
     Coalesce,
+    FillNull,
     IsNotNull,
     IsNull,
     Not,
@@ -46,6 +47,11 @@ def format_coalesce(_node: Coalesce, *operands: str) -> str | None:
     if not operands:
         return None
     return f"COALESCE({', '.join(operands)})"
+
+
+@format_operator_sql.register
+def format_fill_null(_node: FillNull, left: str, right: str) -> str:
+    return f"IFNULL({left}, {right})"
 
 
 @emit_node_sql.register
