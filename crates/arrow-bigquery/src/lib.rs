@@ -334,7 +334,6 @@ impl Client {
         }
     }
 
-<<<<<<< HEAD
     fn configure_reader(&self, mut reader: Reader) -> Reader {
         if let Some(ref retry_policy) = self.retry_policy {
             reader = reader.with_retry_policy(retry_policy.clone());
@@ -346,16 +345,6 @@ impl Client {
         // share a unified adaptive retry budget instead of isolated per-stream defaults.
         reader = reader.with_retry_throttler(self.retry_throttler.clone());
         reader
-=======
-    fn stream_retry_config(&self) -> bigquery_read_retry::StreamRetryConfig {
-        // Always attach the Client-wide shared retry throttler so all stream readers
-        // share a unified adaptive retry budget instead of isolated per-stream defaults.
-        bigquery_read_retry::StreamRetryConfig::new(
-            self.retry_policy.clone(),
-            self.backoff_policy.clone(),
-            self.retry_throttler.clone(),
-        )
->>>>>>> upstream/main
     }
 
     pub async fn read_table(
@@ -368,22 +357,7 @@ impl Client {
             self.select_client()
                 .create_read_session()
                 .with_request(request)
-<<<<<<< HEAD
                 .with_idempotency(true),
-=======
-                .with_idempotency(true)
-                .with_retry_policy(
-                    self.retry_policy
-                        .clone()
-                        .unwrap_or_else(bigquery_read_retry::create_read_session_retry_policy),
-                )
-                .with_backoff_policy(
-                    self.backoff_policy
-                        .clone()
-                        .unwrap_or_else(bigquery_read_retry::default_backoff_policy),
-                )
-                .with_retry_throttler(self.retry_throttler.clone()),
->>>>>>> upstream/main
         );
         let read_session = create_session.send().await?;
         let schema = match read_session.schema {
@@ -406,29 +380,17 @@ impl Client {
         let (tx, rx) = tokio::sync::mpsc::channel(channel_size);
         let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
         let cancel_tx = Arc::new(cancel_tx);
-<<<<<<< HEAD
-=======
-        let retry_config = self.stream_retry_config();
->>>>>>> upstream/main
         let mut handles = Vec::with_capacity(read_session.streams.len());
 
         for (idx, stream) in read_session.streams.into_iter().enumerate() {
             let client = &self.clients[idx % self.clients.len()];
             let read_rows =
                 self.apply_request_options(client.read_rows().set_read_stream(stream.name));
-<<<<<<< HEAD
             let reader = self.configure_reader(read_rows.into_reader());
             let handle = tokio::task::spawn(bigquery_read_stream::read_stream(
                 reader,
                 schema.clone(),
                 tx.clone(),
-=======
-            let handle = tokio::task::spawn(bigquery_read_stream::read_stream(
-                read_rows,
-                schema.clone(),
-                tx.clone(),
-                retry_config.clone(),
->>>>>>> upstream/main
                 Arc::clone(&self.decode_pool),
                 Arc::clone(&cancel_tx),
                 cancel_rx.clone(),
@@ -763,10 +725,7 @@ mod tests {
         use google_cloud_bigquery::model::{
             ArrowSchema as BqArrowSchema, ReadRowsRequest, ReadRowsResponse, ReadStream,
         };
-<<<<<<< HEAD
         use google_cloud_bigquery::read::retry_policy::RetryableErrors;
-=======
->>>>>>> upstream/main
         use google_cloud_gax::error::rpc::{Code, Status};
         use google_cloud_gax::error::Error as GaxError;
         use google_cloud_gax::options::RequestOptions;
@@ -775,11 +734,6 @@ mod tests {
         use google_cloud_gax::retry_state::RetryState;
         use google_cloud_gax::streaming::ResponseStream;
 
-<<<<<<< HEAD
-=======
-        use crate::bigquery_read_retry::RetryableErrors;
-
->>>>>>> upstream/main
         #[derive(Debug, Default)]
         struct NoBackoff;
         impl BackoffPolicy for NoBackoff {
@@ -842,13 +796,8 @@ mod tests {
         let stub = MockReadStub {
             recorded: recorded.clone(),
         };
-<<<<<<< HEAD
         // Configure attempt_limit(1) so Reader performs 0 retries (proving Client's retry_policy
         // is forwarded to Reader rather than discarded in favor of Reader's 10-attempt default).
-=======
-        // Configure attempt_limit(1) so stream reader performs 0 retries (proving Client's retry_policy
-        // is forwarded to the stream retry config rather than discarded in favor of defaults).
->>>>>>> upstream/main
         let client = Client::from_parts(
             vec![Read::from_stub(stub)],
             "test-quota-proj".to_string(),
@@ -877,11 +826,7 @@ mod tests {
         assert_eq!(rec.read_rows_user_agent.as_deref(), Some("custom-ua/2.0"));
         assert_eq!(
             rec.read_rows_calls, 1,
-<<<<<<< HEAD
             "Reader should respect Client's attempt_limit(1) instead of discarding it"
-=======
-            "Stream reader should respect Client's attempt_limit(1) instead of discarding it"
->>>>>>> upstream/main
         );
     }
 
@@ -945,10 +890,7 @@ mod tests {
         use google_cloud_bigquery::model::{
             ArrowSchema as BqArrowSchema, ReadRowsRequest, ReadRowsResponse, ReadStream,
         };
-<<<<<<< HEAD
         use google_cloud_bigquery::read::retry_policy::RetryableErrors;
-=======
->>>>>>> upstream/main
         use google_cloud_gax::error::rpc::{Code, Status};
         use google_cloud_gax::error::Error as GaxError;
         use google_cloud_gax::options::RequestOptions;
@@ -957,12 +899,6 @@ mod tests {
         use google_cloud_gax::retry_state::RetryState;
         use google_cloud_gax::retry_throttler::RetryThrottler;
         use google_cloud_gax::streaming::ResponseStream;
-
-<<<<<<< HEAD
-=======
-        use crate::bigquery_read_retry::RetryableErrors;
-
->>>>>>> upstream/main
         #[derive(Debug, Default)]
         struct NoBackoff;
         impl BackoffPolicy for NoBackoff {

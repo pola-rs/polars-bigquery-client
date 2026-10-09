@@ -1314,12 +1314,7 @@ checksum = "e4eba85ea1d0a966a983acd07deee566e67395d2d96b6fb39e62b5a833f1eb0b"
 [[package]]
 name = "google-cloud-auth"
 version = "1.17.0"
-<<<<<<< HEAD
 source = "git+https://github.com/tswast/google-cloud-rust.git?branch=tswast-bq-storage-reader#61baafa653d62ead60d268422799e1e599edbb55"
-=======
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ac9870b8ea484519aa8601e14886f2efc148ea490034e43d04bef1d246170cc9"
->>>>>>> upstream/main
 dependencies = [
  "async-trait",
  "aws-lc-rs",
@@ -1347,17 +1342,10 @@ dependencies = [
 [[package]]
 name = "google-cloud-bigquery"
 version = "0.18.0"
-<<<<<<< HEAD
 source = "git+https://github.com/tswast/google-cloud-rust.git?branch=tswast-bq-storage-reader#61baafa653d62ead60d268422799e1e599edbb55"
 dependencies = [
  "arc-swap",
  "arrow",
-=======
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e78c988c66c8cb41a3492452eb616cfeb1344f5234045c89ff63eae1af07f1c5"
-dependencies = [
- "arc-swap",
->>>>>>> upstream/main
  "async-trait",
  "base64 0.23.1",
  "bytes",
@@ -1387,12 +1375,7 @@ dependencies = [
 [[package]]
 name = "google-cloud-bigquery-derive"
 version = "0.2.0"
-<<<<<<< HEAD
 source = "git+https://github.com/tswast/google-cloud-rust.git?branch=tswast-bq-storage-reader#61baafa653d62ead60d268422799e1e599edbb55"
-=======
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "103dea01e5f9ef39edc65f76d82619cdb2ffcd4a9e2535e39155a48367b8725f"
->>>>>>> upstream/main
 dependencies = [
  "proc-macro2",
  "quote",
@@ -1402,12 +1385,7 @@ dependencies = [
 [[package]]
 name = "google-cloud-bigquery-v2"
 version = "1.0.0"
-<<<<<<< HEAD
 source = "git+https://github.com/tswast/google-cloud-rust.git?branch=tswast-bq-storage-reader#61baafa653d62ead60d268422799e1e599edbb55"
-=======
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ebbb99a96318d179d9b8a125c27ede1b05b138071dd1a4efebb125ae59528013"
->>>>>>> upstream/main
 dependencies = [
  "async-trait",
  "bytes",
@@ -1428,12 +1406,7 @@ dependencies = [
 [[package]]
 name = "google-cloud-gax"
 version = "1.15.0"
-<<<<<<< HEAD
 source = "git+https://github.com/tswast/google-cloud-rust.git?branch=tswast-bq-storage-reader#61baafa653d62ead60d268422799e1e599edbb55"
-=======
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fc64ee071c0d22cb68662b454f1bea5424506cafeaddc51260fbc585bac1d29d"
->>>>>>> upstream/main
 dependencies = [
  "bytes",
  "futures",
@@ -1452,12 +1425,7 @@ dependencies = [
 [[package]]
 name = "google-cloud-gax-internal"
 version = "0.7.20"
-<<<<<<< HEAD
 source = "git+https://github.com/tswast/google-cloud-rust.git?branch=tswast-bq-storage-reader#61baafa653d62ead60d268422799e1e599edbb55"
-=======
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e873f7e6e39030c07b6d9697bf3b999a269175c8b433e058f56ae10d129f12f7"
->>>>>>> upstream/main
 dependencies = [
  "bytes",
  "futures",
@@ -1495,12 +1463,7 @@ dependencies = [
 [[package]]
 name = "google-cloud-longrunning"
 version = "1.14.0"
-<<<<<<< HEAD
 source = "git+https://github.com/tswast/google-cloud-rust.git?branch=tswast-bq-storage-reader#61baafa653d62ead60d268422799e1e599edbb55"
-=======
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e8ea252eee22a4e2187025ea6789c682a0d791a9748ea99de2abec3026a32cb4"
->>>>>>> upstream/main
 dependencies = [
  "async-trait",
  "bytes",
@@ -1517,12 +1480,7 @@ dependencies = [
 [[package]]
 name = "google-cloud-lro"
 version = "1.11.0"
-<<<<<<< HEAD
 source = "git+https://github.com/tswast/google-cloud-rust.git?branch=tswast-bq-storage-reader#61baafa653d62ead60d268422799e1e599edbb55"
-=======
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dfb938b40ede9ef70c24f49c2687d84f289c9e9104ddfece739985e4b4844b8f"
->>>>>>> upstream/main
 dependencies = [
  "google-cloud-gax",
  "google-cloud-gax-internal",
@@ -1537,12 +1495,7 @@ dependencies = [
 [[package]]
 name = "google-cloud-rpc"
 version = "1.6.0"
-<<<<<<< HEAD
 source = "git+https://github.com/tswast/google-cloud-rust.git?branch=tswast-bq-storage-reader#61baafa653d62ead60d268422799e1e599edbb55"
-=======
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e2162c08a89118130979ba261080e960e44cdcb2d6e2ab8ca9b1da245285d353"
->>>>>>> upstream/main
 dependencies = [
  "bytes",
  "google-cloud-wkt",
@@ -1554,12 +1507,7 @@ dependencies = [
 [[package]]
 name = "google-cloud-type"
 version = "1.6.0"
-<<<<<<< HEAD
 source = "git+https://github.com/tswast/google-cloud-rust.git?branch=tswast-bq-storage-reader#61baafa653d62ead60d268422799e1e599edbb55"
-=======
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "63acc3a92a85f96bab021c3a3e29b53bbacc97651e1b524d4c2991960a63eb82"
->>>>>>> upstream/main
 dependencies = [
  "bytes",
  "google-cloud-wkt",
@@ -1571,12 +1519,7 @@ dependencies = [
 [[package]]
 name = "google-cloud-wkt"
 version = "1.9.0"
-<<<<<<< HEAD
 source = "git+https://github.com/tswast/google-cloud-rust.git?branch=tswast-bq-storage-reader#61baafa653d62ead60d268422799e1e599edbb55"
-=======
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7f3037907e542cf8b8580aa4cf8ad68568d7ac8e7274519a7d0a121867d434da"
->>>>>>> upstream/main
 dependencies = [
  "base64 0.23.1",
  "bytes",
