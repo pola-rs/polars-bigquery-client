@@ -9,8 +9,8 @@ crate-type= ["cdylib"]
 
 [dependencies]
 chrono = "0.4"
-google-cloud-auth = "1.17.0"
-google-cloud-bigquery = "0.18.0"
+google-cloud-auth = { git = "https://github.com/tswast/google-cloud-rust.git", branch = "tswast-bq-storage-reader" }
+google-cloud-bigquery = { git = "https://github.com/tswast/google-cloud-rust.git", branch = "tswast-bq-storage-reader" }
 http = "1.0"
 arrow-bigquery-lib = { package = "arrow-bigquery", path = "../crates/arrow-bigquery" }
 pyo3 = { version = "0.27", features = ["abi3-py310", "chrono"] }
@@ -26,4 +26,4 @@ testing = ["arrow-bigquery-lib/testing"]
 default = ["testing"]
 
 [dev-dependencies]
-google-cloud-gax = "1.15.0"
+google-cloud-gax = { git = "https://github.com/tswast/google-cloud-rust.git", branch = "tswast-bq-storage-reader" }
