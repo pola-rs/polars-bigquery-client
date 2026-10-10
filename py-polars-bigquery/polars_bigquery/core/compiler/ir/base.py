@@ -45,6 +45,18 @@ class VariadicExpr(Expr):
 
 
 @dataclasses.dataclass(frozen=True)
+class TernaryExpr(Expr):
+    """Base class for ternary operation IR nodes."""
+
+    predicate: Expr
+    truthy: Expr
+    falsy: Expr
+
+    def children(self) -> tuple[Expr, ...]:
+        return (self.predicate, self.truthy, self.falsy)
+
+
+@dataclasses.dataclass(frozen=True)
 class Unsupported(Expr):
     """IR node representing an unsupported or unknown expression."""
 

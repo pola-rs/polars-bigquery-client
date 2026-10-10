@@ -105,6 +105,12 @@ def json_to_ir(expr_json: Any) -> Expr:
                     left=ir_nodes[child_indices[0]],
                     right=ir_nodes[child_indices[1]],
                 )
+            elif kind == "Ternary" and len(child_indices) == 3:
+                constructed = cls_or_leaf(
+                    predicate=ir_nodes[child_indices[0]],
+                    truthy=ir_nodes[child_indices[1]],
+                    falsy=ir_nodes[child_indices[2]],
+                )
             elif kind == "Variadic":
                 constructed = cls_or_leaf(
                     tuple(ir_nodes[c_idx] for c_idx in child_indices)
