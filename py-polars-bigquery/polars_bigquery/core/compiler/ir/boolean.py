@@ -44,6 +44,11 @@ class IsNotNull(UnaryExpr):
 
 
 @dataclasses.dataclass(frozen=True)
+class DropNulls(UnaryExpr):
+    """IR node representing a Polars `Expr.drop_nulls()` operation."""
+
+
+@dataclasses.dataclass(frozen=True)
 class Coalesce(VariadicExpr):
     """IR node representing a COALESCE expression."""
 

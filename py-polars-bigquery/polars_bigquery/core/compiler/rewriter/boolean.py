@@ -1,7 +1,18 @@
 from __future__ import annotations
 
-from polars_bigquery.core.compiler.ir.base import Expr
-from polars_bigquery.core.compiler.ir.boolean import And, Not, Or, Ternary, When
+import collections
+import functools
+
+from polars_bigquery.core.compiler.ir.base import Expr, Unsupported
+from polars_bigquery.core.compiler.ir.boolean import (
+    And,
+    DropNulls,
+    IsNotNull,
+    Not,
+    Or,
+    Ternary,
+    When,
+)
 from polars_bigquery.core.compiler.rewriter.base import rewrite_tree
 
 
@@ -50,3 +61,48 @@ def rewrite_de_morgan_node(node: Expr) -> Expr:
 def rewrite_de_morgan(root: Expr) -> Expr:
     """Apply De Morgan's law across an IR tree to turn negated `Or` nodes into `And` nodes."""
     return rewrite_tree(root, rewrite_de_morgan_node)
+
+
+def _has_unsupported_descendant(root: Expr) -> bool:
+    """Return True if `root` or any of its descendants is `Unsupported`."""
+    queue: collections.deque[Expr] = collections.deque([root])
+    while queue:
+        node = queue.popleft()
+        if isinstance(node, Unsupported):
+            return True
+        queue.extend(node.children())
+    return False
+
+
+def _strip_drop_nulls_node(node: Expr) -> Expr:
+    """Strip a `DropNulls` wrapper by returning its inner expression."""
+    return node.expr if isinstance(node, DropNulls) else node
+
+
+def rewrite_drop_nulls_node(node: Expr, *, not_null_exprs: list[Expr]) -> Expr:
+    """Unwrap a single `DropNulls` node and record its inner expression for `IS NOT NULL`."""
+    if not isinstance(node, DropNulls):
+        return node
+    if _has_unsupported_descendant(node.expr):
+        return Unsupported()
+    not_null_exprs.append(node.expr)
+    return node.expr
+
+
+def rewrite_drop_nulls(root: Expr) -> Expr:
+    """Rewrite `DropNulls(expr)` into `expr` and conjoin `IsNotNull(expr)` at the root.
+
+    If any descendant of a `DropNulls` node is `Unsupported`, the entire
+    `DropNulls` node is rewritten to `Unsupported` without adding a top-level
+    `IsNotNull` check.
+    """
+    not_null_exprs: list[Expr] = []
+    node_rewriter = functools.partial(
+        rewrite_drop_nulls_node,
+        not_null_exprs=not_null_exprs,
+    )
+    result = rewrite_tree(root, node_rewriter)
+    for expr in not_null_exprs:
+        cleaned_expr = rewrite_tree(expr, _strip_drop_nulls_node)
+        result = And(left=result, right=IsNotNull(expr=cleaned_expr))
+    return result
