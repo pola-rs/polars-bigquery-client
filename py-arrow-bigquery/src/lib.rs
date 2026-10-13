@@ -23,12 +23,13 @@ pub struct Client {
 #[pymethods]
 impl Client {
     #[new]
-    #[pyo3(signature = (*, quota_project_id, credentials_provider=None, user_agent=None))]
+    #[pyo3(signature = (*, quota_project_id, credentials_provider=None, user_agent=None, bqstorage_endpoint=None))]
     pub fn new(
         py: Python<'_>,
         quota_project_id: String,
         credentials_provider: Option<Py<PyAny>>,
         user_agent: Option<String>,
+        bqstorage_endpoint: Option<String>,
     ) -> PyResult<Self> {
         let cred = match credentials_provider {
             Some(provider) if !provider.is_none(py) => {
@@ -46,6 +47,9 @@ impl Client {
                     .with_quota_project_id(Some(quota_project_id));
                 if let Some(cred) = cred {
                     builder = builder.with_cred(cred);
+                }
+                if let Some(endpoint) = bqstorage_endpoint {
+                    builder = builder.with_endpoint(endpoint);
                 }
 
                 arrow_bigquery_lib::Client::from_builder(builder).await
@@ -290,7 +294,7 @@ mod tests {
     fn test_client_read_table_invalid_compression() {
         Python::initialize();
         Python::attach(|py| {
-            let client = Client::new(py, "test-project".to_string(), None, None).unwrap();
+            let client = Client::new(py, "test-project".to_string(), None, None, None).unwrap();
             let table = BigQueryTableId::new("p".to_string(), "d".to_string(), "t".to_string());
             let err = match client.read_table(
                 py,
@@ -325,7 +329,7 @@ mod tests {
                 .unwrap();
             let dt_py: Py<PyDateTime> = dt.extract().unwrap();
 
-            let client = Client::new(py, "test-project".to_string(), None, None).unwrap();
+            let client = Client::new(py, "test-project".to_string(), None, None, None).unwrap();
             let table = BigQueryTableId::new("p".to_string(), "d".to_string(), "t".to_string());
             let err = match client.read_table(
                 py,
@@ -364,6 +368,7 @@ mod tests {
                 "test-project".to_string(),
                 Some(provider),
                 Some("test-agent/1.0".to_string()),
+                Some("https://custom.endpoint.com".to_string()),
             );
             assert!(client.is_ok());
         });
