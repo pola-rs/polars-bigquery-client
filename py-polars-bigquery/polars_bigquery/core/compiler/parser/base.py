@@ -14,6 +14,7 @@ from polars_bigquery.core.compiler.ir.base import (
     Column,
     Expr,
     NullLiteral,
+    TernaryExpr,
     UnaryExpr,
     Unsupported,
     VariadicExpr,
@@ -22,7 +23,7 @@ from polars_bigquery.core.compiler.ir.list_ import ListLiteral
 
 logger = logging.getLogger(__name__)
 
-RecordKind = Literal["Leaf", "Unary", "Binary", "Variadic"]
+RecordKind = Literal["Leaf", "Unary", "Binary", "Ternary", "Variadic"]
 
 
 class ParseRecord(NamedTuple):
@@ -49,6 +50,7 @@ RECOVERABLE_PARSE_ERRORS: tuple[type[Exception], ...] = (
 )
 
 _VALID_BINARY_EXPR_KEYS = frozenset({"left", "op", "right"})
+_VALID_TERNARY_EXPR_KEYS = frozenset({"predicate", "truthy", "falsy"})
 _VALID_FUNCTION_EXPR_KEYS = frozenset({"input", "function"})
 
 
@@ -361,6 +363,10 @@ def _validate_parse_record(record: ParseRecord) -> ParseRecord:
         if callable(node) and len(children) == 2:
             return record
         return UNSUPPORTED_RECORD
+    if kind == "Ternary":
+        if callable(node) and len(children) == 3:
+            return record
+        return UNSUPPORTED_RECORD
     if kind == "Variadic":
         if callable(node) and len(children) >= 1:
             return record
@@ -478,6 +484,42 @@ def parse_binary_op(
     if operands is None:
         return UNSUPPORTED_RECORD
     return ParseRecord("Binary", binary_cls, operands)
+
+
+def extract_ternary_operands(expr_json: Any) -> tuple[Any, Any, Any] | None:
+    """Extract `(predicate, truthy, falsy)` operand JSONs from a Polars `Ternary` JSON node."""
+    if isinstance(expr_json, dict):
+        if "Ternary" in expr_json:
+            if len(expr_json) != 1:
+                return None
+            ternary_body = expr_json["Ternary"]
+        else:
+            ternary_body = expr_json
+        if (
+            isinstance(ternary_body, dict)
+            and ternary_body.keys() <= _VALID_TERNARY_EXPR_KEYS
+        ):
+            predicate_json = ternary_body.get("predicate")
+            truthy_json = ternary_body.get("truthy")
+            falsy_json = ternary_body.get("falsy")
+            if (
+                predicate_json is not None
+                and truthy_json is not None
+                and falsy_json is not None
+            ):
+                return predicate_json, truthy_json, falsy_json
+    return None
+
+
+def parse_ternary_op(
+    expr_json: Any,
+    ternary_cls: type[TernaryExpr],
+) -> ParseRecord:
+    """Build a Ternary `ParseRecord` for `ternary_cls` from a `Ternary` JSON node."""
+    operands = extract_ternary_operands(expr_json)
+    if operands is None:
+        return UNSUPPORTED_RECORD
+    return ParseRecord("Ternary", ternary_cls, operands)
 
 
 def _has_valid_function_envelope(

@@ -32,16 +32,20 @@ All comparison operators require both operands to be exact, supported expression
 | Polars Expression | Operator / Method | BigQuery SQL Translation | Notes |
 | --- | --- | --- | --- |
 | `a & b` | `And` (`&`) | `(`a` AND `b`)` | **Supports partial pushdown**: if one branch cannot be pushed down, the supported branch is still pushed down to BigQuery. |
+| `pl.all_horizontal(a, b, ...)` | `all_horizontal` | `((`a` AND `b`) ...)` | Folded into left-associative `AND` expressions; supports partial pushdown. |
 | `a \| b` | `Or` (`\|`) | `(`a` OR `b`)` | Pushed down when both branches are supported and exact. |
 | `~a` | `Expr.not_` (`~`) | `(NOT `a`)` | Pushed down when the inner expression is exact. Negated disjunctions `~(a \| b)` are automatically rewritten via De Morgan's Law into `(~a) & (~b)` so supported branches can still be pushed down. |
+| `pl.when(p).then(t).otherwise(f)` | `when` / `then` / `otherwise` | `IF(`p`, `t`, `f`)` or `CASE WHEN `p1` THEN `t1` WHEN `p2` THEN `t2` ... [ELSE `f`] END` | Single `when().then()` expressions compile to `IF(...)` (with `NULL` as the 3rd argument if `.otherwise()` is omitted); chained `.when(...).then(...)` expressions compile to `CASE WHEN ... END` (omitting `ELSE` if `.otherwise()` is omitted). Supports multi-predicate `pl.when(p1, p2, ...)`. Requires all predicates and branches to be supported and exact, no `NULL` predicates, and at least one non-`NULL` result branch. |
 
 ### Null Checks and Handling
 
-| Polars Expression | BigQuery SQL Translation |
-| --- | --- |
-| `expr.is_null()` | `(`expr` IS NULL)` |
-| `expr.is_not_null()` | `(`expr` IS NOT NULL)` |
-| `pl.coalesce(a, b, ...)` | `COALESCE(`a`, `b`, ...)` |
+| Polars Expression | BigQuery SQL Translation | Notes |
+| --- | --- | --- |
+| `expr.is_null()` | `(`expr` IS NULL)` | — |
+| `expr.is_not_null()` | `(`expr` IS NOT NULL)` | — |
+| `pl.coalesce(a, b, ...)` | `COALESCE(`a`, `b`, ...)` | Pushed down when all operands are supported, exact, and non-`Null`. |
+| `expr.fill_null(value)` | `IFNULL(`expr`, `value`)` | Pushed down when both `expr` and `value` are supported, exact, and non-`Null`. |
+| `expr.fill_null(strategy="zero" \| "one")` | `IFNULL(`expr`, 0)` or `IFNULL(`expr`, 1)` | Analytical and aggregate strategies (`"forward"`, `"backward"`, `"min"`, `"max"`, `"mean"`) are not pushed down. |
 
 ### Numeric Predicates
 
