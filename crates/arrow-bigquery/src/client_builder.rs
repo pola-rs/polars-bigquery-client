@@ -1,6 +1,8 @@
 use google_cloud_auth::credentials::Credentials;
 use google_cloud_bigquery::client::Read;
-use google_cloud_gax::retry_throttler::{AdaptiveThrottler, RetryThrottlerArg, SharedRetryThrottler};
+use google_cloud_gax::retry_throttler::{
+    AdaptiveThrottler, RetryThrottlerArg, SharedRetryThrottler,
+};
 
 use crate::{BigQueryError, Client};
 
@@ -60,10 +62,7 @@ impl ServiceConfigBuilder {
 
         let retry_throttler = default_retry_throttler();
 
-        let mut builder = Read::builder()
-            .with_retry_policy(crate::bigquery_read_retry::create_read_session_retry_policy())
-            .with_backoff_policy(crate::bigquery_read_retry::default_backoff_policy())
-            .with_retry_throttler(retry_throttler.clone());
+        let mut builder = Read::builder().with_retry_throttler(retry_throttler.clone());
 
         if let Some(cred) = self.cred {
             builder = builder.with_credentials(cred);
@@ -107,7 +106,10 @@ mod tests {
             .with_quota_project_id(Some("custom-project".to_string()));
 
         assert!(builder.cred.is_some());
-        assert_eq!(builder.endpoint.as_deref(), Some("https://custom.endpoint.com"));
+        assert_eq!(
+            builder.endpoint.as_deref(),
+            Some("https://custom.endpoint.com")
+        );
         assert_eq!(builder.user_agent.as_deref(), Some("custom-agent/1.0"));
         assert_eq!(builder.quota_project_id.as_deref(), Some("custom-project"));
     }
