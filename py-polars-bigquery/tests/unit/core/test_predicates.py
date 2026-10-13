@@ -788,6 +788,7 @@ def test_json_path_parser_registration_and_dispatch() -> None:
         "$.Function.function.Boolean.IsFinite",
         "$.Function.function.Boolean.IsIn",
         "$.Function.function.Coalesce",
+        "$.Function.function.DropNulls",
         "$.Function.function.FillNull",
         "$.Function.function.FillNullWithStrategy",
         "$.Function.function.StringExpr.Uppercase",
@@ -2833,3 +2834,399 @@ def test_parse_fill_null_rejects_invalid_inputs(
 
     # Assert
     assert actual == compiler.parser.base.UNSUPPORTED_RECORD
+
+
+@pytest.mark.parametrize(
+    ("expr", "expected_sql"),
+    [
+        pytest.param(
+            pl.col("id").is_null(),
+            "(`id` IS NULL)",
+            id="column_is_null",
+        ),
+        pytest.param(
+            pl.col("id").is_not_null(),
+            "(`id` IS NOT NULL)",
+            id="column_is_not_null",
+        ),
+        pytest.param(
+            pl.col("name").str.to_lowercase().is_null(),
+            "(LOWER(`name`) IS NULL)",
+            id="string_function_is_null",
+        ),
+        pytest.param(
+            pl.col("name").str.to_uppercase().is_not_null(),
+            "(UPPER(`name`) IS NOT NULL)",
+            id="string_function_is_not_null",
+        ),
+        pytest.param(
+            (pl.col("a") == 1).is_null(),
+            "((`a` = 1) IS NULL)",
+            id="comparison_is_null",
+        ),
+        pytest.param(
+            (pl.col("a") == 1).is_not_null(),
+            "((`a` = 1) IS NOT NULL)",
+            id="comparison_is_not_null",
+        ),
+        pytest.param(
+            pl.col("a").is_null() & (unsupported(pl.col("b")) == 1),
+            "(`a` IS NULL)",
+            id="is_null_in_conjunction_with_unsupported_sibling",
+        ),
+        pytest.param(
+            pl.col("a").is_not_null() & (unsupported(pl.col("b")) == 1),
+            "(`a` IS NOT NULL)",
+            id="is_not_null_in_conjunction_with_unsupported_sibling",
+        ),
+        pytest.param(
+            (~((pl.col("a") == 1) | (pl.col("b") == 2))).is_null(),
+            "(((NOT (`a` = 1)) AND (NOT (`b` = 2))) IS NULL)",
+            id="de_morgan_rewrite_inside_is_null",
+        ),
+        pytest.param(
+            (~((pl.col("a") == 1) | (pl.col("b") == 2))).is_not_null(),
+            "(((NOT (`a` = 1)) AND (NOT (`b` = 2))) IS NOT NULL)",
+            id="de_morgan_rewrite_inside_is_not_null",
+        ),
+    ],
+)
+def test_is_null_and_is_not_null_expression_pushdown(
+    expr: pl.Expr,
+    expected_sql: str,
+) -> None:
+    # Arrange & Act
+    actual_sql = compiler.predicate_to_row_restriction(expr)
+
+    # Assert
+    assert actual_sql == expected_sql
+
+
+@pytest.mark.parametrize(
+    ("expr", "expected_sql"),
+    [
+        pytest.param(
+            unsupported(pl.col("a")).is_null(),
+            "",
+            id="unsupported_operand_is_null",
+        ),
+        pytest.param(
+            unsupported(pl.col("a")).is_not_null(),
+            "",
+            id="unsupported_operand_is_not_null",
+        ),
+        pytest.param(
+            ((pl.col("a") == 1) & (unsupported(pl.col("b")) == 2)).is_null(),
+            "",
+            id="inexact_conjunction_inside_is_null",
+        ),
+        pytest.param(
+            ((pl.col("a") == 1) & (unsupported(pl.col("b")) == 2)).is_not_null(),
+            "",
+            id="inexact_conjunction_inside_is_not_null",
+        ),
+        pytest.param(
+            (~((pl.col("a") == 1) | (unsupported(pl.col("b")) == 2))).is_null()
+            & (pl.col("c") == 3),
+            "(`c` = 3)",
+            id="inexact_de_morgan_inside_is_null_preserves_outer_and",
+        ),
+        pytest.param(
+            (~((pl.col("a") == 1) | (unsupported(pl.col("b")) == 2))).is_not_null()
+            & (pl.col("c") == 3),
+            "(`c` = 3)",
+            id="inexact_de_morgan_inside_is_not_null_preserves_outer_and",
+        ),
+        pytest.param(
+            pl.lit(None).is_null(),
+            "",
+            id="null_literal_is_null",
+        ),
+        pytest.param(
+            pl.lit(None).is_not_null(),
+            "",
+            id="null_literal_is_not_null",
+        ),
+        pytest.param(
+            pl.lit([1, 2]).is_null(),
+            "",
+            id="list_literal_is_null",
+        ),
+        pytest.param(
+            pl.lit([1, 2]).is_not_null(),
+            "",
+            id="list_literal_is_not_null",
+        ),
+    ],
+)
+def test_is_null_and_is_not_null_unsupported_and_degraded_cases(
+    expr: pl.Expr,
+    expected_sql: str,
+) -> None:
+    # Arrange & Act
+    actual_sql = compiler.predicate_to_row_restriction(expr)
+
+    # Assert
+    assert actual_sql == expected_sql
+
+
+@pytest.mark.parametrize(
+    ("expr", "expected_sql"),
+    [
+        pytest.param(
+            pl.col("flag").drop_nulls(),
+            "(`flag` AND (`flag` IS NOT NULL))",
+            id="top_level_boolean_drop_nulls",
+        ),
+        pytest.param(
+            pl.col("a").drop_nulls() == 1,
+            "((`a` = 1) AND (`a` IS NOT NULL))",
+            id="drop_nulls_in_equality_comparison",
+        ),
+        pytest.param(
+            pl.col("a").str.to_lowercase().drop_nulls() == "abc",
+            "((LOWER(`a`) = 'abc') AND (LOWER(`a`) IS NOT NULL))",
+            id="drop_nulls_on_string_function",
+        ),
+        pytest.param(
+            pl.col("a").drop_nulls().str.to_lowercase() == "abc",
+            "((LOWER(`a`) = 'abc') AND (`a` IS NOT NULL))",
+            id="string_function_on_drop_nulls",
+        ),
+        pytest.param(
+            pl.col("a").drop_nulls().str.to_lowercase().drop_nulls() == "abc",
+            "(((LOWER(`a`) = 'abc') AND (LOWER(`a`) IS NOT NULL)) AND (`a` IS NOT NULL))",
+            id="nested_drop_nulls_chain",
+        ),
+        pytest.param(
+            (pl.col("a").drop_nulls() == 1) & (pl.col("b").drop_nulls() == 2),
+            "((((`a` = 1) AND (`b` = 2)) AND (`a` IS NOT NULL)) AND (`b` IS NOT NULL))",
+            id="multiple_drop_nulls_in_conjunction",
+        ),
+        pytest.param(
+            (pl.col("a").drop_nulls() > 5) & (unsupported(pl.col("c")) == 1),
+            "((`a` > 5) AND (`a` IS NOT NULL))",
+            id="drop_nulls_in_conjunction_with_unsupported_sibling",
+        ),
+        pytest.param(
+            pl.col("a").drop_nulls() == unsupported(pl.col("b")),
+            "(`a` IS NOT NULL)",
+            id="drop_nulls_with_unsupported_comparison_sibling_pushes_down_is_not_null",
+        ),
+        pytest.param(
+            ~((pl.col("a").drop_nulls() == 1) | (unsupported(pl.col("b")) == 2)),
+            "((NOT (`a` = 1)) AND (`a` IS NOT NULL))",
+            id="drop_nulls_in_de_morgan_with_unsupported_sibling",
+        ),
+        pytest.param(
+            (~((pl.col("a") == 1) | (pl.col("b") == 2))).drop_nulls(),
+            "(((NOT (`a` = 1)) AND (NOT (`b` = 2))) AND (((NOT (`a` = 1)) AND (NOT (`b` = 2))) IS NOT NULL))",
+            id="de_morgan_rewrite_inside_drop_nulls",
+        ),
+    ],
+)
+def test_drop_nulls_expression_pushdown(
+    expr: pl.Expr,
+    expected_sql: str,
+) -> None:
+    # Arrange & Act
+    actual_sql = compiler.predicate_to_row_restriction(expr)
+
+    # Assert
+    assert actual_sql == expected_sql
+
+
+@pytest.mark.parametrize(
+    ("expr", "expected_sql"),
+    [
+        pytest.param(
+            unsupported(pl.col("a")).drop_nulls() == 1,
+            "",
+            id="unsupported_operand_inside_drop_nulls",
+        ),
+        pytest.param(
+            (unsupported(pl.col("a")).drop_nulls() == 1) & (pl.col("c") == 2),
+            "(`c` = 2)",
+            id="unsupported_operand_inside_drop_nulls_preserves_sibling_and",
+        ),
+        pytest.param(
+            ((pl.col("a") == 1) & (unsupported(pl.col("b")) == 2)).drop_nulls(),
+            "",
+            id="inexact_conjunction_inside_drop_nulls",
+        ),
+        pytest.param(
+            (
+                (pl.col("a").drop_nulls() == 1) & (unsupported(pl.col("b")) == 2)
+            ).drop_nulls(),
+            "",
+            id="nested_drop_nulls_inside_inexact_outer_drop_nulls",
+        ),
+        pytest.param(
+            (~((pl.col("a") == 1) | (unsupported(pl.col("b")) == 2))).drop_nulls()
+            & (pl.col("c") == 3),
+            "(`c` = 3)",
+            id="inexact_de_morgan_inside_drop_nulls_preserves_outer_and",
+        ),
+        pytest.param(
+            pl.lit(None).drop_nulls() == 1,
+            "",
+            id="null_literal_drop_nulls_in_comparison",
+        ),
+        pytest.param(
+            pl.lit([1, 2]).drop_nulls() == 1,
+            "",
+            id="list_literal_drop_nulls_in_comparison",
+        ),
+    ],
+)
+def test_drop_nulls_unsupported_and_degraded_cases(
+    expr: pl.Expr,
+    expected_sql: str,
+) -> None:
+    # Arrange & Act
+    actual_sql = compiler.predicate_to_row_restriction(expr)
+
+    # Assert
+    assert actual_sql == expected_sql
+
+
+@pytest.mark.parametrize(
+    ("parser_fn", "spec", "expr_json"),
+    [
+        pytest.param(
+            compiler.parser.boolean.parse_drop_nulls,
+            {"unexpected": True},
+            {"input": [{"Column": "a"}]},
+            id="drop_nulls_parameterized_spec",
+        ),
+        pytest.param(
+            compiler.parser.boolean.parse_drop_nulls,
+            "DropNulls",
+            {"input": []},
+            id="drop_nulls_empty_inputs",
+        ),
+        pytest.param(
+            compiler.parser.boolean.parse_drop_nulls,
+            "DropNulls",
+            {"input": [{"Column": "a"}, {"Column": "b"}]},
+            id="drop_nulls_too_many_inputs",
+        ),
+        pytest.param(
+            compiler.parser.boolean.parse_is_null,
+            {"unexpected": True},
+            {"input": [{"Column": "a"}]},
+            id="is_null_parameterized_spec",
+        ),
+        pytest.param(
+            compiler.parser.boolean.parse_is_not_null,
+            {"unexpected": True},
+            {"input": [{"Column": "a"}]},
+            id="is_not_null_parameterized_spec",
+        ),
+    ],
+)
+def test_parse_drop_nulls_and_null_checks_reject_invalid_inputs(
+    parser_fn: Any,
+    spec: Any,
+    expr_json: Any,
+) -> None:
+    # Arrange & Act
+    actual = parser_fn(spec, expr_json)
+
+    # Assert
+    assert actual == compiler.parser.base.UNSUPPORTED_RECORD
+
+
+@pytest.mark.parametrize(
+    ("root", "expected"),
+    [
+        pytest.param(
+            compiler.ir.Column("a"),
+            compiler.ir.Column("a"),
+            id="no_drop_nulls_returns_unchanged_root",
+        ),
+        pytest.param(
+            compiler.ir.Eq(
+                left=compiler.ir.DropNulls(expr=compiler.ir.Column("a")),
+                right=compiler.ir.IntLiteral(1),
+            ),
+            compiler.ir.And(
+                left=compiler.ir.Eq(
+                    left=compiler.ir.Column("a"),
+                    right=compiler.ir.IntLiteral(1),
+                ),
+                right=compiler.ir.IsNotNull(expr=compiler.ir.Column("a")),
+            ),
+            id="single_drop_nulls_conjoins_is_not_null_at_root",
+        ),
+        pytest.param(
+            compiler.ir.DropNulls(
+                expr=compiler.ir.And(
+                    left=compiler.ir.Column("a"),
+                    right=compiler.ir.Unsupported(),
+                )
+            ),
+            compiler.ir.Unsupported(),
+            id="drop_nulls_with_unsupported_descendant_rewrites_to_unsupported",
+        ),
+    ],
+)
+def test_rewrite_drop_nulls(
+    root: compiler.ir.Expr,
+    expected: compiler.ir.Expr,
+) -> None:
+    # Arrange & Act
+    actual = compiler.rewriter.boolean.rewrite_drop_nulls(root)
+
+    # Assert
+    assert actual == expected
+
+
+@pytest.mark.parametrize(
+    ("expr", "node_type", "expected"),
+    [
+        pytest.param(
+            compiler.ir.Unsupported(),
+            compiler.ir.Unsupported,
+            True,
+            id="root_matches_type",
+        ),
+        pytest.param(
+            compiler.ir.And(
+                left=compiler.ir.Column("a"),
+                right=compiler.ir.Not(expr=compiler.ir.Unsupported()),
+            ),
+            compiler.ir.Unsupported,
+            True,
+            id="nested_descendant_matches_type",
+        ),
+        pytest.param(
+            compiler.ir.And(
+                left=compiler.ir.Column("a"),
+                right=compiler.ir.IntLiteral(1),
+            ),
+            compiler.ir.Unsupported,
+            False,
+            id="no_descendant_matches_type",
+        ),
+        pytest.param(
+            compiler.ir.And(
+                left=compiler.ir.Column("a"),
+                right=compiler.ir.IntLiteral(1),
+            ),
+            (compiler.ir.Unsupported, compiler.ir.IntLiteral),
+            True,
+            id="tuple_of_types_matches",
+        ),
+    ],
+)
+def test_expr_has_descendant(
+    expr: compiler.ir.Expr,
+    node_type: type[compiler.ir.Expr] | tuple[type[compiler.ir.Expr], ...],
+    expected: bool,
+) -> None:
+    # Arrange & Act
+    actual = expr.has_descendant(node_type)
+
+    # Assert
+    assert actual is expected
