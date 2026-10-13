@@ -13,8 +13,9 @@ from polars_bigquery.core.compiler.rewriter.boolean import (
 
 _REWRITERS: tuple[RewriterFunc, ...] = (
     rewrite_when,
-    rewrite_de_morgan,
     rewrite_drop_nulls,
+    # Apply rewrite_de_morgan last in case any of the above add an OR.
+    rewrite_de_morgan,
 )
 
 

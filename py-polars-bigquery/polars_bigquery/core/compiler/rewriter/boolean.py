@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import collections
 import functools
 
 from polars_bigquery.core.compiler.ir.base import Expr, Unsupported
@@ -63,17 +62,6 @@ def rewrite_de_morgan(root: Expr) -> Expr:
     return rewrite_tree(root, rewrite_de_morgan_node)
 
 
-def _has_unsupported_descendant(root: Expr) -> bool:
-    """Return True if `root` or any of its descendants is `Unsupported`."""
-    queue: collections.deque[Expr] = collections.deque([root])
-    while queue:
-        node = queue.popleft()
-        if isinstance(node, Unsupported):
-            return True
-        queue.extend(node.children())
-    return False
-
-
 def _strip_drop_nulls_node(node: Expr) -> Expr:
     """Strip a `DropNulls` wrapper by returning its inner expression."""
     return node.expr if isinstance(node, DropNulls) else node
@@ -83,7 +71,7 @@ def rewrite_drop_nulls_node(node: Expr, *, not_null_exprs: list[Expr]) -> Expr:
     """Unwrap a single `DropNulls` node and record its inner expression for `IS NOT NULL`."""
     if not isinstance(node, DropNulls):
         return node
-    if _has_unsupported_descendant(node.expr):
+    if node.expr.has_descendant(Unsupported):
         return Unsupported()
     not_null_exprs.append(node.expr)
     return node.expr

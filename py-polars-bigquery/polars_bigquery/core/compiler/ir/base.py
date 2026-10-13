@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import abc
+import collections
 import dataclasses
 
 
@@ -11,6 +12,16 @@ class Expr(abc.ABC):
     @abc.abstractmethod
     def children(self) -> tuple[Expr, ...]:
         """Return the child expressions of this node in order."""
+
+    def has_descendant(self, node_type: type[Expr] | tuple[type[Expr], ...]) -> bool:
+        """Return True if this node or any of its descendants is an instance of `node_type`."""
+        queue: collections.deque[Expr] = collections.deque([self])
+        while queue:
+            node = queue.popleft()
+            if isinstance(node, node_type):
+                return True
+            queue.extend(node.children())
+        return False
 
 
 @dataclasses.dataclass(frozen=True)

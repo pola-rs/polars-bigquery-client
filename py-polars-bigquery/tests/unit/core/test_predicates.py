@@ -3180,3 +3180,53 @@ def test_rewrite_drop_nulls(
 
     # Assert
     assert actual == expected
+
+
+@pytest.mark.parametrize(
+    ("expr", "node_type", "expected"),
+    [
+        pytest.param(
+            compiler.ir.Unsupported(),
+            compiler.ir.Unsupported,
+            True,
+            id="root_matches_type",
+        ),
+        pytest.param(
+            compiler.ir.And(
+                left=compiler.ir.Column("a"),
+                right=compiler.ir.Not(expr=compiler.ir.Unsupported()),
+            ),
+            compiler.ir.Unsupported,
+            True,
+            id="nested_descendant_matches_type",
+        ),
+        pytest.param(
+            compiler.ir.And(
+                left=compiler.ir.Column("a"),
+                right=compiler.ir.IntLiteral(1),
+            ),
+            compiler.ir.Unsupported,
+            False,
+            id="no_descendant_matches_type",
+        ),
+        pytest.param(
+            compiler.ir.And(
+                left=compiler.ir.Column("a"),
+                right=compiler.ir.IntLiteral(1),
+            ),
+            (compiler.ir.Unsupported, compiler.ir.IntLiteral),
+            True,
+            id="tuple_of_types_matches",
+        ),
+    ],
+)
+def test_expr_has_descendant(
+    expr: compiler.ir.Expr,
+    node_type: type[compiler.ir.Expr] | tuple[type[compiler.ir.Expr], ...],
+    expected: bool,
+) -> None:
+    # Arrange & Act
+    actual = expr.has_descendant(node_type)
+
+    # Assert
+    assert actual is expected
