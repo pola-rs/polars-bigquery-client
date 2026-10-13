@@ -267,19 +267,6 @@ impl Client {
         ServiceConfigBuilder::new()
     }
 
-    pub fn new(client: BigQueryReadClient, quota_project_id: String) -> Self {
-        Self::from_parts(
-            client,
-            quota_project_id,
-            None,
-            client_builder::default_retry_throttler(),
-        )
-    }
-
-    pub fn from_arc(client: Arc<BigQueryReadClient>, quota_project_id: String) -> Self {
-        Self::new((*client).clone(), quota_project_id)
-    }
-
     pub(crate) fn from_parts(
         read_client: BigQueryReadClient,
         quota_project_id: String,
@@ -812,7 +799,12 @@ mod tests {
             }
         }
 
-        let client = Client::new(Read::from_stub(FailingAuthStub), "quota-proj".to_string());
+        let client = Client::from_parts(
+            Read::from_stub(FailingAuthStub),
+            "quota-proj".to_string(),
+            None,
+            crate::client_builder::default_retry_throttler(),
+        );
         let table: BigQueryTableId = "proj.ds.tbl".parse().unwrap();
         let err = match client.read_table(&table, ReadOptions::default()).await {
             Err(e) => e,
