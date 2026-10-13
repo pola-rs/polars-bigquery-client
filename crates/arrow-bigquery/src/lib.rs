@@ -698,7 +698,6 @@ mod tests {
         use google_cloud_bigquery::model::{
             ArrowSchema as BqArrowSchema, ReadRowsRequest, ReadRowsResponse, ReadStream,
         };
-        use google_cloud_bigquery::read::retry_policy::RetryableErrors;
         use google_cloud_gax::error::rpc::{Code, Status};
         use google_cloud_gax::error::Error as GaxError;
         use google_cloud_gax::options::RequestOptions;
@@ -845,7 +844,6 @@ mod tests {
         use google_cloud_bigquery::model::{
             ArrowSchema as BqArrowSchema, ReadRowsRequest, ReadRowsResponse, ReadStream,
         };
-        use google_cloud_bigquery::read::retry_policy::RetryableErrors;
         use google_cloud_gax::error::rpc::{Code, Status};
         use google_cloud_gax::error::Error as GaxError;
         use google_cloud_gax::options::RequestOptions;
