@@ -1,10 +1,16 @@
 from __future__ import annotations
 
 import functools
+from collections.abc import Iterator
 
-from polars_bigquery.core.compiler.ir.base import Expr, Unsupported
+from polars_bigquery.core.compiler.ir.base import (
+    Expr,
+    NullLiteral,
+    Unsupported,
+)
 from polars_bigquery.core.compiler.ir.boolean import (
     And,
+    BoolLiteral,
     DropNulls,
     IsNotNull,
     Not,
@@ -13,6 +19,100 @@ from polars_bigquery.core.compiler.ir.boolean import (
     When,
 )
 from polars_bigquery.core.compiler.rewriter.base import rewrite_tree
+
+
+def _is_valid_boolean_ternary(node: Ternary) -> bool:
+    """Return True if `node` and any nested `Ternary` branches form a valid boolean conditional."""
+    stack: list[Expr] = [node]
+    has_non_null_leaf = False
+    while stack:
+        curr = stack.pop()
+        if isinstance(curr, Ternary):
+            if isinstance(curr.predicate, NullLiteral):
+                return False
+            stack.append(curr.falsy)
+            stack.append(curr.truthy)
+        elif not isinstance(curr, NullLiteral):
+            has_non_null_leaf = True
+    return has_non_null_leaf
+
+
+def _iter_ternary_leaves(expr: Expr) -> Iterator[Expr]:
+    """Yield the non-`Ternary` branch leaves of `expr`."""
+    stack: list[Expr] = [expr]
+    while stack:
+        curr = stack.pop()
+        if isinstance(curr, Ternary):
+            stack.append(curr.falsy)
+            stack.append(curr.truthy)
+        else:
+            yield curr
+
+
+def _is_falsy_branch(expr: Expr) -> bool:
+    """Return True if `expr` (or every branch of a nested `Ternary`) is `False` or `NULL`."""
+    return all(
+        leaf in (NullLiteral(), BoolLiteral(False))
+        for leaf in _iter_ternary_leaves(expr)
+    )
+
+
+def _is_truthy_branch(expr: Expr) -> bool:
+    """Return True if `expr` (or every branch of a nested `Ternary`) is `True`."""
+    return all(leaf == BoolLiteral(True) for leaf in _iter_ternary_leaves(expr))
+
+
+def _rewrite_ternary_to_boolean_expr(node: Ternary) -> Expr:
+    """Convert a validated boolean `Ternary(p, t, f)` into `And` / `Or` / `Not` IR nodes."""
+    p, t, f = node.predicate, node.truthy, node.falsy
+    if _is_falsy_branch(t) or _is_truthy_branch(f):
+        p, t, f = Not(expr=p), f, t
+    if _is_falsy_branch(t):
+        return BoolLiteral(value=False)
+    if _is_truthy_branch(f):
+        return BoolLiteral(value=True)
+    if _is_falsy_branch(f):
+        return p if _is_truthy_branch(t) else And(left=p, right=t)
+    if _is_truthy_branch(t):
+        return Or(left=p, right=f)
+    return Or(
+        left=And(left=p, right=t),
+        right=And(left=Not(expr=p), right=f),
+    )
+
+
+def rewrite_boolean_when_node(node: Expr, boolean_nodes: set[int]) -> Expr:
+    """Rewrite a `Ternary` node into boolean conditionals when its output is used as a boolean.
+
+    Propagates boolean context top-down from the filter root through `And`, `Or`,
+    and `Ternary` predicates and branches, then rewrites boolean-valued
+    `Ternary(p, t, f)` nodes into `(p & t) | (~p & f)` (with constant-folding
+    simplifications when `t` or `f` is `True`, `False`, or `NULL`).
+    """
+    in_boolean_context = id(node) in boolean_nodes
+
+    if isinstance(node, (And, Or)) and in_boolean_context:
+        boolean_nodes.update((id(node.left), id(node.right)))
+        return node
+
+    if isinstance(node, Ternary):
+        boolean_nodes.add(id(node.predicate))
+        if not in_boolean_context or not _is_valid_boolean_ternary(node):
+            return node
+        rewritten = _rewrite_ternary_to_boolean_expr(node)
+        boolean_nodes.update((id(node.truthy), id(node.falsy), id(rewritten)))
+        return rewritten
+
+    return node
+
+
+def rewrite_boolean_when(root: Expr) -> Expr:
+    """Rewrite boolean-valued `Ternary` IR nodes across an IR tree into boolean conditionals."""
+    boolean_nodes: set[int] = {id(root)}
+    return rewrite_tree(
+        root,
+        functools.partial(rewrite_boolean_when_node, boolean_nodes=boolean_nodes),
+    )
 
 
 def rewrite_when_node(node: Expr) -> Expr:
