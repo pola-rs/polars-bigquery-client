@@ -2548,17 +2548,23 @@ def test_validate_parse_record_ternary(
             id="null_predicate_ternary_not_rewritten",
         ),
         pytest.param(
-            compiler.ir.Ternary(
-                predicate=compiler.ir.Column("p"),
-                truthy=compiler.ir.IntLiteral(10),
-                falsy=compiler.ir.IntLiteral(20),
+            compiler.ir.Eq(
+                left=compiler.ir.Ternary(
+                    predicate=compiler.ir.Column("p"),
+                    truthy=compiler.ir.IntLiteral(10),
+                    falsy=compiler.ir.IntLiteral(20),
+                ),
+                right=compiler.ir.IntLiteral(10),
             ),
-            compiler.ir.Ternary(
-                predicate=compiler.ir.Column("p"),
-                truthy=compiler.ir.IntLiteral(10),
-                falsy=compiler.ir.IntLiteral(20),
+            compiler.ir.Eq(
+                left=compiler.ir.Ternary(
+                    predicate=compiler.ir.Column("p"),
+                    truthy=compiler.ir.IntLiteral(10),
+                    falsy=compiler.ir.IntLiteral(20),
+                ),
+                right=compiler.ir.IntLiteral(10),
             ),
-            id="non_boolean_branch_leaf_ternary_not_rewritten",
+            id="scalar_ternary_inside_comparison_not_rewritten",
         ),
     ],
 )

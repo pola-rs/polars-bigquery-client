@@ -5,7 +5,6 @@ from collections.abc import Iterator
 
 from polars_bigquery.core.compiler.ir.base import (
     Expr,
-    Literal,
     NullLiteral,
     Unsupported,
 )
@@ -19,16 +18,7 @@ from polars_bigquery.core.compiler.ir.boolean import (
     Ternary,
     When,
 )
-from polars_bigquery.core.compiler.ir.list_ import ListLiteral
-from polars_bigquery.core.compiler.ir.string import Lowercase, Uppercase
 from polars_bigquery.core.compiler.rewriter.base import rewrite_tree
-
-
-def _is_non_boolean_branch_leaf(expr: Expr) -> bool:
-    """Return True if `expr` is a known non-boolean leaf or transform."""
-    return (
-        isinstance(expr, Literal) and not isinstance(expr, (BoolLiteral, NullLiteral))
-    ) or isinstance(expr, (Lowercase, Uppercase))
 
 
 def _is_valid_boolean_ternary(node: Ternary) -> bool:
@@ -38,15 +28,12 @@ def _is_valid_boolean_ternary(node: Ternary) -> bool:
     while stack:
         curr = stack.pop()
         if isinstance(curr, Ternary):
-            if isinstance(curr.predicate, (NullLiteral, ListLiteral)):
+            if isinstance(curr.predicate, NullLiteral):
                 return False
             stack.append(curr.falsy)
             stack.append(curr.truthy)
-        else:
-            if _is_non_boolean_branch_leaf(curr):
-                return False
-            if not isinstance(curr, NullLiteral):
-                has_non_null_leaf = True
+        elif not isinstance(curr, NullLiteral):
+            has_non_null_leaf = True
     return has_non_null_leaf
 
 
