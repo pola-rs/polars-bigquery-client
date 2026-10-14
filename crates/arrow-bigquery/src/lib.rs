@@ -249,12 +249,15 @@ impl From<InvalidTableId> for BigQueryError {
 }
 
 pub type BigQueryReadClient = google_cloud_bigquery::client::Read;
+pub type BigQueryClient = google_cloud_bigquery::client::BigQuery;
 
 /// A BigQuery client for reading tables using the Storage Read API.
 ///
 /// Keeps the gRPC channel open across multiple read operations.
 #[derive(Clone)]
 pub struct Client {
+    #[allow(dead_code)]
+    bq_client: BigQueryClient,
     read_client: BigQueryReadClient,
     quota_project_id: String,
     user_agent: Option<String>,
@@ -268,18 +271,37 @@ impl Client {
     }
 
     pub(crate) fn from_parts(
+        bq_client: BigQueryClient,
         read_client: BigQueryReadClient,
         quota_project_id: String,
         user_agent: Option<String>,
         retry_throttler: SharedRetryThrottler,
     ) -> Self {
         Self {
+            bq_client,
             read_client,
             quota_project_id,
             user_agent,
             retry_throttler,
             decode_pool: bigquery_read_stream::default_decode_pool(),
         }
+    }
+
+    /// Creates a client for testing purposes.
+    #[cfg(any(test, feature = "testing"))]
+    #[doc(hidden)]
+    pub fn new_for_testing(
+        bq_client: BigQueryClient,
+        read_client: BigQueryReadClient,
+        quota_project_id: String,
+    ) -> Self {
+        Self::from_parts(
+            bq_client,
+            read_client,
+            quota_project_id,
+            None,
+            client_builder::default_retry_throttler(),
+        )
     }
 
     pub fn quota_project_id(&self) -> &str {
@@ -676,6 +698,15 @@ mod tests {
         bytes
     }
 
+    async fn test_bq_client() -> BigQueryClient {
+        let cred = google_cloud_auth::credentials::anonymous::Builder::new().build();
+        BigQueryClient::builder()
+            .with_credentials(cred)
+            .build()
+            .await
+            .expect("should build test BigQueryClient")
+    }
+
     #[tokio::test]
     async fn test_client_read_table_applies_options() {
         use std::sync::Mutex;
@@ -745,6 +776,7 @@ mod tests {
             recorded: recorded.clone(),
         };
         let client = Client::from_parts(
+            test_bq_client().await,
             Read::from_stub(stub),
             "test-quota-proj".to_string(),
             Some("custom-ua/2.0".to_string()),
@@ -799,11 +831,10 @@ mod tests {
             }
         }
 
-        let client = Client::from_parts(
+        let client = Client::new_for_testing(
+            test_bq_client().await,
             Read::from_stub(FailingAuthStub),
             "quota-proj".to_string(),
-            None,
-            crate::client_builder::default_retry_throttler(),
         );
         let table: BigQueryTableId = "proj.ds.tbl".parse().unwrap();
         let err = match client.read_table(&table, ReadOptions::default()).await {
@@ -892,6 +923,7 @@ mod tests {
         }));
 
         let client = Client::from_parts(
+            test_bq_client().await,
             Read::from_stub(FailingStreamStub),
             "quota-proj".to_string(),
             None,

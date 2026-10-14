@@ -32,6 +32,8 @@ class Client:
         quota_project_id: str,
         credentials_provider: Any = None,
         user_agent: str | None = None,
+        bq_endpoint: str | None = None,
+        bqstorage_endpoint: str | None = None,
     ) -> None:
         self._quota_project_id = quota_project_id
         self._user_agent = user_agent
@@ -40,6 +42,8 @@ class Client:
             quota_project_id=quota_project_id,
             credentials_provider=credentials_provider,
             user_agent=full_user_agent,
+            bq_endpoint=bq_endpoint,
+            bqstorage_endpoint=bqstorage_endpoint,
         )
 
     @property

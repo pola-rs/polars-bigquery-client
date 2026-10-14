@@ -70,6 +70,24 @@ def test_client_init_passes_credentials_provider():
             quota_project_id="test-proj",
             credentials_provider=mock_cp,
             user_agent=f"arrow-bigquery/{__version__}",
+            bq_endpoint=None,
+            bqstorage_endpoint=None,
+        )
+
+
+def test_client_init_passes_endpoints():
+    with patch("arrow_bigquery._native.Client") as mock_native_cls:
+        Client(
+            quota_project_id="test-proj",
+            bq_endpoint="https://custom.bq.endpoint.com",
+            bqstorage_endpoint="https://custom.bqstorage.endpoint.com",
+        )
+        mock_native_cls.assert_called_once_with(
+            quota_project_id="test-proj",
+            credentials_provider=None,
+            user_agent=f"arrow-bigquery/{__version__}",
+            bq_endpoint="https://custom.bq.endpoint.com",
+            bqstorage_endpoint="https://custom.bqstorage.endpoint.com",
         )
 
 
