@@ -43,6 +43,7 @@ All comparison operators require both operands to be exact, supported expression
 | --- | --- | --- |
 | `expr.is_null()` | `(`expr` IS NULL)` | — |
 | `expr.is_not_null()` | `(`expr` IS NOT NULL)` | — |
+| `expr.drop_nulls()` | `... AND (`expr` IS NOT NULL)` | Replaces `expr.drop_nulls()` with `expr` and conjoins `(`expr` IS NOT NULL)` to the top-level row restriction when `expr` is supported, exact, and non-`Null`. |
 | `pl.coalesce(a, b, ...)` | `COALESCE(`a`, `b`, ...)` | Pushed down when all operands are supported, exact, and non-`Null`. |
 | `expr.fill_null(value)` | `IFNULL(`expr`, `value`)` | Pushed down when both `expr` and `value` are supported, exact, and non-`Null`. |
 | `expr.fill_null(strategy="zero" \| "one")` | `IFNULL(`expr`, 0)` or `IFNULL(`expr`, 1)` | Analytical and aggregate strategies (`"forward"`, `"backward"`, `"min"`, `"max"`, `"mean"`) are not pushed down. |

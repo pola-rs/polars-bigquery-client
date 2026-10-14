@@ -9,6 +9,7 @@ from polars_bigquery.core.compiler.ir.boolean import (
     And,
     BoolLiteral,
     Coalesce,
+    DropNulls,
     FillNull,
     IsNotNull,
     IsNull,
@@ -88,6 +89,12 @@ def parse_is_null(spec: Any, expr_json: Any) -> ParseRecord:
 def parse_is_not_null(spec: Any, expr_json: Any) -> ParseRecord:
     """Parse a Polars `IsNotNull` BooleanFunction node into an IR `IsNotNull` record."""
     return parse_unary_function(expr_json, IsNotNull, func_spec=spec)
+
+
+@register_parser("$.Function.function.DropNulls")
+def parse_drop_nulls(spec: Any, expr_json: Any) -> ParseRecord:
+    """Parse a Polars `DropNulls` Function node into an IR `DropNulls` record."""
+    return parse_unary_function(expr_json, DropNulls, func_spec=spec)
 
 
 @register_parser("$.Function.function.Coalesce")
