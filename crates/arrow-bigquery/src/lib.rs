@@ -2,6 +2,7 @@ mod bigquery_read_retry;
 mod bigquery_read_stream;
 pub mod client_builder;
 mod error;
+pub mod query;
 
 use std::io::Cursor;
 use std::sync::Arc;
@@ -256,7 +257,6 @@ pub type BigQueryClient = google_cloud_bigquery::client::BigQuery;
 /// Keeps the gRPC channel open across multiple read operations.
 #[derive(Clone)]
 pub struct Client {
-    #[allow(dead_code)]
     bq_client: BigQueryClient,
     read_client: BigQueryReadClient,
     quota_project_id: String,
@@ -306,6 +306,10 @@ impl Client {
 
     pub fn quota_project_id(&self) -> &str {
         &self.quota_project_id
+    }
+
+    pub fn query(&self, sql: impl Into<String>) -> query::Query {
+        query::Query::new(self.bq_client.clone(), sql, self.quota_project_id.clone())
     }
 
     pub async fn from_builder(builder: ServiceConfigBuilder) -> Result<Self, BigQueryError> {
