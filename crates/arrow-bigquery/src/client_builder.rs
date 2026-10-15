@@ -1,5 +1,5 @@
 use google_cloud_auth::credentials::Credentials;
-use google_cloud_bigquery::client::Read;
+use google_cloud_bigquery::client::{BigQuery, Read};
 use google_cloud_gax::retry_throttler::{
     AdaptiveThrottler, RetryThrottlerArg, SharedRetryThrottler,
 };
@@ -22,7 +22,8 @@ pub(crate) fn default_retry_throttler() -> SharedRetryThrottler {
 #[derive(Default)]
 pub struct ServiceConfigBuilder {
     cred: Option<Credentials>,
-    endpoint: Option<String>,
+    bq_endpoint: Option<String>,
+    bqstorage_endpoint: Option<String>,
     user_agent: Option<String>,
     quota_project_id: Option<String>,
 }
@@ -37,8 +38,13 @@ impl ServiceConfigBuilder {
         self
     }
 
-    pub fn with_endpoint(mut self, endpoint: impl Into<String>) -> Self {
-        self.endpoint = Some(endpoint.into());
+    pub fn with_bq_endpoint(mut self, endpoint: impl Into<String>) -> Self {
+        self.bq_endpoint = Some(endpoint.into());
+        self
+    }
+
+    pub fn with_bqstorage_endpoint(mut self, endpoint: impl Into<String>) -> Self {
+        self.bqstorage_endpoint = Some(endpoint.into());
         self
     }
 
@@ -62,20 +68,31 @@ impl ServiceConfigBuilder {
 
         let retry_throttler = default_retry_throttler();
 
-        let mut builder = Read::builder().with_retry_throttler(retry_throttler.clone());
+        let mut bq_builder = BigQuery::builder().with_project_id(quota_project_id.clone());
+        let mut read_builder = Read::builder()
+            .with_retry_policy(crate::bigquery_read_retry::create_read_session_retry_policy())
+            .with_backoff_policy(crate::bigquery_read_retry::default_backoff_policy())
+            .with_retry_throttler(retry_throttler.clone());
 
         if let Some(cred) = self.cred {
-            builder = builder.with_credentials(cred);
+            bq_builder = bq_builder.with_credentials(cred.clone());
+            read_builder = read_builder.with_credentials(cred);
         }
 
-        if let Some(endpoint) = self.endpoint {
-            builder = builder.with_endpoint(endpoint);
+        if let Some(endpoint) = self.bq_endpoint {
+            bq_builder = bq_builder.with_endpoint(endpoint);
         }
 
-        let client = builder.build().await?;
+        if let Some(endpoint) = self.bqstorage_endpoint {
+            read_builder = read_builder.with_endpoint(endpoint);
+        }
+
+        let bq_client = bq_builder.build().await?;
+        let read_client = read_builder.build().await?;
 
         Ok(Client::from_parts(
-            client,
+            bq_client,
+            read_client,
             quota_project_id,
             self.user_agent,
             retry_throttler,
@@ -91,7 +108,8 @@ mod tests {
     fn test_service_config_builder_defaults() {
         let builder = ServiceConfigBuilder::new();
         assert!(builder.cred.is_none());
-        assert!(builder.endpoint.is_none());
+        assert!(builder.bq_endpoint.is_none());
+        assert!(builder.bqstorage_endpoint.is_none());
         assert!(builder.user_agent.is_none());
         assert!(builder.quota_project_id.is_none());
     }
@@ -101,17 +119,38 @@ mod tests {
         let cred = google_cloud_auth::credentials::anonymous::Builder::new().build();
         let builder = ServiceConfigBuilder::new()
             .with_cred(cred)
-            .with_endpoint("https://custom.endpoint.com")
+            .with_bq_endpoint("https://custom.bq.endpoint.com")
+            .with_bqstorage_endpoint("https://custom.bqstorage.endpoint.com")
             .with_user_agent(Some("custom-agent/1.0".to_string()))
             .with_quota_project_id(Some("custom-project".to_string()));
 
         assert!(builder.cred.is_some());
         assert_eq!(
-            builder.endpoint.as_deref(),
-            Some("https://custom.endpoint.com")
+            builder.bq_endpoint.as_deref(),
+            Some("https://custom.bq.endpoint.com")
+        );
+        assert_eq!(
+            builder.bqstorage_endpoint.as_deref(),
+            Some("https://custom.bqstorage.endpoint.com")
         );
         assert_eq!(builder.user_agent.as_deref(), Some("custom-agent/1.0"));
         assert_eq!(builder.quota_project_id.as_deref(), Some("custom-project"));
+    }
+
+    #[tokio::test]
+    async fn test_service_config_builder_build_success() {
+        let cred = google_cloud_auth::credentials::anonymous::Builder::new().build();
+        let client = ServiceConfigBuilder::new()
+            .with_cred(cred)
+            .with_bq_endpoint("https://custom.bq.endpoint.com")
+            .with_bqstorage_endpoint("https://custom.bqstorage.endpoint.com")
+            .with_user_agent(Some("custom-agent/1.0".to_string()))
+            .with_quota_project_id(Some("custom-project".to_string()))
+            .build()
+            .await
+            .expect("should build client");
+
+        assert_eq!(client.quota_project_id(), "custom-project");
     }
 
     #[tokio::test]

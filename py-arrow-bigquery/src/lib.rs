@@ -23,12 +23,13 @@ pub struct Client {
 #[pymethods]
 impl Client {
     #[new]
-    #[pyo3(signature = (*, quota_project_id, credentials_provider=None, user_agent=None, bqstorage_endpoint=None))]
+    #[pyo3(signature = (*, quota_project_id, credentials_provider=None, user_agent=None, bq_endpoint=None, bqstorage_endpoint=None))]
     pub fn new(
         py: Python<'_>,
         quota_project_id: String,
         credentials_provider: Option<Py<PyAny>>,
         user_agent: Option<String>,
+        bq_endpoint: Option<String>,
         bqstorage_endpoint: Option<String>,
     ) -> PyResult<Self> {
         let cred = match credentials_provider {
@@ -48,8 +49,11 @@ impl Client {
                 if let Some(cred) = cred {
                     builder = builder.with_cred(cred);
                 }
+                if let Some(endpoint) = bq_endpoint {
+                    builder = builder.with_bq_endpoint(endpoint);
+                }
                 if let Some(endpoint) = bqstorage_endpoint {
-                    builder = builder.with_endpoint(endpoint);
+                    builder = builder.with_bqstorage_endpoint(endpoint);
                 }
 
                 arrow_bigquery_lib::Client::from_builder(builder).await
@@ -294,7 +298,8 @@ mod tests {
     fn test_client_read_table_invalid_compression() {
         Python::initialize();
         Python::attach(|py| {
-            let client = Client::new(py, "test-project".to_string(), None, None, None).unwrap();
+            let client =
+                Client::new(py, "test-project".to_string(), None, None, None, None).unwrap();
             let table = BigQueryTableId::new("p".to_string(), "d".to_string(), "t".to_string());
             let err = match client.read_table(
                 py,
@@ -329,7 +334,8 @@ mod tests {
                 .unwrap();
             let dt_py: Py<PyDateTime> = dt.extract().unwrap();
 
-            let client = Client::new(py, "test-project".to_string(), None, None, None).unwrap();
+            let client =
+                Client::new(py, "test-project".to_string(), None, None, None, None).unwrap();
             let table = BigQueryTableId::new("p".to_string(), "d".to_string(), "t".to_string());
             let err = match client.read_table(
                 py,
@@ -368,7 +374,8 @@ mod tests {
                 "test-project".to_string(),
                 Some(provider),
                 Some("test-agent/1.0".to_string()),
-                Some("https://custom.endpoint.com".to_string()),
+                Some("https://custom.bq.endpoint.com".to_string()),
+                Some("https://custom.bqstorage.endpoint.com".to_string()),
             );
             assert!(client.is_ok());
         });
@@ -377,7 +384,7 @@ mod tests {
     #[test]
     fn test_client_read_table_preserves_python_cause_chain() {
         use google_cloud_auth::errors::CredentialsError;
-        use google_cloud_bigquery::client::Read;
+        use google_cloud_bigquery::client::{BigQuery, Read};
         use google_cloud_bigquery::model::{CreateReadSessionRequest, ReadSession};
         use google_cloud_gax::error::Error as GaxError;
         use google_cloud_gax::options::RequestOptions;
@@ -403,7 +410,18 @@ mod tests {
 
         Python::initialize();
         Python::attach(|py| {
-            let inner_client = arrow_bigquery_lib::Client::new(
+            let rt = pyo3_async_runtimes::tokio::get_runtime();
+            let bq_client = rt.block_on(async {
+                BigQuery::builder()
+                    .with_credentials(
+                        google_cloud_auth::credentials::anonymous::Builder::new().build(),
+                    )
+                    .build()
+                    .await
+                    .unwrap()
+            });
+            let inner_client = arrow_bigquery_lib::Client::new_for_testing(
+                bq_client,
                 Read::from_stub(FailingStub),
                 "test-project".to_string(),
             );
