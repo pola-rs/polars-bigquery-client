@@ -1,4 +1,3 @@
-mod bigquery_read_retry;
 mod bigquery_read_stream;
 pub mod client_builder;
 mod error;
@@ -12,6 +11,7 @@ use google_cloud_bigquery::model::{
     arrow_serialization_options, read_session, ArrowSerializationOptions, CreateReadSessionRequest,
     DataFormat, ReadSession,
 };
+use google_cloud_bigquery::read::Reader;
 use google_cloud_gax::options::RequestOptionsBuilder;
 use google_cloud_gax::retry_throttler::SharedRetryThrottler;
 use google_cloud_wkt::Timestamp;
@@ -320,10 +320,11 @@ impl Client {
         }
     }
 
-    fn stream_retry_config(&self) -> bigquery_read_retry::StreamRetryConfig {
+    fn configure_reader(&self, mut reader: Reader) -> Reader {
         // Always attach the Client-wide shared retry throttler so all stream readers
         // share a unified adaptive retry budget instead of isolated per-stream defaults.
-        bigquery_read_retry::StreamRetryConfig::new(None, None, self.retry_throttler.clone())
+        reader = reader.with_retry_throttler(self.retry_throttler.clone());
+        reader
     }
 
     pub async fn read_table(
@@ -337,8 +338,6 @@ impl Client {
                 .create_read_session()
                 .with_request(request)
                 .with_idempotency(true)
-                .with_retry_policy(bigquery_read_retry::create_read_session_retry_policy())
-                .with_backoff_policy(bigquery_read_retry::default_backoff_policy())
                 .with_retry_throttler(self.retry_throttler.clone()),
         );
         let read_session = create_session.send().await?;
@@ -362,17 +361,19 @@ impl Client {
         let (tx, rx) = tokio::sync::mpsc::channel(channel_size);
         let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
         let cancel_tx = Arc::new(cancel_tx);
-        let retry_config = self.stream_retry_config();
         let mut handles = Vec::with_capacity(read_session.streams.len());
 
         for stream in read_session.streams {
-            let read_rows = self
-                .apply_request_options(self.read_client.read_rows().set_read_stream(stream.name));
+            let reader = self.configure_reader(
+                self.apply_request_options(
+                    self.read_client.read_rows().set_read_stream(stream.name),
+                )
+                .into_reader(),
+            );
             let handle = tokio::task::spawn(bigquery_read_stream::read_stream(
-                read_rows,
+                reader,
                 schema.clone(),
                 tx.clone(),
-                retry_config.clone(),
                 Arc::clone(&self.decode_pool),
                 Arc::clone(&cancel_tx),
                 cancel_rx.clone(),

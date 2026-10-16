@@ -69,10 +69,7 @@ impl ServiceConfigBuilder {
         let retry_throttler = default_retry_throttler();
 
         let mut bq_builder = BigQuery::builder().with_project_id(quota_project_id.clone());
-        let mut read_builder = Read::builder()
-            .with_retry_policy(crate::bigquery_read_retry::create_read_session_retry_policy())
-            .with_backoff_policy(crate::bigquery_read_retry::default_backoff_policy())
-            .with_retry_throttler(retry_throttler.clone());
+        let mut read_builder = Read::builder().with_retry_throttler(retry_throttler.clone());
 
         if let Some(cred) = self.cred {
             bq_builder = bq_builder.with_credentials(cred.clone());
