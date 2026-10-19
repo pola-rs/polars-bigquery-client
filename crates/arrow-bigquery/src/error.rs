@@ -1,5 +1,3 @@
-use google_cloud_bigquery_v2::model::ErrorProto;
-
 #[derive(Debug)]
 pub enum BigQueryError {
     Grpc(google_cloud_bigquery::Error),
@@ -7,7 +5,6 @@ pub enum BigQueryError {
     Arrow(polars_error::PolarsError),
     Protocol(String),
     InvalidConfig(String),
-    JobFailed(Vec<ErrorProto>),
     Other(Box<dyn std::error::Error + Send + Sync>),
 }
 
@@ -43,7 +40,6 @@ impl std::fmt::Display for BigQueryError {
             Self::Arrow(e) => write!(f, "Arrow decoding error: {}", e),
             Self::Protocol(msg) => write!(f, "BigQuery protocol error: {}", msg),
             Self::InvalidConfig(msg) => write!(f, "BigQuery configuration error: {}", msg),
-            Self::JobFailed(errors) => write!(f, "BigQuery job failed: {:?}", errors),
             Self::Other(e) => write!(f, "BigQuery client error: {}", e),
         }
     }
@@ -55,7 +51,7 @@ impl std::error::Error for BigQueryError {
             Self::Grpc(e) => Some(e),
             Self::ClientBuilder(e) => Some(e),
             Self::Arrow(e) => Some(e),
-            Self::Protocol(_) | Self::InvalidConfig(_) | Self::JobFailed(_) => None,
+            Self::Protocol(_) | Self::InvalidConfig(_) => None,
             Self::Other(e) => Some(e.as_ref()),
         }
     }

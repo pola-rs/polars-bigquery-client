@@ -211,6 +211,18 @@ impl BigQueryRecordBatchReceiver {
         }
     }
 
+    pub(crate) fn new(
+        rx: tokio::sync::mpsc::Receiver<Result<RecordBatch, BigQueryError>>,
+        cancel_tx: Option<Arc<tokio::sync::watch::Sender<bool>>>,
+        handles: Vec<tokio::task::JoinHandle<()>>,
+    ) -> Self {
+        Self {
+            rx,
+            cancel_tx,
+            _handles: handles,
+        }
+    }
+
     /// Creates a placeholder receiver for testing purposes.
     #[cfg(any(test, feature = "testing"))]
     #[doc(hidden)]
@@ -218,11 +230,7 @@ impl BigQueryRecordBatchReceiver {
         rx: tokio::sync::mpsc::Receiver<Result<RecordBatch, BigQueryError>>,
         handles: Vec<tokio::task::JoinHandle<()>>,
     ) -> Self {
-        Self {
-            rx,
-            cancel_tx: None,
-            _handles: handles,
-        }
+        Self::new(rx, None, handles)
     }
 }
 
@@ -391,11 +399,7 @@ impl Client {
 
         Ok((
             schema_ref,
-            BigQueryRecordBatchReceiver {
-                rx,
-                cancel_tx: Some(cancel_tx),
-                _handles: handles,
-            },
+            BigQueryRecordBatchReceiver::new(rx, Some(cancel_tx), handles),
         ))
     }
 }

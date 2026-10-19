@@ -110,3 +110,45 @@ async fn test_dry_run_query() {
         .value(0);
     assert!(creation_time > 0);
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_read_query() {
+    let quota_project_id = env::var("GOOGLE_CLOUD_PROJECT")
+        .expect("must set GOOGLE_CLOUD_PROJECT to run integration tests");
+
+    let client = Client::from_builder(
+        ServiceConfigBuilder::new()
+            .with_user_agent(Some("integration-test/1.0".to_string()))
+            .with_quota_project_id(Some(quota_project_id)),
+    )
+    .await
+    .expect("should build client");
+
+    let sql = "SELECT 1 AS one, 'hello' AS greeting";
+    let (schema, mut receiver) = client
+        .query(sql)
+        .read()
+        .await
+        .expect("query read should succeed");
+
+    let col_names: Vec<&str> = schema.iter_names().map(|s| s.as_str()).collect();
+    assert_eq!(col_names, vec!["one", "greeting"]);
+
+    let mut total_rows = 0;
+    while let Some(batch) = receiver.recv().await {
+        let batch = batch.expect("should receive valid record batch");
+        total_rows += batch.len();
+    }
+    assert_eq!(total_rows, 1);
+
+    let empty_sql = "SELECT 1 AS one, 'hello' AS greeting LIMIT 0";
+    let (empty_schema, mut empty_receiver) = client
+        .query(empty_sql)
+        .read()
+        .await
+        .expect("empty query read should succeed");
+    let empty_col_names: Vec<&str> = empty_schema.iter_names().map(|s| s.as_str()).collect();
+    assert_eq!(empty_col_names, vec!["one", "greeting"]);
+    assert!(empty_receiver.recv().await.is_none());
+}
+
