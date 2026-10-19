@@ -2088,7 +2088,7 @@ def test_emit_coalesce_sql_rejects_invalid_inputs(
                 .otherwise(True)
             )
             .otherwise(False),
-            "((`a` = 1) AND ((`b` = 2) OR (NOT (`c` = 3))))",
+            "((`a` = 1) AND ((`b` = 2) OR ((NOT (`b` = 2)) AND (NOT (`c` = 3)))))",
             id="nested_chained_when_in_truthy_branch",
         ),
         pytest.param(
@@ -2130,17 +2130,17 @@ def test_emit_coalesce_sql_rejects_invalid_inputs(
         ),
         pytest.param(
             pl.when(pl.col("a") == 1).then(pl.col("b") == 2).otherwise(True),
-            "((NOT (`a` = 1)) OR (`b` = 2))",
+            "(((`a` = 1) AND (`b` = 2)) OR (NOT (`a` = 1)))",
             id="boolean_when_truthy_expr_falsy_true",
         ),
         pytest.param(
             pl.when(pl.col("a") == 1).then(True).otherwise(pl.col("b") == 2),
-            "((`a` = 1) OR (`b` = 2))",
+            "((`a` = 1) OR ((NOT (`a` = 1)) AND (`b` = 2)))",
             id="boolean_when_truthy_true_falsy_expr",
         ),
         pytest.param(
             pl.when(pl.col("a") == 1).then(True).otherwise(True),
-            "TRUE",
+            "((`a` = 1) OR (NOT (`a` = 1)))",
             id="boolean_when_both_branches_true",
         ),
         pytest.param(
@@ -2187,7 +2187,7 @@ def test_emit_coalesce_sql_rejects_invalid_inputs(
             pl.when(pl.col("a") == 1)
             .then(True)
             .otherwise((pl.col("b") == 2) & (unsupported(pl.col("c")) > 0.5)),
-            "((`a` = 1) OR (`b` = 2))",
+            "((`a` = 1) OR ((NOT (`a` = 1)) AND (`b` = 2)))",
             id="partial_pushdown_relaxed_and_in_falsy_disjunction",
         ),
         pytest.param(
@@ -2237,7 +2237,7 @@ def test_emit_coalesce_sql_rejects_invalid_inputs(
             pl.when(pl.col("a") == 1)
             .then(pl.when(pl.col("b") == 2).then(True).otherwise(True))
             .otherwise(pl.col("c") == 3),
-            "((`a` = 1) OR (`c` = 3))",
+            "(((`a` = 1) AND ((`b` = 2) OR (NOT (`b` = 2)))) OR ((NOT (`a` = 1)) AND (`c` = 3)))",
             id="nested_truthy_when_in_truthy_branch",
         ),
     ],
@@ -2258,16 +2258,16 @@ def test_when_then_otherwise_pushdown(expr: pl.Expr, expected_sql: str) -> None:
             id="unsupported_predicate",
         ),
         pytest.param(
-            pl.when(pl.col("a") == 1)
+            pl.when(unsupported(pl.col("a")) > 0.5)
             .then(True)
             .otherwise(unsupported(pl.col("b")) > 0.5),
-            id="unsupported_falsy_in_disjunction",
+            id="unsupported_predicate_and_falsy",
         ),
         pytest.param(
-            pl.when(pl.col("a") == 1)
+            pl.when(unsupported(pl.col("a")) > 0.5)
             .then(unsupported(pl.col("b")) > 0.5)
             .otherwise(True),
-            id="unsupported_truthy_in_disjunction",
+            id="unsupported_predicate_and_truthy",
         ),
         pytest.param(
             pl.when(pl.col("a") == 1)
@@ -2453,72 +2453,6 @@ def test_validate_parse_record_ternary(
         pytest.param(
             compiler.ir.Ternary(
                 predicate=compiler.ir.Column("p"),
-                truthy=compiler.ir.BoolLiteral(True),
-                falsy=compiler.ir.BoolLiteral(False),
-            ),
-            compiler.ir.Column("p"),
-            id="truthy_true_falsy_false_simplifies_to_predicate",
-        ),
-        pytest.param(
-            compiler.ir.Ternary(
-                predicate=compiler.ir.Column("p"),
-                truthy=compiler.ir.BoolLiteral(False),
-                falsy=compiler.ir.BoolLiteral(True),
-            ),
-            compiler.ir.Not(expr=compiler.ir.Column("p")),
-            id="truthy_false_falsy_true_simplifies_to_not_predicate",
-        ),
-        pytest.param(
-            compiler.ir.Ternary(
-                predicate=compiler.ir.Column("p"),
-                truthy=compiler.ir.Column("t"),
-                falsy=compiler.ir.NullLiteral(),
-            ),
-            compiler.ir.And(
-                left=compiler.ir.Column("p"),
-                right=compiler.ir.Column("t"),
-            ),
-            id="falsy_null_simplifies_to_and",
-        ),
-        pytest.param(
-            compiler.ir.Ternary(
-                predicate=compiler.ir.Column("p"),
-                truthy=compiler.ir.BoolLiteral(True),
-                falsy=compiler.ir.Column("f"),
-            ),
-            compiler.ir.Or(
-                left=compiler.ir.Column("p"),
-                right=compiler.ir.Column("f"),
-            ),
-            id="truthy_true_simplifies_to_or",
-        ),
-        pytest.param(
-            compiler.ir.Ternary(
-                predicate=compiler.ir.Column("p"),
-                truthy=compiler.ir.BoolLiteral(False),
-                falsy=compiler.ir.Column("f"),
-            ),
-            compiler.ir.And(
-                left=compiler.ir.Not(expr=compiler.ir.Column("p")),
-                right=compiler.ir.Column("f"),
-            ),
-            id="truthy_false_simplifies_to_not_and",
-        ),
-        pytest.param(
-            compiler.ir.Ternary(
-                predicate=compiler.ir.Column("p"),
-                truthy=compiler.ir.Column("t"),
-                falsy=compiler.ir.BoolLiteral(True),
-            ),
-            compiler.ir.Or(
-                left=compiler.ir.Not(expr=compiler.ir.Column("p")),
-                right=compiler.ir.Column("t"),
-            ),
-            id="falsy_true_simplifies_to_not_or",
-        ),
-        pytest.param(
-            compiler.ir.Ternary(
-                predicate=compiler.ir.Column("p"),
                 truthy=compiler.ir.Column("t"),
                 falsy=compiler.ir.Column("f"),
             ),
@@ -2574,6 +2508,92 @@ def test_rewrite_boolean_when(
 ) -> None:
     # Arrange & Act
     actual = compiler.rewriter.boolean.rewrite_boolean_when(root)
+
+    # Assert
+    assert actual == expected
+
+
+@pytest.mark.parametrize(
+    ("root", "expected"),
+    [
+        pytest.param(
+            compiler.ir.And(
+                left=compiler.ir.BoolLiteral(True),
+                right=compiler.ir.Column("p"),
+            ),
+            compiler.ir.Column("p"),
+            id="and_left_true_collapses_to_right",
+        ),
+        pytest.param(
+            compiler.ir.And(
+                left=compiler.ir.Column("p"),
+                right=compiler.ir.BoolLiteral(True),
+            ),
+            compiler.ir.Column("p"),
+            id="and_right_true_collapses_to_left",
+        ),
+        pytest.param(
+            compiler.ir.And(
+                left=compiler.ir.BoolLiteral(False),
+                right=compiler.ir.Column("p"),
+            ),
+            compiler.ir.BoolLiteral(False),
+            id="and_left_false_collapses_to_false",
+        ),
+        pytest.param(
+            compiler.ir.And(
+                left=compiler.ir.Column("p"),
+                right=compiler.ir.NullLiteral(),
+            ),
+            compiler.ir.BoolLiteral(False),
+            id="and_right_null_collapses_to_false",
+        ),
+        pytest.param(
+            compiler.ir.Or(
+                left=compiler.ir.BoolLiteral(True),
+                right=compiler.ir.Column("p"),
+            ),
+            compiler.ir.BoolLiteral(True),
+            id="or_left_true_collapses_to_true",
+        ),
+        pytest.param(
+            compiler.ir.Or(
+                left=compiler.ir.BoolLiteral(False),
+                right=compiler.ir.Column("p"),
+            ),
+            compiler.ir.Column("p"),
+            id="or_left_false_collapses_to_right",
+        ),
+        pytest.param(
+            compiler.ir.Or(
+                left=compiler.ir.Column("p"),
+                right=compiler.ir.NullLiteral(),
+            ),
+            compiler.ir.Column("p"),
+            id="or_right_null_collapses_to_left",
+        ),
+        pytest.param(
+            compiler.ir.Or(
+                left=compiler.ir.And(
+                    left=compiler.ir.Column("p"),
+                    right=compiler.ir.BoolLiteral(True),
+                ),
+                right=compiler.ir.And(
+                    left=compiler.ir.Not(expr=compiler.ir.Column("p")),
+                    right=compiler.ir.BoolLiteral(False),
+                ),
+            ),
+            compiler.ir.Column("p"),
+            id="nested_or_of_ands_with_true_false_collapses_to_predicate",
+        ),
+    ],
+)
+def test_rewrite_boolean_literals(
+    root: compiler.ir.Expr,
+    expected: compiler.ir.Expr,
+) -> None:
+    # Arrange & Act
+    actual = compiler.rewriter.boolean.rewrite_boolean_literals(root)
 
     # Assert
     assert actual == expected

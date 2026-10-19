@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import functools
-from collections.abc import Iterator
 
 from polars_bigquery.core.compiler.ir.base import (
     Expr,
@@ -20,6 +19,8 @@ from polars_bigquery.core.compiler.ir.boolean import (
 )
 from polars_bigquery.core.compiler.rewriter.base import rewrite_tree
 
+_FALSY_LITERALS = (BoolLiteral(False), NullLiteral())
+
 
 def _is_valid_boolean_ternary(node: Ternary) -> bool:
     """Return True if `node` and any nested `Ternary` branches form a valid boolean conditional."""
@@ -37,57 +38,12 @@ def _is_valid_boolean_ternary(node: Ternary) -> bool:
     return has_non_null_leaf
 
 
-def _iter_ternary_leaves(expr: Expr) -> Iterator[Expr]:
-    """Yield the non-`Ternary` branch leaves of `expr`."""
-    stack: list[Expr] = [expr]
-    while stack:
-        curr = stack.pop()
-        if isinstance(curr, Ternary):
-            stack.append(curr.falsy)
-            stack.append(curr.truthy)
-        else:
-            yield curr
-
-
-def _is_falsy_branch(expr: Expr) -> bool:
-    """Return True if `expr` (or every branch of a nested `Ternary`) is `False` or `NULL`."""
-    return all(
-        leaf in (NullLiteral(), BoolLiteral(False))
-        for leaf in _iter_ternary_leaves(expr)
-    )
-
-
-def _is_truthy_branch(expr: Expr) -> bool:
-    """Return True if `expr` (or every branch of a nested `Ternary`) is `True`."""
-    return all(leaf == BoolLiteral(True) for leaf in _iter_ternary_leaves(expr))
-
-
-def _rewrite_ternary_to_boolean_expr(node: Ternary) -> Expr:
-    """Convert a validated boolean `Ternary(p, t, f)` into `And` / `Or` / `Not` IR nodes."""
-    p, t, f = node.predicate, node.truthy, node.falsy
-    if _is_falsy_branch(t) or _is_truthy_branch(f):
-        p, t, f = Not(expr=p), f, t
-    if _is_falsy_branch(t):
-        return BoolLiteral(value=False)
-    if _is_truthy_branch(f):
-        return BoolLiteral(value=True)
-    if _is_falsy_branch(f):
-        return p if _is_truthy_branch(t) else And(left=p, right=t)
-    if _is_truthy_branch(t):
-        return Or(left=p, right=f)
-    return Or(
-        left=And(left=p, right=t),
-        right=And(left=Not(expr=p), right=f),
-    )
-
-
 def rewrite_boolean_when_node(node: Expr, boolean_nodes: set[int]) -> Expr:
     """Rewrite a `Ternary` node into boolean conditionals when its output is used as a boolean.
 
     Propagates boolean context top-down from the filter root through `And`, `Or`,
     and `Ternary` predicates and branches, then rewrites boolean-valued
-    `Ternary(p, t, f)` nodes into `(p & t) | (~p & f)` (with constant-folding
-    simplifications when `t` or `f` is `True`, `False`, or `NULL`).
+    `Ternary(p, t, f)` nodes into `(p & t) | (~p & f)`.
     """
     in_boolean_context = id(node) in boolean_nodes
 
@@ -99,8 +55,11 @@ def rewrite_boolean_when_node(node: Expr, boolean_nodes: set[int]) -> Expr:
         boolean_nodes.add(id(node.predicate))
         if not in_boolean_context or not _is_valid_boolean_ternary(node):
             return node
-        rewritten = _rewrite_ternary_to_boolean_expr(node)
-        boolean_nodes.update((id(node.truthy), id(node.falsy), id(rewritten)))
+        rewritten = Or(
+            left=And(left=node.predicate, right=node.truthy),
+            right=And(left=Not(expr=node.predicate), right=node.falsy),
+        )
+        boolean_nodes.add(id(rewritten))
         return rewritten
 
     return node
@@ -113,6 +72,32 @@ def rewrite_boolean_when(root: Expr) -> Expr:
         root,
         functools.partial(rewrite_boolean_when_node, boolean_nodes=boolean_nodes),
     )
+
+
+def rewrite_boolean_literals_node(node: Expr) -> Expr:
+    """Collapse `And` and `Or` nodes when an operand is a `BoolLiteral` or `NullLiteral`."""
+    if isinstance(node, And):
+        if node.left in _FALSY_LITERALS or node.right in _FALSY_LITERALS:
+            return BoolLiteral(value=False)
+        if node.left == BoolLiteral(True):
+            return node.right
+        if node.right == BoolLiteral(True):
+            return node.left
+
+    if isinstance(node, Or):
+        if node.left == BoolLiteral(True) or node.right == BoolLiteral(True):
+            return BoolLiteral(value=True)
+        if node.left in _FALSY_LITERALS:
+            return node.right
+        if node.right in _FALSY_LITERALS:
+            return node.left
+
+    return node
+
+
+def rewrite_boolean_literals(root: Expr) -> Expr:
+    """Collapse `And` and `Or` nodes with boolean or null literal operands across an IR tree."""
+    return rewrite_tree(root, rewrite_boolean_literals_node)
 
 
 def rewrite_when_node(node: Expr) -> Expr:

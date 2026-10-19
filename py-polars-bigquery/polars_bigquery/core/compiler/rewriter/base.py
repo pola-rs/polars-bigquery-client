@@ -89,6 +89,15 @@ def replace_unsupported_children(node: Unsupported, children: tuple[Expr, ...]) 
     return dataclasses.replace(node, operands=children)
 
 
+def _apply_node_rewriter(node: Expr, node_rewriter: NodeRewriterFunc) -> Expr:
+    """Apply `node_rewriter` to `node` repeatedly until a fixed point is reached."""
+    while True:
+        rewritten = node_rewriter(node)
+        if rewritten is node or rewritten == node:
+            return node
+        node = rewritten
+
+
 def rewrite_tree(root: Expr, node_rewriter: NodeRewriterFunc) -> Expr:
     """Rewrite an `Expr` IR tree iteratively using `node_rewriter`.
 
@@ -98,7 +107,8 @@ def rewrite_tree(root: Expr, node_rewriter: NodeRewriterFunc) -> Expr:
        it reaches a fixed point before queueing its children, allowing top-down
        rewrites (such as pushing `Not` down through nested `Or` nodes) to cascade.
     2. Pass 2 (Bottom-up reconstruction): Reconstructs parent nodes with their
-       rewritten children in reverse BFS order.
+       rewritten children in reverse BFS order and re-applies `node_rewriter` so
+       bottom-up simplifications (such as boolean literal folding) cascade upward.
     """
     nodes: list[Expr] = [root]
     children_map: list[tuple[int, ...]] = [()]
@@ -106,12 +116,7 @@ def rewrite_tree(root: Expr, node_rewriter: NodeRewriterFunc) -> Expr:
 
     while queue:
         curr_idx = queue.popleft()
-        node = nodes[curr_idx]
-        while True:
-            rewritten = node_rewriter(node)
-            if rewritten is node or rewritten == node:
-                break
-            node = rewritten
+        node = _apply_node_rewriter(nodes[curr_idx], node_rewriter)
         nodes[curr_idx] = node
 
         node_children = node.children()
@@ -129,6 +134,7 @@ def rewrite_tree(root: Expr, node_rewriter: NodeRewriterFunc) -> Expr:
         child_indices = children_map[idx]
         if child_indices:
             child_nodes = tuple(nodes[c_idx] for c_idx in child_indices)
-            nodes[idx] = replace_children(nodes[idx], child_nodes)
+            reconstructed = replace_children(nodes[idx], child_nodes)
+            nodes[idx] = _apply_node_rewriter(reconstructed, node_rewriter)
 
     return nodes[0]
