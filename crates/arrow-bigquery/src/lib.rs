@@ -250,14 +250,14 @@ impl From<InvalidTableId> for BigQueryError {
 }
 
 pub type BigQueryReadClient = google_cloud_bigquery::client::Read;
-pub type BigQueryClient = google_cloud_bigquery::client::BigQuery;
+pub type BigQueryJobService = google_cloud_bigquery_v2::client::JobService;
 
 /// A BigQuery client for reading tables using the Storage Read API.
 ///
 /// Keeps the gRPC channel open across multiple read operations.
 #[derive(Clone)]
 pub struct Client {
-    bq_client: BigQueryClient,
+    bq_client: BigQueryJobService,
     read_client: BigQueryReadClient,
     quota_project_id: String,
     user_agent: Option<String>,
@@ -271,7 +271,7 @@ impl Client {
     }
 
     pub(crate) fn from_parts(
-        bq_client: BigQueryClient,
+        bq_client: BigQueryJobService,
         read_client: BigQueryReadClient,
         quota_project_id: String,
         user_agent: Option<String>,
@@ -291,7 +291,7 @@ impl Client {
     #[cfg(any(test, feature = "testing"))]
     #[doc(hidden)]
     pub fn new_for_testing(
-        bq_client: BigQueryClient,
+        bq_client: BigQueryJobService,
         read_client: BigQueryReadClient,
         quota_project_id: String,
     ) -> Self {
@@ -309,7 +309,12 @@ impl Client {
     }
 
     pub fn query(&self, sql: impl Into<String>) -> query::Query {
-        query::Query::new(self.bq_client.clone(), sql, self.quota_project_id.clone())
+        query::Query::new(
+            self.bq_client.clone(),
+            sql,
+            self.quota_project_id.clone(),
+            self.user_agent.clone(),
+        )
     }
 
     pub async fn from_builder(builder: ServiceConfigBuilder) -> Result<Self, BigQueryError> {
@@ -702,13 +707,13 @@ mod tests {
         bytes
     }
 
-    async fn test_bq_client() -> BigQueryClient {
+    async fn test_bq_client() -> BigQueryJobService {
         let cred = google_cloud_auth::credentials::anonymous::Builder::new().build();
-        BigQueryClient::builder()
+        BigQueryJobService::builder()
             .with_credentials(cred)
             .build()
             .await
-            .expect("should build test BigQueryClient")
+            .expect("should build test BigQueryJobService")
     }
 
     #[tokio::test]

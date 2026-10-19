@@ -1,6 +1,4 @@
-use google_cloud_bigquery::error::QueryError;
 use google_cloud_bigquery_v2::model::ErrorProto;
-
 
 #[derive(Debug)]
 pub enum BigQueryError {
@@ -59,16 +57,6 @@ impl std::error::Error for BigQueryError {
             Self::Arrow(e) => Some(e),
             Self::Protocol(_) | Self::InvalidConfig(_) | Self::JobFailed(_) => None,
             Self::Other(e) => Some(e.as_ref()),
-        }
-    }
-}
-
-impl From<google_cloud_bigquery::error::QueryError> for BigQueryError {
-    fn from(s: google_cloud_bigquery::error::QueryError) -> Self {
-        match s {
-            QueryError::Rpc { source, .. } => Self::Grpc(source),
-            QueryError::JobFailed { errors, .. } => BigQueryError::JobFailed(errors),
-            _ => Self::Other(Box::new(s)),
         }
     }
 }
