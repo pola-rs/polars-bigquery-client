@@ -124,7 +124,6 @@ async fn execute_query(client: &Arc<Client>, sql: &str) {
     while let Some(batch) = receiver.recv().await {
         total_rows += batch.expect("should receive valid record batch").len();
     }
-    eprintln!("DEBUG execute_query total_rows={total_rows} for sql={sql}");
 }
 
 async fn query_sec_quarterly_financials_table(client: &Arc<Client>, table_id: &str) {
