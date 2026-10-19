@@ -1,10 +1,10 @@
 use google_cloud_auth::credentials::Credentials;
-use google_cloud_bigquery::client::{BigQuery, Read};
+use google_cloud_bigquery::client::Read;
 use google_cloud_gax::retry_throttler::{
     AdaptiveThrottler, RetryThrottlerArg, SharedRetryThrottler,
 };
 
-use crate::{BigQueryError, Client};
+use crate::{BigQueryError, BigQueryJobService, Client};
 
 static INIT_CRYPTO: std::sync::Once = std::sync::Once::new();
 
@@ -68,7 +68,7 @@ impl ServiceConfigBuilder {
 
         let retry_throttler = default_retry_throttler();
 
-        let mut bq_builder = BigQuery::builder().with_project_id(quota_project_id.clone());
+        let mut bq_builder = BigQueryJobService::builder();
         let mut read_builder = Read::builder()
             .with_retry_policy(crate::bigquery_read_retry::create_read_session_retry_policy())
             .with_backoff_policy(crate::bigquery_read_retry::default_backoff_policy())

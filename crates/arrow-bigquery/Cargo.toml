@@ -8,12 +8,14 @@ bytes = "1.0"
 chrono = "0.4"
 google-cloud-auth = "1.17.0"
 google-cloud-bigquery = "0.18.0"
+google-cloud-bigquery-v2 = "1.0.0"
 google-cloud-gax = "1.15.0"
 google-cloud-wkt = "1.9.0"
 polars-arrow = { version = "0.53.0", default-features = false, features = ["io_ipc", "io_ipc_compression"] }
 polars-error = "0.53.0"
 rayon = "1.12"
 rustls = { version = "0.23.37", features = ["aws_lc_rs"] }
+serde_json = "1.0"
 tokio = { version = "1.51.0", features = ["macros", "rt", "sync", "time"] }
 tracing = "0.1"
 tracing-subscriber = { version ="0.3", features = ["env-filter"] }
@@ -27,7 +29,7 @@ testing = []
 bench = false
 
 [dev-dependencies]
-tokio = { version = "1.51.0", features = ["rt-multi-thread", "macros"] }
+tokio = { version = "1.51.0", features = ["io-util", "macros", "net", "rt-multi-thread"] }
 criterion = { version = "0.5.1", features = ["async_tokio", "html_reports"] }
 
 [[bench]]

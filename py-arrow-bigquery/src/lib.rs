@@ -384,7 +384,7 @@ mod tests {
     #[test]
     fn test_client_read_table_preserves_python_cause_chain() {
         use google_cloud_auth::errors::CredentialsError;
-        use google_cloud_bigquery::client::{BigQuery, Read};
+        use google_cloud_bigquery::client::Read;
         use google_cloud_bigquery::model::{CreateReadSessionRequest, ReadSession};
         use google_cloud_gax::error::Error as GaxError;
         use google_cloud_gax::options::RequestOptions;
@@ -412,7 +412,7 @@ mod tests {
         Python::attach(|py| {
             let rt = pyo3_async_runtimes::tokio::get_runtime();
             let bq_client = rt.block_on(async {
-                BigQuery::builder()
+                arrow_bigquery_lib::BigQueryJobService::builder()
                     .with_credentials(
                         google_cloud_auth::credentials::anonymous::Builder::new().build(),
                     )
