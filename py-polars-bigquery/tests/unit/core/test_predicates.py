@@ -2240,6 +2240,21 @@ def test_emit_coalesce_sql_rejects_invalid_inputs(
             "(((`a` = 1) AND ((`b` = 2) OR (NOT (`b` = 2)))) OR ((NOT (`a` = 1)) AND (`c` = 3)))",
             id="nested_truthy_when_in_truthy_branch",
         ),
+        pytest.param(
+            pl.coalesce(
+                pl.when(pl.col("a") == 1).then(pl.col("b") == 2),
+                pl.col("c") == 3,
+            ),
+            "COALESCE(IF((`a` = 1), (`b` = 2), NULL), (`c` = 3))",
+            id="when_without_otherwise_inside_coalesce_not_rewritten",
+        ),
+        pytest.param(
+            pl.when(pl.col("a") == 1)
+            .then(pl.col("b") == 2)
+            .fill_null(pl.col("c") == 3),
+            "IFNULL(IF((`a` = 1), (`b` = 2), NULL), (`c` = 3))",
+            id="when_without_otherwise_inside_fill_null_not_rewritten",
+        ),
     ],
 )
 def test_when_then_otherwise_pushdown(expr: pl.Expr, expected_sql: str) -> None:
