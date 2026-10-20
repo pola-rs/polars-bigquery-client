@@ -90,14 +90,6 @@ impl Query {
         let (tx, rx) = tokio::sync::mpsc::channel(1);
         let mut handles = Vec::new();
 
-        eprintln!(
-            "DEBUG QueryResponse: job_complete={:?}, total_rows={:?}, page_row_count={}, page_token={:?}, has_results={}",
-            response.job_complete,
-            response.total_rows,
-            response.page_row_count,
-            response.page_token,
-            response.results.is_some()
-        );
         match response.results {
             Some(query_response::Results::ArrowRecordBatch(value))
                 if !value.serialized_record_batch.is_empty() =>
