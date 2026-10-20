@@ -6,14 +6,18 @@ from polars_bigquery.core.compiler.ir.base import Expr
 from polars_bigquery.core.compiler.rewriter import base, boolean
 from polars_bigquery.core.compiler.rewriter.base import RewriterFunc
 from polars_bigquery.core.compiler.rewriter.boolean import (
+    rewrite_boolean_literals,
+    rewrite_boolean_when,
     rewrite_de_morgan,
     rewrite_drop_nulls,
     rewrite_when,
 )
 
 _REWRITERS: tuple[RewriterFunc, ...] = (
-    rewrite_when,
     rewrite_drop_nulls,
+    rewrite_boolean_when,
+    rewrite_boolean_literals,
+    rewrite_when,
     # Apply rewrite_de_morgan last in case any of the above add an OR.
     rewrite_de_morgan,
 )
