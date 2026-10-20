@@ -176,6 +176,7 @@ impl ReadOptions {
 
 #[derive(Clone, Debug, Default)]
 pub struct StreamOptions {
+    pub offset: i64,
     /// Optional IPC-serialized Arrow schema bytes.
     ///
     /// If `None`, the schema is extracted from the first `ReadRowsResponse`
@@ -377,6 +378,7 @@ impl Client {
         self.read_streams(
             streams,
             StreamOptions {
+                offset: 0,
                 schema: Some(schema),
             },
         )
@@ -425,10 +427,15 @@ impl Client {
         let mut handles = Vec::with_capacity(streams.len());
 
         for stream_name in streams {
-            let read_rows = self
-                .apply_request_options(self.read_client.read_rows().set_read_stream(stream_name));
+            let read_rows = self.apply_request_options(
+                self.read_client
+                    .read_rows()
+                    .set_read_stream(stream_name)
+                    .set_offset(options.offset),
+            );
             let handle = tokio::task::spawn(bigquery_read_stream::read_stream(
                 read_rows,
+                options.offset,
                 options.schema.clone(),
                 schema_tx.take(),
                 tx.clone(),
@@ -1158,15 +1165,17 @@ mod tests {
 
         #[derive(Debug)]
         struct PreKnownSchemaStub {
+            recorded_offset: Arc<Mutex<Option<i64>>>,
             responses: Arc<Mutex<Vec<ReadRowsResponse>>>,
         }
 
         impl google_cloud_bigquery::stub::Read for PreKnownSchemaStub {
             async fn read_rows(
                 &self,
-                _req: ReadRowsRequest,
+                req: ReadRowsRequest,
                 _options: RequestOptions,
             ) -> google_cloud_bigquery::Result<ResponseStream<ReadRowsResponse>> {
+                *self.recorded_offset.lock().unwrap() = Some(req.offset);
                 let responses = std::mem::take(&mut *self.responses.lock().unwrap());
                 let (tx, rx) = tokio::sync::mpsc::channel(responses.len().max(1));
                 for resp in responses {
@@ -1177,7 +1186,9 @@ mod tests {
         }
 
         let (schema_bytes, resp1) = create_test_arrow_payload(4);
+        let recorded_offset = Arc::new(Mutex::new(None));
         let stub = PreKnownSchemaStub {
+            recorded_offset: Arc::clone(&recorded_offset),
             responses: Arc::new(Mutex::new(vec![resp1])),
         };
         let client = Client::new_for_testing(
@@ -1190,6 +1201,7 @@ mod tests {
             .read_stream(
                 "streams/s1",
                 StreamOptions {
+                    offset: 42,
                     schema: Some(bytes::Bytes::from(schema_bytes)),
                 },
             )
@@ -1202,6 +1214,7 @@ mod tests {
         let batch = rx.recv().await.unwrap().unwrap();
         assert_eq!(batch.len(), 4);
         assert!(rx.recv().await.is_none());
+        assert_eq!(*recorded_offset.lock().unwrap(), Some(42));
     }
 
     #[tokio::test]
