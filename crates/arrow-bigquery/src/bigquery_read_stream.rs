@@ -308,8 +308,10 @@ async fn consume_next_message(
 /// (`backoff_session.reset()`). This ensures that long-lived data streams
 /// experiencing rare, transient network interruptions separated by minutes or
 /// hours always receive a full retry budget.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn read_stream_inner(
     read_rows: ReadRows,
+    mut current_offset: i64,
     schema: bytes::Bytes,
     tx: tokio::sync::mpsc::Sender<Result<RecordBatch, BigQueryError>>,
     retry_config: StreamRetryConfig,
@@ -317,7 +319,6 @@ pub(crate) async fn read_stream_inner(
     cancel_tx: Arc<tokio::sync::watch::Sender<bool>>,
     mut cancel_rx: tokio::sync::watch::Receiver<bool>,
 ) {
-    let mut current_offset = 0i64;
     let mut backoff_session = retry_config.make_reconnect_session();
     let mut state = ReadStreamState::Connecting;
     let mut stream: Option<ResponseStream<ReadRowsResponse>> = None;
@@ -395,8 +396,10 @@ pub(crate) async fn read_stream_inner(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn read_stream(
     read_rows: ReadRows,
+    offset: i64,
     schema: bytes::Bytes,
     tx: tokio::sync::mpsc::Sender<Result<RecordBatch, BigQueryError>>,
     retry_config: StreamRetryConfig,
@@ -406,6 +409,7 @@ pub(crate) async fn read_stream(
 ) {
     read_stream_inner(
         read_rows,
+        offset,
         schema,
         tx,
         retry_config,
@@ -620,6 +624,7 @@ mod tests {
         let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
         read_stream(
             read_rows,
+            10,
             bytes::Bytes::from(schema_bytes),
             tx,
             test_retry_config(3),
@@ -637,8 +642,8 @@ mod tests {
 
         let reqs = requests.lock().unwrap();
         assert_eq!(reqs.len(), 2);
-        assert_eq!(reqs[0].offset, 0);
-        assert_eq!(reqs[1].offset, 3);
+        assert_eq!(reqs[0].offset, 10);
+        assert_eq!(reqs[1].offset, 13);
     }
 
     #[tokio::test]
@@ -665,6 +670,7 @@ mod tests {
         let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
         read_stream(
             read_rows,
+            0,
             bytes::Bytes::from(schema_bytes),
             tx,
             test_retry_config(3),
@@ -704,6 +710,7 @@ mod tests {
         let cancel_tx = Arc::new(cancel_tx);
         read_stream(
             read_rows,
+            0,
             bytes::Bytes::new(),
             tx,
             test_retry_config(3),
@@ -755,6 +762,7 @@ mod tests {
         let cancel_tx = Arc::new(cancel_tx);
         read_stream(
             read_rows,
+            0,
             bytes::Bytes::new(),
             tx,
             test_retry_config(3),
@@ -809,6 +817,7 @@ mod tests {
 
         let task = tokio::spawn(read_stream(
             read_rows,
+            0,
             bytes::Bytes::new(),
             tx,
             test_retry_config(3),
