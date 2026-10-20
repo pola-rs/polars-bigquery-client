@@ -62,11 +62,7 @@ async fn test_dry_run_query() {
         .expect("dry_run should succeed");
 
     assert_eq!(batch.len(), 1);
-    let col_names: Vec<&str> = batch
-        .schema()
-        .iter_names()
-        .map(|s| s.as_str())
-        .collect();
+    let col_names: Vec<&str> = batch.schema().iter_names().map(|s| s.as_str()).collect();
     assert_eq!(
         col_names,
         vec![
@@ -144,11 +140,27 @@ async fn test_read_query() {
     let empty_sql = "SELECT 1 AS one, 'hello' AS greeting LIMIT 0";
     let (empty_schema, mut empty_receiver) = client
         .query(empty_sql)
+        .with_arrow_buffer_compression(CompressionCodec::Zstd)
         .read()
         .await
         .expect("empty query read should succeed");
     let empty_col_names: Vec<&str> = empty_schema.iter_names().map(|s| s.as_str()).collect();
     assert_eq!(empty_col_names, vec!["one", "greeting"]);
     assert!(empty_receiver.recv().await.is_none());
-}
 
+    let multipage_sql =
+        "SELECT * FROM `bigquery-public-data.sec_quarterly_financials.submission` LIMIT 250000";
+    let (_, mut multipage_receiver) = client
+        .query(multipage_sql)
+        .with_arrow_buffer_compression(CompressionCodec::Zstd)
+        .read()
+        .await
+        .expect("multipage query read should succeed");
+
+    let mut multipage_rows = 0;
+    while let Some(batch) = multipage_receiver.recv().await {
+        let batch = batch.expect("should receive valid record batch");
+        multipage_rows += batch.len();
+    }
+    assert_eq!(multipage_rows, 250_000);
+}

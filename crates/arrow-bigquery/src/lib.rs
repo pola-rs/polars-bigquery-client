@@ -9,6 +9,7 @@ use std::sync::Arc;
 
 pub use client_builder::*;
 pub use error::BigQueryError;
+pub use google_cloud_bigquery::model::arrow_serialization_options::CompressionCodec;
 use google_cloud_bigquery::model::{
     arrow_serialization_options, read_session, ArrowSerializationOptions, CreateReadSessionRequest,
     DataFormat, ReadSession,
@@ -270,11 +271,11 @@ pub type BigQueryJobService = google_cloud_bigquery_v2::client::JobService;
 /// A BigQuery client for reading tables using the Storage Read API.
 ///
 /// Keeps the gRPC channel open across multiple read operations.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct Client {
-    bq_client: BigQueryJobService,
+    pub(crate) bq_client: BigQueryJobService,
     read_client: BigQueryReadClient,
-    quota_project_id: String,
+    pub(crate) quota_project_id: String,
     user_agent: Option<String>,
     retry_throttler: SharedRetryThrottler,
     decode_pool: Arc<rayon::ThreadPool>,
@@ -324,19 +325,14 @@ impl Client {
     }
 
     pub fn query(&self, sql: impl Into<String>) -> query::Query {
-        query::Query::new(
-            self.bq_client.clone(),
-            sql,
-            self.quota_project_id.clone(),
-            self.user_agent.clone(),
-        )
+        query::Query::new(self.clone(), sql)
     }
 
     pub async fn from_builder(builder: ServiceConfigBuilder) -> Result<Self, BigQueryError> {
         builder.build().await
     }
 
-    fn apply_request_options<B: RequestOptionsBuilder>(&self, builder: B) -> B {
+    pub(crate) fn apply_request_options<B: RequestOptionsBuilder>(&self, builder: B) -> B {
         let builder = builder.with_quota_project(&self.quota_project_id);
         match &self.user_agent {
             Some(user_agent) => builder.with_user_agent(user_agent),

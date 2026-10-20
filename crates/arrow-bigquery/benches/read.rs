@@ -124,6 +124,7 @@ async fn execute_query(client: &Arc<Client>, sql: &str) {
     while let Some(batch) = receiver.recv().await {
         total_rows += batch.expect("should receive valid record batch").len();
     }
+    assert!(total_rows > 0);
 }
 
 async fn query_sec_quarterly_financials_table(client: &Arc<Client>, table_id: &str) {
@@ -194,4 +195,3 @@ fn read_query(c: &mut Criterion) {
 
 criterion_group!(benches, read_table, read_query);
 criterion_main!(benches);
-
