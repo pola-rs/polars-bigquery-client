@@ -195,7 +195,7 @@ pub struct BigQueryRecordBatchReceiver {
     /// These handles are kept so that the background tasks can be aborted when
     /// the receiver is dropped or encounters a fatal error, preventing resource leaks
     /// from orphan background tasks.
-    _handles: Vec<tokio::task::JoinHandle<()>>,
+    handles: Vec<tokio::task::JoinHandle<()>>,
 }
 
 impl BigQueryRecordBatchReceiver {
@@ -213,7 +213,7 @@ impl BigQueryRecordBatchReceiver {
             let _ = cancel_tx.send_replace(true);
         }
         self.rx.close();
-        for handle in self._handles.drain(..) {
+        for handle in self.handles.drain(..) {
             handle.abort();
         }
     }
@@ -226,7 +226,7 @@ impl BigQueryRecordBatchReceiver {
         Self {
             rx,
             cancel_tx,
-            _handles: handles,
+            handles,
         }
     }
 
@@ -433,7 +433,7 @@ impl Client {
         let receiver = BigQueryRecordBatchReceiver {
             rx,
             cancel_tx: Some(cancel_tx),
-            _handles: handles,
+            handles,
         };
 
         Ok((schema_ref, receiver))
