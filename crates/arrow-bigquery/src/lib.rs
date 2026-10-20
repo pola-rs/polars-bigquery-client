@@ -177,11 +177,8 @@ impl ReadOptions {
 #[derive(Clone, Debug, Default)]
 pub struct StreamOptions {
     pub offset: i64,
-    /// Optional IPC-serialized Arrow schema bytes.
-    ///
-    /// If `None`, the schema is extracted from the first `ReadRowsResponse`
-    /// received from the stream.
-    pub schema: Option<bytes::Bytes>,
+    /// IPC-serialized Arrow schema bytes.
+    pub schema: bytes::Bytes,
 }
 
 /// A receiver that yields [`RecordBatch`]es read from BigQuery.
@@ -375,14 +372,7 @@ impl Client {
             .into_iter()
             .map(|stream| stream.name)
             .collect();
-        self.read_streams(
-            streams,
-            StreamOptions {
-                offset: 0,
-                schema: Some(schema),
-            },
-        )
-        .await
+        self.read_streams(streams, StreamOptions { offset: 0, schema })
     }
 
     pub async fn read_stream(
@@ -390,31 +380,17 @@ impl Client {
         stream: impl Into<String>,
         options: StreamOptions,
     ) -> Result<(ArrowSchemaRef, BigQueryRecordBatchReceiver), BigQueryError> {
-        self.read_streams(vec![stream.into()], options).await
+        self.read_streams(vec![stream.into()], options)
     }
 
-    async fn read_streams(
+    fn read_streams(
         &self,
         streams: Vec<String>,
         options: StreamOptions,
     ) -> Result<(ArrowSchemaRef, BigQueryRecordBatchReceiver), BigQueryError> {
-        let (schema_ref, mut schema_tx, schema_rx) = match &options.schema {
-            Some(schema) => {
-                let mut schema_cursor = Cursor::new(schema.clone());
-                let metadata = read_stream_metadata(&mut schema_cursor)?;
-                (Some(Arc::new(metadata.schema)), None, None)
-            },
-            None => {
-                if streams.is_empty() {
-                    return Err(BigQueryError::Protocol(
-                        "Cannot determine schema when there are no streams and no schema was provided"
-                            .into(),
-                    ));
-                }
-                let (tx, rx) = tokio::sync::oneshot::channel();
-                (None, Some(tx), Some(rx))
-            },
-        };
+        let mut schema_cursor = Cursor::new(options.schema.clone());
+        let metadata = read_stream_metadata(&mut schema_cursor)?;
+        let schema_ref = Arc::new(metadata.schema);
 
         let channel_size = match std::thread::available_parallelism() {
             Ok(value) => value.get() * 2,
@@ -437,7 +413,6 @@ impl Client {
                 read_rows,
                 options.offset,
                 options.schema.clone(),
-                schema_tx.take(),
                 tx.clone(),
                 retry_config.clone(),
                 Arc::clone(&self.decode_pool),
@@ -451,18 +426,6 @@ impl Client {
             rx,
             cancel_tx: Some(cancel_tx),
             _handles: handles,
-        };
-
-        let schema_ref = match schema_ref {
-            Some(schema_ref) => schema_ref,
-            None => {
-                let schema_rx = schema_rx.expect("schema_rx must be Some when schema_ref is None");
-                schema_rx.await.map_err(|_| {
-                    BigQueryError::Other(
-                        "ReadRows stream task terminated before sending schema".into(),
-                    )
-                })??
-            },
         };
 
         Ok((schema_ref, receiver))
@@ -1071,19 +1034,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_client_read_stream_extracts_schema_from_first_response() {
+    async fn test_client_read_stream() {
         use std::sync::Mutex;
 
         use google_cloud_bigquery::client::Read;
-        use google_cloud_bigquery::model::{
-            ArrowSchema as BqArrowSchema, ReadRowsRequest, ReadRowsResponse,
-        };
+        use google_cloud_bigquery::model::{ReadRowsRequest, ReadRowsResponse};
         use google_cloud_gax::options::RequestOptions;
         use google_cloud_gax::streaming::ResponseStream;
 
         #[derive(Debug, Default)]
         struct RecordedReadRows {
             stream_name: Option<String>,
+            offset: Option<i64>,
             quota_project: Option<String>,
             user_agent: Option<String>,
         }
@@ -1103,6 +1065,7 @@ mod tests {
                 {
                     let mut rec = self.recorded.lock().unwrap();
                     rec.stream_name = Some(req.read_stream);
+                    rec.offset = Some(req.offset);
                     rec.quota_project = options.quota_project().clone();
                     rec.user_agent = options.user_agent().clone();
                 }
@@ -1117,8 +1080,6 @@ mod tests {
 
         let (schema_bytes, resp1) = create_test_arrow_payload(3);
         let (_, resp2) = create_test_arrow_payload(2);
-        let resp1 =
-            resp1.set_arrow_schema(BqArrowSchema::new().set_serialized_schema(schema_bytes));
 
         let recorded = Arc::new(Mutex::new(RecordedReadRows::default()));
         let stub = StreamReadStub {
@@ -1135,7 +1096,13 @@ mod tests {
 
         let stream_name = "projects/p/locations/us/sessions/s/streams/0";
         let (schema, mut rx) = client
-            .read_stream(stream_name, StreamOptions::default())
+            .read_stream(
+                stream_name,
+                StreamOptions {
+                    offset: 42,
+                    schema: bytes::Bytes::from(schema_bytes),
+                },
+            )
             .await
             .unwrap();
 
@@ -1150,138 +1117,19 @@ mod tests {
 
         let rec = recorded.lock().unwrap();
         assert_eq!(rec.stream_name.as_deref(), Some(stream_name));
+        assert_eq!(rec.offset, Some(42));
         assert_eq!(rec.quota_project.as_deref(), Some("test-quota-proj"));
         assert_eq!(rec.user_agent.as_deref(), Some("custom-ua/2.0"));
     }
 
     #[tokio::test]
-    async fn test_client_read_stream_with_provided_schema() {
-        use std::sync::Mutex;
-
-        use google_cloud_bigquery::client::Read;
-        use google_cloud_bigquery::model::{ReadRowsRequest, ReadRowsResponse};
-        use google_cloud_gax::options::RequestOptions;
-        use google_cloud_gax::streaming::ResponseStream;
-
-        #[derive(Debug)]
-        struct PreKnownSchemaStub {
-            recorded_offset: Arc<Mutex<Option<i64>>>,
-            responses: Arc<Mutex<Vec<ReadRowsResponse>>>,
-        }
-
-        impl google_cloud_bigquery::stub::Read for PreKnownSchemaStub {
-            async fn read_rows(
-                &self,
-                req: ReadRowsRequest,
-                _options: RequestOptions,
-            ) -> google_cloud_bigquery::Result<ResponseStream<ReadRowsResponse>> {
-                *self.recorded_offset.lock().unwrap() = Some(req.offset);
-                let responses = std::mem::take(&mut *self.responses.lock().unwrap());
-                let (tx, rx) = tokio::sync::mpsc::channel(responses.len().max(1));
-                for resp in responses {
-                    let _ = tx.send(Ok(resp)).await;
-                }
-                Ok(ResponseStream::from(rx))
-            }
-        }
-
-        let (schema_bytes, resp1) = create_test_arrow_payload(4);
-        let recorded_offset = Arc::new(Mutex::new(None));
-        let stub = PreKnownSchemaStub {
-            recorded_offset: Arc::clone(&recorded_offset),
-            responses: Arc::new(Mutex::new(vec![resp1])),
-        };
-        let client = Client::new_for_testing(
-            test_bq_client().await,
-            Read::from_stub(stub),
-            "test-quota-proj".to_string(),
-        );
-
-        let (schema, mut rx) = client
-            .read_stream(
-                "streams/s1",
-                StreamOptions {
-                    offset: 42,
-                    schema: Some(bytes::Bytes::from(schema_bytes)),
-                },
-            )
-            .await
-            .unwrap();
-
-        let col_names: Vec<&str> = schema.iter_names().map(|s| s.as_str()).collect();
-        assert_eq!(col_names, vec!["col1"]);
-
-        let batch = rx.recv().await.unwrap().unwrap();
-        assert_eq!(batch.len(), 4);
-        assert!(rx.recv().await.is_none());
-        assert_eq!(*recorded_offset.lock().unwrap(), Some(42));
-    }
-
-    #[tokio::test]
-    async fn test_client_read_stream_errors_when_schema_not_provided() {
+    async fn test_client_read_stream_errors() {
         use google_cloud_bigquery::client::Read;
         use google_cloud_bigquery::model::{ReadRowsRequest, ReadRowsResponse};
         use google_cloud_gax::error::rpc::{Code, Status};
         use google_cloud_gax::error::Error as GaxError;
         use google_cloud_gax::options::RequestOptions;
         use google_cloud_gax::streaming::ResponseStream;
-
-        #[derive(Debug)]
-        struct MissingSchemaStub;
-
-        impl google_cloud_bigquery::stub::Read for MissingSchemaStub {
-            async fn read_rows(
-                &self,
-                _req: ReadRowsRequest,
-                _options: RequestOptions,
-            ) -> google_cloud_bigquery::Result<ResponseStream<ReadRowsResponse>> {
-                let (tx, rx) = tokio::sync::mpsc::channel(1);
-                let _ = tx.send(Ok(ReadRowsResponse::new())).await;
-                Ok(ResponseStream::from(rx))
-            }
-        }
-
-        let client = Client::new_for_testing(
-            test_bq_client().await,
-            Read::from_stub(MissingSchemaStub),
-            "test-quota-proj".to_string(),
-        );
-        let err = match client
-            .read_stream("streams/s1", StreamOptions::default())
-            .await
-        {
-            Err(e) => e,
-            Ok(_) => panic!("expected Protocol error when first response has no schema"),
-        };
-        assert!(matches!(err, BigQueryError::Protocol(_)));
-
-        #[derive(Debug)]
-        struct EmptyStreamStub;
-
-        impl google_cloud_bigquery::stub::Read for EmptyStreamStub {
-            async fn read_rows(
-                &self,
-                _req: ReadRowsRequest,
-                _options: RequestOptions,
-            ) -> google_cloud_bigquery::Result<ResponseStream<ReadRowsResponse>> {
-                let (_tx, rx) = tokio::sync::mpsc::channel(1);
-                Ok(ResponseStream::from(rx))
-            }
-        }
-
-        let client = Client::new_for_testing(
-            test_bq_client().await,
-            Read::from_stub(EmptyStreamStub),
-            "test-quota-proj".to_string(),
-        );
-        let err = match client
-            .read_stream("streams/s1", StreamOptions::default())
-            .await
-        {
-            Err(e) => e,
-            Ok(_) => panic!("expected Protocol error when stream closes without sending schema"),
-        };
-        assert!(matches!(err, BigQueryError::Protocol(_)));
 
         #[derive(Debug)]
         struct FailingReadRowsStub;
@@ -1305,13 +1153,32 @@ mod tests {
             Read::from_stub(FailingReadRowsStub),
             "test-quota-proj".to_string(),
         );
+
         let err = match client
             .read_stream("streams/s1", StreamOptions::default())
             .await
         {
             Err(e) => e,
-            Ok(_) => panic!("expected Grpc error when ReadRows fails"),
+            Ok(_) => panic!("expected Arrow error when schema bytes are empty/invalid"),
         };
+        assert!(matches!(err, BigQueryError::Arrow(_)));
+
+        let (schema_bytes, _) = create_test_arrow_payload(1);
+        let (_schema, mut rx) = client
+            .read_stream(
+                "streams/s1",
+                StreamOptions {
+                    offset: 0,
+                    schema: bytes::Bytes::from(schema_bytes),
+                },
+            )
+            .await
+            .unwrap();
+        let err = rx
+            .recv()
+            .await
+            .expect("expected error item")
+            .expect_err("expected Grpc error when ReadRows fails");
         assert!(matches!(err, BigQueryError::Grpc(_)));
     }
 }
