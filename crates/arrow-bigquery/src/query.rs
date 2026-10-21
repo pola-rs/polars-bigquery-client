@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use google_cloud_bigquery_v2::model::query_request::QueryResultsFormat;
+use google_cloud_bigquery_v2::model::query_request::{JobCreationMode, QueryResultsFormat};
 use google_cloud_bigquery_v2::model::{
     arrow_serialization_options, query_response, ArrowSerializationOptions, QueryRequest,
     QueryResponse,
@@ -73,6 +73,7 @@ impl<'a> Query<'a> {
                 .unwrap_or_else(|| bq_to_gapic_compression_codec(crate::DEFAULT_COMPRESSION)),
         );
         QueryRequest::new()
+            .set_job_creation_mode(JobCreationMode::JobCreationOptional)
             .set_query_results_format(QueryResultsFormat::Arrow)
             .set_arrow_serialization_options(arrow_options)
             .set_or_clear_use_query_cache(self.use_query_cache)
@@ -509,6 +510,11 @@ mod tests {
                 "unexpected request path: {req_str}"
             );
             assert!(
+                req_str.contains("\"jobCreationMode\":2")
+                    || req_str.contains("\"jobCreationMode\":\"JOB_CREATION_OPTIONAL\""),
+                "expected jobCreationMode set to JobCreationOptional in request body: {req_str}"
+            );
+            assert!(
                 req_str.contains("\"queryResultsFormat\":2")
                     || req_str.contains("\"queryResultsFormat\":\"ARROW\""),
                 "expected queryResultsFormat set to Arrow in request body: {req_str}"
@@ -590,6 +596,7 @@ mod tests {
                 let q = req.query_request.expect("query_request should be set");
                 assert_eq!(q.query, "SELECT col1 FROM tbl WHERE FALSE");
                 assert_eq!(q.use_legacy_sql, Some(false));
+                assert_eq!(q.job_creation_mode, JobCreationMode::JobCreationOptional);
                 assert_eq!(q.query_results_format, QueryResultsFormat::Arrow);
                 let arrow_opts = q
                     .arrow_serialization_options()
@@ -814,6 +821,10 @@ mod tests {
         );
 
         let default_req = client.query("SELECT 1").build_read_request();
+        assert_eq!(
+            default_req.job_creation_mode,
+            JobCreationMode::JobCreationOptional
+        );
         assert_eq!(
             default_req
                 .arrow_serialization_options()
