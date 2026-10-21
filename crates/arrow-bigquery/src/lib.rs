@@ -276,8 +276,8 @@ pub type BigQueryJobService = google_cloud_bigquery_v2::client::JobService;
 pub struct Client {
     pub(crate) bq_client: BigQueryJobService,
     read_client: BigQueryReadClient,
-    pub(crate) quota_project_id: String,
-    user_agent: Option<String>,
+    pub(crate) quota_project_id: Arc<str>,
+    user_agent: Option<Arc<str>>,
     retry_throttler: SharedRetryThrottler,
     pub(crate) decode_pool: Arc<rayon::ThreadPool>,
 }
@@ -297,8 +297,8 @@ impl Client {
         Self {
             bq_client,
             read_client,
-            quota_project_id,
-            user_agent,
+            quota_project_id: Arc::from(quota_project_id),
+            user_agent: user_agent.map(Arc::from),
             retry_throttler,
             decode_pool: bigquery_read_stream::default_decode_pool(),
         }
@@ -325,8 +325,8 @@ impl Client {
         &self.quota_project_id
     }
 
-    pub fn query(&self, sql: impl Into<String>) -> query::Query {
-        query::Query::new(self.clone(), sql)
+    pub fn query(&self, sql: impl Into<String>) -> query::Query<'_> {
+        query::Query::new(self, sql)
     }
 
     pub async fn from_builder(builder: ServiceConfigBuilder) -> Result<Self, BigQueryError> {
@@ -334,9 +334,9 @@ impl Client {
     }
 
     pub(crate) fn apply_request_options<B: RequestOptionsBuilder>(&self, builder: B) -> B {
-        let builder = builder.with_quota_project(&self.quota_project_id);
+        let builder = builder.with_quota_project(&*self.quota_project_id);
         match &self.user_agent {
-            Some(user_agent) => builder.with_user_agent(user_agent),
+            Some(user_agent) => builder.with_user_agent(&**user_agent),
             None => builder,
         }
     }
@@ -365,6 +365,32 @@ impl Client {
                 .set_read_stream(stream_name)
                 .set_offset(offset),
         )
+    }
+
+    pub(crate) fn spawn_query_stream(
+        &self,
+        first_page_bytes: Option<bytes::Bytes>,
+        page_row_count: i64,
+        read_rows: Option<google_cloud_bigquery::builder::read::ReadRows>,
+        metadata: Arc<polars_arrow::io::ipc::read::StreamMetadata>,
+    ) -> BigQueryRecordBatchReceiver {
+        let (tx, rx) = tokio::sync::mpsc::channel(Self::channel_size());
+        let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+        let cancel_tx = Arc::new(cancel_tx);
+        let handle = tokio::task::spawn(bigquery_read_stream::read_query_stream(
+            bigquery_read_stream::ReadQueryStreamOptions {
+                first_page_bytes,
+                page_row_count,
+                read_rows,
+                metadata,
+                tx,
+                retry_config: self.stream_retry_config(),
+                decode_pool: Arc::clone(&self.decode_pool),
+                cancel_tx: Arc::clone(&cancel_tx),
+                cancel_rx,
+            },
+        ));
+        BigQueryRecordBatchReceiver::new(rx, Some(cancel_tx), vec![handle])
     }
 
     pub async fn read_table(
@@ -448,15 +474,17 @@ impl Client {
         for stream_name in streams {
             let read_rows = self.prepare_read_rows(stream_name, options.offset);
             let handle = tokio::task::spawn(bigquery_read_stream::read_stream(
-                read_rows,
-                options.offset,
-                metadata.clone(),
-                schema_tx.take(),
-                tx.clone(),
-                retry_config.clone(),
-                Arc::clone(&self.decode_pool),
-                Arc::clone(&cancel_tx),
-                cancel_rx.clone(),
+                bigquery_read_stream::ReadStreamOptions {
+                    read_rows,
+                    current_offset: options.offset,
+                    metadata: metadata.clone(),
+                    schema_tx: schema_tx.take(),
+                    tx: tx.clone(),
+                    retry_config: retry_config.clone(),
+                    decode_pool: Arc::clone(&self.decode_pool),
+                    cancel_tx: Arc::clone(&cancel_tx),
+                    cancel_rx: cancel_rx.clone(),
+                },
             ));
             handles.push(handle);
         }
@@ -484,10 +512,11 @@ impl Client {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::num::NonZero;
 
     use super::*;
+    use crate::bigquery_read_stream::tests::{create_test_arrow_payload, CannedReadRowsStub};
 
     #[test]
     fn table_id_to_table_path_success() -> Result<(), Box<dyn std::error::Error>> {
@@ -790,13 +819,22 @@ mod tests {
         bytes
     }
 
-    async fn test_bq_client() -> BigQueryJobService {
+    pub(crate) async fn test_bq_client() -> BigQueryJobService {
         let cred = google_cloud_auth::credentials::anonymous::Builder::new().build();
         BigQueryJobService::builder()
             .with_credentials(cred)
             .build()
             .await
             .expect("should build test BigQueryJobService")
+    }
+
+    pub(crate) async fn test_read_client() -> BigQueryReadClient {
+        let cred = google_cloud_auth::credentials::anonymous::Builder::new().build();
+        BigQueryReadClient::builder()
+            .with_credentials(cred)
+            .build()
+            .await
+            .expect("should build test BigQueryReadClient")
     }
 
     #[tokio::test]
@@ -1038,98 +1076,10 @@ mod tests {
         );
     }
 
-    fn create_test_arrow_payload(
-        num_rows: usize,
-    ) -> (Vec<u8>, google_cloud_bigquery::model::ReadRowsResponse) {
-        use google_cloud_bigquery::model::{ArrowRecordBatch, ReadRowsResponse};
-        use polars_arrow::array::Int32Array;
-        use polars_arrow::datatypes::{ArrowDataType, ArrowSchema, Field};
-        use polars_arrow::io::ipc::write::{StreamWriter, WriteOptions};
-
-        let field = Field::new("col1".into(), ArrowDataType::Int32, false);
-        let schema = ArrowSchema::from_iter(vec![field]);
-
-        let mut schema_bytes = Vec::new();
-        {
-            let mut writer =
-                StreamWriter::new(&mut schema_bytes, WriteOptions { compression: None });
-            writer.start(&schema, None).unwrap();
-        }
-        let schema_len = schema_bytes.len();
-
-        let array = Int32Array::from_slice((0..num_rows as i32).collect::<Vec<_>>());
-        let batch = RecordBatch::try_new(
-            num_rows,
-            Arc::new(schema.clone()),
-            vec![Box::new(array) as Box<dyn polars_arrow::array::Array>],
-        )
-        .unwrap();
-
-        let mut full_stream_bytes = Vec::new();
-        {
-            let mut writer =
-                StreamWriter::new(&mut full_stream_bytes, WriteOptions { compression: None });
-            writer.start(&schema, None).unwrap();
-            writer.write(&batch, None).unwrap();
-        }
-
-        let batch_bytes = full_stream_bytes[schema_len..].to_vec();
-
-        let response = ReadRowsResponse::new()
-            .set_arrow_record_batch(
-                ArrowRecordBatch::new().set_serialized_record_batch(batch_bytes),
-            )
-            .set_row_count(num_rows as i64);
-
-        (schema_bytes, response)
-    }
-
     #[tokio::test]
     async fn test_client_read_stream_extracts_schema_from_first_response() {
-        use std::sync::Mutex;
-
         use google_cloud_bigquery::client::Read;
-        use google_cloud_bigquery::model::{
-            ArrowSchema as BqArrowSchema, ReadRowsRequest, ReadRowsResponse,
-        };
-        use google_cloud_gax::options::RequestOptions;
-        use google_cloud_gax::streaming::ResponseStream;
-
-        #[derive(Debug, Default)]
-        struct RecordedReadRows {
-            stream_name: Option<String>,
-            offset: Option<i64>,
-            quota_project: Option<String>,
-            user_agent: Option<String>,
-        }
-
-        #[derive(Debug)]
-        struct StreamReadStub {
-            recorded: Arc<Mutex<RecordedReadRows>>,
-            responses: Arc<Mutex<Vec<ReadRowsResponse>>>,
-        }
-
-        impl google_cloud_bigquery::stub::Read for StreamReadStub {
-            async fn read_rows(
-                &self,
-                req: ReadRowsRequest,
-                options: RequestOptions,
-            ) -> google_cloud_bigquery::Result<ResponseStream<ReadRowsResponse>> {
-                {
-                    let mut rec = self.recorded.lock().unwrap();
-                    rec.stream_name = Some(req.read_stream);
-                    rec.offset = Some(req.offset);
-                    rec.quota_project = options.quota_project().clone();
-                    rec.user_agent = options.user_agent().clone();
-                }
-                let responses = std::mem::take(&mut *self.responses.lock().unwrap());
-                let (tx, rx) = tokio::sync::mpsc::channel(responses.len().max(1));
-                for resp in responses {
-                    let _ = tx.send(Ok(resp)).await;
-                }
-                Ok(ResponseStream::from(rx))
-            }
-        }
+        use google_cloud_bigquery::model::{ArrowSchema as BqArrowSchema, ReadRowsResponse};
 
         let heartbeat = ReadRowsResponse::new();
         let (schema_bytes, resp1) = create_test_arrow_payload(3);
@@ -1137,11 +1087,7 @@ mod tests {
         let resp1 =
             resp1.set_arrow_schema(BqArrowSchema::new().set_serialized_schema(schema_bytes));
 
-        let recorded = Arc::new(Mutex::new(RecordedReadRows::default()));
-        let stub = StreamReadStub {
-            recorded: Arc::clone(&recorded),
-            responses: Arc::new(Mutex::new(vec![heartbeat, resp1, resp2])),
-        };
+        let (stub, recorded) = CannedReadRowsStub::new(vec![heartbeat, resp1, resp2]);
         let client = Client::from_parts(
             test_bq_client().await,
             Read::from_stub(stub),
@@ -1174,41 +1120,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_client_read_stream_with_provided_schema() {
-        use std::sync::Mutex;
-
         use google_cloud_bigquery::client::Read;
-        use google_cloud_bigquery::model::{ReadRowsRequest, ReadRowsResponse};
-        use google_cloud_gax::options::RequestOptions;
-        use google_cloud_gax::streaming::ResponseStream;
-
-        #[derive(Debug)]
-        struct PreKnownSchemaStub {
-            recorded_offset: Arc<Mutex<Option<i64>>>,
-            responses: Arc<Mutex<Vec<ReadRowsResponse>>>,
-        }
-
-        impl google_cloud_bigquery::stub::Read for PreKnownSchemaStub {
-            async fn read_rows(
-                &self,
-                req: ReadRowsRequest,
-                _options: RequestOptions,
-            ) -> google_cloud_bigquery::Result<ResponseStream<ReadRowsResponse>> {
-                *self.recorded_offset.lock().unwrap() = Some(req.offset);
-                let responses = std::mem::take(&mut *self.responses.lock().unwrap());
-                let (tx, rx) = tokio::sync::mpsc::channel(responses.len().max(1));
-                for resp in responses {
-                    let _ = tx.send(Ok(resp)).await;
-                }
-                Ok(ResponseStream::from(rx))
-            }
-        }
 
         let (schema_bytes, resp1) = create_test_arrow_payload(4);
-        let recorded_offset = Arc::new(Mutex::new(None));
-        let stub = PreKnownSchemaStub {
-            recorded_offset: Arc::clone(&recorded_offset),
-            responses: Arc::new(Mutex::new(vec![resp1])),
-        };
+        let (stub, recorded) = CannedReadRowsStub::new(vec![resp1]);
         let client = Client::new_for_testing(
             test_bq_client().await,
             Read::from_stub(stub),
@@ -1232,7 +1147,7 @@ mod tests {
         let batch = rx.recv().await.unwrap().unwrap();
         assert_eq!(batch.len(), 4);
         assert!(rx.recv().await.is_none());
-        assert_eq!(*recorded_offset.lock().unwrap(), Some(42));
+        assert_eq!(recorded.lock().unwrap().offset, Some(42));
     }
 
     #[tokio::test]
