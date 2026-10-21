@@ -90,11 +90,11 @@ pub(crate) fn validate_non_empty_arrow_bytes(
 pub(crate) fn decode_arrow_record_batches(
     serialized_record_batch: bytes::Bytes,
     expected_row_count: i64,
-    metadata: &StreamMetadata,
+    metadata: StreamMetadata,
 ) -> Result<Vec<RecordBatch>, BigQueryError> {
     let cursor = Cursor::new(serialized_record_batch);
-    let mut reader = StreamReader::new(cursor, metadata.clone(), None);
-    let mut batches = Vec::new();
+    let mut reader = StreamReader::new(cursor, metadata, None);
+    let mut batches = Vec::with_capacity(1);
     let mut actual_rows: i64 = 0;
 
     for result in &mut reader {
@@ -150,7 +150,7 @@ fn read_rows_response_to_record_batch(
         return Ok(None);
     };
     let metadata = parse_arrow_schema(schema)?;
-    let mut batches = decode_arrow_record_batches(serialized_record_batch, row_count, &metadata)?;
+    let mut batches = decode_arrow_record_batches(serialized_record_batch, row_count, metadata)?;
     if batches.is_empty() {
         Ok(None)
     } else {
@@ -173,8 +173,11 @@ pub(crate) async fn decode_batches_on_pool(
         if done_tx.is_closed() {
             return;
         }
-        let res =
-            decode_arrow_record_batches(serialized_record_batch, expected_row_count, &metadata);
+        let res = decode_arrow_record_batches(
+            serialized_record_batch,
+            expected_row_count,
+            Arc::unwrap_or_clone(metadata),
+        );
         let _ = done_tx.send(res);
     });
 
@@ -335,7 +338,7 @@ pub(crate) struct ReadStreamOptions {
 }
 
 pub(crate) struct ReadQueryStreamOptions {
-    pub(crate) first_page_bytes: Option<bytes::Bytes>,
+    pub(crate) first_page_bytes: bytes::Bytes,
     pub(crate) page_row_count: i64,
     pub(crate) read_rows: Option<ReadRows>,
     pub(crate) metadata: Arc<StreamMetadata>,
@@ -575,9 +578,9 @@ async fn read_stream_with_initial(
     }
 }
 
-/// Decodes an optional first page of query results and streams any remaining rows
+/// Decodes the first page of query results and streams any remaining rows
 /// from `read_rows`, overlapping first-page CPU decompression with the gRPC
-/// `ReadRows` stream connection when both are present.
+/// `ReadRows` stream connection when `read_rows` is present.
 pub(crate) async fn read_query_stream(options: ReadQueryStreamOptions) {
     let ReadQueryStreamOptions {
         first_page_bytes,
@@ -592,12 +595,12 @@ pub(crate) async fn read_query_stream(options: ReadQueryStreamOptions) {
     } = options;
     let mut current_offset = 0;
 
-    match (first_page_bytes, read_rows) {
-        (Some(serialized_record_batch), Some(read_rows)) => {
+    match read_rows {
+        Some(read_rows) => {
             let mut connect_cancel_rx = cancel_rx.clone();
             let decode_fut = decode_and_send_batches(DecodeAndSendOptions {
                 decode_pool: &decode_pool,
-                serialized_record_batch,
+                serialized_record_batch: first_page_bytes,
                 expected_row_count: page_row_count,
                 metadata: Arc::clone(&metadata),
                 current_offset: &mut current_offset,
@@ -639,10 +642,10 @@ pub(crate) async fn read_query_stream(options: ReadQueryStreamOptions) {
             )
             .await;
         },
-        (Some(serialized_record_batch), None) => {
+        None => {
             let _ = decode_and_send_batches(DecodeAndSendOptions {
                 decode_pool: &decode_pool,
-                serialized_record_batch,
+                serialized_record_batch: first_page_bytes,
                 expected_row_count: page_row_count,
                 metadata,
                 current_offset: &mut current_offset,
@@ -652,21 +655,6 @@ pub(crate) async fn read_query_stream(options: ReadQueryStreamOptions) {
             })
             .await;
         },
-        (None, Some(read_rows)) => {
-            read_stream(ReadStreamOptions {
-                read_rows,
-                current_offset: page_row_count,
-                metadata: Some(metadata),
-                schema_tx: None,
-                tx,
-                retry_config,
-                decode_pool,
-                cancel_tx,
-                cancel_rx,
-            })
-            .await;
-        },
-        (None, None) => {},
     }
 }
 

@@ -3,18 +3,30 @@ use std::env;
 use arrow_bigquery::*;
 use polars_arrow::array::{Int64Array, Utf8Array};
 
-#[tokio::test(flavor = "multi_thread")]
-async fn test_read_small_public_table() {
+async fn setup_client() -> Client {
     let quota_project_id = env::var("GOOGLE_CLOUD_PROJECT")
         .expect("must set GOOGLE_CLOUD_PROJECT to run integration tests");
 
-    let client = Client::from_builder(
+    Client::from_builder(
         ServiceConfigBuilder::new()
             .with_user_agent(Some("integration-test/1.0".to_string()))
             .with_quota_project_id(Some(quota_project_id)),
     )
     .await
-    .expect("should build client");
+    .expect("should build client")
+}
+
+async fn consume_receiver(mut receiver: BigQueryRecordBatchReceiver) -> usize {
+    let mut total_rows = 0;
+    while let Some(batch) = receiver.recv().await {
+        total_rows += batch.expect("should receive valid record batch").len();
+    }
+    total_rows
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_read_small_public_table() {
+    let client = setup_client().await;
 
     let table = BigQueryTableId {
         project_id: "bigquery-public-data".to_string(),
@@ -22,7 +34,7 @@ async fn test_read_small_public_table() {
         table_id: "usa_1910_2013".to_string(),
     };
 
-    let (_, mut receiver) = client
+    let (_, receiver) = client
         .read_table(
             &table,
             ReadOptions {
@@ -33,25 +45,12 @@ async fn test_read_small_public_table() {
         .await
         .expect("public table read should work with default credentials");
 
-    let mut total_rows = 0;
-    while let Some(batch) = receiver.recv().await {
-        total_rows += batch.expect("should receive valid record batch").len();
-    }
-    assert!(total_rows > 0);
+    assert!(consume_receiver(receiver).await > 0);
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_dry_run_query() {
-    let quota_project_id = env::var("GOOGLE_CLOUD_PROJECT")
-        .expect("must set GOOGLE_CLOUD_PROJECT to run integration tests");
-
-    let client = Client::from_builder(
-        ServiceConfigBuilder::new()
-            .with_user_agent(Some("integration-test/1.0".to_string()))
-            .with_quota_project_id(Some(quota_project_id.clone())),
-    )
-    .await
-    .expect("should build client");
+    let client = setup_client().await;
 
     let sql =
         "SELECT name, number FROM `bigquery-public-data.usa_names.usa_1910_2013` WHERE state = 'WA'";
@@ -109,19 +108,10 @@ async fn test_dry_run_query() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_read_query() {
-    let quota_project_id = env::var("GOOGLE_CLOUD_PROJECT")
-        .expect("must set GOOGLE_CLOUD_PROJECT to run integration tests");
-
-    let client = Client::from_builder(
-        ServiceConfigBuilder::new()
-            .with_user_agent(Some("integration-test/1.0".to_string()))
-            .with_quota_project_id(Some(quota_project_id)),
-    )
-    .await
-    .expect("should build client");
+    let client = setup_client().await;
 
     let sql = "SELECT 1 AS one, 'hello' AS greeting";
-    let (schema, mut receiver) = client
+    let (schema, receiver) = client
         .query(sql)
         .read()
         .await
@@ -129,13 +119,7 @@ async fn test_read_query() {
 
     let col_names: Vec<&str> = schema.iter_names().map(|s| s.as_str()).collect();
     assert_eq!(col_names, vec!["one", "greeting"]);
-
-    let mut total_rows = 0;
-    while let Some(batch) = receiver.recv().await {
-        let batch = batch.expect("should receive valid record batch");
-        total_rows += batch.len();
-    }
-    assert_eq!(total_rows, 1);
+    assert_eq!(consume_receiver(receiver).await, 1);
 
     let empty_sql = "SELECT 1 AS one, 'hello' AS greeting LIMIT 0";
     let (empty_schema, mut empty_receiver) = client
@@ -150,33 +134,19 @@ async fn test_read_query() {
 
     let multipage_sql =
         "SELECT * FROM `bigquery-public-data.sec_quarterly_financials.submission` LIMIT 250000";
-    let (_, mut multipage_receiver) = client
+    let (_, multipage_receiver) = client
         .query(multipage_sql)
         .with_arrow_buffer_compression(CompressionCodec::Zstd)
         .read()
         .await
         .expect("multipage query read should succeed");
 
-    let mut multipage_rows = 0;
-    while let Some(batch) = multipage_receiver.recv().await {
-        let batch = batch.expect("should receive valid record batch");
-        multipage_rows += batch.len();
-    }
-    assert_eq!(multipage_rows, 250_000);
+    assert_eq!(consume_receiver(multipage_receiver).await, 250_000);
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_read_long_running_query() {
-    let quota_project_id = env::var("GOOGLE_CLOUD_PROJECT")
-        .expect("must set GOOGLE_CLOUD_PROJECT to run integration tests");
-
-    let client = Client::from_builder(
-        ServiceConfigBuilder::new()
-            .with_user_agent(Some("integration-test/1.0".to_string()))
-            .with_quota_project_id(Some(quota_project_id)),
-    )
-    .await
-    .expect("should build client");
+    let client = setup_client().await;
 
     let sql = r#"
         WITH
@@ -230,7 +200,7 @@ async fn test_read_long_running_query() {
         LIMIT 10000
     "#;
 
-    let (schema, mut receiver) = client
+    let (schema, receiver) = client
         .query(sql)
         .with_use_query_cache(false)
         .read()
@@ -239,11 +209,5 @@ async fn test_read_long_running_query() {
 
     let col_names: Vec<&str> = schema.iter_names().map(|s| s.as_str()).collect();
     assert_eq!(col_names, vec!["id1", "match_count", "max_digest"]);
-
-    let mut total_rows = 0;
-    while let Some(batch) = receiver.recv().await {
-        let batch = batch.expect("should receive valid record batch");
-        total_rows += batch.len();
-    }
-    assert_eq!(total_rows, 10_000);
+    assert_eq!(consume_receiver(receiver).await, 10_000);
 }

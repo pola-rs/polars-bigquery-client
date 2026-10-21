@@ -279,6 +279,7 @@ pub struct Client {
     pub(crate) quota_project_id: Arc<str>,
     user_agent: Option<Arc<str>>,
     retry_throttler: SharedRetryThrottler,
+    retry_config: bigquery_read_retry::StreamRetryConfig,
     pub(crate) decode_pool: Arc<rayon::ThreadPool>,
 }
 
@@ -294,12 +295,17 @@ impl Client {
         user_agent: Option<String>,
         retry_throttler: SharedRetryThrottler,
     ) -> Self {
+        // Always attach the Client-wide shared retry throttler so all stream readers
+        // share a unified adaptive retry budget instead of isolated per-stream defaults.
+        let retry_config =
+            bigquery_read_retry::StreamRetryConfig::new(None, None, retry_throttler.clone());
         Self {
             bq_client,
             read_client,
             quota_project_id: Arc::from(quota_project_id),
             user_agent: user_agent.map(Arc::from),
             retry_throttler,
+            retry_config,
             decode_pool: bigquery_read_stream::default_decode_pool(),
         }
     }
@@ -342,16 +348,11 @@ impl Client {
     }
 
     pub(crate) fn stream_retry_config(&self) -> bigquery_read_retry::StreamRetryConfig {
-        // Always attach the Client-wide shared retry throttler so all stream readers
-        // share a unified adaptive retry budget instead of isolated per-stream defaults.
-        bigquery_read_retry::StreamRetryConfig::new(None, None, self.retry_throttler.clone())
+        self.retry_config.clone()
     }
 
-    pub(crate) fn channel_size() -> usize {
-        match std::thread::available_parallelism() {
-            Ok(value) => value.get() * 2,
-            Err(_) => 2,
-        }
+    pub(crate) fn channel_size(&self) -> usize {
+        self.decode_pool.current_num_threads().max(1) * 2
     }
 
     pub(crate) fn prepare_read_rows(
@@ -369,12 +370,12 @@ impl Client {
 
     pub(crate) fn spawn_query_stream(
         &self,
-        first_page_bytes: Option<bytes::Bytes>,
+        first_page_bytes: bytes::Bytes,
         page_row_count: i64,
         read_rows: Option<google_cloud_bigquery::builder::read::ReadRows>,
         metadata: Arc<polars_arrow::io::ipc::read::StreamMetadata>,
     ) -> BigQueryRecordBatchReceiver {
-        let (tx, rx) = tokio::sync::mpsc::channel(Self::channel_size());
+        let (tx, rx) = tokio::sync::mpsc::channel(self.channel_size());
         let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
         let cancel_tx = Arc::new(cancel_tx);
         let handle = tokio::task::spawn(bigquery_read_stream::read_query_stream(
@@ -464,7 +465,7 @@ impl Client {
             },
         };
 
-        let channel_size = Self::channel_size();
+        let channel_size = self.channel_size();
         let (tx, rx) = tokio::sync::mpsc::channel(channel_size);
         let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
         let cancel_tx = Arc::new(cancel_tx);
@@ -489,11 +490,7 @@ impl Client {
             handles.push(handle);
         }
 
-        let receiver = BigQueryRecordBatchReceiver {
-            rx,
-            cancel_tx: Some(cancel_tx),
-            handles,
-        };
+        let receiver = BigQueryRecordBatchReceiver::new(rx, Some(cancel_tx), handles);
 
         let schema_ref = match schema_ref {
             Some(schema_ref) => schema_ref,
@@ -807,18 +804,6 @@ pub(crate) mod tests {
         }
     }
 
-    fn empty_arrow_schema_bytes() -> Vec<u8> {
-        use polars_arrow::datatypes::{ArrowDataType, ArrowSchema, Field};
-        use polars_arrow::io::ipc::write::{StreamWriter, WriteOptions};
-
-        let schema =
-            ArrowSchema::from_iter(vec![Field::new("col1".into(), ArrowDataType::Int32, false)]);
-        let mut bytes = Vec::new();
-        let mut writer = StreamWriter::new(&mut bytes, WriteOptions { compression: None });
-        writer.start(&schema, None).unwrap();
-        bytes
-    }
-
     pub(crate) async fn test_bq_client() -> BigQueryJobService {
         let cred = google_cloud_auth::credentials::anonymous::Builder::new().build();
         BigQueryJobService::builder()
@@ -878,7 +863,7 @@ pub(crate) mod tests {
                 }
                 let session = ReadSession::new()
                     .set_arrow_schema(
-                        BqArrowSchema::new().set_serialized_schema(empty_arrow_schema_bytes()),
+                        BqArrowSchema::new().set_serialized_schema(create_test_arrow_payload(0).0),
                     )
                     .set_streams(vec![ReadStream::new().set_name("streams/s1")]);
                 Ok(Response::from(session))
@@ -1028,7 +1013,7 @@ pub(crate) mod tests {
             ) -> google_cloud_bigquery::Result<Response<ReadSession>> {
                 let session = ReadSession::new()
                     .set_arrow_schema(
-                        BqArrowSchema::new().set_serialized_schema(empty_arrow_schema_bytes()),
+                        BqArrowSchema::new().set_serialized_schema(create_test_arrow_payload(0).0),
                     )
                     .set_streams(vec![ReadStream::new().set_name("streams/s0")]);
                 Ok(Response::from(session))
