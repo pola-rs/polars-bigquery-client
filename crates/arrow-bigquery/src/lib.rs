@@ -450,17 +450,35 @@ impl Client {
         self.read_streams(vec![stream.into()], options).await
     }
 
+    pub(crate) async fn read_stream_with_first_page_check(
+        &self,
+        stream: String,
+        options: StreamOptions,
+        first_page_check: Option<bigquery_read_stream::FirstPageCheck>,
+    ) -> Result<Option<(ArrowSchemaRef, BigQueryRecordBatchReceiver)>, BigQueryError> {
+        self.read_streams_inner(vec![stream], options, first_page_check)
+            .await
+    }
+
     async fn read_streams(
         &self,
         streams: Vec<String>,
         options: StreamOptions,
     ) -> Result<(ArrowSchemaRef, BigQueryRecordBatchReceiver), BigQueryError> {
-        let (metadata, schema_ref, mut schema_tx, schema_rx) = match &options.schema {
-            Some(schema) => {
-                let metadata = Arc::new(bigquery_read_stream::parse_arrow_schema(schema)?);
-                let schema_ref = Arc::new(metadata.schema.clone());
-                (Some(metadata), Some(schema_ref), None, None)
-            },
+        Ok(self
+            .read_streams_inner(streams, options, None)
+            .await?
+            .expect("read_streams without first_page_check must not switch to read session"))
+    }
+
+    async fn read_streams_inner(
+        &self,
+        streams: Vec<String>,
+        options: StreamOptions,
+        mut first_page_check: Option<bigquery_read_stream::FirstPageCheck>,
+    ) -> Result<Option<(ArrowSchemaRef, BigQueryRecordBatchReceiver)>, BigQueryError> {
+        let metadata = match &options.schema {
+            Some(schema) => Some(Arc::new(bigquery_read_stream::parse_arrow_schema(schema)?)),
             None => {
                 if streams.is_empty() {
                     return Err(BigQueryError::Protocol(
@@ -468,9 +486,15 @@ impl Client {
                             .into(),
                     ));
                 }
-                let (tx, rx) = tokio::sync::oneshot::channel();
-                (None, None, Some(tx), Some(rx))
+                None
             },
+        };
+
+        let (mut schema_tx, schema_rx) = if metadata.is_none() || first_page_check.is_some() {
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            (Some(tx), Some(rx))
+        } else {
+            (None, None)
         };
 
         let channel_size = self.channel_size();
@@ -492,6 +516,7 @@ impl Client {
                     current_offset: options.offset,
                     metadata: metadata.clone(),
                     schema_tx: schema_tx.take(),
+                    first_page_check: first_page_check.take(),
                     tx: tx.clone(),
                     retry_config: retry_config.clone(),
                     decode_pool: Arc::clone(&self.decode_pool),
@@ -504,19 +529,25 @@ impl Client {
 
         let receiver = BigQueryRecordBatchReceiver::new(rx, Some(cancel_tx), handles);
 
-        let schema_ref = match schema_ref {
-            Some(schema_ref) => schema_ref,
-            None => {
-                let schema_rx = schema_rx.expect("schema_rx must be Some when schema_ref is None");
-                schema_rx.await.map_err(|_| {
+        match schema_rx {
+            Some(schema_rx) => {
+                let start = schema_rx.await.map_err(|_| {
                     BigQueryError::Other(
                         "ReadRows stream task terminated before sending schema".into(),
                     )
-                })??
+                })??;
+                match start {
+                    bigquery_read_stream::StreamStart::Ready(schema_ref) => {
+                        Ok(Some((schema_ref, receiver)))
+                    },
+                    bigquery_read_stream::StreamStart::SwitchToReadSession => Ok(None),
+                }
             },
-        };
-
-        Ok((schema_ref, receiver))
+            None => {
+                let metadata = metadata.expect("metadata must be Some when schema_rx is None");
+                Ok(Some((Arc::new(metadata.schema.clone()), receiver)))
+            },
+        }
     }
 }
 

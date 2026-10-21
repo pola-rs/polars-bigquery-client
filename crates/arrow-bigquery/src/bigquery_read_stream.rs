@@ -44,7 +44,36 @@ use polars_arrow::record_batch::RecordBatch;
 use super::bigquery_read_retry::{self, StreamRetryConfig};
 use crate::BigQueryError;
 
-pub(crate) type SchemaSender = tokio::sync::oneshot::Sender<Result<ArrowSchemaRef, BigQueryError>>;
+pub(crate) enum StreamStart {
+    Ready(ArrowSchemaRef),
+    SwitchToReadSession,
+}
+
+pub(crate) type SchemaSender = tokio::sync::oneshot::Sender<Result<StreamStart, BigQueryError>>;
+
+pub(crate) struct FirstPageCheck {
+    pub(crate) threshold_bytes: u64,
+    pub(crate) fallback_total_rows: Option<u64>,
+}
+
+/// Estimates the remaining serialized Arrow bytes in the single job stream based on
+/// the first page's byte size, the first page's row count, and the total row count.
+pub(crate) fn estimate_remaining_bytes(
+    first_page_bytes: Option<&bytes::Bytes>,
+    page_row_count: u64,
+    total_rows: Option<u64>,
+) -> u64 {
+    let (Some(first_page), Some(total_rows)) = (first_page_bytes, total_rows) else {
+        return 0;
+    };
+    if page_row_count == 0 || total_rows <= page_row_count {
+        return 0;
+    }
+    let remaining_rows = total_rows - page_row_count;
+    let estimated = (first_page.len() as u128).saturating_mul(remaining_rows as u128)
+        / (page_row_count as u128);
+    u64::try_from(estimated).unwrap_or(u64::MAX)
+}
 
 static DEFAULT_DECODE_POOL: LazyLock<Arc<rayon::ThreadPool>> = LazyLock::new(|| {
     let num_threads = std::thread::available_parallelism()
@@ -330,6 +359,7 @@ pub(crate) struct ReadStreamOptions {
     pub(crate) current_offset: i64,
     pub(crate) metadata: Option<Arc<StreamMetadata>>,
     pub(crate) schema_tx: Option<SchemaSender>,
+    pub(crate) first_page_check: Option<FirstPageCheck>,
     pub(crate) tx: tokio::sync::mpsc::Sender<Result<RecordBatch, BigQueryError>>,
     pub(crate) retry_config: StreamRetryConfig,
     pub(crate) decode_pool: Arc<rayon::ThreadPool>,
@@ -406,14 +436,18 @@ async fn consume_next_message(
                             return ReadStreamState::Terminated;
                         },
                     };
-                    if let Some(sender) = options.schema_tx.take() {
-                        let _ = sender.send(Ok(Arc::new(parsed.schema.clone())));
+                    if options.first_page_check.is_none() {
+                        if let Some(sender) = options.schema_tx.take() {
+                            let _ = sender
+                                .send(Ok(StreamStart::Ready(Arc::new(parsed.schema.clone()))));
+                        }
                     }
                     options.metadata = Some(Arc::clone(&parsed));
                     parsed
                 },
             };
 
+            let total_estimated_row_count = value.total_estimated_row_count;
             let (serialized_record_batch, row_count) = match extract_response_arrow_bytes(value) {
                 Ok(Some(pair)) => pair,
                 Ok(None) => return ReadStreamState::Running,
@@ -423,6 +457,45 @@ async fn consume_next_message(
                     return ReadStreamState::Terminated;
                 },
             };
+
+            if let Some(check) = options.first_page_check.take() {
+                let page_row_count = match u64::try_from(row_count) {
+                    Ok(n) => n,
+                    Err(_) => {
+                        send_fatal_error(
+                            BigQueryError::Protocol(format!(
+                                "Negative row_count in ReadRowsResponse: {row_count}"
+                            )),
+                            &mut options.schema_tx,
+                            &options.tx,
+                            &options.cancel_tx,
+                        )
+                        .await;
+                        return ReadStreamState::Terminated;
+                    },
+                };
+                let total_rows = total_estimated_row_count
+                    .and_then(|n| u64::try_from(n).ok())
+                    .filter(|&n| n > 0)
+                    .or_else(|| check.fallback_total_rows.filter(|&n| n > 0));
+
+                if estimate_remaining_bytes(
+                    Some(&serialized_record_batch),
+                    page_row_count,
+                    total_rows,
+                ) >= check.threshold_bytes
+                {
+                    if let Some(sender) = options.schema_tx.take() {
+                        let _ = sender.send(Ok(StreamStart::SwitchToReadSession));
+                    }
+                    return ReadStreamState::Terminated;
+                }
+                if let Some(sender) = options.schema_tx.take() {
+                    let _ = sender.send(Ok(StreamStart::Ready(Arc::new(
+                        metadata_arc.schema.clone(),
+                    ))));
+                }
+            }
 
             decode_and_send_batches(DecodeAndSendOptions {
                 decode_pool: &options.decode_pool,
@@ -437,7 +510,11 @@ async fn consume_next_message(
             .await
         },
         None => {
-            if options.schema_tx.is_some() {
+            if let Some(ref metadata) = options.metadata {
+                if let Some(sender) = options.schema_tx.take() {
+                    let _ = sender.send(Ok(StreamStart::Ready(Arc::new(metadata.schema.clone()))));
+                }
+            } else if options.schema_tx.is_some() {
                 send_fatal_error(
                     BigQueryError::Protocol(
                         "ReadRows stream closed without sending an Arrow schema".into(),
@@ -632,6 +709,7 @@ pub(crate) async fn read_query_stream(options: ReadQueryStreamOptions) {
                     current_offset,
                     metadata: Some(metadata),
                     schema_tx: None,
+                    first_page_check: None,
                     tx,
                     retry_config,
                     decode_pool,
@@ -926,6 +1004,7 @@ pub(crate) mod tests {
             current_offset: 10,
             metadata: Some(metadata),
             schema_tx: None,
+            first_page_check: None,
             tx,
             retry_config: test_retry_config(3),
             decode_pool: default_decode_pool(),
@@ -974,6 +1053,7 @@ pub(crate) mod tests {
             current_offset: 0,
             metadata: Some(metadata),
             schema_tx: None,
+            first_page_check: None,
             tx,
             retry_config: test_retry_config(3),
             decode_pool: default_decode_pool(),
@@ -1015,6 +1095,7 @@ pub(crate) mod tests {
             current_offset: 0,
             metadata: None,
             schema_tx: None,
+            first_page_check: None,
             tx,
             retry_config: test_retry_config(3),
             decode_pool: default_decode_pool(),
@@ -1068,6 +1149,7 @@ pub(crate) mod tests {
             current_offset: 0,
             metadata: None,
             schema_tx: None,
+            first_page_check: None,
             tx,
             retry_config: test_retry_config(3),
             decode_pool: default_decode_pool(),
@@ -1124,6 +1206,7 @@ pub(crate) mod tests {
             current_offset: 0,
             metadata: None,
             schema_tx: None,
+            first_page_check: None,
             tx,
             retry_config: test_retry_config(3),
             decode_pool: default_decode_pool(),

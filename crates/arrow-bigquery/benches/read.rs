@@ -119,9 +119,10 @@ fn read_table(c: &mut Criterion) {
     group.finish();
 }
 
-async fn execute_query(client: &Arc<Client>, sql: &str) {
+async fn execute_query(client: &Arc<Client>, sql: &str, maintain_order: bool) {
     let (_, receiver) = client
         .query(sql)
+        .with_maintain_order(maintain_order)
         .read()
         .await
         .expect("query read should work with default credentials");
@@ -158,7 +159,7 @@ fn read_query(c: &mut Criterion) {
     group.bench_function("select_1", |b| {
         let client = &client;
         b.to_async(&rt)
-            .iter(|| async move { execute_query(client, "SELECT 1").await });
+            .iter(|| async move { execute_query(client, "SELECT 1", true).await });
     });
 
     let sic_codes_sql = format_sec_quarterly_financials_query("sic_codes");
@@ -167,7 +168,7 @@ fn read_query(c: &mut Criterion) {
         let client = &client;
         let sql = sic_codes_sql.as_str();
         b.to_async(&rt)
-            .iter(|| async move { execute_query(client, sql).await });
+            .iter(|| async move { execute_query(client, sql, true).await });
     });
 
     let submission_sql = format_sec_quarterly_financials_query("submission");
@@ -176,7 +177,7 @@ fn read_query(c: &mut Criterion) {
         let client = &client;
         let sql = submission_sql.as_str();
         b.to_async(&rt)
-            .iter(|| async move { execute_query(client, sql).await });
+            .iter(|| async move { execute_query(client, sql, true).await });
     });
 
     for (proportion, target_secs) in PROPORTIONS.into_iter().zip([150.0, 500.0, 800.0]) {
@@ -188,7 +189,7 @@ fn read_query(c: &mut Criterion) {
             |b, sql| {
                 let client = &client;
                 b.to_async(&rt)
-                    .iter(|| async move { execute_query(client, sql).await });
+                    .iter(|| async move { execute_query(client, sql, false).await });
             },
         );
     }
