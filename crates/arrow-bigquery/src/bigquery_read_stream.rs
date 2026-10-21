@@ -680,6 +680,7 @@ pub(crate) mod tests {
     pub(crate) struct RecordedReadRows {
         pub(crate) stream_name: Option<String>,
         pub(crate) offset: Option<i64>,
+        pub(crate) arrow_buffer_compression: Option<crate::CompressionCodec>,
         pub(crate) quota_project: Option<String>,
         pub(crate) user_agent: Option<String>,
     }
@@ -711,6 +712,9 @@ pub(crate) mod tests {
         ) -> google_cloud_bigquery::Result<ResponseStream<ReadRowsResponse>> {
             {
                 let mut rec = self.recorded.lock().unwrap();
+                rec.arrow_buffer_compression = req
+                    .arrow_serialization_options()
+                    .map(|opts| opts.buffer_compression.clone());
                 rec.stream_name = Some(req.read_stream);
                 rec.offset = Some(req.offset);
                 rec.quota_project = options.quota_project().clone();
