@@ -30,17 +30,21 @@
 //! ```
 
 use std::io::Cursor;
-use std::iter::Iterator;
 use std::sync::{Arc, LazyLock};
 
 use google_cloud_bigquery::builder::read::ReadRows;
 use google_cloud_bigquery::model::{read_rows_response, ReadRowsResponse};
 use google_cloud_gax::streaming::ResponseStream;
-use polars_arrow::io::ipc::read::{read_stream_metadata, StreamReader, StreamState};
+use polars_arrow::datatypes::ArrowSchemaRef;
+use polars_arrow::io::ipc::read::{
+    read_stream_metadata, StreamMetadata, StreamReader, StreamState,
+};
 use polars_arrow::record_batch::RecordBatch;
 
 use super::bigquery_read_retry::{self, StreamRetryConfig};
 use crate::BigQueryError;
+
+pub(crate) type SchemaSender = tokio::sync::oneshot::Sender<Result<ArrowSchemaRef, BigQueryError>>;
 
 static DEFAULT_DECODE_POOL: LazyLock<Arc<rayon::ThreadPool>> = LazyLock::new(|| {
     let num_threads = std::thread::available_parallelism()
@@ -60,14 +64,62 @@ pub(crate) fn default_decode_pool() -> Arc<rayon::ThreadPool> {
     Arc::clone(&DEFAULT_DECODE_POOL)
 }
 
-/// Convert a ReadRowsResponse into an Arrow record batch + stream offset.
-///
-/// Returns an error if we got an invalid message. Rather than try to continue
-/// in an invalid state, this should terminate the reader.
-fn read_rows_response_to_record_batch(
+/// Parses IPC-serialized Arrow schema bytes into [`StreamMetadata`].
+pub(crate) fn parse_arrow_schema(schema_bytes: &[u8]) -> Result<StreamMetadata, BigQueryError> {
+    let mut cursor = Cursor::new(schema_bytes);
+    Ok(read_stream_metadata(&mut cursor)?)
+}
+
+/// Decodes an Arrow IPC record batch payload and verifies its total row count
+/// matches `expected_row_count`.
+pub(crate) fn decode_arrow_record_batches(
+    serialized_record_batch: bytes::Bytes,
+    expected_row_count: i64,
+    metadata: &StreamMetadata,
+) -> Result<Vec<RecordBatch>, BigQueryError> {
+    if serialized_record_batch.is_empty() {
+        if expected_row_count != 0 {
+            return Err(BigQueryError::Protocol(format!(
+                "Row count mismatch: gRPC protobuf reported {} rows, but Arrow IPC decoded 0 rows",
+                expected_row_count
+            )));
+        }
+        return Ok(Vec::new());
+    }
+
+    let cursor = Cursor::new(serialized_record_batch);
+    let mut reader = StreamReader::new(cursor, metadata.clone(), None);
+    let mut batches = Vec::new();
+    let mut actual_rows: i64 = 0;
+
+    for result in &mut reader {
+        match result {
+            Ok(StreamState::Some(batch)) => {
+                actual_rows = actual_rows.checked_add(batch.len() as i64).ok_or_else(|| {
+                    BigQueryError::Protocol("Decoded batch row count overflow".into())
+                })?;
+                batches.push(batch);
+            },
+            Ok(StreamState::Waiting) => break,
+            Err(e) => return Err(BigQueryError::Arrow(e)),
+        }
+    }
+
+    if actual_rows != expected_row_count {
+        return Err(BigQueryError::Protocol(format!(
+            "Row count mismatch: gRPC protobuf reported {} rows, but Arrow IPC decoded {} rows",
+            expected_row_count, actual_rows
+        )));
+    }
+
+    Ok(batches)
+}
+
+/// Extracts the serialized Arrow record batch bytes and expected row count from
+/// a [`ReadRowsResponse`].
+fn extract_response_arrow_bytes(
     response: ReadRowsResponse,
-    schema: &[u8],
-) -> Result<Option<(RecordBatch, i64)>, BigQueryError> {
+) -> Result<Option<(bytes::Bytes, i64)>, BigQueryError> {
     let row_count = response.row_count;
 
     let serialized_record_batch = match response.rows {
@@ -98,51 +150,36 @@ fn read_rows_response_to_record_batch(
         return Ok(None);
     }
 
-    let mut cursor = Cursor::new(schema);
-    let metadata = read_stream_metadata(&mut cursor)?;
-    let cursor = Cursor::new(serialized_record_batch);
-    let mut reader = StreamReader::new(cursor, metadata, None);
+    Ok(Some((serialized_record_batch, row_count)))
+}
 
-    match reader.next() {
-        Some(Ok(StreamState::Some(batch))) => {
-            let actual_rows = batch.len() as i64;
-            if actual_rows != row_count {
-                return Err(BigQueryError::Protocol(format!(
-                    "Row count mismatch: gRPC protobuf reported {} rows, but Arrow IPC decoded {} rows",
-                    row_count, actual_rows
-                )));
-            }
-            Ok(Some((batch, actual_rows)))
-        },
-        Some(Ok(StreamState::Waiting)) | None => {
-            if row_count != 0 {
-                return Err(BigQueryError::Protocol(format!(
-                    "Row count mismatch: gRPC protobuf reported {} rows, but Arrow IPC decoded 0 rows",
-                    row_count
-                )));
-            }
-            Ok(None)
-        },
-        Some(Err(e)) => Err(BigQueryError::Arrow(e)),
+#[cfg(test)]
+fn read_rows_response_to_record_batch(
+    response: ReadRowsResponse,
+    schema: &[u8],
+) -> Result<Option<(RecordBatch, i64)>, BigQueryError> {
+    let Some((serialized_record_batch, row_count)) = extract_response_arrow_bytes(response)? else {
+        return Ok(None);
+    };
+    let metadata = parse_arrow_schema(schema)?;
+    let mut batches = decode_arrow_record_batches(serialized_record_batch, row_count, &metadata)?;
+    if batches.is_empty() {
+        Ok(None)
+    } else {
+        let batch = batches.remove(0);
+        let actual_rows = batch.len() as i64;
+        Ok(Some((batch, actual_rows)))
     }
 }
 
-async fn decode_response_on_pool(
+pub(crate) async fn decode_batches_on_pool(
     decode_pool: &rayon::ThreadPool,
-    response: ReadRowsResponse,
-    schema: bytes::Bytes,
-) -> Result<Option<(RecordBatch, i64)>, BigQueryError> {
-    // Fast-path empty heartbeat responses without dispatching to the thread pool.
-    if response.row_count == 0 {
-        match &response.rows {
-            None => return Ok(None),
-            Some(read_rows_response::Rows::ArrowRecordBatch(b))
-                if b.serialized_record_batch.is_empty() =>
-            {
-                return Ok(None);
-            },
-            _ => {},
-        }
+    serialized_record_batch: bytes::Bytes,
+    expected_row_count: i64,
+    metadata: Arc<StreamMetadata>,
+) -> Result<Vec<RecordBatch>, BigQueryError> {
+    if expected_row_count == 0 && serialized_record_batch.is_empty() {
+        return Ok(Vec::new());
     }
 
     let (done_tx, done_rx) = tokio::sync::oneshot::channel();
@@ -152,13 +189,25 @@ async fn decode_response_on_pool(
         if done_tx.is_closed() {
             return;
         }
-        let res = read_rows_response_to_record_batch(response, &schema);
+        let res =
+            decode_arrow_record_batches(serialized_record_batch, expected_row_count, &metadata);
         let _ = done_tx.send(res);
     });
 
     done_rx.await.map_err(|_| {
         BigQueryError::Other("Arrow IPC decode worker terminated unexpectedly".into())
     })?
+}
+
+async fn decode_response_on_pool(
+    decode_pool: &rayon::ThreadPool,
+    response: ReadRowsResponse,
+    metadata: Arc<StreamMetadata>,
+) -> Result<Vec<RecordBatch>, BigQueryError> {
+    let Some((serialized_record_batch, row_count)) = extract_response_arrow_bytes(response)? else {
+        return Ok(Vec::new());
+    };
+    decode_batches_on_pool(decode_pool, serialized_record_batch, row_count, metadata).await
 }
 
 /// Represents the state of the stream reading state machine.
@@ -214,12 +263,28 @@ async fn connect_read_rows_stream(
     }
 }
 
+async fn send_fatal_error(
+    err: BigQueryError,
+    schema_tx: &mut Option<SchemaSender>,
+    tx: &tokio::sync::mpsc::Sender<Result<RecordBatch, BigQueryError>>,
+    cancel_tx: &tokio::sync::watch::Sender<bool>,
+) {
+    let _ = cancel_tx.send_replace(true);
+    if let Some(schema_tx) = schema_tx.take() {
+        let _ = schema_tx.send(Err(err));
+    } else {
+        let _ = tx.send(Err(err)).await;
+    }
+}
+
 /// Layer 2: Consumes a single message from an established read stream and returns the next [`ReadStreamState`].
 ///
 /// Processes the next message from an active read stream while in [`ReadStreamState::Running`].
+#[allow(clippy::too_many_arguments)]
 async fn consume_next_message(
     stream: &mut ResponseStream<ReadRowsResponse>,
-    schema: &bytes::Bytes,
+    metadata: &mut Option<Arc<StreamMetadata>>,
+    schema_tx: &mut Option<SchemaSender>,
     current_offset: &mut i64,
     tx: &tokio::sync::mpsc::Sender<Result<RecordBatch, BigQueryError>>,
     decode_pool: &rayon::ThreadPool,
@@ -237,55 +302,110 @@ async fn consume_next_message(
     };
 
     match next_item {
-        Some(Ok(value)) => {
+        Some(Ok(mut value)) => {
+            let metadata_arc = match metadata {
+                Some(ref m) => Arc::clone(m),
+                None => {
+                    let serialized_schema = match value.schema.take() {
+                        Some(read_rows_response::Schema::ArrowSchema(arrow_schema)) => {
+                            arrow_schema.serialized_schema
+                        },
+                        None if value.rows.is_none() && value.row_count == 0 => {
+                            // Empty heartbeat response sent by BigQuery while waiting
+                            // for a running query job to produce its schema and rows.
+                            return ReadStreamState::Running;
+                        },
+                        _ => {
+                            send_fatal_error(
+                                BigQueryError::Protocol(
+                                    "Unexpectedly got schema type other than arrow".into(),
+                                ),
+                                schema_tx,
+                                tx,
+                                cancel_tx,
+                            )
+                            .await;
+                            return ReadStreamState::Terminated;
+                        },
+                    };
+                    let parsed = match parse_arrow_schema(&serialized_schema) {
+                        Ok(parsed) => Arc::new(parsed),
+                        Err(err) => {
+                            send_fatal_error(err, schema_tx, tx, cancel_tx).await;
+                            return ReadStreamState::Terminated;
+                        },
+                    };
+                    if let Some(sender) = schema_tx.take() {
+                        let _ = sender.send(Ok(Arc::new(parsed.schema.clone())));
+                    }
+                    *metadata = Some(Arc::clone(&parsed));
+                    parsed
+                },
+            };
+
             let decoded = tokio::select! {
                 biased;
                 _ = cancel_rx.changed() => return ReadStreamState::Terminated,
-                res = decode_response_on_pool(decode_pool, value, schema.clone()) => res,
+                res = decode_response_on_pool(decode_pool, value, metadata_arc) => res,
             };
             match decoded {
-                Ok(Some((batch, row_count))) => {
-                    match current_offset.checked_add(row_count) {
-                        Some(next_offset) => *current_offset = next_offset,
-                        None => {
-                            let _ = cancel_tx.send_replace(true);
-                            let _ = tx
-                                .send(Err(BigQueryError::Protocol(format!(
-                                    "stream offset overflow: current_offset={current_offset}, row_count={row_count}"
-                                ))))
+                Ok(batches) => {
+                    for batch in batches {
+                        let row_count = batch.len() as i64;
+                        match current_offset.checked_add(row_count) {
+                            Some(next_offset) => *current_offset = next_offset,
+                            None => {
+                                send_fatal_error(
+                                    BigQueryError::Protocol(format!(
+                                        "stream offset overflow: current_offset={current_offset}, row_count={row_count}"
+                                    )),
+                                    schema_tx,
+                                    tx,
+                                    cancel_tx,
+                                )
                                 .await;
-                            return ReadStreamState::Terminated;
-                        },
-                    }
-                    tokio::select! {
-                        biased;
-                        _ = cancel_rx.changed() => ReadStreamState::Terminated,
-                        send_res = tx.send(Ok(batch)) => {
-                            if send_res.is_err() {
-                                // `tx.send` returns `Err` strictly when all `Receiver` handles (`rx`) have been
-                                // dropped or closed. Terminating this stream cleanly prevents orphan background tasks.
-                                ReadStreamState::Terminated
-                            } else {
-                                ReadStreamState::Running
+                                return ReadStreamState::Terminated;
+                            },
+                        }
+                        tokio::select! {
+                            biased;
+                            _ = cancel_rx.changed() => return ReadStreamState::Terminated,
+                            send_res = tx.send(Ok(batch)) => {
+                                if send_res.is_err() {
+                                    // `tx.send` returns `Err` strictly when all `Receiver` handles (`rx`) have been
+                                    // dropped or closed. Terminating this stream cleanly prevents orphan background tasks.
+                                    return ReadStreamState::Terminated;
+                                }
                             }
                         }
                     }
+                    ReadStreamState::Running
                 },
-                Ok(None) => ReadStreamState::Running,
                 Err(err) => {
-                    let _ = cancel_tx.send_replace(true);
-                    let _ = tx.send(Err(err)).await;
+                    send_fatal_error(err, schema_tx, tx, cancel_tx).await;
                     ReadStreamState::Terminated
                 },
             }
         },
-        None => ReadStreamState::Terminated,
+        None => {
+            if schema_tx.is_some() {
+                send_fatal_error(
+                    BigQueryError::Protocol(
+                        "ReadRows stream closed without sending an Arrow schema".into(),
+                    ),
+                    schema_tx,
+                    tx,
+                    cancel_tx,
+                )
+                .await;
+            }
+            ReadStreamState::Terminated
+        },
         Some(Err(err)) => {
             if bigquery_read_retry::stream_reconnect_predicate(&err) {
                 ReadStreamState::BackingOff(err)
             } else {
-                let _ = cancel_tx.send_replace(true);
-                let _ = tx.send(Err(BigQueryError::Grpc(err))).await;
+                send_fatal_error(BigQueryError::Grpc(err), schema_tx, tx, cancel_tx).await;
                 ReadStreamState::Terminated
             }
         },
@@ -312,7 +432,8 @@ async fn consume_next_message(
 pub(crate) async fn read_stream_inner(
     read_rows: ReadRows,
     mut current_offset: i64,
-    schema: bytes::Bytes,
+    mut metadata: Option<Arc<StreamMetadata>>,
+    mut schema_tx: Option<SchemaSender>,
     tx: tokio::sync::mpsc::Sender<Result<RecordBatch, BigQueryError>>,
     retry_config: StreamRetryConfig,
     decode_pool: Arc<rayon::ThreadPool>,
@@ -343,8 +464,8 @@ pub(crate) async fn read_stream_inner(
                         ReadStreamState::Running
                     },
                     ConnectOutcome::Failed(err) => {
-                        let _ = cancel_tx.send_replace(true);
-                        let _ = tx.send(Err(BigQueryError::Grpc(err))).await;
+                        send_fatal_error(BigQueryError::Grpc(err), &mut schema_tx, &tx, &cancel_tx)
+                            .await;
                         ReadStreamState::Terminated
                     },
                     ConnectOutcome::Cancelled => ReadStreamState::Terminated,
@@ -355,7 +476,8 @@ pub(crate) async fn read_stream_inner(
                     let prev_offset = current_offset;
                     let next_state = consume_next_message(
                         inner_stream,
-                        &schema,
+                        &mut metadata,
+                        &mut schema_tx,
                         &mut current_offset,
                         &tx,
                         &decode_pool,
@@ -371,12 +493,15 @@ pub(crate) async fn read_stream_inner(
                     next_state
                 },
                 None => {
-                    let _ = cancel_tx.send_replace(true);
-                    let _ = tx
-                        .send(Err(BigQueryError::Other(
+                    send_fatal_error(
+                        BigQueryError::Other(
                             "Tried to read from BigQuery stream but not connected".into(),
-                        )))
-                        .await;
+                        ),
+                        &mut schema_tx,
+                        &tx,
+                        &cancel_tx,
+                    )
+                    .await;
                     ReadStreamState::Terminated
                 },
             },
@@ -385,8 +510,8 @@ pub(crate) async fn read_stream_inner(
                     Ok(Some(())) => ReadStreamState::Connecting,
                     Ok(None) => ReadStreamState::Terminated,
                     Err(err) => {
-                        let _ = cancel_tx.send_replace(true);
-                        let _ = tx.send(Err(BigQueryError::Grpc(err))).await;
+                        send_fatal_error(BigQueryError::Grpc(err), &mut schema_tx, &tx, &cancel_tx)
+                            .await;
                         ReadStreamState::Terminated
                     },
                 }
@@ -400,7 +525,8 @@ pub(crate) async fn read_stream_inner(
 pub(crate) async fn read_stream(
     read_rows: ReadRows,
     offset: i64,
-    schema: bytes::Bytes,
+    metadata: Option<Arc<StreamMetadata>>,
+    schema_tx: Option<SchemaSender>,
     tx: tokio::sync::mpsc::Sender<Result<RecordBatch, BigQueryError>>,
     retry_config: StreamRetryConfig,
     decode_pool: Arc<rayon::ThreadPool>,
@@ -410,7 +536,8 @@ pub(crate) async fn read_stream(
     read_stream_inner(
         read_rows,
         offset,
-        schema,
+        metadata,
+        schema_tx,
         tx,
         retry_config,
         decode_pool,
@@ -600,6 +727,7 @@ mod tests {
     async fn test_stream_reconnection_offset() {
         let (schema_bytes, resp1) = create_test_arrow_payload(3);
         let (_, resp2) = create_test_arrow_payload(2);
+        let metadata = Arc::new(parse_arrow_schema(&schema_bytes).unwrap());
 
         let stream1 = Ok(vec![
             Ok(resp1),
@@ -625,7 +753,8 @@ mod tests {
         read_stream(
             read_rows,
             10,
-            bytes::Bytes::from(schema_bytes),
+            Some(metadata),
+            None,
             tx,
             test_retry_config(3),
             default_decode_pool(),
@@ -649,6 +778,7 @@ mod tests {
     #[tokio::test]
     async fn test_connect_read_rows_stream_retries_transient_error() {
         let (schema_bytes, resp1) = create_test_arrow_payload(4);
+        let metadata = Arc::new(parse_arrow_schema(&schema_bytes).unwrap());
 
         let requests = Arc::new(Mutex::new(vec![]));
         let mock_client = MockClient {
@@ -671,7 +801,8 @@ mod tests {
         read_stream(
             read_rows,
             0,
-            bytes::Bytes::from(schema_bytes),
+            Some(metadata),
+            None,
             tx,
             test_retry_config(3),
             default_decode_pool(),
@@ -711,7 +842,8 @@ mod tests {
         read_stream(
             read_rows,
             0,
-            bytes::Bytes::new(),
+            None,
+            None,
             tx,
             test_retry_config(3),
             default_decode_pool(),
@@ -763,7 +895,8 @@ mod tests {
         read_stream(
             read_rows,
             0,
-            bytes::Bytes::new(),
+            None,
+            None,
             tx,
             test_retry_config(3),
             default_decode_pool(),
@@ -818,7 +951,8 @@ mod tests {
         let task = tokio::spawn(read_stream(
             read_rows,
             0,
-            bytes::Bytes::new(),
+            None,
+            None,
             tx,
             test_retry_config(3),
             default_decode_pool(),

@@ -1,4 +1,3 @@
-use std::io::Cursor;
 use std::sync::Arc;
 
 use google_cloud_bigquery_v2::model::query_request::QueryResultsFormat;
@@ -9,14 +8,10 @@ use google_cloud_bigquery_v2::model::{
 use google_cloud_gax::options::RequestOptionsBuilder;
 use polars_arrow::array::{Array, BooleanArray, Int64Array, Utf8Array};
 use polars_arrow::datatypes::{ArrowDataType, ArrowSchema, ArrowSchemaRef, Field, TimeUnit};
-use polars_arrow::io::ipc::read::{read_stream_metadata, StreamReader, StreamState};
 use polars_arrow::record_batch::RecordBatch;
 
 use crate::error::BigQueryError;
 use crate::{BigQueryRecordBatchReceiver, StreamOptions};
-
-const DEFAULT_COMPRESSION: arrow_serialization_options::CompressionCodec =
-    arrow_serialization_options::CompressionCodec::Lz4Frame;
 
 /// Converts a compression codec option into the `google_cloud_bigquery_v2` representation.
 pub trait CompressionCodecArg {
@@ -26,12 +21,6 @@ pub trait CompressionCodecArg {
 impl CompressionCodecArg for arrow_serialization_options::CompressionCodec {
     fn into_compression_codec(self) -> Option<arrow_serialization_options::CompressionCodec> {
         Some(self)
-    }
-}
-
-impl CompressionCodecArg for Option<arrow_serialization_options::CompressionCodec> {
-    fn into_compression_codec(self) -> Option<arrow_serialization_options::CompressionCodec> {
-        self
     }
 }
 
@@ -64,11 +53,9 @@ impl CompressionCodecArg
     }
 }
 
-impl CompressionCodecArg
-    for Option<google_cloud_bigquery::model::arrow_serialization_options::CompressionCodec>
-{
+impl<T: CompressionCodecArg> CompressionCodecArg for Option<T> {
     fn into_compression_codec(self) -> Option<arrow_serialization_options::CompressionCodec> {
-        self.map(bq_to_gapic_compression_codec)
+        self.and_then(CompressionCodecArg::into_compression_codec)
     }
 }
 
@@ -77,6 +64,7 @@ pub struct Query {
     client: crate::Client,
     sql: String,
     arrow_buffer_compression: Option<arrow_serialization_options::CompressionCodec>,
+    use_query_cache: Option<bool>,
 }
 
 impl Query {
@@ -85,6 +73,7 @@ impl Query {
             client,
             sql: sql.into(),
             arrow_buffer_compression: None,
+            use_query_cache: None,
         }
     }
 
@@ -93,15 +82,21 @@ impl Query {
         self
     }
 
+    pub fn with_use_query_cache(mut self, use_query_cache: impl Into<Option<bool>>) -> Self {
+        self.use_query_cache = use_query_cache.into();
+        self
+    }
+
     fn build_read_request(&self) -> QueryRequest {
         let arrow_options = ArrowSerializationOptions::new().set_buffer_compression(
             self.arrow_buffer_compression
                 .clone()
-                .unwrap_or(DEFAULT_COMPRESSION),
+                .unwrap_or_else(|| bq_to_gapic_compression_codec(crate::DEFAULT_COMPRESSION)),
         );
         QueryRequest::new()
             .set_query_results_format(QueryResultsFormat::Arrow)
             .set_arrow_serialization_options(arrow_options)
+            .set_or_clear_use_query_cache(self.use_query_cache)
     }
 
     fn prepare_query(
@@ -113,7 +108,12 @@ impl Query {
                 .bq_client
                 .query()
                 .set_project_id(&self.client.quota_project_id)
-                .set_query_request(query_request.set_query(&self.sql).set_use_legacy_sql(false)),
+                .set_query_request(
+                    query_request
+                        .set_query(&self.sql)
+                        .set_use_legacy_sql(false)
+                        .set_or_clear_use_query_cache(self.use_query_cache),
+                ),
         )
     }
 
@@ -133,6 +133,20 @@ impl Query {
     ) -> Result<(ArrowSchemaRef, BigQueryRecordBatchReceiver), BigQueryError> {
         let response = self.prepare_query(self.build_read_request()).send().await?;
 
+        if response.job_complete == Some(false) {
+            let stream_name = default_job_stream_path(&response)?;
+            return self
+                .client
+                .read_stream(
+                    stream_name,
+                    StreamOptions {
+                        offset: 0,
+                        schema: None,
+                    },
+                )
+                .await;
+        }
+
         let schema = match response.results_schema {
             Some(query_response::ResultsSchema::ArrowSchema(ref value)) => {
                 value.serialized_schema.clone()
@@ -144,23 +158,8 @@ impl Query {
             },
         };
 
-        let mut schema_cursor = Cursor::new(&schema);
-        let metadata = read_stream_metadata(&mut schema_cursor)?;
+        let metadata = Arc::new(crate::bigquery_read_stream::parse_arrow_schema(&schema)?);
         let schema_ref = Arc::new(metadata.schema.clone());
-
-        let first_page_bytes = match &response.results {
-            Some(query_response::Results::ArrowRecordBatch(value))
-                if !value.serialized_record_batch.is_empty() =>
-            {
-                Some(value.serialized_record_batch.clone())
-            },
-            Some(query_response::Results::ArrowRecordBatch(_)) | None => None,
-            Some(_) => {
-                return Err(BigQueryError::Protocol(
-                    "Unexpectedly got some format other than arrow bytes".into(),
-                ));
-            },
-        };
 
         let page_row_count = u64::try_from(response.page_row_count).map_err(|_| {
             BigQueryError::Protocol(format!(
@@ -168,70 +167,114 @@ impl Query {
                 response.page_row_count
             ))
         })?;
+
+        let first_page_bytes = match &response.results {
+            Some(query_response::Results::ArrowRecordBatch(value))
+                if !value.serialized_record_batch.is_empty() =>
+            {
+                Some(value.serialized_record_batch.clone())
+            },
+            Some(query_response::Results::ArrowRecordBatch(_)) | None => {
+                if page_row_count != 0 {
+                    return Err(BigQueryError::Protocol(format!(
+                        "Row count mismatch: QueryResponse reported {} rows, but results field didn't include any rows",
+                        page_row_count
+                    )));
+                }
+                None
+            },
+            Some(_) => {
+                return Err(BigQueryError::Protocol(
+                    "Unexpectedly got some format other than arrow bytes".into(),
+                ));
+            },
+        };
+
         let has_remaining_rows = response
             .total_rows
             .is_some_and(|total_rows| total_rows > page_row_count)
             || !response.page_token.is_empty();
 
-        let mut stream_receiver = if has_remaining_rows {
+        let read_rows = if has_remaining_rows {
             let stream_name = default_job_stream_path(&response)?;
-            let (_, receiver) = self
-                .client
-                .read_stream(
-                    stream_name,
-                    StreamOptions {
-                        offset: response.page_row_count,
-                        schema,
-                    },
-                )
-                .await?;
-            Some(receiver)
+            Some(
+                self.client
+                    .prepare_read_rows(stream_name, response.page_row_count),
+            )
         } else {
             None
         };
 
-        let Some(serialized_record_batch) = first_page_bytes else {
-            if let Some(stream_receiver) = stream_receiver {
-                return Ok((schema_ref, stream_receiver));
-            }
+        if first_page_bytes.is_none() && read_rows.is_none() {
             let (_tx, rx) = tokio::sync::mpsc::channel(1);
             return Ok((
                 schema_ref,
                 BigQueryRecordBatchReceiver::new(rx, None, Vec::new()),
             ));
-        };
+        }
 
-        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        let (tx, rx) = tokio::sync::mpsc::channel(crate::Client::channel_size());
+        let (cancel_tx, mut cancel_rx) = tokio::sync::watch::channel(false);
+        let cancel_tx = Arc::new(cancel_tx);
+        let decode_pool = Arc::clone(&self.client.decode_pool);
+        let retry_config = self.client.stream_retry_config();
+        let page_row_count_i64 = response.page_row_count;
+        let task_cancel_tx = Arc::clone(&cancel_tx);
+
         let handle = tokio::task::spawn(async move {
-            let cursor = Cursor::new(serialized_record_batch);
-            let mut reader = StreamReader::new(cursor, metadata, None);
-            for result in &mut reader {
-                match result {
-                    Ok(StreamState::Some(batch)) => {
-                        if tx.send(Ok(batch)).await.is_err() {
-                            return;
+            if let Some(serialized_record_batch) = first_page_bytes {
+                let decoded = tokio::select! {
+                    biased;
+                    _ = cancel_rx.changed() => return,
+                    res = crate::bigquery_read_stream::decode_batches_on_pool(
+                        &decode_pool,
+                        serialized_record_batch,
+                        page_row_count_i64,
+                        Arc::clone(&metadata),
+                    ) => res,
+                };
+
+                match decoded {
+                    Ok(batches) => {
+                        for batch in batches {
+                            tokio::select! {
+                                biased;
+                                _ = cancel_rx.changed() => return,
+                                send_res = tx.send(Ok(batch)) => {
+                                    if send_res.is_err() {
+                                        return;
+                                    }
+                                }
+                            }
                         }
                     },
-                    Ok(StreamState::Waiting) => break,
-                    Err(e) => {
-                        let _ = tx.send(Err(BigQueryError::Arrow(e))).await;
+                    Err(err) => {
+                        let _ = task_cancel_tx.send_replace(true);
+                        let _ = tx.send(Err(err)).await;
                         return;
                     },
                 }
             }
 
-            if let Some(ref mut stream_receiver) = stream_receiver {
-                while let Some(result) = stream_receiver.recv().await {
-                    if tx.send(result).await.is_err() {
-                        break;
-                    }
-                }
+            if let Some(read_rows) = read_rows {
+                crate::bigquery_read_stream::read_stream_inner(
+                    read_rows,
+                    page_row_count_i64,
+                    Some(metadata),
+                    None,
+                    tx,
+                    retry_config,
+                    decode_pool,
+                    task_cancel_tx,
+                    cancel_rx,
+                )
+                .await;
             }
         });
 
         Ok((
             schema_ref,
-            BigQueryRecordBatchReceiver::new(rx, None, vec![handle]),
+            BigQueryRecordBatchReceiver::new(rx, Some(cancel_tx), vec![handle]),
         ))
     }
 }
@@ -518,37 +561,7 @@ mod tests {
     }
 
     fn create_test_arrow_payload(num_rows: usize) -> (Vec<u8>, Vec<u8>) {
-        use polars_arrow::io::ipc::write::{StreamWriter, WriteOptions};
-
-        let field = Field::new("col1".into(), ArrowDataType::Int64, false);
-        let schema = ArrowSchema::from_iter(vec![field]);
-
-        let mut schema_bytes = Vec::new();
-        {
-            let mut writer =
-                StreamWriter::new(&mut schema_bytes, WriteOptions { compression: None });
-            writer.start(&schema, None).unwrap();
-        }
-        let schema_len = schema_bytes.len();
-
-        let array = Int64Array::from_slice((0..num_rows as i64).collect::<Vec<_>>());
-        let batch = RecordBatch::try_new(
-            num_rows,
-            Arc::new(schema.clone()),
-            vec![Box::new(array) as Box<dyn Array>],
-        )
-        .unwrap();
-
-        let mut full_stream_bytes = Vec::new();
-        {
-            let mut writer =
-                StreamWriter::new(&mut full_stream_bytes, WriteOptions { compression: None });
-            writer.start(&schema, None).unwrap();
-            writer.write(&batch, None).unwrap();
-        }
-
-        let batch_bytes = full_stream_bytes[schema_len..].to_vec();
-        (schema_bytes, batch_bytes)
+        create_test_arrow_payload_with_range(0, num_rows)
     }
 
     async fn test_read_client() -> crate::BigQueryReadClient {
@@ -773,7 +786,8 @@ mod tests {
                     .set_arrow_record_batch(
                         BqArrowRecordBatch::new()
                             .set_serialized_record_batch(self.batch_bytes.clone()),
-                    );
+                    )
+                    .set_page_row_count(2);
                 Ok(Response::from(resp))
             }
         }
@@ -981,6 +995,19 @@ mod tests {
                 .buffer_compression,
             V2Codec::CompressionUnspecified
         );
+        assert_eq!(default_req.use_query_cache, None);
+
+        let no_cache_req = client
+            .query("SELECT 1")
+            .with_use_query_cache(false)
+            .build_read_request();
+        assert_eq!(no_cache_req.use_query_cache, Some(false));
+
+        let cache_req = client
+            .query("SELECT 1")
+            .with_use_query_cache(Some(true))
+            .build_read_request();
+        assert_eq!(cache_req.use_query_cache, Some(true));
     }
 
     #[tokio::test]
@@ -1240,5 +1267,193 @@ mod tests {
             Ok(_) => panic!("expected Protocol error when job_reference is missing"),
         };
         assert!(matches!(err, BigQueryError::Protocol(_)));
+    }
+
+    #[tokio::test]
+    async fn test_read_job_incomplete_streams_from_read_rows() {
+        use std::sync::Mutex;
+
+        use google_cloud_bigquery::client::Read;
+        use google_cloud_bigquery::model::{
+            ArrowRecordBatch as StorageArrowRecordBatch, ArrowSchema as StorageArrowSchema,
+            ReadRowsRequest, ReadRowsResponse,
+        };
+        use google_cloud_bigquery_v2::model::PostQueryRequest;
+        use google_cloud_gax::options::RequestOptions;
+        use google_cloud_gax::response::Response;
+        use google_cloud_gax::streaming::ResponseStream;
+
+        #[derive(Debug)]
+        struct IncompleteJobQueryStub;
+
+        impl google_cloud_bigquery_v2::stub::JobService for IncompleteJobQueryStub {
+            async fn query(
+                &self,
+                _req: PostQueryRequest,
+                _options: RequestOptions,
+            ) -> google_cloud_bigquery_v2::Result<Response<QueryResponse>> {
+                let resp = QueryResponse::new()
+                    .set_job_complete(false)
+                    .set_job_reference(
+                        JobReference::new()
+                            .set_project_id("job-proj")
+                            .set_location("US")
+                            .set_job_id("running-job-456"),
+                    );
+                Ok(Response::from(resp))
+            }
+        }
+
+        #[derive(Debug, Default)]
+        struct RecordedStreamCall {
+            stream_name: Option<String>,
+            offset: Option<i64>,
+        }
+
+        #[derive(Debug)]
+        struct IncompleteJobReadStub {
+            recorded: Arc<Mutex<RecordedStreamCall>>,
+            responses: Arc<Mutex<Vec<ReadRowsResponse>>>,
+        }
+
+        impl google_cloud_bigquery::stub::Read for IncompleteJobReadStub {
+            async fn read_rows(
+                &self,
+                req: ReadRowsRequest,
+                _options: RequestOptions,
+            ) -> google_cloud_bigquery::Result<ResponseStream<ReadRowsResponse>> {
+                {
+                    let mut rec = self.recorded.lock().unwrap();
+                    rec.stream_name = Some(req.read_stream);
+                    rec.offset = Some(req.offset);
+                }
+                let responses = std::mem::take(&mut *self.responses.lock().unwrap());
+                let (tx, rx) = tokio::sync::mpsc::channel(responses.len().max(1));
+                for resp in responses {
+                    let _ = tx.send(Ok(resp)).await;
+                }
+                Ok(ResponseStream::from(rx))
+            }
+        }
+
+        let (schema_bytes, batch1_bytes) = create_test_arrow_payload_with_range(0, 3);
+        let (_, batch2_bytes) = create_test_arrow_payload_with_range(3, 2);
+
+        // Simulate a server heartbeat (empty ReadRowsResponse) while query is still executing,
+        // followed by the first response with schema + rows, and then a second response.
+        let heartbeat = ReadRowsResponse::new();
+        let resp1 = ReadRowsResponse::new()
+            .set_arrow_schema(StorageArrowSchema::new().set_serialized_schema(schema_bytes))
+            .set_arrow_record_batch(
+                StorageArrowRecordBatch::new().set_serialized_record_batch(batch1_bytes),
+            )
+            .set_row_count(3);
+        let resp2 = ReadRowsResponse::new()
+            .set_arrow_record_batch(
+                StorageArrowRecordBatch::new().set_serialized_record_batch(batch2_bytes),
+            )
+            .set_row_count(2);
+
+        let recorded = Arc::new(Mutex::new(RecordedStreamCall::default()));
+        let bq_client = crate::BigQueryJobService::from_stub(IncompleteJobQueryStub);
+        let read_client = Read::from_stub(IncompleteJobReadStub {
+            recorded: Arc::clone(&recorded),
+            responses: Arc::new(Mutex::new(vec![heartbeat, resp1, resp2])),
+        });
+        let client =
+            crate::Client::new_for_testing(bq_client, read_client, "test-quota-proj".to_string());
+
+        let (schema, mut receiver) = client.query("SELECT col1 FROM tbl").read().await.unwrap();
+        let col_names: Vec<&str> = schema.iter_names().map(|s| s.as_str()).collect();
+        assert_eq!(col_names, vec!["col1"]);
+
+        let mut all_values = Vec::new();
+        while let Some(batch) = receiver.recv().await {
+            let batch = batch.unwrap();
+            let arr = batch.arrays()[0]
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap();
+            all_values.extend_from_slice(arr.values().as_slice());
+        }
+        assert_eq!(all_values, vec![0, 1, 2, 3, 4]);
+
+        let rec = recorded.lock().unwrap();
+        assert_eq!(
+            rec.stream_name.as_deref(),
+            Some("projects/job-proj/locations/US/jobs/running-job-456/streams/_default")
+        );
+        assert_eq!(rec.offset, Some(0));
+    }
+
+    #[tokio::test]
+    async fn test_read_first_page_row_count_mismatch_error() {
+        use google_cloud_bigquery_v2::model::{
+            ArrowRecordBatch as BqArrowRecordBatch, ArrowSchema as BqArrowSchema, PostQueryRequest,
+        };
+        use google_cloud_gax::options::RequestOptions;
+        use google_cloud_gax::response::Response;
+
+        #[derive(Debug)]
+        struct MismatchQueryStub {
+            schema_bytes: Vec<u8>,
+            batch_bytes: Option<Vec<u8>>,
+            page_row_count: i64,
+        }
+
+        impl google_cloud_bigquery_v2::stub::JobService for MismatchQueryStub {
+            async fn query(
+                &self,
+                _req: PostQueryRequest,
+                _options: RequestOptions,
+            ) -> google_cloud_bigquery_v2::Result<Response<QueryResponse>> {
+                let mut resp = QueryResponse::new()
+                    .set_arrow_schema(
+                        BqArrowSchema::new().set_serialized_schema(self.schema_bytes.clone()),
+                    )
+                    .set_page_row_count(self.page_row_count);
+                if let Some(batch_bytes) = &self.batch_bytes {
+                    resp = resp.set_arrow_record_batch(
+                        BqArrowRecordBatch::new().set_serialized_record_batch(batch_bytes.clone()),
+                    );
+                }
+                Ok(Response::from(resp))
+            }
+        }
+
+        let (schema_bytes, batch_bytes) = create_test_arrow_payload(2);
+
+        // Case 1: No results batch, but page_row_count > 0 -> immediate Protocol error
+        let bq_client = crate::BigQueryJobService::from_stub(MismatchQueryStub {
+            schema_bytes: schema_bytes.clone(),
+            batch_bytes: None,
+            page_row_count: 2,
+        });
+        let client = crate::Client::new_for_testing(
+            bq_client,
+            test_read_client().await,
+            "test-quota-proj".to_string(),
+        );
+        let err = match client.query("SELECT col1 FROM tbl").read().await {
+            Err(e) => e,
+            Ok(_) => panic!("expected Protocol error when results is empty and page_row_count > 0"),
+        };
+        assert!(matches!(err, BigQueryError::Protocol(_)));
+
+        // Case 2: 2 rows in batch, but page_row_count == 5 -> Protocol error sent on channel
+        let bq_client = crate::BigQueryJobService::from_stub(MismatchQueryStub {
+            schema_bytes,
+            batch_bytes: Some(batch_bytes),
+            page_row_count: 5,
+        });
+        let client = crate::Client::new_for_testing(
+            bq_client,
+            test_read_client().await,
+            "test-quota-proj".to_string(),
+        );
+        let (_, mut receiver) = client.query("SELECT col1 FROM tbl").read().await.unwrap();
+        let err = receiver.recv().await.unwrap().unwrap_err();
+        assert!(matches!(err, BigQueryError::Protocol(_)));
+        assert!(receiver.recv().await.is_none());
     }
 }

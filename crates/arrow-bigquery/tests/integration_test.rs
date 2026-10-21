@@ -164,3 +164,86 @@ async fn test_read_query() {
     }
     assert_eq!(multipage_rows, 250_000);
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_read_long_running_query() {
+    let quota_project_id = env::var("GOOGLE_CLOUD_PROJECT")
+        .expect("must set GOOGLE_CLOUD_PROJECT to run integration tests");
+
+    let client = Client::from_builder(
+        ServiceConfigBuilder::new()
+            .with_user_agent(Some("integration-test/1.0".to_string()))
+            .with_quota_project_id(Some(quota_project_id)),
+    )
+    .await
+    .expect("should build client");
+
+    let sql = r#"
+        WITH
+          base AS (
+            SELECT
+              a * 1000 + b AS id,
+              FARM_FINGERPRINT(CAST(a * 1000 + b AS STRING)) AS fp,
+              TO_HEX(SHA256(CAST(a * 1000 + b AS STRING))) AS digest
+            FROM
+              UNNEST(GENERATE_ARRAY(0, 999)) AS a
+            CROSS JOIN
+              UNNEST(GENERATE_ARRAY(0, 999)) AS b
+          ),
+          stage1 AS (
+            SELECT
+              b1.id AS id1,
+              b2.id AS id2,
+              FARM_FINGERPRINT(CONCAT(b1.digest, b2.digest)) AS combined_fp,
+              TO_HEX(SHA256(CONCAT(b1.digest, b2.digest))) AS combined_digest
+            FROM
+              base AS b1
+            INNER JOIN
+              base AS b2
+            ON
+              MOD(ABS(b1.fp), 200000) = MOD(ABS(b2.fp), 200000)
+              AND b1.id != b2.id
+          ),
+          stage2 AS (
+            SELECT
+              s1.id1,
+              COUNT(*) AS match_count,
+              MAX(s1.combined_digest) AS max_digest
+            FROM
+              stage1 AS s1
+            INNER JOIN
+              base AS b3
+            ON
+              MOD(ABS(s1.combined_fp), 500000) = b3.id
+            GROUP BY
+              s1.id1
+          )
+        SELECT
+          id1,
+          match_count,
+          max_digest
+        FROM
+          stage2
+        ORDER BY
+          match_count DESC,
+          id1 ASC
+        LIMIT 10000
+    "#;
+
+    let (schema, mut receiver) = client
+        .query(sql)
+        .with_use_query_cache(false)
+        .read()
+        .await
+        .expect("long running query read should succeed");
+
+    let col_names: Vec<&str> = schema.iter_names().map(|s| s.as_str()).collect();
+    assert_eq!(col_names, vec!["id1", "match_count", "max_digest"]);
+
+    let mut total_rows = 0;
+    while let Some(batch) = receiver.recv().await {
+        let batch = batch.expect("should receive valid record batch");
+        total_rows += batch.len();
+    }
+    assert_eq!(total_rows, 10_000);
+}

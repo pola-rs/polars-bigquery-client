@@ -61,7 +61,9 @@ impl Iterator for ReceiverIterator {
                 }
 
                 Ok(py.detach(|| {
-                    rt.block_on(async { tokio::time::timeout(timeout_duration, rx.recv()).await })
+                    rt.block_on(async {
+                        tokio::time::timeout(timeout_duration, rx.recv()).await
+                    })
                 }))
             });
 

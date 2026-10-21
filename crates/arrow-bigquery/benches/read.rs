@@ -127,13 +127,12 @@ async fn execute_query(client: &Arc<Client>, sql: &str) {
     assert!(total_rows > 0);
 }
 
-async fn query_sec_quarterly_financials_table(client: &Arc<Client>, table_id: &str) {
-    let sql = format!("SELECT * FROM `bigquery-public-data.sec_quarterly_financials.{table_id}`");
-    execute_query(client, &sql).await;
+fn format_sec_quarterly_financials_query(table_id: &str) -> String {
+    format!("SELECT * FROM `bigquery-public-data.sec_quarterly_financials.{table_id}`")
 }
 
-async fn query_numbers_table(client: &Arc<Client>, proportion: f64) {
-    let sql = format!(
+fn format_numbers_query(proportion: f64) -> String {
+    format!(
         r#"
         SELECT *
         FROM `bigquery-public-data.sec_quarterly_financials.numbers`
@@ -142,8 +141,7 @@ async fn query_numbers_table(client: &Arc<Client>, proportion: f64) {
                 BETWEEN TIMESTAMP("2019-01-01") AND TIMESTAMP("2019-12-31")
             AND ((FARM_FINGERPRINT(submission_number) / POW(2.0, 64)) + 0.5) < {proportion}
         "#,
-    );
-    execute_query(client, &sql).await;
+    )
 }
 
 fn read_query(c: &mut Criterion) {
@@ -155,23 +153,25 @@ fn read_query(c: &mut Criterion) {
     group.sample_size(10);
 
     group.bench_function("select_1", |b| {
-        let client = &client.clone();
+        let client = &client;
         b.to_async(&rt)
             .iter(|| async move { execute_query(client, "SELECT 1").await });
     });
 
+    let sic_codes_sql = format_sec_quarterly_financials_query("sic_codes");
     group.bench_function("sec_quarterly_financials_sic_codes", |b| {
-        let client = &client.clone();
-        b.to_async(&rt).iter(|| async move {
-            query_sec_quarterly_financials_table(client, "sic_codes").await
-        });
+        let client = &client;
+        let sql = sic_codes_sql.as_str();
+        b.to_async(&rt)
+            .iter(|| async move { execute_query(client, sql).await });
     });
 
+    let submission_sql = format_sec_quarterly_financials_query("submission");
     group.bench_function("sec_quarterly_financials_submission", |b| {
-        let client = &client.clone();
-        b.to_async(&rt).iter(|| async move {
-            query_sec_quarterly_financials_table(client, "submission").await
-        });
+        let client = &client;
+        let sql = submission_sql.as_str();
+        b.to_async(&rt)
+            .iter(|| async move { execute_query(client, sql).await });
     });
 
     // The portion of the "numbers" table we are reading is about 5 GB total, so
@@ -179,13 +179,14 @@ fn read_query(c: &mut Criterion) {
     let proportions = vec![0.1, 0.5, 1.0];
 
     for proportion in proportions {
+        let sql = format_numbers_query(proportion);
         group.bench_with_input(
             BenchmarkId::new("sec_quarterly_financials_numbers", proportion),
-            &proportion,
-            |b, &proportion| {
-                let client = &client.clone();
+            &sql,
+            |b, sql| {
+                let client = &client;
                 b.to_async(&rt)
-                    .iter(|| async move { query_numbers_table(client, proportion).await });
+                    .iter(|| async move { execute_query(client, sql).await });
             },
         );
     }

@@ -402,10 +402,11 @@ impl CredentialsProvider for PythonTokenSource {
 
         // 1. Happy path: shared read lock on the cache + monotonic Instant check.
         let (freshness, soft_resource, can_attempt_soft_refresh) = {
-            let cache =
-                self.inner.cache.read().map_err(|_| {
-                    CredentialsError::from_msg(false, "token cache lock is poisoned")
-                })?;
+            let cache = self
+                .inner
+                .cache
+                .read()
+                .map_err(|_| CredentialsError::from_msg(false, "token cache lock is poisoned"))?;
             match cache.token.as_ref() {
                 Some(cached) => match cached.freshness(now) {
                     Freshness::Fresh => return Ok(cached.to_cacheable_resource(&extensions)),
@@ -470,10 +471,11 @@ impl CredentialsProvider for PythonTokenSource {
 
         // Double-checked locking: check if another task refreshed the token while we waited.
         {
-            let cache =
-                self.inner.cache.read().map_err(|_| {
-                    CredentialsError::from_msg(false, "token cache lock is poisoned")
-                })?;
+            let cache = self
+                .inner
+                .cache
+                .read()
+                .map_err(|_| CredentialsError::from_msg(false, "token cache lock is poisoned"))?;
             if let Some(cached) = cache.token.as_ref() {
                 if cached.freshness(Instant::now()) != Freshness::HardExpired {
                     return Ok(cached.to_cacheable_resource(&extensions));
