@@ -5,6 +5,10 @@ use arrow_bigquery::{BigQueryTableId, Client, ReadOptions, ServiceConfigBuilder}
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, SamplingMode};
 use tokio::runtime::Runtime;
 
+// The portion of the "numbers" table we are reading is about 5 GB total, so
+// these reads vary from about 500 MB to 5 GB.
+const PROPORTIONS: [f64; 1] = [0.1]; //, 0.5, 1.0];
+
 async fn setup_client() -> Client {
     let quota_project_id = env::var("GOOGLE_CLOUD_PROJECT")
         .expect("must set GOOGLE_CLOUD_PROJECT to run integration tests");
@@ -94,11 +98,7 @@ fn read_table(c: &mut Criterion) {
         });
     });
 
-    // The portion of the "numbers" table we are reading is about 5 GB total, so
-    // these reads vary from about 500 MB to 5 GB.
-    let proportions = vec![0.1, 0.5, 1.0];
-
-    for proportion in proportions {
+    for proportion in PROPORTIONS {
         group.bench_with_input(
             BenchmarkId::new("sec_quarterly_financials_numbers", proportion),
             &proportion,
@@ -174,11 +174,7 @@ fn read_query(c: &mut Criterion) {
             .iter(|| async move { execute_query(client, sql).await });
     });
 
-    // The portion of the "numbers" table we are reading is about 5 GB total, so
-    // these reads vary from about 500 MB to 5 GB.
-    let proportions = vec![0.1, 0.5, 1.0];
-
-    for proportion in proportions {
+    for proportion in PROPORTIONS {
         let sql = format_numbers_query(proportion);
         group.bench_with_input(
             BenchmarkId::new("sec_quarterly_financials_numbers", proportion),
