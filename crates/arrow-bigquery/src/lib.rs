@@ -181,6 +181,7 @@ pub struct StreamOptions {
     /// If `None`, the schema is extracted from the first `ReadRowsResponse`
     /// received from the stream.
     pub schema: Option<bytes::Bytes>,
+    pub arrow_buffer_compression: Option<arrow_serialization_options::CompressionCodec>,
 }
 
 /// A receiver that yields [`RecordBatch`]es read from BigQuery.
@@ -359,13 +360,19 @@ impl Client {
         &self,
         stream_name: String,
         offset: i64,
+        arrow_buffer_compression: Option<arrow_serialization_options::CompressionCodec>,
     ) -> google_cloud_bigquery::builder::read::ReadRows {
-        self.apply_request_options(
-            self.read_client
-                .read_rows()
-                .set_read_stream(stream_name)
-                .set_offset(offset),
-        )
+        let mut builder = self
+            .read_client
+            .read_rows()
+            .set_read_stream(stream_name)
+            .set_offset(offset);
+        if let Some(codec) = arrow_buffer_compression {
+            builder = builder.set_arrow_serialization_options(
+                ArrowSerializationOptions::new().set_buffer_compression(codec),
+            );
+        }
+        self.apply_request_options(builder)
     }
 
     pub(crate) fn spawn_query_stream(
@@ -429,6 +436,7 @@ impl Client {
             StreamOptions {
                 offset: 0,
                 schema: Some(schema),
+                arrow_buffer_compression: None,
             },
         )
         .await
@@ -473,7 +481,11 @@ impl Client {
         let mut handles = Vec::with_capacity(streams.len());
 
         for stream_name in streams {
-            let read_rows = self.prepare_read_rows(stream_name, options.offset);
+            let read_rows = self.prepare_read_rows(
+                stream_name,
+                options.offset,
+                options.arrow_buffer_compression.clone(),
+            );
             let handle = tokio::task::spawn(bigquery_read_stream::read_stream(
                 bigquery_read_stream::ReadStreamOptions {
                     read_rows,
@@ -1099,6 +1111,7 @@ pub(crate) mod tests {
         let rec = recorded.lock().unwrap();
         assert_eq!(rec.stream_name.as_deref(), Some(stream_name));
         assert_eq!(rec.offset, Some(0));
+        assert_eq!(rec.arrow_buffer_compression, None);
         assert_eq!(rec.quota_project.as_deref(), Some("test-quota-proj"));
         assert_eq!(rec.user_agent.as_deref(), Some("custom-ua/2.0"));
     }
@@ -1121,6 +1134,9 @@ pub(crate) mod tests {
                 StreamOptions {
                     offset: 42,
                     schema: Some(bytes::Bytes::from(schema_bytes)),
+                    arrow_buffer_compression: Some(
+                        arrow_serialization_options::CompressionCodec::Zstd,
+                    ),
                 },
             )
             .await
@@ -1132,7 +1148,12 @@ pub(crate) mod tests {
         let batch = rx.recv().await.unwrap().unwrap();
         assert_eq!(batch.len(), 4);
         assert!(rx.recv().await.is_none());
-        assert_eq!(recorded.lock().unwrap().offset, Some(42));
+        let rec = recorded.lock().unwrap();
+        assert_eq!(rec.offset, Some(42));
+        assert_eq!(
+            rec.arrow_buffer_compression,
+            Some(arrow_serialization_options::CompressionCodec::Zstd)
+        );
     }
 
     #[tokio::test]
@@ -1239,6 +1260,7 @@ pub(crate) mod tests {
                 StreamOptions {
                     offset: 0,
                     schema: Some(bytes::Bytes::new()),
+                    arrow_buffer_compression: None,
                 },
             )
             .await
@@ -1255,6 +1277,7 @@ pub(crate) mod tests {
                 StreamOptions {
                     offset: 0,
                     schema: Some(bytes::Bytes::from(schema_bytes)),
+                    arrow_buffer_compression: None,
                 },
             )
             .await

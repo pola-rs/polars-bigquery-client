@@ -39,7 +39,7 @@ fn bq_to_gapic_compression_codec(
 pub struct Query<'a> {
     client: &'a crate::Client,
     sql: String,
-    arrow_buffer_compression: Option<arrow_serialization_options::CompressionCodec>,
+    arrow_buffer_compression: Option<crate::CompressionCodec>,
     use_query_cache: Option<bool>,
 }
 
@@ -57,7 +57,7 @@ impl<'a> Query<'a> {
         mut self,
         codec: impl Into<Option<crate::CompressionCodec>>,
     ) -> Self {
-        self.arrow_buffer_compression = codec.into().map(bq_to_gapic_compression_codec);
+        self.arrow_buffer_compression = codec.into();
         self
     }
 
@@ -66,11 +66,15 @@ impl<'a> Query<'a> {
         self
     }
 
+    fn arrow_buffer_compression(&self) -> crate::CompressionCodec {
+        self.arrow_buffer_compression
+            .clone()
+            .unwrap_or(crate::DEFAULT_COMPRESSION)
+    }
+
     fn build_read_request(&self) -> QueryRequest {
         let arrow_options = ArrowSerializationOptions::new().set_buffer_compression(
-            self.arrow_buffer_compression
-                .clone()
-                .unwrap_or_else(|| bq_to_gapic_compression_codec(crate::DEFAULT_COMPRESSION)),
+            bq_to_gapic_compression_codec(self.arrow_buffer_compression()),
         );
         QueryRequest::new()
             .set_job_creation_mode(JobCreationMode::JobCreationOptional)
@@ -117,6 +121,7 @@ impl<'a> Query<'a> {
                     StreamOptions {
                         offset: 0,
                         schema: None,
+                        arrow_buffer_compression: Some(self.arrow_buffer_compression()),
                     },
                 )
                 .await;
@@ -181,14 +186,20 @@ impl<'a> Query<'a> {
                         StreamOptions {
                             offset: response.page_row_count,
                             schema: Some(serialized_schema),
+                            arrow_buffer_compression: Some(self.arrow_buffer_compression()),
                         },
                     )
                     .await
             },
             (Some(first_page_bytes), stream_name) => {
                 let metadata = crate::bigquery_read_stream::parse_arrow_schema(&serialized_schema)?;
-                let read_rows = stream_name
-                    .map(|name| self.client.prepare_read_rows(name, response.page_row_count));
+                let read_rows = stream_name.map(|name| {
+                    self.client.prepare_read_rows(
+                        name,
+                        response.page_row_count,
+                        Some(self.arrow_buffer_compression()),
+                    )
+                });
                 let schema_ref = Arc::new(metadata.schema.clone());
                 let receiver = self.client.spawn_query_stream(
                     first_page_bytes,
@@ -986,6 +997,10 @@ mod tests {
             Some("projects/job-proj/locations/EU/jobs/job-123/streams/_default")
         );
         assert_eq!(rec.offset, Some(3));
+        assert_eq!(
+            rec.arrow_buffer_compression,
+            Some(crate::CompressionCodec::Zstd)
+        );
     }
 
     #[tokio::test]
@@ -1180,6 +1195,93 @@ mod tests {
             Some("projects/job-proj/locations/US/jobs/running-job-456/streams/_default")
         );
         assert_eq!(rec.offset, Some(0));
+        assert_eq!(
+            rec.arrow_buffer_compression,
+            Some(crate::CompressionCodec::Lz4Frame)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_read_empty_first_page_with_remaining_rows_streams_from_read_rows() {
+        use google_cloud_bigquery::client::Read;
+        use google_cloud_bigquery::model::{
+            ArrowRecordBatch as StorageArrowRecordBatch, ReadRowsResponse,
+        };
+        use google_cloud_bigquery_v2::model::{ArrowSchema as BqArrowSchema, PostQueryRequest};
+        use google_cloud_gax::options::RequestOptions;
+        use google_cloud_gax::response::Response;
+
+        #[derive(Debug)]
+        struct EmptyFirstPageQueryStub {
+            schema_bytes: Vec<u8>,
+        }
+
+        impl google_cloud_bigquery_v2::stub::JobService for EmptyFirstPageQueryStub {
+            async fn query(
+                &self,
+                req: PostQueryRequest,
+                _options: RequestOptions,
+            ) -> google_cloud_bigquery_v2::Result<Response<QueryResponse>> {
+                let q = req.query_request.expect("query_request should be set");
+                let arrow_opts = q
+                    .arrow_serialization_options()
+                    .expect("arrow_serialization_options should be set");
+                assert_eq!(
+                    arrow_opts.buffer_compression,
+                    arrow_serialization_options::CompressionCodec::CompressionUnspecified
+                );
+
+                let resp = QueryResponse::new()
+                    .set_job_reference(
+                        JobReference::new()
+                            .set_project_id("job-proj")
+                            .set_location("US")
+                            .set_job_id("job-empty-first-page"),
+                    )
+                    .set_arrow_schema(
+                        BqArrowSchema::new().set_serialized_schema(self.schema_bytes.clone()),
+                    )
+                    .set_page_row_count(0)
+                    .set_total_rows(3_u64);
+                Ok(Response::from(resp))
+            }
+        }
+
+        let (schema_bytes, stream_batch_bytes) = create_test_arrow_payload_with_range(0, 3);
+        let resp = ReadRowsResponse::new()
+            .set_arrow_record_batch(
+                StorageArrowRecordBatch::new().set_serialized_record_batch(stream_batch_bytes),
+            )
+            .set_row_count(3);
+
+        let bq_client =
+            crate::BigQueryJobService::from_stub(EmptyFirstPageQueryStub { schema_bytes });
+        let (read_stub, recorded) = CannedReadRowsStub::new(vec![resp]);
+        let read_client = Read::from_stub(read_stub);
+        let client =
+            crate::Client::new_for_testing(bq_client, read_client, "test-quota-proj".to_string());
+
+        let (_, mut receiver) = client
+            .query("SELECT col1 FROM tbl")
+            .with_arrow_buffer_compression(crate::CompressionCodec::CompressionUnspecified)
+            .read()
+            .await
+            .unwrap();
+
+        let batch = receiver.recv().await.unwrap().unwrap();
+        assert_eq!(batch.len(), 3);
+        assert!(receiver.recv().await.is_none());
+
+        let rec = recorded.lock().unwrap();
+        assert_eq!(
+            rec.stream_name.as_deref(),
+            Some("projects/job-proj/locations/US/jobs/job-empty-first-page/streams/_default")
+        );
+        assert_eq!(rec.offset, Some(0));
+        assert_eq!(
+            rec.arrow_buffer_compression,
+            Some(crate::CompressionCodec::CompressionUnspecified)
+        );
     }
 
     #[tokio::test]
