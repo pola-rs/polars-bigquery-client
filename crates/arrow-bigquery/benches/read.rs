@@ -1,5 +1,6 @@
 use std::env;
 use std::sync::Arc;
+use std::time::Duration;
 
 use arrow_bigquery::{
     BigQueryRecordBatchReceiver, BigQueryTableId, Client, ReadOptions, ServiceConfigBuilder,
@@ -87,12 +88,14 @@ fn read_table(c: &mut Criterion) {
     group.sampling_mode(SamplingMode::Flat);
     group.sample_size(10);
 
+    group.measurement_time(Duration::from_secs_f64(7.2));
     group.bench_function("sec_quarterly_financials_sic_codes", |b| {
         let client = &client.clone();
         b.to_async(&rt)
             .iter(|| async move { read_sec_quarterly_financials_table(client, "sic_codes").await });
     });
 
+    group.measurement_time(Duration::from_secs_f64(12.2));
     group.bench_function("sec_quarterly_financials_submission", |b| {
         let client = &client.clone();
         b.to_async(&rt).iter(|| async move {
@@ -100,7 +103,8 @@ fn read_table(c: &mut Criterion) {
         });
     });
 
-    for proportion in PROPORTIONS {
+    for (proportion, target_secs) in PROPORTIONS.into_iter().zip([13.5, 432.9, 51.8]) {
+        group.measurement_time(Duration::from_secs_f64(target_secs));
         group.bench_with_input(
             BenchmarkId::new("sec_quarterly_financials_numbers", proportion),
             &proportion,
@@ -150,6 +154,7 @@ fn read_query(c: &mut Criterion) {
     group.sampling_mode(SamplingMode::Flat);
     group.sample_size(10);
 
+    group.measurement_time(Duration::from_secs_f64(5.2));
     group.bench_function("select_1", |b| {
         let client = &client;
         b.to_async(&rt)
@@ -157,6 +162,7 @@ fn read_query(c: &mut Criterion) {
     });
 
     let sic_codes_sql = format_sec_quarterly_financials_query("sic_codes");
+    group.measurement_time(Duration::from_secs_f64(6.4));
     group.bench_function("sec_quarterly_financials_sic_codes", |b| {
         let client = &client;
         let sql = sic_codes_sql.as_str();
@@ -165,6 +171,7 @@ fn read_query(c: &mut Criterion) {
     });
 
     let submission_sql = format_sec_quarterly_financials_query("submission");
+    group.measurement_time(Duration::from_secs_f64(56.5));
     group.bench_function("sec_quarterly_financials_submission", |b| {
         let client = &client;
         let sql = submission_sql.as_str();
@@ -172,8 +179,9 @@ fn read_query(c: &mut Criterion) {
             .iter(|| async move { execute_query(client, sql).await });
     });
 
-    for proportion in PROPORTIONS {
+    for (proportion, target_secs) in PROPORTIONS.into_iter().zip([129.7, 485.1, 798.7]) {
         let sql = format_numbers_query(proportion);
+        group.measurement_time(Duration::from_secs_f64(target_secs));
         group.bench_with_input(
             BenchmarkId::new("sec_quarterly_financials_numbers", proportion),
             &sql,
