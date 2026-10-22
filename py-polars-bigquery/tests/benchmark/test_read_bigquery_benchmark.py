@@ -14,8 +14,8 @@ SEC_TABLES = [
 ]
 
 # The portion of the "numbers" table we are reading is about 5 GB total, so
-# these reads vary from about 500 MB to 5 GB.
-PROPORTIONS = [0.1, 0.5, 1.0]
+# these reads vary from about 5 MB to 500 MB.
+PROPORTIONS = [0.001, 0.01, 0.1]
 
 
 def _format_sec_quarterly_financials_query(table_id: str) -> str:
