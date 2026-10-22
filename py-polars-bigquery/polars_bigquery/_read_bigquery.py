@@ -1,12 +1,13 @@
 from __future__ import annotations
 
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from typing import Any
 
 import arrow_bigquery
 import arrow_bigquery.api.resources
 import polars as pl
 import polars.io.plugins
+from polars.datatypes import DataType, DataTypeClass
 
 import polars_bigquery.core.schema
 import polars_bigquery.core.version
@@ -203,13 +204,15 @@ class Client:
     def scan_table(
         self,
         table: Any,
+        *,
+        schema: pl.Schema | Mapping[str, DataType | DataTypeClass] | None = None,
     ) -> pl.LazyFrame:
         """Lazily scan a BigQuery table into a Polars `LazyFrame`.
 
         Fetches table schema and partitioning metadata via the BigQuery REST API
-        when constructing the `LazyFrame`, and defers reading rows from the
-        BigQuery Storage Read API until query execution (`.collect()` or
-        `.collect_batches()`).
+        when constructing the `LazyFrame` (unless `schema` is provided), and
+        defers reading rows from the BigQuery Storage Read API until query
+        execution (`.collect()` or `.collect_batches()`).
 
         Supports both **projection pushdown** (only reading referenced columns)
         and **row predicate pushdown** (translating `.filter()` expressions into
@@ -219,8 +222,8 @@ class Client:
 
         For ingestion-time partitioned tables, `_PARTITIONDATE` (`pl.Date`) and
         `_PARTITIONTIME` (`pl.Datetime("us", "utc")`) pseudo-columns are
-        automatically added to the `LazyFrame` schema so partition pruning
-        filters can be pushed down.
+        automatically added to the `LazyFrame` schema when `schema` is not
+        provided, so partition pruning filters can be pushed down.
 
         Parameters
         ----------
@@ -229,6 +232,14 @@ class Client:
             string, an `arrow_bigquery.BigQueryTableId`, or any object with
             `project` (or `project_id`), `dataset_id`, and `table_id` attributes
             (such as `google.cloud.bigquery.TableReference`).
+        schema
+            Optional Polars schema (`polars.Schema` or a mapping of column names
+            to Polars data types) for the table. When provided, `scan_table`
+            avoids calling the BigQuery `tables.get` REST API to fetch table
+            metadata. For ingestion-time partitioned tables, include
+            `"_PARTITIONDATE": pl.Date` and/or
+            `"_PARTITIONTIME": pl.Datetime("us", "utc")` in `schema` if you want
+            to filter or select those pseudo-columns.
 
         Returns
         -------
@@ -238,7 +249,8 @@ class Client:
         Raises
         ------
         polars_bigquery.exceptions.BigQueryError
-            If fetching the table metadata from the BigQuery REST API fails.
+            If `schema` is `None` and fetching the table metadata from the
+            BigQuery REST API fails.
 
         Examples
         --------
@@ -254,8 +266,15 @@ class Client:
         ```
         """
         table_ref = arrow_bigquery.api.resources.parse_table_id(table)
-        table_metadata = self._rest_client.get_table_metadata(table_ref)
-        schema = polars_bigquery.core.schema.extract_polars_schema(table_metadata)
+        if schema is None:
+            table_metadata = self._rest_client.get_table_metadata(table_ref)
+            polars_schema = polars_bigquery.core.schema.extract_polars_schema(
+                table_metadata
+            )
+        else:
+            polars_schema = (
+                schema if isinstance(schema, pl.Schema) else pl.Schema(schema)
+            )
 
         def source_generator(
             with_columns: list[str] | None,
@@ -263,7 +282,9 @@ class Client:
             n_rows: int | None,
             batch_size: int | None,
         ) -> Iterator[pl.DataFrame]:
-            columns = with_columns if with_columns is not None else list(schema.keys())
+            columns = (
+                with_columns if with_columns is not None else list(polars_schema.keys())
+            )
             predicate_cols = (
                 predicate.meta.root_names() if predicate is not None else []
             )
@@ -293,5 +314,5 @@ class Client:
 
         return polars.io.plugins.register_io_source(
             io_source=source_generator,
-            schema=schema,
+            schema=polars_schema,
         )
