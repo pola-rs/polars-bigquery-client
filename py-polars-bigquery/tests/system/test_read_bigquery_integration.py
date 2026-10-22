@@ -43,3 +43,28 @@ def test_read_bigquery_public_data_unordered(client):
     # Make sure we got all of the expected data, not just a subset.
     assert df.height > 200  # rows
     assert df.width > 0  # columns
+
+
+def test_read_bigquery_dry_run(client):
+    df = client.read_query(
+        query="""
+        SELECT name, number
+        FROM `bigquery-public-data.usa_names.usa_1910_2013`
+        WHERE state = 'WA'
+        """,
+        dry_run=True,
+    )
+    assert isinstance(df, pl.DataFrame)
+    assert df.height == 1
+    assert df.columns == [
+        "bigquerySchema",
+        "projectId",
+        "jobId",
+        "location",
+        "totalBytesProcessed",
+        "cacheHit",
+        "statementType",
+        "creationTime",
+    ]
+    assert df["totalBytesProcessed"][0] > 0
+    assert df["statementType"][0] == "SELECT"

@@ -109,6 +109,71 @@ impl Client {
         let (schema, receiver) = result.map_err(|err| error::to_py_err(py, err))?;
         Ok(ArrowStreamExporter::new(schema, receiver))
     }
+
+    /// Executes a BigQuery SQL query (or dry run) and returns an [`ArrowStreamExporter`]
+    /// which can be consumed by Polars in Python.
+    #[pyo3(signature = (
+        query,
+        *,
+        arrow_buffer_compression="lz4frame",
+        dry_run=false,
+        maintain_order=false,
+        use_query_cache=None
+    ))]
+    pub fn read_query(
+        &self,
+        py: Python<'_>,
+        query: &str,
+        arrow_buffer_compression: &str,
+        dry_run: bool,
+        maintain_order: bool,
+        use_query_cache: Option<bool>,
+    ) -> PyResult<ArrowStreamExporter> {
+        let arrow_buffer_compression = parse_compression_codec(arrow_buffer_compression)?;
+        let rt = pyo3_async_runtimes::tokio::get_runtime();
+        let client = self.client.clone();
+        let query = query.to_owned();
+        if dry_run {
+            let result = py.detach(|| {
+                rt.block_on(async move {
+                    client
+                        .query(query)
+                        .with_arrow_buffer_compression(arrow_buffer_compression)
+                        .with_maintain_order(maintain_order)
+                        .with_use_query_cache(use_query_cache)
+                        .dry_run()
+                        .await
+                })
+            });
+            let batch = result.map_err(|err| error::to_py_err(py, err))?;
+            Ok(ArrowStreamExporter::from_record_batch(batch))
+        } else {
+            let result = py.detach(|| {
+                rt.block_on(async move {
+                    client
+                        .query(query)
+                        .with_arrow_buffer_compression(arrow_buffer_compression)
+                        .with_maintain_order(maintain_order)
+                        .with_use_query_cache(use_query_cache)
+                        .read()
+                        .await
+                })
+            });
+            let (schema, receiver) = result.map_err(|err| error::to_py_err(py, err))?;
+            Ok(ArrowStreamExporter::new(schema, receiver))
+        }
+    }
+}
+
+fn parse_compression_codec(arrow_buffer_compression: &str) -> PyResult<CompressionCodec> {
+    match arrow_buffer_compression {
+        "unspecified" => Ok(CompressionCodec::CompressionUnspecified),
+        "lz4frame" => Ok(CompressionCodec::Lz4Frame),
+        "zstd" => Ok(CompressionCodec::Zstd),
+        _ => Err(PyValueError::new_err(format!(
+            "got unexpected compression codec {arrow_buffer_compression}"
+        ))),
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -129,16 +194,7 @@ fn parse_read_options(
         ),
         None => None,
     };
-    let arrow_buffer_compression = Some(match arrow_buffer_compression {
-        "unspecified" => CompressionCodec::CompressionUnspecified,
-        "lz4frame" => CompressionCodec::Lz4Frame,
-        "zstd" => CompressionCodec::Zstd,
-        _ => {
-            return Err(PyValueError::new_err(format!(
-                "got unexpected compression codec {arrow_buffer_compression}"
-            )))
-        },
-    });
+    let arrow_buffer_compression = Some(parse_compression_codec(arrow_buffer_compression)?);
     Ok(arrow_bigquery_lib::ReadOptions {
         arrow_buffer_compression,
         maintain_order,
@@ -449,6 +505,23 @@ mod tests {
                 .to_string()
                 .contains("underlying python token generator broke"));
             assert!(cause.cause(py).is_none());
+        });
+    }
+
+    #[test]
+    fn test_client_read_query_invalid_compression() {
+        Python::initialize();
+        Python::attach(|py| {
+            let client =
+                Client::new(py, "test-project".to_string(), None, None, None, None).unwrap();
+            let err = match client.read_query(py, "SELECT 1", "invalid_codec", false, false, None) {
+                Err(e) => e,
+                Ok(_) => panic!("expected Err for invalid compression codec"),
+            };
+            assert!(err.is_instance_of::<PyValueError>(py));
+            assert!(err
+                .to_string()
+                .contains("got unexpected compression codec invalid_codec"));
         });
     }
 }

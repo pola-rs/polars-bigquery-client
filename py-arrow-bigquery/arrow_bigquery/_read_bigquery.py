@@ -73,3 +73,20 @@ class Client:
             selected_fields=selected_fields,
             snapshot_time=snapshot_time,
         )
+
+    def read_query(
+        self,
+        query: str,
+        *,
+        arrow_buffer_compression: str = "lz4frame",
+        dry_run: bool = False,
+        maintain_order: bool = False,
+        use_query_cache: bool | None = None,
+    ) -> arrow_bigquery._native.ArrowStreamExporter:
+        return self._client.read_query(
+            query,
+            arrow_buffer_compression=arrow_buffer_compression,
+            dry_run=dry_run,
+            maintain_order=maintain_order,
+            use_query_cache=use_query_cache,
+        )

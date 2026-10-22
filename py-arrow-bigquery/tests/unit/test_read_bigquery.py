@@ -215,6 +215,124 @@ def test_client_read_bigquery_propagates_errors(mock_rust_client):
         client.read_table(table=BigQueryTableId("p", "d", "t"))
 
 
+def test_client_read_query_calls_rust(mock_rust_client):
+    placeholder = object()
+    mock_rust_client.read_query.return_value = placeholder
+
+    client = Client(quota_project_id="q")
+    result = client.read_query("SELECT 1")
+
+    mock_rust_client.read_query.assert_called_once_with(
+        "SELECT 1",
+        arrow_buffer_compression="lz4frame",
+        dry_run=False,
+        maintain_order=False,
+        use_query_cache=None,
+    )
+    assert result is placeholder
+
+
+def test_client_read_query_passes_additional_parameters(mock_rust_client):
+    placeholder = object()
+    mock_rust_client.read_query.return_value = placeholder
+
+    client = Client(quota_project_id="q")
+    result = client.read_query(
+        "SELECT 1",
+        arrow_buffer_compression="zstd",
+        dry_run=True,
+        maintain_order=True,
+        use_query_cache=False,
+    )
+
+    mock_rust_client.read_query.assert_called_once_with(
+        "SELECT 1",
+        arrow_buffer_compression="zstd",
+        dry_run=True,
+        maintain_order=True,
+        use_query_cache=False,
+    )
+    assert result is placeholder
+
+
+def test_client_read_query_propagates_errors(mock_rust_client):
+    mock_rust_client.read_query.side_effect = Exception("Rust query error")
+
+    client = Client(quota_project_id="q")
+    with pytest.raises(Exception, match="Rust query error"):
+        client.read_query("SELECT 1")
+
+
+def test_client_read_query_dry_run_and_read_with_mock_server():
+    import json
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self):
+            length = int(self.headers.get("Content-Length", "0"))
+            body = json.loads(self.rfile.read(length).decode("utf-8"))
+            assert self.path.startswith("/bigquery/v2/projects/test-proj/queries")
+            assert body["query"] == "SELECT 1 AS one"
+            assert body["useLegacySql"] is False
+            assert body.get("dryRun") is True
+
+            resp = {
+                "jobReference": {
+                    "projectId": "test-proj",
+                    "location": "US",
+                },
+                "totalBytesProcessed": "42",
+                "cacheHit": False,
+                "statementType": "SELECT",
+                "creationTime": "1767037135155",
+                "schema": {"fields": [{"name": "one", "type": "INT64"}]},
+            }
+            payload = json.dumps(resp).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+        def log_message(self, format, *args):
+            pass
+
+    server = HTTPServer(("127.0.0.1", 0), Handler)
+    port = server.server_port
+    server_thread = threading.Thread(target=server.handle_request)
+    server_thread.start()
+
+    try:
+        client = Client(
+            quota_project_id="test-proj",
+            credentials_provider=lambda: ({"bearer_token": "fake-tok"}, None),
+            bq_endpoint=f"http://127.0.0.1:{port}",
+        )
+        exporter = client.read_query("SELECT 1 AS one", dry_run=True)
+    finally:
+        server_thread.join()
+        server.server_close()
+
+    arr = nanoarrow.ArrayStream(exporter).read_all()
+    assert len(arr) == 1
+    col_names = [field.name for field in arr.schema.fields]
+    assert col_names == [
+        "bigquerySchema",
+        "projectId",
+        "jobId",
+        "location",
+        "totalBytesProcessed",
+        "cacheHit",
+        "statementType",
+        "creationTime",
+    ]
+    assert arr.child(4).to_pylist() == [42]
+
+    # Consuming a second time raises ValueError
+    with pytest.raises(ValueError, match="Stream already consumed"):
+        nanoarrow.c_array_stream(exporter)
+
+
 def test_receiver_iterator_interrupt():
     exporter = _native._create_test_exporter()
 

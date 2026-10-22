@@ -1,5 +1,21 @@
 use polars_arrow::datatypes::ArrowSchemaRef;
+use polars_arrow::record_batch::RecordBatch;
 use pyo3::prelude::*;
+
+enum StreamSource {
+    Receiver(arrow_bigquery_lib::BigQueryRecordBatchReceiver),
+    Batch(RecordBatch),
+}
+
+fn record_batch_to_struct_array(
+    batch: RecordBatch,
+    dtype: polars_arrow::datatypes::ArrowDataType,
+) -> Box<dyn polars_arrow::array::Array> {
+    let len = batch.len();
+    let (_, arrays) = batch.into_schema_and_arrays();
+    let struct_array = polars_arrow::array::StructArray::new(dtype, len, arrays, None);
+    Box::new(struct_array) as Box<dyn polars_arrow::array::Array>
+}
 
 /// A Python-exposed class that implements the Arrow C Stream interface.
 ///
@@ -10,9 +26,9 @@ use pyo3::prelude::*;
 pub struct ArrowStreamExporter {
     /// The schema of the Arrow stream.
     schema: ArrowSchemaRef,
-    /// The underlying BigQuery record batch receiver, wrapped in a mutex.
+    /// The underlying BigQuery record batch source, wrapped in a mutex.
     /// It is an `Option` because the stream can only be consumed once.
-    receiver: std::sync::Mutex<Option<arrow_bigquery_lib::BigQueryRecordBatchReceiver>>,
+    source: std::sync::Mutex<Option<StreamSource>>,
 }
 
 impl ArrowStreamExporter {
@@ -22,7 +38,15 @@ impl ArrowStreamExporter {
     ) -> Self {
         Self {
             schema,
-            receiver: std::sync::Mutex::new(Some(receiver)),
+            source: std::sync::Mutex::new(Some(StreamSource::Receiver(receiver))),
+        }
+    }
+
+    pub(crate) fn from_record_batch(batch: RecordBatch) -> Self {
+        let schema = std::sync::Arc::new(batch.schema().clone());
+        Self {
+            schema,
+            source: std::sync::Mutex::new(Some(StreamSource::Batch(batch))),
         }
     }
 }
@@ -81,17 +105,7 @@ impl Iterator for ReceiverIterator {
 
             match result {
                 Ok(Some(Ok(batch))) => {
-                    let len = batch.len();
-                    let (_, arrays) = batch.into_schema_and_arrays();
-                    let struct_array = polars_arrow::array::StructArray::new(
-                        self.dtype.clone(),
-                        len,
-                        arrays,
-                        None,
-                    );
-                    return Some(Ok(
-                        Box::new(struct_array) as Box<dyn polars_arrow::array::Array>
-                    ));
+                    return Some(Ok(record_batch_to_struct_array(batch, self.dtype.clone())));
                 },
                 Ok(Some(Err(err))) => {
                     // Drop the receiver immediately so sibling background streams are aborted now.
@@ -129,10 +143,10 @@ impl ArrowStreamExporter {
         requested_schema: Option<Py<PyAny>>,
     ) -> PyResult<Py<PyAny>> {
         let _ = requested_schema;
-        let mut rx_guard = self.receiver.lock().map_err(|_| {
+        let mut source_guard = self.source.lock().map_err(|_| {
             pyo3::exceptions::PyRuntimeError::new_err("Stream receiver lock is poisoned")
         })?;
-        let rx = rx_guard
+        let source = source_guard
             .take()
             .ok_or_else(|| pyo3::exceptions::PyValueError::new_err("Stream already consumed"))?;
 
@@ -140,18 +154,21 @@ impl ArrowStreamExporter {
             self.schema.iter().map(|(_, field)| field.clone()).collect();
         let dtype = polars_arrow::datatypes::ArrowDataType::Struct(fields);
 
-        let iter = ReceiverIterator {
-            rx: Some(rx),
-            dtype: dtype.clone(),
-        };
-        let box_iter = Box::new(iter)
-            as Box<
-                dyn Iterator<
-                    Item = pyo3_polars::export::polars_error::PolarsResult<
-                        Box<dyn polars_arrow::array::Array>,
-                    >,
+        let box_iter: Box<
+            dyn Iterator<
+                Item = pyo3_polars::export::polars_error::PolarsResult<
+                    Box<dyn polars_arrow::array::Array>,
                 >,
-            >;
+            >,
+        > = match source {
+            StreamSource::Receiver(rx) => Box::new(ReceiverIterator {
+                rx: Some(rx),
+                dtype: dtype.clone(),
+            }),
+            StreamSource::Batch(batch) => Box::new(std::iter::once(Ok(
+                record_batch_to_struct_array(batch, dtype.clone()),
+            ))),
+        };
 
         let field = polars_arrow::datatypes::Field::new("".into(), dtype, false);
 

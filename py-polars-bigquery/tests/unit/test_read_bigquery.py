@@ -69,58 +69,60 @@ def test_client_read_bigquery_calls_arrow_with_parsed_id(mock_arrow_client):
 
 def test_client_read_query(mock_arrow_client):
     mock_exporter = MagicMock()
-    mock_arrow_client.read_table.return_value = mock_exporter
+    mock_arrow_client.read_query.return_value = mock_exporter
 
-    with (
-        patch("polars_bigquery.core.bigquery_rest.run_query") as mock_run_query,
-        patch("polars.DataFrame") as mock_df_cls,
-    ):
-        mock_run_query.return_value = "project.dataset.temp_table"
+    with patch("polars.DataFrame") as mock_df_cls:
         mock_df = MagicMock()
         mock_df_cls.return_value = mock_df
 
         client = Client(quota_project_id="q")
         result = client.read_query(query="SELECT 1")
 
-        expected_ua = f"polars-bigquery/{__version__}"
-        mock_run_query.assert_called_once_with(
+        mock_arrow_client.read_query.assert_called_once_with(
             "SELECT 1",
-            quota_project_id="q",
-            credentials_provider=client.credentials_provider,
-            user_agent=expected_ua,
-            session=client._rest_client.session,
-        )
-        mock_arrow_client.read_table.assert_called_once_with(
-            arrow_bigquery.BigQueryTableId("project", "dataset", "temp_table"),
+            arrow_buffer_compression="lz4frame",
+            dry_run=False,
             maintain_order=False,
+            use_query_cache=None,
         )
+        mock_df_cls.assert_called_once_with(mock_exporter)
         assert result is mock_df
 
 
-def test_client_read_query_with_user_agent(mock_arrow_client):
+def test_client_read_query_passes_additional_parameters(mock_arrow_client):
     mock_exporter = MagicMock()
-    mock_arrow_client.read_table.return_value = mock_exporter
+    mock_arrow_client.read_query.return_value = mock_exporter
 
-    with (
-        patch("polars_bigquery.core.bigquery_rest.run_query") as mock_run_query,
-        patch("polars.DataFrame") as mock_df_cls,
-    ):
-        mock_run_query.return_value = "project.dataset.temp_table"
+    with patch("polars.DataFrame") as mock_df_cls:
         mock_df = MagicMock()
         mock_df_cls.return_value = mock_df
 
-        client = Client(user_agent="custom-ua/1.0", quota_project_id="q")
-        result = client.read_query(query="SELECT 1")
-
-        assert result is not None
-        expected_ua = f"polars-bigquery/{__version__} custom-ua/1.0"
-        mock_run_query.assert_called_once_with(
-            "SELECT 1",
-            quota_project_id="q",
-            credentials_provider=client.credentials_provider,
-            user_agent=expected_ua,
-            session=client._rest_client.session,
+        client = Client(quota_project_id="q")
+        result = client.read_query(
+            query="SELECT 1",
+            arrow_buffer_compression="zstd",
+            dry_run=True,
+            maintain_order=True,
+            use_query_cache=False,
         )
+
+        mock_arrow_client.read_query.assert_called_once_with(
+            "SELECT 1",
+            arrow_buffer_compression="zstd",
+            dry_run=True,
+            maintain_order=True,
+            use_query_cache=False,
+        )
+        mock_df_cls.assert_called_once_with(mock_exporter)
+        assert result is mock_df
+
+
+def test_client_read_query_propagates_errors(mock_arrow_client):
+    mock_arrow_client.read_query.side_effect = Exception("Rust query error")
+
+    client = Client(quota_project_id="q")
+    with pytest.raises(Exception, match="Rust query error"):
+        client.read_query(query="SELECT 1")
 
 
 def test_client_read_bigquery_handles_bigquery_objects(mock_arrow_client):
@@ -428,3 +430,74 @@ def test_client_context_manager_closes_rest_session(mock_arrow_client):
         with Client(quota_project_id="q") as client:
             assert client.quota_project_id == "q"
         mock_close.assert_called_once()
+
+
+def test_client_read_query_dry_run_returns_polars_dataframe():
+    import json
+    import threading
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self):
+            length = int(self.headers.get("Content-Length", "0"))
+            body = json.loads(self.rfile.read(length).decode("utf-8"))
+            assert self.path.startswith("/bigquery/v2/projects/test-proj/queries")
+            assert body["query"] == "SELECT 1 AS one"
+            assert body.get("dryRun") is True
+
+            resp = {
+                "jobReference": {
+                    "projectId": "test-proj",
+                    "location": "US",
+                },
+                "totalBytesProcessed": "128",
+                "cacheHit": True,
+                "statementType": "SELECT",
+                "creationTime": "1767037135155",
+                "schema": {"fields": [{"name": "one", "type": "INT64"}]},
+            }
+            payload = json.dumps(resp).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+        def log_message(self, format, *args):
+            pass
+
+    server = HTTPServer(("127.0.0.1", 0), Handler)
+    port = server.server_port
+    server_thread = threading.Thread(target=server.handle_request)
+    server_thread.start()
+
+    try:
+        creds = lambda: ({"bearer_token": "fake-tok"}, None)
+        client = Client(quota_project_id="test-proj", credentials_provider=creds)
+        client._arrow_client = arrow_bigquery.Client(
+            quota_project_id="test-proj",
+            credentials_provider=creds,
+            bq_endpoint=f"http://127.0.0.1:{port}",
+        )
+        df = client.read_query("SELECT 1 AS one", dry_run=True)
+    finally:
+        server_thread.join()
+        server.server_close()
+
+    assert isinstance(df, pl.DataFrame)
+    assert df.height == 1
+    assert df.columns == [
+        "bigquerySchema",
+        "projectId",
+        "jobId",
+        "location",
+        "totalBytesProcessed",
+        "cacheHit",
+        "statementType",
+        "creationTime",
+    ]
+    assert df["projectId"].to_list() == ["test-proj"]
+    assert df["location"].to_list() == ["US"]
+    assert df["totalBytesProcessed"].to_list() == [128]
+    assert df["cacheHit"].to_list() == [True]
+    assert df["statementType"].to_list() == ["SELECT"]
