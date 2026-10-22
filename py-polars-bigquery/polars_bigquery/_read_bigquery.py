@@ -150,32 +150,49 @@ class Client:
         self,
         query: str,
         *,
+        arrow_buffer_compression: str = "lz4frame",
+        dry_run: bool = False,
         maintain_order: bool = False,
+        use_query_cache: bool | None = None,
     ) -> pl.DataFrame:
         """Execute a GoogleSQL query and read the result into a Polars `DataFrame`.
 
-        Submits a query job via the BigQuery Jobs REST API, waits for job
-        completion, and streams the destination table via the BigQuery Storage
-        Read API.
+        Executes the query via the BigQuery `jobs.query` API with
+        `JOB_CREATION_OPTIONAL` and streams the Arrow results via the BigQuery
+        Storage Read API.
 
         Parameters
         ----------
         query
             GoogleSQL query string to execute in BigQuery.
+        arrow_buffer_compression
+            Compression codec for Arrow record batch buffers (`"lz4frame"`,
+            `"zstd"`, or `"unspecified"`). Defaults to `"lz4frame"`.
+        dry_run
+            If `True`, validates the query without executing it and returns a
+            1-row `DataFrame` containing job statistics and schema metadata
+            (`bigquerySchema`, `projectId`, `jobId`, `location`,
+            `totalBytesProcessed`, `cacheHit`, `statementType`, `creationTime`).
+            Defaults to `False`.
         maintain_order
             Whether to preserve the row order produced by an `ORDER BY` clause
             by reading from a single Storage Read API stream. Defaults to
-            `False`, which enables parallel multi-stream reads.
+            `False`, which switches to parallel multi-stream reads for large
+            result sets.
+        use_query_cache
+            Whether to look for the result in the query cache. If `None`, the
+            BigQuery API default (`True`) is used.
 
         Returns
         -------
         pl.DataFrame
-            A Polars `DataFrame` containing the query results.
+            A Polars `DataFrame` containing the query results (or dry-run
+            metadata when `dry_run=True`).
 
         Raises
         ------
         polars_bigquery.exceptions.BigQueryError
-            If the BigQuery query job fails or times out.
+            If the BigQuery query fails.
 
         Examples
         --------
@@ -192,11 +209,12 @@ class Client:
         )
         ```
         """
-        table = self._rest_client.run_query(query)
-        table_ref = arrow_bigquery.api.resources.parse_table_id(table)
-        arrow_stream_exporter = self._arrow_client.read_table(
-            table_ref,
+        arrow_stream_exporter = self._arrow_client.read_query(
+            query,
+            arrow_buffer_compression=arrow_buffer_compression,
+            dry_run=dry_run,
             maintain_order=maintain_order,
+            use_query_cache=use_query_cache,
         )
         return pl.DataFrame(arrow_stream_exporter)
 

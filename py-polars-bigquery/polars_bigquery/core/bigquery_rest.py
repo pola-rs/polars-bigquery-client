@@ -1,14 +1,8 @@
-"""Utilities for running a query in BigQuery and getting the results as a table.
-
-TODO(tswast): Implement this in Rust using jobs.query and the
-JOB_CREATION_OPTIONAL parameter to improve latency in small query results.
-"""
+"""Utilities for fetching table metadata from the BigQuery REST API."""
 
 from __future__ import annotations
 
 import contextlib
-import time
-import uuid
 from typing import Any
 
 import arrow_bigquery.api.resources
@@ -25,7 +19,6 @@ _BIGQUERY_ENDPOINT = "https://bigquery.googleapis.com/bigquery/v2"
 _CONNECT_TIMEOUT = 60.0
 _READ_TIMEOUT = 250.0
 DEFAULT_TIMEOUT: tuple[float, float] = (_CONNECT_TIMEOUT, _READ_TIMEOUT)
-MAX_POLL_SECONDS: float = 21600.0
 
 
 def create_resilient_session() -> requests.Session:
@@ -73,99 +66,6 @@ def _get_table_metadata_url(
     )
 
 
-def _get_jobs_insert_url(quota_project_id: str) -> str:
-    return f"{_BIGQUERY_ENDPOINT}/projects/{quota_project_id}/jobs"
-
-
-def _get_jobs_insert_body(query: str, quota_project_id: str) -> dict:
-    return {
-        "jobReference": {
-            "projectId": quota_project_id,
-            "jobId": f"polars_bq_{uuid.uuid4().hex}",
-        },
-        "configuration": {
-            "query": {
-                "query": query,
-                "useLegacySql": False,
-            }
-        },
-    }
-
-
-def _get_jobs_get_url(
-    job_id: str, quota_project_id: str, location: str | None = None
-) -> str:
-    url = f"{_BIGQUERY_ENDPOINT}/projects/{quota_project_id}/jobs/{job_id}"
-    if location:
-        url += f"?location={location}"
-    return url
-
-
-def _get_query_results_url(
-    job_id: str, quota_project_id: str, location: str | None = None
-) -> str:
-    # Set maxResults=0 and timeoutMs=10000 to use this endpoint to wait for job completion.
-    url = (
-        f"{_BIGQUERY_ENDPOINT}/projects/{quota_project_id}/queries/{job_id}/results"
-        "?maxResults=0&timeoutMs=10000"
-    )
-    if location:
-        url += f"&location={location}"
-    return url
-
-
-def _wait_for_job(
-    job_id: str,
-    quota_project_id: str,
-    credentials_provider: pl.CredentialProviderGCP,
-    user_agent: str,
-    *,
-    location: str | None = None,
-    session: requests.Session | None = None,
-    timeout: tuple[float, float] = DEFAULT_TIMEOUT,
-    max_poll_seconds: float = MAX_POLL_SECONDS,
-) -> dict:
-    http = session if session is not None else requests
-    start_time = time.monotonic()
-    while True:
-        if time.monotonic() - start_time > max_poll_seconds:
-            raise polars_bigquery.exceptions.BigQueryError(
-                f"Timed out waiting for BigQuery job {job_id} after {max_poll_seconds}s"
-            )
-        headers = _get_headers(
-            quota_project_id=quota_project_id,
-            credentials_provider=credentials_provider,
-            user_agent=user_agent,
-        )
-        response = http.get(
-            _get_jobs_get_url(job_id, quota_project_id, location=location),
-            headers=headers,
-            timeout=timeout,
-        )
-        _raise_for_bigquery_error(response)
-        job = response.json()
-
-        if job["status"]["state"] == "DONE":
-            if "errorResult" in job["status"]:
-                raise polars_bigquery.exceptions.BigQueryError(
-                    job["status"]["errorResult"]["message"]
-                )
-            return job
-
-        # jobs.getQueryResults waits about 10s or until the query finishes.
-        poll_start = time.monotonic()
-        poll_response = http.get(
-            _get_query_results_url(job_id, quota_project_id, location=location),
-            headers=headers,
-            timeout=timeout,
-        )
-        _raise_for_bigquery_error(poll_response)
-        # Avoid busy-spinning if the polling endpoint returns without blocking
-        elapsed = time.monotonic() - poll_start
-        if elapsed < 1.0:
-            time.sleep(1.0 - elapsed)
-
-
 def _get_headers(
     *,
     quota_project_id: str,
@@ -180,49 +80,6 @@ def _get_headers(
         "Content-Type": "application/json",
         "x-goog-user-project": quota_project_id,
     }
-
-
-def run_query(
-    query: str,
-    *,
-    quota_project_id: str,
-    credentials_provider: pl.CredentialProviderGCP,
-    user_agent: str,
-    session: requests.Session | None = None,
-    timeout: tuple[float, float] = DEFAULT_TIMEOUT,
-) -> str:
-    """Run a query and return the destination table from the job resource."""
-    http = session if session is not None else requests
-    headers = _get_headers(
-        quota_project_id=quota_project_id,
-        credentials_provider=credentials_provider,
-        user_agent=user_agent,
-    )
-
-    # 1. Insert the job
-    insert_url = _get_jobs_insert_url(quota_project_id)
-    body = _get_jobs_insert_body(query, quota_project_id)
-    response = http.post(insert_url, headers=headers, json=body, timeout=timeout)
-    _raise_for_bigquery_error(response)
-    job_resource = response.json()
-    job_ref = job_resource.get("jobReference", {})
-    job_id = job_ref["jobId"]
-    location = job_ref.get("location")
-
-    # 2. Wait for the job to complete (refreshing credentials on each poll)
-    job = _wait_for_job(
-        job_id,
-        quota_project_id,
-        credentials_provider,
-        user_agent,
-        location=location,
-        session=session,
-        timeout=timeout,
-    )
-
-    # 3. Return the destination table ID
-    dest = job["configuration"]["query"]["destinationTable"]
-    return f"{dest['projectId']}.{dest['datasetId']}.{dest['tableId']}"
 
 
 def get_table_metadata(
@@ -277,15 +134,6 @@ class BigQueryRestClient:
 
     def __exit__(self, *exc_info: object) -> None:
         self.close()
-
-    def run_query(self, query: str) -> str:
-        return run_query(
-            query,
-            quota_project_id=self._quota_project_id,
-            credentials_provider=self._credentials_provider,
-            user_agent=self._user_agent,
-            session=self._session,
-        )
 
     def get_table_metadata(
         self,
