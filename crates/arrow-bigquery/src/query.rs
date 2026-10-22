@@ -108,56 +108,13 @@ impl<'a> Query<'a> {
         )
     }
 
-    async fn get_destination_table(
-        &self,
-        response: &QueryResponse,
-    ) -> Result<crate::BigQueryTableId, BigQueryError> {
-        let (project_id, job_id, location) = extract_required_job_reference(response)?;
-        let job = self
-            .client
-            .apply_request_options(
-                self.client
-                    .bq_client
-                    .get_job()
-                    .set_project_id(project_id)
-                    .set_job_id(job_id)
-                    .set_location(location),
-            )
-            .with_idempotency(true)
-            .send()
-            .await?;
-
-        let destination_table = job
-            .configuration
-            .and_then(|c| c.query)
-            .and_then(|q| q.destination_table)
-            .ok_or_else(|| {
-                BigQueryError::Protocol(
-                    "Job response is missing configuration.query.destination_table".into(),
-                )
-            })?;
-
-        if destination_table.project_id.is_empty()
-            || destination_table.dataset_id.is_empty()
-            || destination_table.table_id.is_empty()
-        {
-            return Err(BigQueryError::Protocol(
-                "Job destination_table is missing project_id, dataset_id, or table_id".into(),
-            ));
-        }
-
-        Ok(crate::BigQueryTableId::new(
-            destination_table.project_id,
-            destination_table.dataset_id,
-            destination_table.table_id,
-        ))
-    }
-
     async fn read_destination_table(
         &self,
         response: &QueryResponse,
     ) -> Result<(ArrowSchemaRef, BigQueryRecordBatchReceiver), BigQueryError> {
-        let destination_table = self.get_destination_table(response).await?;
+        let (project_id, job_id, location) = extract_required_job_reference(response)?;
+        let destination_table =
+            get_destination_table(self.client, project_id, job_id, location).await?;
         self.client
             .read_table(
                 &destination_table,
@@ -177,13 +134,28 @@ impl<'a> Query<'a> {
         offset: i64,
         serialized_schema: Option<bytes::Bytes>,
     ) -> Result<(ArrowSchemaRef, BigQueryRecordBatchReceiver), BigQueryError> {
-        let first_page_check =
-            (!self.maintain_order).then_some(crate::bigquery_read_stream::FirstPageCheck {
-                threshold_bytes: MULTI_STREAM_THRESHOLD_BYTES,
-                fallback_total_rows: response.total_rows,
-            });
-        match self
-            .client
+        let first_page_check = if !self.maintain_order {
+            let (project_id, job_id, location) = extract_required_job_reference(response)?;
+            Some((
+                crate::bigquery_read_stream::FirstPageCheck {
+                    threshold_bytes: MULTI_STREAM_THRESHOLD_BYTES,
+                    fallback_total_rows: response.total_rows,
+                },
+                crate::FallbackReadSession {
+                    project_id: project_id.to_string(),
+                    job_id: job_id.to_string(),
+                    location: location.to_string(),
+                    read_options: crate::ReadOptions {
+                        maintain_order: false,
+                        arrow_buffer_compression: Some(self.arrow_buffer_compression()),
+                        ..Default::default()
+                    },
+                },
+            ))
+        } else {
+            None
+        };
+        self.client
             .read_stream_with_first_page_check(
                 stream_name,
                 StreamOptions {
@@ -193,11 +165,7 @@ impl<'a> Query<'a> {
                 },
                 first_page_check,
             )
-            .await?
-        {
-            Some(result) => Ok(result),
-            None => self.read_destination_table(response).await,
-        }
+            .await
     }
 
     pub async fn dry_run(&self) -> Result<RecordBatch, BigQueryError> {
@@ -318,6 +286,51 @@ impl<'a> Query<'a> {
 
 fn non_empty_str(s: &str) -> Option<&str> {
     (!s.is_empty()).then_some(s)
+}
+
+pub(crate) async fn get_destination_table(
+    client: &crate::Client,
+    project_id: &str,
+    job_id: &str,
+    location: &str,
+) -> Result<crate::BigQueryTableId, BigQueryError> {
+    let job = client
+        .apply_request_options(
+            client
+                .bq_client
+                .get_job()
+                .set_project_id(project_id)
+                .set_job_id(job_id)
+                .set_location(location),
+        )
+        .with_idempotency(true)
+        .send()
+        .await?;
+
+    let destination_table = job
+        .configuration
+        .and_then(|c| c.query)
+        .and_then(|q| q.destination_table)
+        .ok_or_else(|| {
+            BigQueryError::Protocol(
+                "Job response is missing configuration.query.destination_table".into(),
+            )
+        })?;
+
+    if destination_table.project_id.is_empty()
+        || destination_table.dataset_id.is_empty()
+        || destination_table.table_id.is_empty()
+    {
+        return Err(BigQueryError::Protocol(
+            "Job destination_table is missing project_id, dataset_id, or table_id".into(),
+        ));
+    }
+
+    Ok(crate::BigQueryTableId::new(
+        destination_table.project_id,
+        destination_table.dataset_id,
+        destination_table.table_id,
+    ))
 }
 
 fn extract_job_reference(response: &QueryResponse) -> (Option<&str>, Option<&str>, Option<&str>) {

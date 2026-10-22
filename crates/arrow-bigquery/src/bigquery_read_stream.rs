@@ -44,12 +44,15 @@ use polars_arrow::record_batch::RecordBatch;
 use super::bigquery_read_retry::{self, StreamRetryConfig};
 use crate::BigQueryError;
 
-pub(crate) enum StreamStart {
-    Ready(ArrowSchemaRef),
+pub(crate) type SchemaSender = tokio::sync::oneshot::Sender<Result<ArrowSchemaRef, BigQueryError>>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TerminationReason {
+    /// Stream completed cleanly, fatal error occurred, or consumer dropped the receiver.
+    Finished,
+    /// Cancelled after the first response to read in parallel from a fresh read session.
     SwitchToReadSession,
 }
-
-pub(crate) type SchemaSender = tokio::sync::oneshot::Sender<Result<StreamStart, BigQueryError>>;
 
 pub(crate) struct FirstPageCheck {
     pub(crate) threshold_bytes: u64,
@@ -224,8 +227,8 @@ enum ReadStreamState {
     Running,
     /// Encountered a transient mid-stream disconnection; backing off before reconnecting.
     BackingOff(google_cloud_bigquery::Error),
-    /// Stream completed cleanly, fatal error occurred, or consumer dropped the receiver.
-    Terminated,
+    /// Stream terminated with a [`TerminationReason`].
+    Terminated(TerminationReason),
 }
 
 enum ConnectOutcome {
@@ -306,7 +309,7 @@ async fn decode_and_send_batches(options: DecodeAndSendOptions<'_>) -> ReadStrea
     } = options;
     let decoded = tokio::select! {
         biased;
-        _ = cancel_rx.changed() => return ReadStreamState::Terminated,
+        _ = cancel_rx.changed() => return ReadStreamState::Terminated(TerminationReason::Finished),
         res = decode_batches_on_pool(
             decode_pool,
             serialized_record_batch,
@@ -330,17 +333,17 @@ async fn decode_and_send_batches(options: DecodeAndSendOptions<'_>) -> ReadStrea
                             cancel_tx,
                         )
                         .await;
-                        return ReadStreamState::Terminated;
+                        return ReadStreamState::Terminated(TerminationReason::Finished);
                     },
                 }
                 tokio::select! {
                     biased;
-                    _ = cancel_rx.changed() => return ReadStreamState::Terminated,
+                    _ = cancel_rx.changed() => return ReadStreamState::Terminated(TerminationReason::Finished),
                     send_res = tx.send(Ok(batch)) => {
                         if send_res.is_err() {
                             // `tx.send` returns `Err` strictly when all `Receiver` handles (`rx`) have been
                             // dropped or closed. Terminating this stream cleanly prevents orphan background tasks.
-                            return ReadStreamState::Terminated;
+                            return ReadStreamState::Terminated(TerminationReason::Finished);
                         }
                     }
                 }
@@ -349,7 +352,7 @@ async fn decode_and_send_batches(options: DecodeAndSendOptions<'_>) -> ReadStrea
         },
         Err(err) => {
             send_fatal_error(err, &mut None, tx, cancel_tx).await;
-            ReadStreamState::Terminated
+            ReadStreamState::Terminated(TerminationReason::Finished)
         },
     }
 }
@@ -387,12 +390,12 @@ async fn consume_next_message(
     options: &mut ReadStreamOptions,
 ) -> ReadStreamState {
     if *options.cancel_rx.borrow_and_update() {
-        return ReadStreamState::Terminated;
+        return ReadStreamState::Terminated(TerminationReason::Finished);
     }
 
     let next_item = tokio::select! {
         biased;
-        _ = options.cancel_rx.changed() => return ReadStreamState::Terminated,
+        _ = options.cancel_rx.changed() => return ReadStreamState::Terminated(TerminationReason::Finished),
         item = stream.next() => item,
     };
 
@@ -420,7 +423,7 @@ async fn consume_next_message(
                                 &options.cancel_tx,
                             )
                             .await;
-                            return ReadStreamState::Terminated;
+                            return ReadStreamState::Terminated(TerminationReason::Finished);
                         },
                     };
                     let parsed = match parse_arrow_schema(&serialized_schema) {
@@ -433,14 +436,11 @@ async fn consume_next_message(
                                 &options.cancel_tx,
                             )
                             .await;
-                            return ReadStreamState::Terminated;
+                            return ReadStreamState::Terminated(TerminationReason::Finished);
                         },
                     };
-                    if options.first_page_check.is_none() {
-                        if let Some(sender) = options.schema_tx.take() {
-                            let _ = sender
-                                .send(Ok(StreamStart::Ready(Arc::new(parsed.schema.clone()))));
-                        }
+                    if let Some(sender) = options.schema_tx.take() {
+                        let _ = sender.send(Ok(Arc::new(parsed.schema.clone())));
                     }
                     options.metadata = Some(Arc::clone(&parsed));
                     parsed
@@ -454,7 +454,7 @@ async fn consume_next_message(
                 Err(err) => {
                     send_fatal_error(err, &mut options.schema_tx, &options.tx, &options.cancel_tx)
                         .await;
-                    return ReadStreamState::Terminated;
+                    return ReadStreamState::Terminated(TerminationReason::Finished);
                 },
             };
 
@@ -471,7 +471,7 @@ async fn consume_next_message(
                             &options.cancel_tx,
                         )
                         .await;
-                        return ReadStreamState::Terminated;
+                        return ReadStreamState::Terminated(TerminationReason::Finished);
                     },
                 };
                 let total_rows = total_estimated_row_count
@@ -485,15 +485,7 @@ async fn consume_next_message(
                     total_rows,
                 ) >= check.threshold_bytes
                 {
-                    if let Some(sender) = options.schema_tx.take() {
-                        let _ = sender.send(Ok(StreamStart::SwitchToReadSession));
-                    }
-                    return ReadStreamState::Terminated;
-                }
-                if let Some(sender) = options.schema_tx.take() {
-                    let _ = sender.send(Ok(StreamStart::Ready(Arc::new(
-                        metadata_arc.schema.clone(),
-                    ))));
+                    return ReadStreamState::Terminated(TerminationReason::SwitchToReadSession);
                 }
             }
 
@@ -510,11 +502,7 @@ async fn consume_next_message(
             .await
         },
         None => {
-            if let Some(ref metadata) = options.metadata {
-                if let Some(sender) = options.schema_tx.take() {
-                    let _ = sender.send(Ok(StreamStart::Ready(Arc::new(metadata.schema.clone()))));
-                }
-            } else if options.schema_tx.is_some() {
+            if options.schema_tx.is_some() {
                 send_fatal_error(
                     BigQueryError::Protocol(
                         "ReadRows stream closed without sending an Arrow schema".into(),
@@ -525,7 +513,7 @@ async fn consume_next_message(
                 )
                 .await;
             }
-            ReadStreamState::Terminated
+            ReadStreamState::Terminated(TerminationReason::Finished)
         },
         Some(Err(err)) => {
             if bigquery_read_retry::stream_reconnect_predicate(&err) {
@@ -538,7 +526,7 @@ async fn consume_next_message(
                     &options.cancel_tx,
                 )
                 .await;
-                ReadStreamState::Terminated
+                ReadStreamState::Terminated(TerminationReason::Finished)
             }
         },
     }
@@ -560,14 +548,14 @@ async fn consume_next_message(
 /// (`backoff_session.reset()`). This ensures that long-lived data streams
 /// experiencing rare, transient network interruptions separated by minutes or
 /// hours always receive a full retry budget.
-pub(crate) async fn read_stream(options: ReadStreamOptions) {
-    read_stream_with_initial(options, None).await;
+pub(crate) async fn read_stream(options: ReadStreamOptions) -> TerminationReason {
+    read_stream_with_initial(options, None).await
 }
 
 async fn read_stream_with_initial(
     mut options: ReadStreamOptions,
     mut stream: Option<ResponseStream<ReadRowsResponse>>,
-) {
+) -> TerminationReason {
     let mut backoff_session = options.retry_config.make_reconnect_session();
     let mut state = if stream.is_some() {
         ReadStreamState::Running
@@ -575,9 +563,9 @@ async fn read_stream_with_initial(
         ReadStreamState::Connecting
     };
 
-    while !matches!(state, ReadStreamState::Terminated) {
+    loop {
         if *options.cancel_rx.borrow_and_update() {
-            break;
+            return TerminationReason::Finished;
         }
 
         state = match state {
@@ -602,9 +590,11 @@ async fn read_stream_with_initial(
                             &options.cancel_tx,
                         )
                         .await;
-                        ReadStreamState::Terminated
+                        ReadStreamState::Terminated(TerminationReason::Finished)
                     },
-                    ConnectOutcome::Cancelled => ReadStreamState::Terminated,
+                    ConnectOutcome::Cancelled => {
+                        ReadStreamState::Terminated(TerminationReason::Finished)
+                    },
                 }
             },
             ReadStreamState::Running => match stream {
@@ -628,7 +618,7 @@ async fn read_stream_with_initial(
                         &options.cancel_tx,
                     )
                     .await;
-                    ReadStreamState::Terminated
+                    ReadStreamState::Terminated(TerminationReason::Finished)
                 },
             },
             ReadStreamState::BackingOff(last_err) => {
@@ -637,7 +627,7 @@ async fn read_stream_with_initial(
                     .await
                 {
                     Ok(Some(())) => ReadStreamState::Connecting,
-                    Ok(None) => ReadStreamState::Terminated,
+                    Ok(None) => ReadStreamState::Terminated(TerminationReason::Finished),
                     Err(err) => {
                         send_fatal_error(
                             BigQueryError::Grpc(err),
@@ -646,11 +636,11 @@ async fn read_stream_with_initial(
                             &options.cancel_tx,
                         )
                         .await;
-                        ReadStreamState::Terminated
+                        ReadStreamState::Terminated(TerminationReason::Finished)
                     },
                 }
             },
-            ReadStreamState::Terminated => break,
+            ReadStreamState::Terminated(reason) => return reason,
         };
     }
 }
@@ -692,7 +682,7 @@ pub(crate) async fn read_query_stream(options: ReadQueryStreamOptions) {
                 &mut connect_cancel_rx,
             );
             let (first_page_state, connect_outcome) = tokio::join!(decode_fut, connect_fut);
-            if matches!(first_page_state, ReadStreamState::Terminated) {
+            if matches!(first_page_state, ReadStreamState::Terminated(_)) {
                 return;
             }
             let initial_stream = match connect_outcome {
@@ -703,7 +693,7 @@ pub(crate) async fn read_query_stream(options: ReadQueryStreamOptions) {
                 },
                 ConnectOutcome::Cancelled => return,
             };
-            read_stream_with_initial(
+            let _ = read_stream_with_initial(
                 ReadStreamOptions {
                     read_rows,
                     current_offset,
