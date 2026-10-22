@@ -328,3 +328,133 @@ async fn test_read_initial_query_oom_failure() {
     assert!(err.to_string().starts_with("BigQuery job failed"));
     assert!(err.to_string().contains("Resources exceeded"));
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_read_long_running_empty_query() {
+    let client = setup_client().await;
+
+    let sql = r#"
+        WITH
+          base AS (
+            SELECT
+              a * 1000 + b AS id,
+              FARM_FINGERPRINT(CAST(a * 1000 + b AS STRING)) AS fp,
+              TO_HEX(SHA256(CAST(a * 1000 + b AS STRING))) AS digest
+            FROM
+              UNNEST(GENERATE_ARRAY(0, 999)) AS a
+            CROSS JOIN
+              UNNEST(GENERATE_ARRAY(0, 999)) AS b
+          ),
+          stage1 AS (
+            SELECT
+              b1.id AS id1,
+              b2.id AS id2,
+              FARM_FINGERPRINT(CONCAT(b1.digest, b2.digest)) AS combined_fp,
+              TO_HEX(SHA256(CONCAT(b1.digest, b2.digest))) AS combined_digest
+            FROM
+              base AS b1
+            INNER JOIN
+              base AS b2
+            ON
+              MOD(ABS(b1.fp), 200000) = MOD(ABS(b2.fp), 200000)
+              AND b1.id != b2.id
+          ),
+          stage2 AS (
+            SELECT
+              s1.id1,
+              COUNT(*) AS match_count,
+              MAX(s1.combined_digest) AS max_digest
+            FROM
+              stage1 AS s1
+            INNER JOIN
+              base AS b3
+            ON
+              MOD(ABS(s1.combined_fp), 500000) = b3.id
+            GROUP BY
+              s1.id1
+          )
+        SELECT
+          id1,
+          match_count,
+          max_digest
+        FROM
+          stage2
+        WHERE
+          match_count < 0
+    "#;
+
+    let (schema, receiver) = client
+        .query(sql)
+        .with_use_query_cache(false)
+        .read()
+        .await
+        .expect("long running empty query read should succeed");
+
+    let col_names: Vec<&str> = schema.iter_names().map(|s| s.as_str()).collect();
+    assert_eq!(col_names, vec!["id1", "match_count", "max_digest"]);
+    assert_eq!(consume_receiver(receiver).await, 0);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_read_ddl_queries() {
+    let client = setup_client().await;
+    let project_id = client.quota_project_id().to_string();
+    let suffix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let dataset_id = format!("_arrow_bq_ddl_test_{suffix}");
+
+    // 1. Short-running DDL query with no schema (CREATE SCHEMA)
+    let create_schema_sql = format!(
+        "CREATE SCHEMA `{project_id}.{dataset_id}` OPTIONS(default_table_expiration_days=1)"
+    );
+    let (schema, receiver) = client
+        .query(create_schema_sql)
+        .read()
+        .await
+        .expect("CREATE SCHEMA query().read() should succeed");
+    assert_eq!(schema.len(), 0);
+    assert_eq!(consume_receiver(receiver).await, 0);
+
+    let test_result = async {
+        // 2. Short-running DDL query (CREATE TABLE)
+        let create_table_sql = format!(
+            "CREATE OR REPLACE TABLE `{project_id}.{dataset_id}.test_tbl` (x INT64, y STRING)"
+        );
+        let (_, receiver) = client
+            .query(create_table_sql)
+            .read()
+            .await
+            .expect("CREATE TABLE query().read() should succeed");
+        assert_eq!(consume_receiver(receiver).await, 0);
+
+        // 3. Long-running DDL query (CREATE MODEL)
+        let create_model_sql = format!(
+            "CREATE OR REPLACE MODEL `{project_id}.{dataset_id}.test_model` \
+             OPTIONS(model_type='linear_reg', max_iterations=1) AS \
+             SELECT CAST(x AS FLOAT64) AS f1, CAST(x * 2 + 1 AS FLOAT64) AS label \
+             FROM UNNEST(GENERATE_ARRAY(1, 100)) AS x"
+        );
+        let (model_schema, model_receiver) = client
+            .query(create_model_sql)
+            .read()
+            .await
+            .expect("CREATE MODEL query().read() should succeed");
+        assert_eq!(model_schema.len(), 0);
+        assert_eq!(consume_receiver(model_receiver).await, 0);
+    }
+    .await;
+
+    // 4. Always clean up the temporary dataset (DROP SCHEMA ... CASCADE)
+    let drop_schema_sql = format!("DROP SCHEMA IF EXISTS `{project_id}.{dataset_id}` CASCADE");
+    let (drop_schema, drop_receiver) = client
+        .query(drop_schema_sql)
+        .read()
+        .await
+        .expect("DROP SCHEMA query().read() should succeed");
+    assert_eq!(drop_schema.len(), 0);
+    assert_eq!(consume_receiver(drop_receiver).await, 0);
+
+    let () = test_result;
+}
