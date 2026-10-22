@@ -1613,7 +1613,7 @@ mod tests {
         }
         assert_eq!(
             err.format_causal_chain(),
-            "BigQuery job failed (resourcesExceeded): Resources exceeded during query execution: Out of memory."
+            "BigQuery job US:failed-job-789 failed (resourcesExceeded): Resources exceeded during query execution: Out of memory."
         );
 
         // Case 2: get_job fails -> returns original ReadRows Grpc error, not get_job error

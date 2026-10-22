@@ -102,7 +102,13 @@ fn is_same_job_error(a: &JobError, b: &JobError) -> bool {
 
 impl std::fmt::Display for JobFailedError {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        write!(f, "BigQuery job failed")?;
+        let location = self.location.as_deref().map(str::trim).unwrap_or("");
+        let job_id = self.job_id.as_deref().map(str::trim).unwrap_or("");
+        match (!location.is_empty(), !job_id.is_empty()) {
+            (true, true) => write!(f, "BigQuery job {location}:{job_id} failed")?,
+            (false, true) => write!(f, "BigQuery job {job_id} failed")?,
+            _ => write!(f, "BigQuery job failed")?,
+        }
         format_job_error(f, &self.error, true)?;
         for extra in &self.errors {
             if !is_same_job_error(&self.error, extra) {
@@ -267,7 +273,7 @@ mod tests {
         assert!(err.source().is_none());
         assert_eq!(
             err.format_causal_chain(),
-            "BigQuery job failed (resourcesExceeded): Resources exceeded during query execution: Out of memory."
+            "BigQuery job US:job-1 failed (resourcesExceeded): Resources exceeded during query execution: Out of memory."
         );
 
         let multi_job_failed = JobFailedError {
