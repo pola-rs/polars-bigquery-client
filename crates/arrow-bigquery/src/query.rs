@@ -16,7 +16,7 @@ use crate::{BigQueryRecordBatchReceiver, StreamOptions};
 /// Minimum estimated remaining bytes in the single job stream before switching
 /// to a multi-stream `ReadSession` on the destination table when `maintain_order`
 /// is `false`.
-const MULTI_STREAM_THRESHOLD_BYTES: u64 = 250 * 1024 * 1024;
+const MULTI_STREAM_THRESHOLD_BYTES: f64 = (250 * 1024 * 1024) as f64;
 
 fn bq_to_gapic_compression_codec(
     codec: crate::CompressionCodec,
@@ -1625,13 +1625,13 @@ mod tests {
         use crate::bigquery_read_stream::estimate_remaining_bytes;
 
         let page = bytes::Bytes::from(vec![0u8; 1024]);
-        assert_eq!(estimate_remaining_bytes(None, 10, Some(100)), 0);
-        assert_eq!(estimate_remaining_bytes(Some(&page), 0, Some(100)), 0);
-        assert_eq!(estimate_remaining_bytes(Some(&page), 10, None), 0);
-        assert_eq!(estimate_remaining_bytes(Some(&page), 10, Some(10)), 0);
-        assert_eq!(estimate_remaining_bytes(Some(&page), 10, Some(5)), 0);
+        assert_eq!(estimate_remaining_bytes(None, 10, Some(100)), 0.0);
+        assert_eq!(estimate_remaining_bytes(Some(&page), 0, Some(100)), 0.0);
+        assert_eq!(estimate_remaining_bytes(Some(&page), 10, None), 0.0);
+        assert_eq!(estimate_remaining_bytes(Some(&page), 10, Some(10)), 0.0);
+        assert_eq!(estimate_remaining_bytes(Some(&page), 10, Some(5)), 0.0);
         // 1024 bytes for 10 rows, 90 remaining rows => 9 * 1024 = 9216 bytes
-        assert_eq!(estimate_remaining_bytes(Some(&page), 10, Some(100)), 9216);
+        assert_eq!(estimate_remaining_bytes(Some(&page), 10, Some(100)), 9216.0);
     }
 
     #[tokio::test]

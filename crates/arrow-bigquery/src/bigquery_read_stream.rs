@@ -55,7 +55,7 @@ pub(crate) enum TerminationReason {
 }
 
 pub(crate) struct FirstPageCheck {
-    pub(crate) threshold_bytes: u64,
+    pub(crate) threshold_bytes: f64,
     pub(crate) fallback_total_rows: Option<u64>,
 }
 
@@ -65,17 +65,15 @@ pub(crate) fn estimate_remaining_bytes(
     first_page_bytes: Option<&bytes::Bytes>,
     page_row_count: u64,
     total_rows: Option<u64>,
-) -> u64 {
+) -> f64 {
     let (Some(first_page), Some(total_rows)) = (first_page_bytes, total_rows) else {
-        return 0;
+        return 0.0;
     };
     if page_row_count == 0 || total_rows <= page_row_count {
-        return 0;
+        return 0.0;
     }
-    let remaining_rows = total_rows - page_row_count;
-    let estimated = (first_page.len() as u128).saturating_mul(remaining_rows as u128)
-        / (page_row_count as u128);
-    u64::try_from(estimated).unwrap_or(u64::MAX)
+    let remaining_rows = (total_rows - page_row_count) as f64;
+    (first_page.len() as f64) * remaining_rows / (page_row_count as f64)
 }
 
 static DEFAULT_DECODE_POOL: LazyLock<Arc<rayon::ThreadPool>> = LazyLock::new(|| {
