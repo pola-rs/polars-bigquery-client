@@ -96,7 +96,7 @@ The following Polars data types are supported as scalar literals in comparisons 
 
 ### BigQuery-to-Polars Table Schema Mapping
 
-When [`Client.scan_table`][polars_bigquery.Client.scan_table] inspects a BigQuery table's metadata, BigQuery column types are mapped to the following Polars data types:
+When [`Client.scan_table`][polars_bigquery.Client.scan_table] inspects a BigQuery table's metadata (or when you pass an explicit `schema` to [`Client.scan_table`][polars_bigquery.Client.scan_table]), BigQuery column types correspond to the following Polars data types:
 
 | BigQuery Type | Polars Data Type |
 | --- | --- |

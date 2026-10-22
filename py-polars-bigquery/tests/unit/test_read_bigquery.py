@@ -193,6 +193,83 @@ def test_client_scan_bigquery_calls_arrow_with_parsed_id(mock_arrow_client):
         assert df.equals(mock_lazy_df.collect())
 
 
+def test_client_scan_bigquery_with_schema_dict_skips_get_table_metadata(
+    mock_arrow_client,
+):
+    mock_stream = MagicMock()
+    mock_arrow_client.read_table.return_value = mock_stream
+
+    with (
+        patch(
+            "polars_bigquery.core.bigquery_rest.get_table_metadata"
+        ) as mock_get_metadata,
+        patch("polars.scan_arrow_c_stream") as mock_scan,
+    ):
+        mock_lazy_df = pl.LazyFrame({"col1": [1, 2], "col2": ["a", "b"]})
+        mock_scan.return_value = mock_lazy_df
+
+        client = Client(quota_project_id="q")
+        result = client.scan_table(
+            table="my-project.my_dataset.my_table",
+            schema={"col1": pl.Int64, "col2": pl.String()},
+        )
+
+        mock_get_metadata.assert_not_called()
+        assert result.collect_schema() == pl.Schema(
+            {"col1": pl.Int64(), "col2": pl.String()}
+        )
+
+        df = result.collect()
+
+        mock_arrow_client.read_table.assert_called_once_with(
+            arrow_bigquery.BigQueryTableId("my-project", "my_dataset", "my_table"),
+            maintain_order=False,
+            selected_fields=["col1", "col2"],
+            row_restriction="",
+        )
+        assert df.equals(mock_lazy_df.collect())
+
+
+def test_client_scan_bigquery_with_polars_schema_pushes_down_projection_and_filter(
+    mock_arrow_client,
+):
+    mock_stream = MagicMock()
+    mock_arrow_client.read_table.return_value = mock_stream
+
+    with (
+        patch(
+            "polars_bigquery.core.bigquery_rest.get_table_metadata"
+        ) as mock_get_metadata,
+        patch("polars.scan_arrow_c_stream") as mock_scan,
+    ):
+        mock_scan.return_value = pl.LazyFrame(
+            {"visible": ["a", "b"], "hidden": [5, 15]}
+        )
+
+        client = Client(quota_project_id="q")
+        lf = client.scan_table(
+            table="my-project.my_dataset.my_table",
+            schema=pl.Schema(
+                {
+                    "visible": pl.String(),
+                    "hidden": pl.Int64(),
+                    "unused": pl.String(),
+                }
+            ),
+        )
+        mock_get_metadata.assert_not_called()
+
+        df = lf.filter(pl.col("hidden") > 10).select(["visible"]).collect()
+
+        mock_arrow_client.read_table.assert_called_once_with(
+            arrow_bigquery.BigQueryTableId("my-project", "my_dataset", "my_table"),
+            maintain_order=False,
+            selected_fields=["visible", "hidden"],
+            row_restriction="(`hidden` > 10)",
+        )
+        assert df.equals(pl.DataFrame({"visible": ["b"]}))
+
+
 def test_client_scan_bigquery_handles_bigquery_objects(mock_arrow_client):
     mock_stream = MagicMock()
     mock_arrow_client.read_table.return_value = mock_stream
