@@ -211,3 +211,120 @@ async fn test_read_long_running_query() {
     assert_eq!(col_names, vec!["id1", "match_count", "max_digest"]);
     assert_eq!(consume_receiver(receiver).await, 10_000);
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_read_long_running_query_oom_fails_with_job_failed() {
+    let client = setup_client().await;
+
+    let sql = r#"
+        WITH
+          base AS (
+            SELECT
+              a * 1000 + b AS id,
+              FARM_FINGERPRINT(CAST(a * 1000 + b AS STRING)) AS fp,
+              TO_HEX(SHA256(CAST(a * 1000 + b AS STRING))) AS digest
+            FROM
+              UNNEST(GENERATE_ARRAY(0, 999)) AS a
+            CROSS JOIN
+              UNNEST(GENERATE_ARRAY(0, 999)) AS b
+          ),
+          stage1 AS (
+            SELECT
+              b1.id AS id1,
+              b2.id AS id2,
+              FARM_FINGERPRINT(CONCAT(b1.digest, b2.digest)) AS combined_fp,
+              TO_HEX(SHA256(CONCAT(b1.digest, b2.digest))) AS combined_digest
+            FROM
+              base AS b1
+            INNER JOIN
+              base AS b2
+            ON
+              MOD(ABS(b1.fp), 200000) = MOD(ABS(b2.fp), 200000)
+              AND b1.id != b2.id
+          ),
+          stage2 AS (
+            SELECT
+              s1.id1,
+              COUNT(*) AS match_count,
+              MAX(s1.combined_digest) AS max_digest
+            FROM
+              stage1 AS s1
+            INNER JOIN
+              base AS b3
+            ON
+              MOD(ABS(s1.combined_fp), 500000) = b3.id
+            GROUP BY
+              s1.id1
+          )
+        SELECT
+          id1,
+          match_count,
+          ROW_NUMBER() OVER (ORDER BY REPEAT(max_digest, 2048) DESC, id1 ASC) AS rn
+        FROM
+          stage2
+        ORDER BY
+          rn ASC
+        LIMIT 10000
+    "#;
+
+    let err = match client.query(sql).with_use_query_cache(false).read().await {
+        Err(err) => err,
+        Ok(_) => panic!("expected long-running OOM query to fail"),
+    };
+
+    match &err {
+        BigQueryError::JobFailed(job_failed) => {
+            assert!(job_failed.job_id.is_some());
+            assert_eq!(
+                job_failed.error.reason.as_deref(),
+                Some("resourcesExceeded")
+            );
+            assert!(job_failed.error.message.contains("Resources exceeded"));
+        },
+        other => panic!("expected BigQueryError::JobFailed, got {other:?}"),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_read_initial_query_oom_failure() {
+    let client = setup_client().await;
+
+    let sql = r#"
+        WITH
+          base AS (
+            SELECT
+              a * 1000 + b AS id,
+              TO_HEX(SHA256(CAST(a * 1000 + b AS STRING))) AS digest
+            FROM
+              UNNEST(GENERATE_ARRAY(0, 999)) AS a
+            CROSS JOIN
+              UNNEST(GENERATE_ARRAY(0, 999)) AS b
+          )
+        SELECT
+          id,
+          ROW_NUMBER() OVER (ORDER BY REPEAT(digest, 2048) DESC, id ASC) AS rn
+        FROM
+          base
+        ORDER BY
+          rn ASC
+        LIMIT 10000
+    "#;
+
+    let err = match client.query(sql).with_use_query_cache(false).read().await {
+        Err(err) => err,
+        Ok(_) => panic!("expected initial query OOM to fail"),
+    };
+
+    match &err {
+        BigQueryError::JobFailed(job_failed) => {
+            assert!(
+                job_failed.error.message.contains("Resources exceeded"),
+                "unexpected error message: {}",
+                job_failed.error.message
+            );
+        },
+        other => panic!("expected BigQueryError::JobFailed, got {other:?}"),
+    }
+    assert!(err.to_string().starts_with("BigQuery job failed"));
+    assert!(err.to_string().contains("Resources exceeded"));
+}

@@ -10,7 +10,7 @@ use polars_arrow::array::{Array, BooleanArray, Int64Array, Utf8Array};
 use polars_arrow::datatypes::{ArrowDataType, ArrowSchema, ArrowSchemaRef, Field, TimeUnit};
 use polars_arrow::record_batch::RecordBatch;
 
-use crate::error::BigQueryError;
+use crate::error::{BigQueryError, JobError, JobFailedError};
 use crate::{BigQueryRecordBatchReceiver, StreamOptions};
 
 fn bq_to_gapic_compression_codec(
@@ -101,7 +101,8 @@ impl<'a> Query<'a> {
             .prepare_query(QueryRequest::new().set_dry_run(true))
             .with_idempotency(true)
             .send()
-            .await?;
+            .await
+            .map_err(map_query_error)?;
         // Keep column names/types in sync with pandas-gbq:
         // https://github.com/googleapis/google-cloud-python/blob/main/packages/pandas-gbq/pandas_gbq/dry_runs.py#L4
         query_response_to_record_batch(&response)
@@ -110,11 +111,15 @@ impl<'a> Query<'a> {
     pub async fn read(
         &self,
     ) -> Result<(ArrowSchemaRef, BigQueryRecordBatchReceiver), BigQueryError> {
-        let mut response = self.prepare_query(self.build_read_request()).send().await?;
+        let mut response = self
+            .prepare_query(self.build_read_request())
+            .send()
+            .await
+            .map_err(map_query_error)?;
 
         if response.job_complete == Some(false) {
             let stream_name = default_job_stream_path(&response)?;
-            return self
+            let res = self
                 .client
                 .read_stream(
                     stream_name,
@@ -125,6 +130,10 @@ impl<'a> Query<'a> {
                     },
                 )
                 .await;
+            return match res {
+                Ok(stream) => Ok(stream),
+                Err(err) => Err(self.resolve_job_error(&response, err).await),
+            };
         }
 
         let serialized_schema = match response.results_schema.take() {
@@ -211,10 +220,129 @@ impl<'a> Query<'a> {
             },
         }
     }
+
+    async fn resolve_job_error(
+        &self,
+        response: &QueryResponse,
+        original_err: BigQueryError,
+    ) -> BigQueryError {
+        let (Some(project_id), Some(job_id), location) = extract_job_reference(response) else {
+            return original_err;
+        };
+
+        let mut get_job = self
+            .client
+            .bq_client
+            .get_job()
+            .set_project_id(project_id)
+            .set_job_id(job_id);
+        if let Some(location) = location {
+            get_job = get_job.set_location(location);
+        }
+        let get_job = self
+            .client
+            .apply_request_options(get_job)
+            .with_idempotency(true);
+
+        if let Ok(job) = get_job.send().await {
+            if let Some(status) = job.status {
+                if let Some(error_result) = status.error_result {
+                    return BigQueryError::JobFailed(Box::new(JobFailedError {
+                        project_id: Some(project_id.to_string()),
+                        location: location.map(str::to_string),
+                        job_id: Some(job_id.to_string()),
+                        error: JobError::from(error_result),
+                        errors: status.errors.into_iter().map(JobError::from).collect(),
+                    }));
+                }
+            }
+        }
+
+        original_err
+    }
 }
 
 fn non_empty_str(s: &str) -> Option<&str> {
     (!s.is_empty()).then_some(s)
+}
+
+fn job_failed_from_gax_status(status: &google_cloud_gax::error::rpc::Status) -> JobFailedError {
+    use google_cloud_gax::error::rpc::StatusDetails;
+
+    let debug_info = status.details.iter().find_map(|d| match d {
+        StatusDetails::DebugInfo(info) if !info.detail.is_empty() => Some(info.detail.clone()),
+        _ => None,
+    });
+
+    let mut errors: Vec<JobError> = status
+        .details
+        .iter()
+        .filter_map(|d| match d {
+            StatusDetails::ErrorInfo(info) => {
+                let message = info
+                    .metadata
+                    .get("message")
+                    .cloned()
+                    .unwrap_or_else(|| status.message.clone());
+                let location = info
+                    .metadata
+                    .get("location")
+                    .filter(|s| !s.is_empty())
+                    .cloned();
+                let item_debug_info = info
+                    .metadata
+                    .get("debugInfo")
+                    .filter(|s| !s.is_empty())
+                    .cloned()
+                    .or_else(|| debug_info.clone());
+                Some(JobError {
+                    reason: (!info.reason.is_empty()).then(|| info.reason.clone()),
+                    location,
+                    message,
+                    debug_info: item_debug_info,
+                })
+            },
+            _ => None,
+        })
+        .collect();
+
+    let error = match errors.first() {
+        Some(first) => JobError {
+            reason: first.reason.clone(),
+            location: first.location.clone(),
+            message: if !status.message.is_empty() {
+                status.message.clone()
+            } else {
+                first.message.clone()
+            },
+            debug_info: debug_info.or_else(|| first.debug_info.clone()),
+        },
+        None => JobError {
+            reason: None,
+            location: None,
+            message: status.message.clone(),
+            debug_info,
+        },
+    };
+
+    if errors.is_empty() {
+        errors.push(error.clone());
+    }
+
+    JobFailedError {
+        project_id: None,
+        location: None,
+        job_id: None,
+        error,
+        errors,
+    }
+}
+
+fn map_query_error(err: google_cloud_bigquery_v2::Error) -> BigQueryError {
+    if let Some(status) = err.status() {
+        return BigQueryError::JobFailed(Box::new(job_failed_from_gax_status(status)));
+    }
+    BigQueryError::from(err)
 }
 
 fn extract_job_reference(response: &QueryResponse) -> (Option<&str>, Option<&str>, Option<&str>) {
@@ -679,13 +807,27 @@ mod tests {
 
         let err = match client.query("SELECT").read().await {
             Err(e) => e,
-            Ok(_) => panic!("expected Grpc error for HTTP 400"),
+            Ok(_) => panic!("expected JobFailed error for HTTP 400"),
         };
         server_task.await.unwrap();
-        assert!(matches!(err, BigQueryError::Grpc(_)));
-        assert!(err
-            .to_string()
-            .contains("Syntax error: Unexpected end of script"));
+        match &err {
+            BigQueryError::JobFailed(job_failed) => {
+                assert_eq!(job_failed.project_id, None);
+                assert_eq!(job_failed.location, None);
+                assert_eq!(job_failed.job_id, None);
+                assert_eq!(job_failed.error.reason.as_deref(), Some("invalidQuery"));
+                assert_eq!(job_failed.error.location.as_deref(), Some("q"));
+                assert_eq!(
+                    job_failed.error.message,
+                    "Syntax error: Unexpected end of script at [1:7]"
+                );
+            },
+            other => panic!("expected BigQueryError::JobFailed, got {other:?}"),
+        }
+        assert_eq!(
+            err.to_string(),
+            "BigQuery job failed (invalidQuery at q): Syntax error: Unexpected end of script at [1:7]"
+        );
     }
 
     #[tokio::test]
@@ -1353,5 +1495,208 @@ mod tests {
         let err = receiver.recv().await.unwrap().unwrap_err();
         assert!(matches!(err, BigQueryError::Protocol(_)));
         assert!(receiver.recv().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_read_job_incomplete_failure_surfaces_job_failed_error() {
+        use google_cloud_bigquery::client::Read;
+        use google_cloud_bigquery::model::{ReadRowsRequest, ReadRowsResponse};
+        use google_cloud_bigquery_v2::model::{
+            ErrorProto, GetJobRequest, Job, JobStatus, PostQueryRequest,
+        };
+        use google_cloud_gax::error::rpc::{Code, Status};
+        use google_cloud_gax::error::Error as GaxError;
+        use google_cloud_gax::options::RequestOptions;
+        use google_cloud_gax::response::Response;
+        use google_cloud_gax::streaming::ResponseStream;
+
+        #[derive(Debug)]
+        struct FailedJobStub {
+            get_job_result: std::sync::Mutex<Option<google_cloud_bigquery_v2::Result<Job>>>,
+        }
+
+        impl google_cloud_bigquery_v2::stub::JobService for FailedJobStub {
+            async fn query(
+                &self,
+                _req: PostQueryRequest,
+                _options: RequestOptions,
+            ) -> google_cloud_bigquery_v2::Result<Response<QueryResponse>> {
+                let resp = QueryResponse::new()
+                    .set_job_complete(false)
+                    .set_job_reference(
+                        JobReference::new()
+                            .set_project_id("job-proj")
+                            .set_location("US")
+                            .set_job_id("failed-job-789"),
+                    );
+                Ok(Response::from(resp))
+            }
+
+            async fn get_job(
+                &self,
+                req: GetJobRequest,
+                options: RequestOptions,
+            ) -> google_cloud_bigquery_v2::Result<Response<Job>> {
+                assert_eq!(req.project_id, "job-proj");
+                assert_eq!(req.job_id, "failed-job-789");
+                assert_eq!(req.location, "US");
+                assert_eq!(options.quota_project().as_deref(), Some("test-quota-proj"));
+                assert_eq!(options.idempotent(), Some(true));
+
+                let res = self
+                    .get_job_result
+                    .lock()
+                    .unwrap()
+                    .take()
+                    .expect("get_job should be called once");
+                res.map(Response::from)
+            }
+        }
+
+        #[derive(Debug)]
+        struct InvalidArgReadRowsStub;
+
+        impl google_cloud_bigquery::stub::Read for InvalidArgReadRowsStub {
+            async fn read_rows(
+                &self,
+                _req: ReadRowsRequest,
+                _options: RequestOptions,
+            ) -> google_cloud_bigquery::Result<ResponseStream<ReadRowsResponse>> {
+                let (tx, rx) = tokio::sync::mpsc::channel(1);
+                let status = Status::default()
+                    .set_code(Code::InvalidArgument)
+                    .set_message("Job failed-job-789 failed with error: Resources exceeded");
+                let _ = tx.send(Err(GaxError::service(status))).await;
+                Ok(ResponseStream::from(rx))
+            }
+        }
+
+        // Case 1: get_job succeeds with status.error_result -> returns BigQueryError::JobFailed(job_failed)
+        let expected_error_result = ErrorProto::new()
+            .set_reason("resourcesExceeded")
+            .set_message("Resources exceeded during query execution: Out of memory.");
+        let expected_status = JobStatus::new()
+            .set_state("DONE")
+            .set_error_result(expected_error_result.clone())
+            .set_errors([expected_error_result]);
+        let bq_client = crate::BigQueryJobService::from_stub(FailedJobStub {
+            get_job_result: std::sync::Mutex::new(Some(Ok(Job::new().set_status(expected_status)))),
+        });
+        let read_client = Read::from_stub(InvalidArgReadRowsStub);
+        let client =
+            crate::Client::new_for_testing(bq_client, read_client, "test-quota-proj".to_string());
+
+        let err = match client.query("SELECT * FROM huge_tbl").read().await {
+            Err(e) => e,
+            Ok(_) => panic!("expected JobFailed error"),
+        };
+        let expected_job_error = JobError {
+            reason: Some("resourcesExceeded".into()),
+            location: None,
+            message: "Resources exceeded during query execution: Out of memory.".into(),
+            debug_info: None,
+        };
+        match &err {
+            BigQueryError::JobFailed(job_failed) => {
+                assert_eq!(
+                    job_failed.as_ref(),
+                    &JobFailedError {
+                        project_id: Some("job-proj".into()),
+                        location: Some("US".into()),
+                        job_id: Some("failed-job-789".into()),
+                        error: expected_job_error.clone(),
+                        errors: vec![expected_job_error],
+                    }
+                );
+            },
+            other => panic!("expected BigQueryError::JobFailed, got {other:?}"),
+        }
+        assert_eq!(
+            err.format_causal_chain(),
+            "BigQuery job US:failed-job-789 failed (resourcesExceeded): Resources exceeded during query execution: Out of memory."
+        );
+
+        // Case 2: get_job fails -> returns original ReadRows Grpc error, not get_job error
+        let get_job_err = GaxError::service(
+            Status::default()
+                .set_code(Code::PermissionDenied)
+                .set_message("get_job permission denied"),
+        );
+        let bq_client = crate::BigQueryJobService::from_stub(FailedJobStub {
+            get_job_result: std::sync::Mutex::new(Some(Err(get_job_err))),
+        });
+        let read_client = Read::from_stub(InvalidArgReadRowsStub);
+        let client =
+            crate::Client::new_for_testing(bq_client, read_client, "test-quota-proj".to_string());
+
+        let err = match client.query("SELECT * FROM huge_tbl").read().await {
+            Err(e) => e,
+            Ok(_) => panic!("expected original Grpc error when get_job fails"),
+        };
+        assert!(matches!(err, BigQueryError::Grpc(_)));
+        assert!(err
+            .to_string()
+            .contains("Job failed-job-789 failed with error: Resources exceeded"));
+        assert!(!err.to_string().contains("get_job permission denied"));
+
+        // Case 3: get_job succeeds but job status has no error_result -> returns original ReadRows Grpc error
+        let bq_client = crate::BigQueryJobService::from_stub(FailedJobStub {
+            get_job_result: std::sync::Mutex::new(Some(Ok(
+                Job::new().set_status(JobStatus::new().set_state("DONE"))
+            ))),
+        });
+        let read_client = Read::from_stub(InvalidArgReadRowsStub);
+        let client =
+            crate::Client::new_for_testing(bq_client, read_client, "test-quota-proj".to_string());
+
+        let err = match client.query("SELECT * FROM huge_tbl").read().await {
+            Err(e) => e,
+            Ok(_) => panic!("expected original Grpc error when job has no error_result"),
+        };
+        assert!(matches!(err, BigQueryError::Grpc(_)));
+    }
+
+    #[test]
+    fn test_map_query_error_debug_info_and_non_service() {
+        use google_cloud_gax::error::rpc::{Code, Status, StatusDetails};
+        use google_cloud_gax::error::Error as GaxError;
+
+        // Service status with DebugInfo in details (no ErrorInfo) -> JobFailed
+        let detail: StatusDetails = serde_json::from_value(serde_json::json!({
+            "@type": "type.googleapis.com/google.rpc.DebugInfo",
+            "detail": "RESOURCES_EXCEEDED: Out of memory"
+        }))
+        .expect("valid StatusDetails JSON");
+        let status = Status::default()
+            .set_code(Code::InvalidArgument)
+            .set_message("Resources exceeded during query execution: Out of memory.")
+            .set_details([detail]);
+        let err = map_query_error(GaxError::service(status));
+        match &err {
+            BigQueryError::JobFailed(job_failed) => {
+                assert_eq!(job_failed.project_id, None);
+                assert_eq!(job_failed.location, None);
+                assert_eq!(job_failed.job_id, None);
+                assert_eq!(
+                    job_failed.error.message,
+                    "Resources exceeded during query execution: Out of memory."
+                );
+                assert_eq!(
+                    job_failed.error.debug_info.as_deref(),
+                    Some("RESOURCES_EXCEEDED: Out of memory")
+                );
+                assert_eq!(job_failed.errors.len(), 1);
+            },
+            other => panic!("expected BigQueryError::JobFailed, got {other:?}"),
+        }
+        assert_eq!(
+            err.to_string(),
+            "BigQuery job failed: Resources exceeded during query execution: Out of memory."
+        );
+
+        // Non-service transport error -> remains BigQueryError::Grpc
+        let io_err = GaxError::io("connection reset");
+        let mapped = map_query_error(io_err);
+        assert!(matches!(mapped, BigQueryError::Grpc(_)));
     }
 }
