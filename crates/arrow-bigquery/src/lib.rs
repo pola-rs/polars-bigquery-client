@@ -284,6 +284,13 @@ pub struct Client {
     pub(crate) decode_pool: Arc<rayon::ThreadPool>,
 }
 
+pub(crate) struct FallbackReadSession {
+    pub(crate) project_id: String,
+    pub(crate) job_id: String,
+    pub(crate) location: String,
+    pub(crate) read_options: ReadOptions,
+}
+
 impl Client {
     pub fn builder() -> ServiceConfigBuilder {
         ServiceConfigBuilder::new()
@@ -401,11 +408,11 @@ impl Client {
         BigQueryRecordBatchReceiver::new(rx, Some(cancel_tx), vec![handle])
     }
 
-    pub async fn read_table(
+    async fn create_table_read_session(
         &self,
         table: &BigQueryTableId,
         options: ReadOptions,
-    ) -> Result<(ArrowSchemaRef, BigQueryRecordBatchReceiver), BigQueryError> {
+    ) -> Result<(bytes::Bytes, Vec<String>), BigQueryError> {
         let request = options.build_request(table.to_table_path(), &self.quota_project_id);
         let create_session = self.apply_request_options(
             self.read_client
@@ -431,6 +438,15 @@ impl Client {
             .into_iter()
             .map(|stream| stream.name)
             .collect();
+        Ok((schema, streams))
+    }
+
+    pub async fn read_table(
+        &self,
+        table: &BigQueryTableId,
+        options: ReadOptions,
+    ) -> Result<(ArrowSchemaRef, BigQueryRecordBatchReceiver), BigQueryError> {
+        let (schema, streams) = self.create_table_read_session(table, options).await?;
         self.read_streams(
             streams,
             StreamOptions {
@@ -450,10 +466,72 @@ impl Client {
         self.read_streams(vec![stream.into()], options).await
     }
 
+    pub(crate) async fn read_stream_with_first_page_check(
+        &self,
+        stream: String,
+        options: StreamOptions,
+        first_page_check: Option<(bigquery_read_stream::FirstPageCheck, FallbackReadSession)>,
+    ) -> Result<(ArrowSchemaRef, BigQueryRecordBatchReceiver), BigQueryError> {
+        self.read_streams_inner(vec![stream], options, first_page_check)
+            .await
+    }
+
     async fn read_streams(
         &self,
         streams: Vec<String>,
         options: StreamOptions,
+    ) -> Result<(ArrowSchemaRef, BigQueryRecordBatchReceiver), BigQueryError> {
+        self.read_streams_inner(streams, options, None).await
+    }
+
+    async fn switch_to_read_session(
+        &self,
+        fallback: FallbackReadSession,
+        tx: tokio::sync::mpsc::Sender<Result<RecordBatch, BigQueryError>>,
+        cancel_tx: Arc<tokio::sync::watch::Sender<bool>>,
+        cancel_rx: tokio::sync::watch::Receiver<bool>,
+    ) -> Result<(), BigQueryError> {
+        let destination_table = query::get_destination_table(
+            self,
+            &fallback.project_id,
+            &fallback.job_id,
+            &fallback.location,
+        )
+        .await?;
+        let (schema, streams) = self
+            .create_table_read_session(&destination_table, fallback.read_options)
+            .await?;
+        let metadata = Arc::new(bigquery_read_stream::parse_arrow_schema(&schema)?);
+        let retry_config = self.stream_retry_config();
+        let mut join_set = tokio::task::JoinSet::new();
+
+        for stream_name in streams {
+            let read_rows = self.prepare_read_rows(stream_name, 0, None);
+            join_set.spawn(bigquery_read_stream::read_stream(
+                bigquery_read_stream::ReadStreamOptions {
+                    read_rows,
+                    current_offset: 0,
+                    metadata: Some(Arc::clone(&metadata)),
+                    schema_tx: None,
+                    first_page_check: None,
+                    tx: tx.clone(),
+                    retry_config: retry_config.clone(),
+                    decode_pool: Arc::clone(&self.decode_pool),
+                    cancel_tx: Arc::clone(&cancel_tx),
+                    cancel_rx: cancel_rx.clone(),
+                },
+            ));
+        }
+        drop(tx);
+        while join_set.join_next().await.is_some() {}
+        Ok(())
+    }
+
+    async fn read_streams_inner(
+        &self,
+        streams: Vec<String>,
+        options: StreamOptions,
+        mut first_page_check: Option<(bigquery_read_stream::FirstPageCheck, FallbackReadSession)>,
     ) -> Result<(ArrowSchemaRef, BigQueryRecordBatchReceiver), BigQueryError> {
         let (metadata, schema_ref, mut schema_tx, schema_rx) = match &options.schema {
             Some(schema) => {
@@ -486,19 +564,47 @@ impl Client {
                 options.offset,
                 options.arrow_buffer_compression.clone(),
             );
-            let handle = tokio::task::spawn(bigquery_read_stream::read_stream(
-                bigquery_read_stream::ReadStreamOptions {
-                    read_rows,
-                    current_offset: options.offset,
-                    metadata: metadata.clone(),
-                    schema_tx: schema_tx.take(),
-                    tx: tx.clone(),
-                    retry_config: retry_config.clone(),
-                    decode_pool: Arc::clone(&self.decode_pool),
-                    cancel_tx: Arc::clone(&cancel_tx),
-                    cancel_rx: cancel_rx.clone(),
-                },
-            ));
+            let (check, fallback) = match first_page_check.take() {
+                Some((check, fallback)) => (Some(check), Some((self.clone(), fallback))),
+                None => (None, None),
+            };
+            let metadata = metadata.clone();
+            let schema_tx = schema_tx.take();
+            let tx = tx.clone();
+            let retry_config = retry_config.clone();
+            let decode_pool = Arc::clone(&self.decode_pool);
+            let cancel_tx = Arc::clone(&cancel_tx);
+            let cancel_rx = cancel_rx.clone();
+            let offset = options.offset;
+            let handle = tokio::task::spawn(async move {
+                let reason =
+                    bigquery_read_stream::read_stream(bigquery_read_stream::ReadStreamOptions {
+                        read_rows,
+                        current_offset: offset,
+                        metadata,
+                        schema_tx,
+                        first_page_check: check,
+                        tx: tx.clone(),
+                        retry_config,
+                        decode_pool,
+                        cancel_tx: Arc::clone(&cancel_tx),
+                        cancel_rx: cancel_rx.clone(),
+                    })
+                    .await;
+
+                if reason == bigquery_read_stream::TerminationReason::SwitchToReadSession {
+                    if let Some((client, fallback)) = fallback {
+                        let tx_err = tx.clone();
+                        if let Err(err) = client
+                            .switch_to_read_session(fallback, tx, Arc::clone(&cancel_tx), cancel_rx)
+                            .await
+                        {
+                            let _ = cancel_tx.send_replace(true);
+                            let _ = tx_err.send(Err(err)).await;
+                        }
+                    }
+                }
+            });
             handles.push(handle);
         }
 
