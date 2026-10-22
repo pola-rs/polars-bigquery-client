@@ -1,8 +1,39 @@
+use google_cloud_bigquery_v2::model::ErrorProto;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct JobError {
+    pub reason: Option<String>,
+    pub location: Option<String>,
+    pub message: String,
+    pub debug_info: Option<String>,
+}
+
+impl From<ErrorProto> for JobError {
+    fn from(proto: ErrorProto) -> Self {
+        Self {
+            reason: (!proto.reason.is_empty()).then_some(proto.reason),
+            location: (!proto.location.is_empty()).then_some(proto.location),
+            message: proto.message,
+            debug_info: (!proto.debug_info.is_empty()).then_some(proto.debug_info),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct JobFailedError {
+    pub project_id: Option<String>,
+    pub location: Option<String>,
+    pub job_id: Option<String>,
+    pub error: JobError,
+    pub errors: Vec<JobError>,
+}
+
 #[derive(Debug)]
 pub enum BigQueryError {
     Grpc(google_cloud_bigquery::Error),
     ClientBuilder(google_cloud_gax::client_builder::Error),
     Arrow(polars_error::PolarsError),
+    JobFailed(Box<JobFailedError>),
     Protocol(String),
     InvalidConfig(String),
     Other(Box<dyn std::error::Error + Send + Sync>),
@@ -32,12 +63,64 @@ impl BigQueryError {
     }
 }
 
+fn format_job_error(
+    f: &mut std::fmt::Formatter,
+    err: &JobError,
+    is_primary: bool,
+) -> std::fmt::Result {
+    let reason = err.reason.as_deref().map(str::trim).unwrap_or("");
+    let location = err.location.as_deref().map(str::trim).unwrap_or("");
+    let message = err.message.trim_end();
+    let has_meta = !reason.is_empty() || !location.is_empty();
+
+    if is_primary && has_meta {
+        write!(f, " ")?;
+    }
+
+    match (!reason.is_empty(), !location.is_empty()) {
+        (true, true) => write!(f, "({reason} at {location})"),
+        (true, false) => write!(f, "({reason})"),
+        (false, true) => write!(f, "(at {location})"),
+        (false, false) => Ok(()),
+    }?;
+
+    if !message.is_empty() {
+        if is_primary || has_meta {
+            write!(f, ": {message}")?;
+        } else {
+            write!(f, "{message}")?;
+        }
+    }
+    Ok(())
+}
+
+fn is_same_job_error(a: &JobError, b: &JobError) -> bool {
+    a.reason.as_deref().map(str::trim) == b.reason.as_deref().map(str::trim)
+        && a.location.as_deref().map(str::trim) == b.location.as_deref().map(str::trim)
+        && a.message.trim() == b.message.trim()
+}
+
+impl std::fmt::Display for JobFailedError {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(f, "BigQuery job failed")?;
+        format_job_error(f, &self.error, true)?;
+        for extra in &self.errors {
+            if !is_same_job_error(&self.error, extra) {
+                write!(f, "; ")?;
+                format_job_error(f, extra, false)?;
+            }
+        }
+        Ok(())
+    }
+}
+
 impl std::fmt::Display for BigQueryError {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         match self {
             Self::Grpc(s) => write!(f, "BigQuery Storage API error: {}", s),
             Self::ClientBuilder(e) => write!(f, "BigQuery client builder error: {}", e),
             Self::Arrow(e) => write!(f, "Arrow decoding error: {}", e),
+            Self::JobFailed(err) => std::fmt::Display::fmt(err, f),
             Self::Protocol(msg) => write!(f, "BigQuery protocol error: {}", msg),
             Self::InvalidConfig(msg) => write!(f, "BigQuery configuration error: {}", msg),
             Self::Other(e) => write!(f, "BigQuery client error: {}", e),
@@ -51,7 +134,7 @@ impl std::error::Error for BigQueryError {
             Self::Grpc(e) => Some(e),
             Self::ClientBuilder(e) => Some(e),
             Self::Arrow(e) => Some(e),
-            Self::Protocol(_) | Self::InvalidConfig(_) => None,
+            Self::JobFailed(_) | Self::Protocol(_) | Self::InvalidConfig(_) => None,
             Self::Other(e) => Some(e.as_ref()),
         }
     }
@@ -161,6 +244,61 @@ mod tests {
         assert_eq!(
             err.format_causal_chain(),
             "BigQuery configuration error: quota_project_id is required"
+        );
+    }
+
+    #[test]
+    fn test_bigquery_error_job_failed_display_and_causal_chain() {
+        let primary = JobError::from(
+            ErrorProto::new()
+                .set_reason("resourcesExceeded")
+                .set_message("Resources exceeded during query execution: Out of memory.\n"),
+        );
+        let duplicate = primary.clone();
+        let job_failed = JobFailedError {
+            project_id: Some("proj".into()),
+            location: Some("US".into()),
+            job_id: Some("job-1".into()),
+            error: primary,
+            errors: vec![duplicate],
+        };
+        let err = BigQueryError::JobFailed(Box::new(job_failed));
+
+        assert!(err.source().is_none());
+        assert_eq!(
+            err.format_causal_chain(),
+            "BigQuery job failed (resourcesExceeded): Resources exceeded during query execution: Out of memory."
+        );
+
+        let multi_job_failed = JobFailedError {
+            project_id: None,
+            location: None,
+            job_id: None,
+            error: JobError {
+                reason: Some("invalid".into()),
+                location: None,
+                message: "Too many errors encountered.".into(),
+                debug_info: None,
+            },
+            errors: vec![
+                JobError {
+                    reason: Some("invalid".into()),
+                    location: None,
+                    message: "Too many errors encountered.".into(),
+                    debug_info: None,
+                },
+                JobError {
+                    reason: Some("invalid".into()),
+                    location: Some("row 42".into()),
+                    message: "Bad int64 value".into(),
+                    debug_info: None,
+                },
+            ],
+        };
+        let multi_err = BigQueryError::JobFailed(Box::new(multi_job_failed));
+        assert_eq!(
+            multi_err.to_string(),
+            "BigQuery job failed (invalid): Too many errors encountered.; (invalid at row 42): Bad int64 value"
         );
     }
 }
