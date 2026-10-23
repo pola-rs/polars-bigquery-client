@@ -1,5 +1,5 @@
 use std::env;
-use std::sync::Arc;
+use std::sync::{Arc, Once};
 use std::time::Duration;
 
 use arrow_bigquery::{
@@ -11,6 +11,15 @@ use tokio::runtime::Runtime;
 // The portion of the "numbers" table we are reading is about 5 GB total, so
 // these reads vary from about 500 MB to 5 GB.
 const PROPORTIONS: [f64; 3] = [0.1, 0.5, 1.0];
+
+static INIT: Once = Once::new();
+
+fn init_console() {
+    INIT.call_once(|| {
+        // Initializes the console subscriber once for the whole test binary
+        console_subscriber::init();
+    });
+}
 
 async fn setup_client() -> Client {
     let quota_project_id = env::var("GOOGLE_CLOUD_PROJECT")
@@ -81,6 +90,7 @@ async fn read_numbers_table(client: &Arc<Client>, proportion: f64) {
 }
 
 fn read_table(c: &mut Criterion) {
+    init_console();
     let rt = Runtime::new().unwrap();
     let client = Arc::new(rt.block_on(async { setup_client().await }));
 
@@ -148,6 +158,7 @@ fn format_numbers_query(proportion: f64) -> String {
 }
 
 fn read_query(c: &mut Criterion) {
+    init_console();
     let rt = Runtime::new().unwrap();
     let client = Arc::new(rt.block_on(async { setup_client().await }));
 
