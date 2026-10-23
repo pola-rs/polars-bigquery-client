@@ -36,3 +36,7 @@ criterion = { version = "0.5.1", features = ["async_tokio", "html_reports"] }
 [[bench]]
 name = "read"
 harness = false
+
+[[bench]]
+name = "query"
+harness = false
