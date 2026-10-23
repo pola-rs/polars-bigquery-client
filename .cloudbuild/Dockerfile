@@ -75,8 +75,8 @@ RUN cargo chef prepare --recipe-path recipe.json
 FROM base
 # 1. Pre-warm Cargo cache in an isolated layer so Python lockfile updates never trigger Rust rebuilds
 COPY --from=planner /tmp/warmup/recipe.json recipe.json
-RUN cargo chef cook --locked --package arrow-bigquery --tests --benches --all-features --recipe-path recipe.json \
-    && cargo chef cook --locked --release --package arrow-bigquery --benches --all-features --recipe-path recipe.json \
+RUN cargo chef cook --locked --package arrow-bigquery --tests --benches --features testing --recipe-path recipe.json \
+    && cargo chef cook --locked --release --package arrow-bigquery --benches --recipe-path recipe.json \
     && cargo chef cook --locked --release --package py-arrow-bigquery --features extension-module --recipe-path recipe.json \
     && cargo chef cook --locked --release --package py-polars-expressions-testing --features extension-module --recipe-path recipe.json \
     && cargo clean -p arrow-bigquery -p py-arrow-bigquery -p py-polars-expressions-testing \
