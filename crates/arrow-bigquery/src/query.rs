@@ -133,7 +133,7 @@ impl<'a> Query<'a> {
         stream_name: String,
         offset: i64,
         serialized_schema: Option<bytes::Bytes>,
-    ) -> Result<(ArrowSchemaRef, BigQueryRecordBatchReceiver), BigQueryError> {
+    ) -> Result<(Option<ArrowSchemaRef>, BigQueryRecordBatchReceiver), BigQueryError> {
         let first_page_check = if !self.maintain_order {
             let (project_id, job_id, location) = extract_required_job_reference(response)?;
             Some((
@@ -195,14 +195,20 @@ impl<'a> Query<'a> {
                 .read_job_stream_or_table(&response, stream_name, 0, None)
                 .await;
             return match res {
-                Ok(stream) => Ok(stream),
+                Ok((Some(schema_ref), receiver)) => Ok((schema_ref, receiver)),
+                Ok((None, _receiver)) => self.resolve_empty_job_stream(&response).await,
                 Err(err) => Err(self.resolve_job_error(&response, err).await),
             };
         }
 
         let serialized_schema = match response.results_schema.take() {
-            Some(query_response::ResultsSchema::ArrowSchema(value)) => value.serialized_schema,
-            _ => {
+            Some(query_response::ResultsSchema::ArrowSchema(value))
+                if !value.serialized_schema.is_empty() =>
+            {
+                Some(value.serialized_schema)
+            },
+            None | Some(query_response::ResultsSchema::ArrowSchema(_)) => None,
+            Some(_) => {
                 return Err(BigQueryError::Protocol(
                     "Unexpectedly got schema type other than arrow".into(),
                 ))
@@ -253,23 +259,36 @@ impl<'a> Query<'a> {
             None
         };
 
+        let Some(serialized_schema) = serialized_schema else {
+            if first_page_bytes.is_none()
+                && stream_name.is_none()
+                && response.total_rows.is_none()
+                && response.statement_type != "SELECT"
+            {
+                return Ok((Arc::new(ArrowSchema::default()), empty_receiver()));
+            }
+            return Err(BigQueryError::Protocol(
+                "QueryResponse is missing Arrow schema".into(),
+            ));
+        };
+
         match (first_page_bytes, stream_name) {
             (None, None) => {
                 let metadata = crate::bigquery_read_stream::parse_arrow_schema(&serialized_schema)?;
-                let (_tx, rx) = tokio::sync::mpsc::channel(1);
-                Ok((
-                    Arc::new(metadata.schema),
-                    BigQueryRecordBatchReceiver::new(rx, None, Vec::new()),
-                ))
+                Ok((Arc::new(metadata.schema), empty_receiver()))
             },
             (None, Some(stream_name)) => {
-                self.read_job_stream_or_table(
-                    &response,
-                    stream_name,
-                    response.page_row_count,
-                    Some(serialized_schema),
-                )
-                .await
+                let (schema_ref, receiver) = self
+                    .read_job_stream_or_table(
+                        &response,
+                        stream_name,
+                        response.page_row_count,
+                        Some(serialized_schema),
+                    )
+                    .await?;
+                let schema_ref =
+                    schema_ref.expect("schema_ref must be Some when serialized_schema is Some");
+                Ok((schema_ref, receiver))
             },
             (Some(first_page_bytes), stream_name) => {
                 let metadata = crate::bigquery_read_stream::parse_arrow_schema(&serialized_schema)?;
@@ -292,6 +311,51 @@ impl<'a> Query<'a> {
         }
     }
 
+    async fn resolve_empty_job_stream(
+        &self,
+        response: &QueryResponse,
+    ) -> Result<(ArrowSchemaRef, BigQueryRecordBatchReceiver), BigQueryError> {
+        let (project_id, job_id, location) = extract_required_job_reference(response)?;
+        let job = fetch_job(self.client, project_id, job_id, Some(location)).await?;
+        check_job_status_error(job.status, project_id, Some(location), job_id)?;
+
+        let query_stats = job.statistics.as_ref().and_then(|s| s.query.as_ref());
+        let statement_type = query_stats
+            .and_then(|q| non_empty_str(&q.statement_type))
+            .or_else(|| non_empty_str(&response.statement_type));
+        let is_ddl = query_stats
+            .and_then(|q| non_empty_str(&q.ddl_operation_performed))
+            .is_some();
+
+        if is_ddl || statement_type.is_some_and(|st| st != "SELECT") {
+            return Ok((Arc::new(ArrowSchema::default()), empty_receiver()));
+        }
+
+        let Some(destination_table) = extract_destination_table(job.configuration)? else {
+            if statement_type == Some("SELECT") {
+                return Err(BigQueryError::Protocol(
+                    "Job response is missing configuration.query.destination_table".into(),
+                ));
+            }
+            return Ok((Arc::new(ArrowSchema::default()), empty_receiver()));
+        };
+
+        let (serialized_schema, _streams) = self
+            .client
+            .create_table_read_session(
+                &destination_table,
+                crate::ReadOptions {
+                    maintain_order: true,
+                    arrow_buffer_compression: Some(self.arrow_buffer_compression()),
+                    max_stream_count: Some(1),
+                    ..Default::default()
+                },
+            )
+            .await?;
+        let metadata = crate::bigquery_read_stream::parse_arrow_schema(&serialized_schema)?;
+        Ok((Arc::new(metadata.schema), empty_receiver()))
+    }
+
     async fn resolve_job_error(
         &self,
         response: &QueryResponse,
@@ -301,31 +365,9 @@ impl<'a> Query<'a> {
             return original_err;
         };
 
-        let mut get_job = self
-            .client
-            .bq_client
-            .get_job()
-            .set_project_id(project_id)
-            .set_job_id(job_id);
-        if let Some(location) = location {
-            get_job = get_job.set_location(location);
-        }
-        let get_job = self
-            .client
-            .apply_request_options(get_job)
-            .with_idempotency(true);
-
-        if let Ok(job) = get_job.send().await {
-            if let Some(status) = job.status {
-                if let Some(error_result) = status.error_result {
-                    return BigQueryError::JobFailed(Box::new(JobFailedError {
-                        project_id: Some(project_id.to_string()),
-                        location: location.map(str::to_string),
-                        job_id: Some(job_id.to_string()),
-                        error: JobError::from(error_result),
-                        errors: status.errors.into_iter().map(JobError::from).collect(),
-                    }));
-                }
+        if let Ok(job) = fetch_job(self.client, project_id, job_id, location).await {
+            if let Err(job_err) = check_job_status_error(job.status, project_id, location, job_id) {
+                return job_err;
             }
         }
 
@@ -333,38 +375,65 @@ impl<'a> Query<'a> {
     }
 }
 
+fn empty_receiver() -> BigQueryRecordBatchReceiver {
+    let (_tx, rx) = tokio::sync::mpsc::channel(1);
+    BigQueryRecordBatchReceiver::new(rx, None, Vec::new())
+}
+
 fn non_empty_str(s: &str) -> Option<&str> {
     (!s.is_empty()).then_some(s)
 }
 
-pub(crate) async fn get_destination_table(
+async fn fetch_job(
     client: &crate::Client,
     project_id: &str,
     job_id: &str,
-    location: &str,
-) -> Result<crate::BigQueryTableId, BigQueryError> {
-    let job = client
-        .apply_request_options(
-            client
-                .bq_client
-                .get_job()
-                .set_project_id(project_id)
-                .set_job_id(job_id)
-                .set_location(location),
-        )
+    location: Option<&str>,
+) -> Result<google_cloud_bigquery_v2::model::Job, BigQueryError> {
+    let mut get_job = client
+        .bq_client
+        .get_job()
+        .set_project_id(project_id)
+        .set_job_id(job_id);
+    if let Some(location) = location {
+        get_job = get_job.set_location(location);
+    }
+    Ok(client
+        .apply_request_options(get_job)
         .with_idempotency(true)
         .send()
-        .await?;
+        .await?)
+}
 
-    let destination_table = job
-        .configuration
+fn check_job_status_error(
+    status: Option<google_cloud_bigquery_v2::model::JobStatus>,
+    project_id: &str,
+    location: Option<&str>,
+    job_id: &str,
+) -> Result<(), BigQueryError> {
+    if let Some(status) = status {
+        if let Some(error_result) = status.error_result {
+            return Err(BigQueryError::JobFailed(Box::new(JobFailedError {
+                project_id: Some(project_id.to_string()),
+                location: location.map(str::to_string),
+                job_id: Some(job_id.to_string()),
+                error: JobError::from(error_result),
+                errors: status.errors.into_iter().map(JobError::from).collect(),
+            })));
+        }
+    }
+    Ok(())
+}
+
+fn extract_destination_table(
+    configuration: Option<google_cloud_bigquery_v2::model::JobConfiguration>,
+) -> Result<Option<crate::BigQueryTableId>, BigQueryError> {
+    let Some(destination_table) = configuration
         .and_then(|c| c.query)
         .and_then(|q| q.destination_table)
-        .ok_or_else(|| {
-            BigQueryError::Protocol(
-                "Job response is missing configuration.query.destination_table".into(),
-            )
-        })?;
+    else {
+        return Ok(None);
+    };
 
     if destination_table.project_id.is_empty()
         || destination_table.dataset_id.is_empty()
@@ -375,11 +444,25 @@ pub(crate) async fn get_destination_table(
         ));
     }
 
-    Ok(crate::BigQueryTableId::new(
+    Ok(Some(crate::BigQueryTableId::new(
         destination_table.project_id,
         destination_table.dataset_id,
         destination_table.table_id,
-    ))
+    )))
+}
+
+pub(crate) async fn get_destination_table(
+    client: &crate::Client,
+    project_id: &str,
+    job_id: &str,
+    location: &str,
+) -> Result<crate::BigQueryTableId, BigQueryError> {
+    let job = fetch_job(client, project_id, job_id, Some(location)).await?;
+    extract_destination_table(job.configuration)?.ok_or_else(|| {
+        BigQueryError::Protocol(
+            "Job response is missing configuration.query.destination_table".into(),
+        )
+    })
 }
 
 fn job_failed_from_gax_status(status: &google_cloud_gax::error::rpc::Status) -> JobFailedError {
@@ -1022,7 +1105,9 @@ mod tests {
                 _req: PostQueryRequest,
                 _options: RequestOptions,
             ) -> google_cloud_bigquery_v2::Result<Response<QueryResponse>> {
-                Ok(Response::from(QueryResponse::new()))
+                Ok(Response::from(
+                    QueryResponse::new().set_statement_type("SELECT"),
+                ))
             }
         }
 
@@ -2395,5 +2480,401 @@ mod tests {
         let io_err = GaxError::io("connection reset");
         let mapped = map_query_error(io_err);
         assert!(matches!(mapped, BigQueryError::Grpc(_)));
+    }
+
+    #[tokio::test]
+    async fn test_read_short_ddl_query_no_schema() {
+        use google_cloud_bigquery_v2::model::PostQueryRequest;
+        use google_cloud_gax::options::RequestOptions;
+        use google_cloud_gax::response::Response;
+
+        #[derive(Debug)]
+        struct ShortDdlStub;
+
+        impl google_cloud_bigquery_v2::stub::JobService for ShortDdlStub {
+            async fn query(
+                &self,
+                _req: PostQueryRequest,
+                _options: RequestOptions,
+            ) -> google_cloud_bigquery_v2::Result<Response<QueryResponse>> {
+                let resp = QueryResponse::new()
+                    .set_job_complete(true)
+                    .set_statement_type("CREATE_SCHEMA")
+                    .set_job_reference(
+                        JobReference::new()
+                            .set_project_id("job-proj")
+                            .set_location("US")
+                            .set_job_id("ddl-job-1"),
+                    );
+                Ok(Response::from(resp))
+            }
+        }
+
+        let bq_client = crate::BigQueryJobService::from_stub(ShortDdlStub);
+        let client = crate::Client::new_for_testing(
+            bq_client,
+            test_read_client().await,
+            "test-quota-proj".to_string(),
+        );
+
+        let (schema, mut receiver) = client
+            .query("CREATE SCHEMA IF NOT EXISTS my_dataset")
+            .read()
+            .await
+            .unwrap();
+        assert_eq!(schema.len(), 0);
+        assert!(receiver.recv().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_read_long_ddl_query_no_schema() {
+        use google_cloud_bigquery::client::Read;
+        use google_cloud_bigquery::model::{
+            CreateReadSessionRequest, ReadRowsRequest, ReadRowsResponse, ReadSession,
+        };
+        use google_cloud_bigquery_v2::model::{
+            GetJobRequest, Job, JobConfiguration, JobConfigurationQuery, JobStatistics,
+            JobStatistics2, JobStatus, PostQueryRequest, TableReference,
+        };
+        use google_cloud_gax::options::RequestOptions;
+        use google_cloud_gax::response::Response;
+        use google_cloud_gax::streaming::ResponseStream;
+
+        #[derive(Debug)]
+        struct LongDdlJobStub {
+            get_job_calls: Arc<std::sync::Mutex<usize>>,
+        }
+
+        impl google_cloud_bigquery_v2::stub::JobService for LongDdlJobStub {
+            async fn query(
+                &self,
+                _req: PostQueryRequest,
+                _options: RequestOptions,
+            ) -> google_cloud_bigquery_v2::Result<Response<QueryResponse>> {
+                let resp = QueryResponse::new()
+                    .set_job_complete(false)
+                    .set_job_reference(
+                        JobReference::new()
+                            .set_project_id("job-proj")
+                            .set_location("US")
+                            .set_job_id("create-model-job-1"),
+                    );
+                Ok(Response::from(resp))
+            }
+
+            async fn get_job(
+                &self,
+                req: GetJobRequest,
+                _options: RequestOptions,
+            ) -> google_cloud_bigquery_v2::Result<Response<Job>> {
+                *self.get_job_calls.lock().unwrap() += 1;
+                assert_eq!(req.project_id, "job-proj");
+                assert_eq!(req.job_id, "create-model-job-1");
+                assert_eq!(req.location, "US");
+
+                // Real BigQuery CREATE_MODEL jobs populate destination_table with the model
+                // reference (which fails if passed to create_read_session) and set
+                // statement_type = "CREATE_MODEL", ddl_operation_performed = "CREATE".
+                let job = Job::new()
+                    .set_status(JobStatus::new().set_state("DONE"))
+                    .set_statistics(
+                        JobStatistics::new().set_query(
+                            JobStatistics2::new()
+                                .set_statement_type("CREATE_MODEL")
+                                .set_ddl_operation_performed("CREATE"),
+                        ),
+                    )
+                    .set_configuration(
+                        JobConfiguration::new().set_query(
+                            JobConfigurationQuery::new().set_destination_table(
+                                TableReference::new()
+                                    .set_project_id("job-proj")
+                                    .set_dataset_id("my_ds")
+                                    .set_table_id("my_model"),
+                            ),
+                        ),
+                    );
+                Ok(Response::from(job))
+            }
+        }
+
+        #[derive(Debug)]
+        struct HeartbeatThenCloseReadStub;
+
+        impl google_cloud_bigquery::stub::Read for HeartbeatThenCloseReadStub {
+            async fn create_read_session(
+                &self,
+                _req: CreateReadSessionRequest,
+                _options: RequestOptions,
+            ) -> google_cloud_bigquery::Result<Response<ReadSession>> {
+                panic!("create_read_session must not be called for DDL queries");
+            }
+
+            async fn read_rows(
+                &self,
+                req: ReadRowsRequest,
+                _options: RequestOptions,
+            ) -> google_cloud_bigquery::Result<ResponseStream<ReadRowsResponse>> {
+                assert_eq!(
+                    req.read_stream,
+                    "projects/job-proj/locations/US/jobs/create-model-job-1/streams/_default"
+                );
+                let (tx, rx) = tokio::sync::mpsc::channel(2);
+                // Simulate heartbeat while model is training, followed by clean EOF.
+                tx.try_send(Ok(ReadRowsResponse::new())).unwrap();
+                drop(tx);
+                Ok(ResponseStream::from(rx))
+            }
+        }
+
+        let get_job_calls = Arc::new(std::sync::Mutex::new(0));
+        let bq_client = crate::BigQueryJobService::from_stub(LongDdlJobStub {
+            get_job_calls: Arc::clone(&get_job_calls),
+        });
+        let read_client = Read::from_stub(HeartbeatThenCloseReadStub);
+        let client =
+            crate::Client::new_for_testing(bq_client, read_client, "test-quota-proj".to_string());
+
+        let (schema, mut receiver) = client
+            .query("CREATE OR REPLACE MODEL my_ds.my_model OPTIONS(model_type='linear_reg') AS SELECT 1 AS x, 2 AS label")
+            .read()
+            .await
+            .unwrap();
+        assert_eq!(schema.len(), 0);
+        assert!(receiver.recv().await.is_none());
+        assert_eq!(*get_job_calls.lock().unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_read_long_empty_select_fetches_schema_from_destination_table() {
+        use std::sync::Mutex;
+
+        use google_cloud_bigquery::client::Read;
+        use google_cloud_bigquery::model::{
+            ArrowSchema as StorageArrowSchema, CreateReadSessionRequest, ReadRowsRequest,
+            ReadRowsResponse, ReadSession, ReadStream,
+        };
+        use google_cloud_bigquery_v2::model::{
+            GetJobRequest, Job, JobConfiguration, JobConfigurationQuery, JobStatistics,
+            JobStatistics2, JobStatus, PostQueryRequest, TableReference,
+        };
+        use google_cloud_gax::options::RequestOptions;
+        use google_cloud_gax::response::Response;
+        use google_cloud_gax::streaming::ResponseStream;
+
+        #[derive(Debug, Default)]
+        struct Recorded {
+            get_job_calls: usize,
+            create_session_table: Option<String>,
+            read_rows_streams: Vec<String>,
+        }
+
+        #[derive(Debug)]
+        struct LongEmptySelectJobStub {
+            recorded: Arc<Mutex<Recorded>>,
+        }
+
+        impl google_cloud_bigquery_v2::stub::JobService for LongEmptySelectJobStub {
+            async fn query(
+                &self,
+                _req: PostQueryRequest,
+                _options: RequestOptions,
+            ) -> google_cloud_bigquery_v2::Result<Response<QueryResponse>> {
+                let resp = QueryResponse::new()
+                    .set_job_complete(false)
+                    .set_job_reference(
+                        JobReference::new()
+                            .set_project_id("job-proj")
+                            .set_location("US")
+                            .set_job_id("long-empty-select-1"),
+                    );
+                Ok(Response::from(resp))
+            }
+
+            async fn get_job(
+                &self,
+                _req: GetJobRequest,
+                _options: RequestOptions,
+            ) -> google_cloud_bigquery_v2::Result<Response<Job>> {
+                self.recorded.lock().unwrap().get_job_calls += 1;
+                let job = Job::new()
+                    .set_status(JobStatus::new().set_state("DONE"))
+                    .set_statistics(
+                        JobStatistics::new()
+                            .set_query(JobStatistics2::new().set_statement_type("SELECT")),
+                    )
+                    .set_configuration(
+                        JobConfiguration::new().set_query(
+                            JobConfigurationQuery::new().set_destination_table(
+                                TableReference::new()
+                                    .set_project_id("dest-proj")
+                                    .set_dataset_id("_anon_ds")
+                                    .set_table_id("anon_empty_tbl"),
+                            ),
+                        ),
+                    );
+                Ok(Response::from(job))
+            }
+        }
+
+        #[derive(Debug)]
+        struct LongEmptySelectReadStub {
+            schema_bytes: Vec<u8>,
+            recorded: Arc<Mutex<Recorded>>,
+        }
+
+        impl google_cloud_bigquery::stub::Read for LongEmptySelectReadStub {
+            async fn create_read_session(
+                &self,
+                req: CreateReadSessionRequest,
+                _options: RequestOptions,
+            ) -> google_cloud_bigquery::Result<Response<ReadSession>> {
+                let mut rec = self.recorded.lock().unwrap();
+                rec.create_session_table = req.read_session.map(|rs| rs.table);
+                let session = ReadSession::new()
+                    .set_arrow_schema(
+                        StorageArrowSchema::new().set_serialized_schema(self.schema_bytes.clone()),
+                    )
+                    .set_streams([ReadStream::new().set_name("streams/unused_table_stream")]);
+                Ok(Response::from(session))
+            }
+
+            async fn read_rows(
+                &self,
+                req: ReadRowsRequest,
+                _options: RequestOptions,
+            ) -> google_cloud_bigquery::Result<ResponseStream<ReadRowsResponse>> {
+                self.recorded
+                    .lock()
+                    .unwrap()
+                    .read_rows_streams
+                    .push(req.read_stream.clone());
+                assert!(
+                    req.read_stream.ends_with("/streams/_default"),
+                    "should only call read_rows on the _default job stream, not the empty destination table stream"
+                );
+                let (tx, rx) = tokio::sync::mpsc::channel(1);
+                tx.try_send(Ok(ReadRowsResponse::new())).unwrap();
+                drop(tx);
+                Ok(ResponseStream::from(rx))
+            }
+        }
+
+        let (schema_bytes, _) = create_test_arrow_payload_with_range(0, 0);
+        let recorded = Arc::new(Mutex::new(Recorded::default()));
+        let bq_client = crate::BigQueryJobService::from_stub(LongEmptySelectJobStub {
+            recorded: Arc::clone(&recorded),
+        });
+        let read_client = Read::from_stub(LongEmptySelectReadStub {
+            schema_bytes,
+            recorded: Arc::clone(&recorded),
+        });
+        let client =
+            crate::Client::new_for_testing(bq_client, read_client, "test-quota-proj".to_string());
+
+        let (schema, mut receiver) = client
+            .query("SELECT col1 FROM tbl WHERE FALSE")
+            .read()
+            .await
+            .unwrap();
+        let col_names: Vec<&str> = schema.iter_names().map(|s| s.as_str()).collect();
+        assert_eq!(col_names, vec!["col1"]);
+        assert!(receiver.recv().await.is_none());
+
+        let rec = recorded.lock().unwrap();
+        assert_eq!(rec.get_job_calls, 1);
+        assert_eq!(
+            rec.create_session_table.as_deref(),
+            Some("projects/dest-proj/datasets/_anon_ds/tables/anon_empty_tbl")
+        );
+        assert_eq!(
+            rec.read_rows_streams,
+            vec!["projects/job-proj/locations/US/jobs/long-empty-select-1/streams/_default"]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_read_long_empty_select_missing_destination_table_error() {
+        use google_cloud_bigquery::client::Read;
+        use google_cloud_bigquery_v2::model::{
+            ErrorProto, GetJobRequest, Job, JobStatistics, JobStatistics2, JobStatus,
+            PostQueryRequest,
+        };
+        use google_cloud_gax::options::RequestOptions;
+        use google_cloud_gax::response::Response;
+
+        #[derive(Debug)]
+        struct ConfigurableEmptyJobStub {
+            job: std::sync::Mutex<Option<Job>>,
+        }
+
+        impl google_cloud_bigquery_v2::stub::JobService for ConfigurableEmptyJobStub {
+            async fn query(
+                &self,
+                _req: PostQueryRequest,
+                _options: RequestOptions,
+            ) -> google_cloud_bigquery_v2::Result<Response<QueryResponse>> {
+                let resp = QueryResponse::new()
+                    .set_job_complete(false)
+                    .set_job_reference(
+                        JobReference::new()
+                            .set_project_id("job-proj")
+                            .set_location("US")
+                            .set_job_id("empty-stream-job"),
+                    );
+                Ok(Response::from(resp))
+            }
+
+            async fn get_job(
+                &self,
+                _req: GetJobRequest,
+                _options: RequestOptions,
+            ) -> google_cloud_bigquery_v2::Result<Response<Job>> {
+                let job = self.job.lock().unwrap().take().unwrap();
+                Ok(Response::from(job))
+            }
+        }
+
+        // Case 1: SELECT job with no destination_table -> Protocol error
+        let select_without_dest = Job::new()
+            .set_status(JobStatus::new().set_state("DONE"))
+            .set_statistics(
+                JobStatistics::new().set_query(JobStatistics2::new().set_statement_type("SELECT")),
+            );
+        let bq_client = crate::BigQueryJobService::from_stub(ConfigurableEmptyJobStub {
+            job: std::sync::Mutex::new(Some(select_without_dest)),
+        });
+        let (read_stub, _) = CannedReadRowsStub::new(vec![]);
+        let client = crate::Client::new_for_testing(
+            bq_client,
+            Read::from_stub(read_stub),
+            "test-quota-proj".to_string(),
+        );
+        let err = match client.query("SELECT 1 WHERE FALSE").read().await {
+            Err(e) => e,
+            Ok(_) => panic!("expected Protocol error when SELECT job has no destination_table"),
+        };
+        assert!(matches!(err, BigQueryError::Protocol(_)));
+
+        // Case 2: Failed job where ReadRows closed cleanly at EOF -> JobFailed error
+        let failed_job = Job::new().set_status(
+            JobStatus::new()
+                .set_state("DONE")
+                .set_error_result(ErrorProto::new().set_reason("invalid").set_message("bad")),
+        );
+        let bq_client = crate::BigQueryJobService::from_stub(ConfigurableEmptyJobStub {
+            job: std::sync::Mutex::new(Some(failed_job)),
+        });
+        let (read_stub, _) = CannedReadRowsStub::new(vec![]);
+        let client = crate::Client::new_for_testing(
+            bq_client,
+            Read::from_stub(read_stub),
+            "test-quota-proj".to_string(),
+        );
+        let err = match client.query("CREATE MODEL ...").read().await {
+            Err(e) => e,
+            Ok(_) => panic!("expected JobFailed error when job failed"),
+        };
+        assert!(matches!(err, BigQueryError::JobFailed(_)));
     }
 }

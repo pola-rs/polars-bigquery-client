@@ -44,7 +44,8 @@ use polars_arrow::record_batch::RecordBatch;
 use super::bigquery_read_retry::{self, StreamRetryConfig};
 use crate::BigQueryError;
 
-pub(crate) type SchemaSender = tokio::sync::oneshot::Sender<Result<ArrowSchemaRef, BigQueryError>>;
+pub(crate) type SchemaSender =
+    tokio::sync::oneshot::Sender<Result<Option<ArrowSchemaRef>, BigQueryError>>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TerminationReason {
@@ -438,7 +439,7 @@ async fn consume_next_message(
                         },
                     };
                     if let Some(sender) = options.schema_tx.take() {
-                        let _ = sender.send(Ok(Arc::new(parsed.schema.clone())));
+                        let _ = sender.send(Ok(Some(Arc::new(parsed.schema.clone()))));
                     }
                     options.metadata = Some(Arc::clone(&parsed));
                     parsed
@@ -500,16 +501,11 @@ async fn consume_next_message(
             .await
         },
         None => {
-            if options.schema_tx.is_some() {
-                send_fatal_error(
-                    BigQueryError::Protocol(
-                        "ReadRows stream closed without sending an Arrow schema".into(),
-                    ),
-                    &mut options.schema_tx,
-                    &options.tx,
-                    &options.cancel_tx,
-                )
-                .await;
+            if let Some(sender) = options.schema_tx.take() {
+                // TODO(b/573768143): If the Read API is updated to always send a schema before
+                // closing, this can go beack to being an error condition. Currently, we might
+                // encounter this case for long-running queries.
+                let _ = sender.send(Ok(None));
             }
             ReadStreamState::Terminated(TerminationReason::Finished)
         },

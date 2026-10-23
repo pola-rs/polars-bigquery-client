@@ -408,7 +408,7 @@ impl Client {
         BigQueryRecordBatchReceiver::new(rx, Some(cancel_tx), vec![handle])
     }
 
-    async fn create_table_read_session(
+    pub(crate) async fn create_table_read_session(
         &self,
         table: &BigQueryTableId,
         options: ReadOptions,
@@ -471,7 +471,7 @@ impl Client {
         stream: String,
         options: StreamOptions,
         first_page_check: Option<(bigquery_read_stream::FirstPageCheck, FallbackReadSession)>,
-    ) -> Result<(ArrowSchemaRef, BigQueryRecordBatchReceiver), BigQueryError> {
+    ) -> Result<(Option<ArrowSchemaRef>, BigQueryRecordBatchReceiver), BigQueryError> {
         self.read_streams_inner(vec![stream], options, first_page_check)
             .await
     }
@@ -481,7 +481,11 @@ impl Client {
         streams: Vec<String>,
         options: StreamOptions,
     ) -> Result<(ArrowSchemaRef, BigQueryRecordBatchReceiver), BigQueryError> {
-        self.read_streams_inner(streams, options, None).await
+        let (schema_ref, receiver) = self.read_streams_inner(streams, options, None).await?;
+        let schema_ref = schema_ref.ok_or_else(|| {
+            BigQueryError::Protocol("ReadRows stream closed without sending an Arrow schema".into())
+        })?;
+        Ok((schema_ref, receiver))
     }
 
     async fn switch_to_read_session(
@@ -532,7 +536,7 @@ impl Client {
         streams: Vec<String>,
         options: StreamOptions,
         mut first_page_check: Option<(bigquery_read_stream::FirstPageCheck, FallbackReadSession)>,
-    ) -> Result<(ArrowSchemaRef, BigQueryRecordBatchReceiver), BigQueryError> {
+    ) -> Result<(Option<ArrowSchemaRef>, BigQueryRecordBatchReceiver), BigQueryError> {
         let (metadata, schema_ref, mut schema_tx, schema_rx) = match &options.schema {
             Some(schema) => {
                 let metadata = Arc::new(bigquery_read_stream::parse_arrow_schema(schema)?);
@@ -611,7 +615,7 @@ impl Client {
         let receiver = BigQueryRecordBatchReceiver::new(rx, Some(cancel_tx), handles);
 
         let schema_ref = match schema_ref {
-            Some(schema_ref) => schema_ref,
+            Some(schema_ref) => Some(schema_ref),
             None => {
                 let schema_rx = schema_rx.expect("schema_rx must be Some when schema_ref is None");
                 schema_rx.await.map_err(|_| {
