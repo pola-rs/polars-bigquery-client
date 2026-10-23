@@ -163,6 +163,7 @@ impl<'a> Query<'a> {
                     schema: serialized_schema,
                     arrow_buffer_compression: Some(self.arrow_buffer_compression()),
                 },
+                self.maintain_order,
                 first_page_check,
             )
             .await
@@ -233,10 +234,8 @@ impl<'a> Query<'a> {
                 ));
             },
         };
-        let first_page_bytes = crate::bigquery_read_stream::validate_non_empty_arrow_bytes(
-            raw_first_page,
-            response.page_row_count,
-        )?;
+        let first_page_bytes =
+            crate::decode::validate_non_empty_arrow_bytes(raw_first_page, response.page_row_count)?;
 
         if !self.maintain_order
             && crate::bigquery_read_stream::estimate_remaining_bytes(
@@ -274,7 +273,7 @@ impl<'a> Query<'a> {
 
         match (first_page_bytes, stream_name) {
             (None, None) => {
-                let metadata = crate::bigquery_read_stream::parse_arrow_schema(&serialized_schema)?;
+                let metadata = crate::decode::parse_arrow_schema(&serialized_schema)?;
                 Ok((Arc::new(metadata.schema), empty_receiver()))
             },
             (None, Some(stream_name)) => {
@@ -291,7 +290,7 @@ impl<'a> Query<'a> {
                 Ok((schema_ref, receiver))
             },
             (Some(first_page_bytes), stream_name) => {
-                let metadata = crate::bigquery_read_stream::parse_arrow_schema(&serialized_schema)?;
+                let metadata = crate::decode::parse_arrow_schema(&serialized_schema)?;
                 let read_rows = stream_name.map(|name| {
                     self.client.prepare_read_rows(
                         name,
@@ -305,6 +304,7 @@ impl<'a> Query<'a> {
                     response.page_row_count,
                     read_rows,
                     Arc::new(metadata),
+                    self.maintain_order,
                 );
                 Ok((schema_ref, receiver))
             },
@@ -352,7 +352,7 @@ impl<'a> Query<'a> {
                 },
             )
             .await?;
-        let metadata = crate::bigquery_read_stream::parse_arrow_schema(&serialized_schema)?;
+        let metadata = crate::decode::parse_arrow_schema(&serialized_schema)?;
         Ok((Arc::new(metadata.schema), empty_receiver()))
     }
 
@@ -2235,6 +2235,7 @@ mod tests {
                 .unwrap();
             all_values.extend_from_slice(arr.values().as_slice());
         }
+        all_values.sort_unstable();
         assert_eq!(all_values, vec![0, 1, 2, 3, 4]);
         assert_eq!(
             recorded.lock().unwrap().arrow_buffer_compression,
