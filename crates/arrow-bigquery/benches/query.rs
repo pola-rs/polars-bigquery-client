@@ -12,8 +12,8 @@ use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Samplin
 use tokio::runtime::Runtime;
 
 // The portion of the "numbers" table we are reading is about 5 GB total, so
-// these reads vary from about 5 MB to 500 MB.
-const PROPORTIONS: [f64; 3] = [0.001, 0.01, 0.1];
+// these reads vary from about 5 MB to 2.5 GB.
+const PROPORTIONS: [f64; 3] = [0.001, 0.01, 0.5];
 
 #[cfg(feature = "tracing")]
 static INIT: Once = Once::new();

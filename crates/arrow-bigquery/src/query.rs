@@ -13,10 +13,41 @@ use polars_arrow::record_batch::RecordBatch;
 use crate::error::{BigQueryError, JobError, JobFailedError};
 use crate::{BigQueryRecordBatchReceiver, StreamOptions};
 
-/// Minimum estimated remaining bytes in the single job stream before switching
-/// to a multi-stream `ReadSession` on the destination table when `maintain_order`
-/// is `false`.
+/// Minimum estimated remaining compressed bytes in the single job stream
+/// (`streams/_default`) before switching to a multi-stream `ReadSession` on the
+/// destination table when `maintain_order` is `false`.
+///
+/// Break-even calculation from benchmark measurements:
+/// - Single-stream (`streams/_default`) drain rate after the first batch:
+///   ~96 MB/s of LZ4-compressed Arrow data (~10.4 ms/MB, or ~350 MB/s uncompressed).
+/// - Multi-stream (`CreateReadSession` + parallel `ReadRows`) drain rate:
+///   ~336 MB/s compressed (~2.98 ms/MB, or ~1.23 GB/s uncompressed).
+/// - Net time saved by switching to multi-stream:
+///   10.4 ms/MB - 2.98 ms/MB = ~7.42 ms per compressed MB (~2.03 s per uncompressed GB).
+/// - Switching after receiving the first message on `streams/_default` incurs
+///   ~1.8–2.0 s of additional overhead (`jobs.get` ~0.18 s + `CreateReadSession`
+///   ~1.35 s + initial multi-stream `ReadRows` connect ~0.3–0.5 s):
+///   2.0 s / 0.00742 s/MB ≈ 270 MB compressed (~250 MiB, or ~1 GB uncompressed).
 const MULTI_STREAM_THRESHOLD_BYTES: f64 = (250 * 1024 * 1024) as f64;
+
+/// Assumed median uncompressed row size in bytes used to estimate whether a
+/// query that finishes within the `jobs.query` call is large enough to read via
+/// a multi-stream `ReadSession` when `maintain_order` is `false`.
+const MEDIAN_ROW_SIZE_BYTES: u64 = 8;
+
+/// Minimum total rows in a completed `jobs.query` response before reading from
+/// the destination table with a multi-stream `ReadSession` when `maintain_order`
+/// is `false`.
+///
+/// When `jobs.query` completes and creates a job (`job_creation_reason = LargeResults`),
+/// it returns 0 inline Arrow rows, so we cannot estimate bytes per row from an
+/// inline batch. However, skipping `streams/_default` entirely avoids the ~0.90 s
+/// `_default` stream connection cost, reducing the net multi-stream setup overhead
+/// to ~0.53 s (`jobs.get` ~0.18 s + `CreateReadSession` ~1.25 s - 0.90 s), which
+/// breaks even at ~70 MB compressed (~250 MB uncompressed). Assuming a median row
+/// size of ~8 bytes uncompressed yields 250 MiB / 8 B = 32,768,000 rows.
+const MULTI_STREAM_THRESHOLD_ROWS: u64 =
+    (MULTI_STREAM_THRESHOLD_BYTES as u64) / MEDIAN_ROW_SIZE_BYTES;
 
 fn bq_to_gapic_compression_codec(
     codec: crate::CompressionCodec,
@@ -238,11 +269,9 @@ impl<'a> Query<'a> {
             crate::decode::validate_non_empty_arrow_bytes(raw_first_page, response.page_row_count)?;
 
         if !self.maintain_order
-            && crate::bigquery_read_stream::estimate_remaining_bytes(
-                first_page_bytes.as_ref(),
-                page_row_count,
-                response.total_rows,
-            ) >= MULTI_STREAM_THRESHOLD_BYTES
+            && response
+                .total_rows
+                .is_some_and(|total_rows| total_rows >= MULTI_STREAM_THRESHOLD_ROWS)
         {
             return self.read_destination_table(&response).await;
         }
@@ -1710,13 +1739,12 @@ mod tests {
         use crate::bigquery_read_stream::estimate_remaining_bytes;
 
         let page = bytes::Bytes::from(vec![0u8; 1024]);
-        assert_eq!(estimate_remaining_bytes(None, 10, Some(100)), 0.0);
-        assert_eq!(estimate_remaining_bytes(Some(&page), 0, Some(100)), 0.0);
-        assert_eq!(estimate_remaining_bytes(Some(&page), 10, None), 0.0);
-        assert_eq!(estimate_remaining_bytes(Some(&page), 10, Some(10)), 0.0);
-        assert_eq!(estimate_remaining_bytes(Some(&page), 10, Some(5)), 0.0);
+        assert_eq!(estimate_remaining_bytes(&page, 0, Some(100)), 0.0);
+        assert_eq!(estimate_remaining_bytes(&page, 10, None), 0.0);
+        assert_eq!(estimate_remaining_bytes(&page, 10, Some(10)), 0.0);
+        assert_eq!(estimate_remaining_bytes(&page, 10, Some(5)), 0.0);
         // 1024 bytes for 10 rows, 90 remaining rows => 9 * 1024 = 9216 bytes
-        assert_eq!(estimate_remaining_bytes(Some(&page), 10, Some(100)), 9216.0);
+        assert_eq!(estimate_remaining_bytes(&page, 10, Some(100)), 9216.0);
     }
 
     #[tokio::test]
@@ -1730,8 +1758,8 @@ mod tests {
             ReadRowsResponse, ReadSession, ReadStream,
         };
         use google_cloud_bigquery_v2::model::{
-            ArrowRecordBatch as BqArrowRecordBatch, ArrowSchema as BqArrowSchema, GetJobRequest,
-            Job, JobConfiguration, JobConfigurationQuery, PostQueryRequest, TableReference,
+            ArrowSchema as BqArrowSchema, GetJobRequest, Job, JobConfiguration,
+            JobConfigurationQuery, PostQueryRequest, TableReference,
         };
         use google_cloud_gax::options::RequestOptions;
         use google_cloud_gax::response::Response;
@@ -1752,7 +1780,6 @@ mod tests {
         #[derive(Debug)]
         struct LargeQueryJobStub {
             schema_bytes: Vec<u8>,
-            first_page_bytes: Vec<u8>,
             recorded: Arc<Mutex<RecordedCalls>>,
         }
 
@@ -1762,8 +1789,8 @@ mod tests {
                 _req: PostQueryRequest,
                 _options: RequestOptions,
             ) -> google_cloud_bigquery_v2::Result<Response<QueryResponse>> {
-                // 2 rows in first_page_bytes (~144 bytes). Set total_rows high enough
-                // so estimated remaining bytes > 250 MB.
+                // Query finishes in jobs.query with 0 inline Arrow rows and
+                // total_rows >= MULTI_STREAM_THRESHOLD_ROWS.
                 let resp = QueryResponse::new()
                     .set_job_reference(
                         JobReference::new()
@@ -1774,12 +1801,8 @@ mod tests {
                     .set_arrow_schema(
                         BqArrowSchema::new().set_serialized_schema(self.schema_bytes.clone()),
                     )
-                    .set_arrow_record_batch(
-                        BqArrowRecordBatch::new()
-                            .set_serialized_record_batch(self.first_page_bytes.clone()),
-                    )
-                    .set_page_row_count(2)
-                    .set_total_rows(10_000_000_u64);
+                    .set_page_row_count(0)
+                    .set_total_rows(MULTI_STREAM_THRESHOLD_ROWS);
                 Ok(Response::from(resp))
             }
 
@@ -1876,15 +1899,12 @@ mod tests {
             }
         }
 
-        // First page has values [100, 101] which must be discarded when switching to read_table.
-        let (schema_bytes, first_page_bytes) = create_test_arrow_payload_with_range(100, 2);
-        let (_, stream1_bytes) = create_test_arrow_payload_with_range(0, 2);
+        let (schema_bytes, stream1_bytes) = create_test_arrow_payload_with_range(0, 2);
         let (_, stream2_bytes) = create_test_arrow_payload_with_range(2, 2);
         let recorded = Arc::new(Mutex::new(RecordedCalls::default()));
 
         let bq_client = crate::BigQueryJobService::from_stub(LargeQueryJobStub {
             schema_bytes: schema_bytes.clone(),
-            first_page_bytes,
             recorded: Arc::clone(&recorded),
         });
         let read_client = Read::from_stub(MultiStreamReadStub {
@@ -1914,7 +1934,6 @@ mod tests {
             all_values.extend_from_slice(arr.values().as_slice());
         }
         all_values.sort_unstable();
-        // First page [100, 101] was discarded; only [0, 1, 2, 3] from destination table streams are returned.
         assert_eq!(all_values, vec![0, 1, 2, 3]);
 
         let rec = recorded.lock().unwrap();
