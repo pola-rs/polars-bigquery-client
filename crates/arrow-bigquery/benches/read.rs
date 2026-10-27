@@ -1,5 +1,7 @@
 use std::env;
-use std::sync::{Arc, Once};
+use std::sync::Arc;
+#[cfg(feature = "tracing")]
+use std::sync::Once;
 use std::time::Duration;
 
 use arrow_bigquery::{
@@ -12,9 +14,11 @@ use tokio::runtime::Runtime;
 // these reads vary from about 500 MB to 5 GB.
 const PROPORTIONS: [f64; 3] = [0.1, 0.5, 1.0];
 
+#[cfg(feature = "tracing")]
 static INIT: Once = Once::new();
 
 fn init_console() {
+    #[cfg(feature = "tracing")]
     INIT.call_once(|| {
         // Initializes the console subscriber once for the whole test binary
         console_subscriber::init();

@@ -43,12 +43,12 @@ if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
 ```bash
 set -euo pipefail
-cargo test --workspace --exclude py-arrow-bigquery --exclude py-polars-expressions-testing --lib --bins --benches --all-features --no-run
+cargo test --workspace --exclude py-arrow-bigquery --exclude py-polars-expressions-testing --lib --bins --benches --features testing --no-run
 ```
 
 ```powershell
 $ErrorActionPreference = "Stop"
-cargo test --workspace --exclude py-arrow-bigquery --exclude py-polars-expressions-testing --lib --bins --benches --all-features --no-run
+cargo test --workspace --exclude py-arrow-bigquery --exclude py-polars-expressions-testing --lib --bins --benches --features testing --no-run
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 ```
 
@@ -62,12 +62,12 @@ if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
 ```bash
 set -euo pipefail
-cargo test --workspace --exclude py-arrow-bigquery --exclude py-polars-expressions-testing --lib --bins --all-features
+cargo test --workspace --exclude py-arrow-bigquery --exclude py-polars-expressions-testing --lib --bins --features testing
 ```
 
 ```powershell
 $ErrorActionPreference = "Stop"
-cargo test --workspace --exclude py-arrow-bigquery --exclude py-polars-expressions-testing --lib --bins --all-features
+cargo test --workspace --exclude py-arrow-bigquery --exclude py-polars-expressions-testing --lib --bins --features testing
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 ```
 
@@ -78,7 +78,7 @@ if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 ```bash
 set -euo pipefail
 : "${GOOGLE_CLOUD_PROJECT:?Set GOOGLE_CLOUD_PROJECT to run BigQuery integration tests}"
-cargo test --package arrow-bigquery --test integration_test --all-features
+cargo test --package arrow-bigquery --test integration_test --features testing
 ```
 
 ```powershell
@@ -87,7 +87,7 @@ if (-not $env:GOOGLE_CLOUD_PROJECT) {
   Write-Error "Set GOOGLE_CLOUD_PROJECT to run BigQuery integration tests"
   exit 1
 }
-cargo test --package arrow-bigquery --test integration_test --all-features
+cargo test --package arrow-bigquery --test integration_test --features testing
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 ```
 
