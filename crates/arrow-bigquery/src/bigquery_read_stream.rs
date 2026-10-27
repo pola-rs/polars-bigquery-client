@@ -61,18 +61,18 @@ pub(crate) struct FirstPageCheck {
 /// Estimates the remaining serialized Arrow bytes in the single job stream based on
 /// the first page's byte size, the first page's row count, and the total row count.
 pub(crate) fn estimate_remaining_bytes(
-    first_page_bytes: Option<&bytes::Bytes>,
+    first_page_bytes: &bytes::Bytes,
     page_row_count: u64,
     total_rows: Option<u64>,
 ) -> f64 {
-    let (Some(first_page), Some(total_rows)) = (first_page_bytes, total_rows) else {
+    let Some(total_rows) = total_rows else {
         return 0.0;
     };
     if page_row_count == 0 || total_rows <= page_row_count {
         return 0.0;
     }
     let remaining_rows = (total_rows - page_row_count) as f64;
-    (first_page.len() as f64) * remaining_rows / (page_row_count as f64)
+    (first_page_bytes.len() as f64) * remaining_rows / (page_row_count as f64)
 }
 
 /// Extracts the serialized Arrow record batch bytes and expected row count from
@@ -372,11 +372,8 @@ async fn consume_next_message(
                     .filter(|&n| n > 0)
                     .or_else(|| check.fallback_total_rows.filter(|&n| n > 0));
 
-                if estimate_remaining_bytes(
-                    Some(&serialized_record_batch),
-                    page_row_count,
-                    total_rows,
-                ) >= check.threshold_bytes
+                if estimate_remaining_bytes(&serialized_record_batch, page_row_count, total_rows)
+                    >= check.threshold_bytes
                 {
                     return ReadStreamState::Terminated(TerminationReason::SwitchToReadSession);
                 }
