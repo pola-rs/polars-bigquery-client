@@ -1,0 +1,36 @@
+name: Release
+
+on:
+  release:
+    types:
+      - published
+
+permissions:
+  contents: read
+
+jobs:
+  build_wheels:
+    name: Build wheels and sdist
+    uses: ./.github/workflows/build-wheels.yml # zizmor: ignore[self-repository] # actionlint does not support $/ syntax yet
+    permissions:
+      contents: read
+
+  publish_pypi:
+    name: Publish to PyPI
+    needs: build_wheels
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/p/polars-bigquery
+    permissions:
+      id-token: write
+
+    steps:
+      - name: Download built artifacts
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Publish packages to PyPI
+        uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086 # v1.14.3
