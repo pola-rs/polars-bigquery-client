@@ -1,44 +1,50 @@
 //! ## bigquery_read_stream.rs
 //!
-//! This module reads from BQ Storage Read API stream and writes the results
-//! as arrow record batches to a tokio mpsc queue as messages arrive.
+//! This module reads from a BigQuery Storage Read API stream and writes the
+//! results as Arrow record batches to a tokio mpsc queue as messages arrive.
 //!
 //! To robustly handle disruptions, this module uses the following state
-//! machine, containing single API method retries and stream-level reconnection
-//! logic.
+//! machine for connection and mid-stream reconnection logic:
 //!
 //! ```text
-//! ┌─ read_stream ───────────────────────────────────────────────────────┐
-//! │              ┌──►──┐                                                │
-//! │   Receive valid message                                             │
-//! │  including empty/waiting                                            │
-//! │          ┌───┼─────▼────┐                                           │
-//! │        consume_next_message ◄─────────────────────┐                 │
-//! │  ┌───────┼   Running    │                         │                 │
-//! │  │       └───────┬──────┘                     ReadRows              │
-//! │  │    Recoverable│error                        success              │
-//! │  │               │                         ┌──────┼───────┐         │
-//! │  │       ┌───────▼──────┐ Exponential  connect_read_rows_stream     │
-//! │  │       │ Backing off  ┼──Back─off───────►│(Re)Connecting│         │
-//! │  ▼       └─────────────┬┘                  └───────┬──────┘         │
-//! │ Unrecoverable error   Out of retries       ReadRows│error           │
-//! │ or no more messages    │                 after exhausting retries   │
-//! │  │                  ┌──▼───────────┐               │                │
-//! │  └──────────────────►  Terminated──◄───────────────┘                │
-//! │                     └──────────────┘                                │
-//! └─────────────────────────────────────────────────────────────────────┘
+//!                Start here
+//!                    │
+//!              ┌─────▼──────┐      Retryable       ┌─────────┐
+//!        ┌─────┼ Connecting ┼─────────────────────►│ Backoff │
+//!        │     └─────┬──────┘◄─────────────────────┼         │
+//!        │           │          Deadline elapsed   └────▲────┘
+//!   Exhausted        │                                  │
+//!    Retries         │                             Retryable
+//!       or           │                               Error
+//! Unrecoverable      │                  (retains retry_state if Some, or
+//!      Error   ┌─────▼──────┐            starts fresh RetryState if None)
+//!        │     │  Reading   ┼───────────────────────────┘
+//!        │     └─────┬──────┘ (clears retry_state
+//!        │           │         on first message)
+//!        │           ▼
+//!        │      Unrecoverable
+//!        │      Error or EOF
+//!        │           │            ┌────────────┐
+//!        │           └───────────►│            │
+//!        └───────────────────────►│ Terminated │
+//!                                 │            │
+//!                                 └────────────┘
 //! ```
 
 use std::sync::Arc;
 
 use google_cloud_bigquery::builder::read::ReadRows;
 use google_cloud_bigquery::model::{read_rows_response, ReadRowsResponse};
+use google_cloud_gax::retry_result::RetryResult;
+use google_cloud_gax::retry_state::RetryState;
 use google_cloud_gax::streaming::ResponseStream;
+use google_cloud_gax::throttle_result::ThrottleResult;
 use polars_arrow::datatypes::ArrowSchemaRef;
 use polars_arrow::io::ipc::read::StreamMetadata;
 use polars_arrow::record_batch::RecordBatch;
+use tokio::time::Instant;
 
-use super::bigquery_read_retry::{self, StreamRetryConfig};
+use super::bigquery_read_retry::StreamRetryConfig;
 use crate::decode::{parse_arrow_schema, validate_non_empty_arrow_bytes, DecodeJob, DecodeQueue};
 use crate::BigQueryError;
 
@@ -116,121 +122,58 @@ fn read_rows_response_to_record_batch(
     }
 }
 
-/// Represents the state of the stream reading state machine.
+/// State machine for reconnection logic. If reading fails at some point,
+/// attempt to reconnect with the current row offset.
+///
+/// All mutable runtime state for stream reconnection (such as the current row
+/// offset, active stream, and retry progress) is stored in [`ReadStreamState`],
+/// keeping state transitions explicit and self-contained inside [`ReadStream::step`].
 #[derive(Debug)]
-enum ReadStreamState {
-    /// Establishing or resuming the BigQuery read stream at `current_offset`.
-    Connecting,
-    /// Waiting for the next message in a BigQuery read stream.
-    Running,
-    /// Encountered a transient mid-stream disconnection; backing off before reconnecting.
-    BackingOff(google_cloud_bigquery::Error),
-    /// Stream terminated with a [`TerminationReason`].
+pub(crate) enum ReadStreamState {
+    /// Connect or reconnect to the BigQuery read stream.
+    Connecting {
+        offset: i64,
+        retry_state: RetryState,
+    },
+    /// Waiting until `deadline` before reconnecting to the BigQuery read stream.
+    Backoff {
+        offset: i64,
+        retry_state: RetryState,
+        deadline: Instant,
+    },
+    /// Reading messages from an open BigQuery read stream.
+    ///
+    /// `retry_state` is `Some` while waiting for the first message after connecting
+    /// (so failures before any data progress retain the retry count from `Connecting`),
+    /// and is cleared to `None` once the first message is successfully received.
+    Reading {
+        offset: i64,
+        retry_state: Option<RetryState>,
+        stream: ResponseStream<ReadRowsResponse>,
+    },
+    /// Stream completed cleanly, fatal error occurred, consumer dropped the receiver,
+    /// or cancelled after the first response to read in parallel from a fresh read session.
     Terminated(TerminationReason),
 }
 
-enum ConnectOutcome {
-    Connected(ResponseStream<ReadRowsResponse>),
-    Failed(google_cloud_bigquery::Error),
-    Cancelled,
-}
-
-/// Layer 1: Connects to a BigQuery read stream at `offset`, retrying transient gRPC connection errors.
-async fn connect_read_rows_stream(
-    read_rows: &ReadRows,
-    offset: i64,
-    retry_config: &StreamRetryConfig,
-    cancel_rx: &mut tokio::sync::watch::Receiver<bool>,
-) -> ConnectOutcome {
-    let mut connect_session = retry_config.make_connect_session();
-    loop {
-        if *cancel_rx.borrow_and_update() {
-            return ConnectOutcome::Cancelled;
-        }
-
-        let send_fut = read_rows.clone().set_offset(offset).send();
-        let res = tokio::select! {
-            biased;
-            _ = cancel_rx.changed() => return ConnectOutcome::Cancelled,
-            res = send_fut => res,
-        };
-
-        match res {
-            Ok(stream) => {
-                connect_session.record_success();
-                return ConnectOutcome::Connected(stream);
-            },
-            Err(err) => match connect_session.next_delay(err, cancel_rx).await {
-                Ok(Some(())) => continue,
-                Ok(None) => return ConnectOutcome::Cancelled,
-                Err(err) => return ConnectOutcome::Failed(err),
-            },
-        }
-    }
-}
-
-async fn send_fatal_error(
-    err: BigQueryError,
-    schema_tx: &mut Option<SchemaSender>,
-    tx: &tokio::sync::mpsc::Sender<Result<RecordBatch, BigQueryError>>,
-    cancel_tx: &tokio::sync::watch::Sender<bool>,
-) {
-    let _ = cancel_tx.send_replace(true);
-    if let Some(schema_tx) = schema_tx.take() {
-        let _ = schema_tx.send(Err(err));
-    } else {
-        let _ = tx.send(Err(err)).await;
-    }
-}
-
-struct EnqueueDecodeOptions<'a> {
-    decode_queue: &'a DecodeQueue,
+async fn enqueue_decode_batch(
+    decode_queue: &DecodeQueue,
     serialized_record_batch: bytes::Bytes,
     expected_row_count: i64,
     metadata: Arc<StreamMetadata>,
-    current_offset: &'a mut i64,
-    tx: &'a tokio::sync::mpsc::Sender<Result<RecordBatch, BigQueryError>>,
-    cancel_tx: &'a Arc<tokio::sync::watch::Sender<bool>>,
-    cancel_rx: &'a mut tokio::sync::watch::Receiver<bool>,
-}
-
-async fn enqueue_decode_batches(options: EnqueueDecodeOptions<'_>) -> ReadStreamState {
-    let EnqueueDecodeOptions {
-        decode_queue,
-        serialized_record_batch,
-        expected_row_count,
-        metadata,
-        current_offset,
-        tx,
-        cancel_tx,
-        cancel_rx,
-    } = options;
-
-    match current_offset.checked_add(expected_row_count) {
-        Some(next_offset) => *current_offset = next_offset,
-        None => {
-            send_fatal_error(
-                BigQueryError::Protocol(format!(
-                    "stream offset overflow: current_offset={current_offset}, row_count={expected_row_count}"
-                )),
-                &mut None,
-                tx,
-                cancel_tx,
-            )
-            .await;
-            return ReadStreamState::Terminated(TerminationReason::Finished);
-        },
-    }
-
+    tx: &tokio::sync::mpsc::Sender<Result<RecordBatch, BigQueryError>>,
+    cancel_tx: &Arc<tokio::sync::watch::Sender<bool>>,
+    cancel_rx: &mut tokio::sync::watch::Receiver<bool>,
+) -> bool {
     let permit = tokio::select! {
         biased;
-        _ = cancel_rx.changed() => return ReadStreamState::Terminated(TerminationReason::Finished),
+        _ = cancel_rx.changed() => return false,
         res = tx.clone().reserve_owned() => match res {
             Ok(permit) => permit,
             Err(_) => {
                 // `reserve_owned` returns `Err` strictly when all `Receiver` handles (`rx`) have been
                 // dropped or closed. Terminating this stream cleanly prevents orphan background tasks.
-                return ReadStreamState::Terminated(TerminationReason::Finished);
+                return false;
             }
         }
     };
@@ -244,7 +187,7 @@ async fn enqueue_decode_batches(options: EnqueueDecodeOptions<'_>) -> ReadStream
         cancel_rx: cancel_rx.clone(),
     });
 
-    ReadStreamState::Running
+    true
 }
 
 pub(crate) struct ReadStreamOptions {
@@ -274,263 +217,366 @@ pub(crate) struct ReadQueryStreamOptions {
     pub(crate) cancel_rx: tokio::sync::watch::Receiver<bool>,
 }
 
-/// Layer 2: Consumes a single message from an established read stream and returns the next [`ReadStreamState`].
-///
-/// Processes the next message from an active read stream while in [`ReadStreamState::Running`].
-async fn consume_next_message(
-    stream: &mut ResponseStream<ReadRowsResponse>,
-    options: &mut ReadStreamOptions,
-    decode_queue: &DecodeQueue,
-) -> ReadStreamState {
-    if *options.cancel_rx.borrow_and_update() {
-        return ReadStreamState::Terminated(TerminationReason::Finished);
+pub(crate) struct ReadStream {
+    read_rows: ReadRows,
+    metadata: Option<Arc<StreamMetadata>>,
+    schema_tx: Option<SchemaSender>,
+    first_page_check: Option<FirstPageCheck>,
+    tx: tokio::sync::mpsc::Sender<Result<RecordBatch, BigQueryError>>,
+    retry_config: StreamRetryConfig,
+    decode_queue: DecodeQueue,
+    cancel_tx: Arc<tokio::sync::watch::Sender<bool>>,
+    cancel_rx: tokio::sync::watch::Receiver<bool>,
+    /// Encapsulates mutable connection and retry state for the stream reader.
+    pub(crate) state: ReadStreamState,
+}
+
+impl ReadStream {
+    fn new(options: ReadStreamOptions, decode_queue: DecodeQueue) -> Self {
+        let ReadStreamOptions {
+            read_rows,
+            current_offset,
+            metadata,
+            schema_tx,
+            first_page_check,
+            tx,
+            retry_config,
+            decode_pool: _,
+            maintain_order: _,
+            cancel_tx,
+            cancel_rx,
+        } = options;
+        Self {
+            read_rows,
+            metadata,
+            schema_tx,
+            first_page_check,
+            tx,
+            retry_config,
+            decode_queue,
+            cancel_tx,
+            cancel_rx,
+            state: ReadStreamState::Connecting {
+                offset: current_offset,
+                retry_state: RetryState::new(true),
+            },
+        }
     }
 
-    let next_item = tokio::select! {
-        biased;
-        _ = options.cancel_rx.changed() => return ReadStreamState::Terminated(TerminationReason::Finished),
-        item = stream.next() => item,
-    };
+    fn record_success(&self) {
+        self.retry_config
+            .retry_throttler
+            .lock()
+            .expect("retry throttler lock is poisoned")
+            .on_success();
+    }
 
-    match next_item {
-        Some(Ok(mut value)) => {
-            let metadata_arc = match options.metadata {
-                Some(ref m) => Arc::clone(m),
-                None => {
-                    let serialized_schema = match value.schema.take() {
-                        Some(read_rows_response::Schema::ArrowSchema(arrow_schema)) => {
-                            arrow_schema.serialized_schema
-                        },
-                        None if value.rows.is_none() && value.row_count == 0 => {
-                            // Empty heartbeat response sent by BigQuery while waiting
-                            // for a running query job to produce its schema and rows.
-                            return ReadStreamState::Running;
-                        },
-                        _ => {
-                            send_fatal_error(
-                                BigQueryError::Protocol(
-                                    "Unexpectedly got schema type other than arrow".into(),
-                                ),
-                                &mut options.schema_tx,
-                                &options.tx,
-                                &options.cancel_tx,
-                            )
-                            .await;
-                            return ReadStreamState::Terminated(TerminationReason::Finished);
-                        },
-                    };
-                    let parsed = match parse_arrow_schema(&serialized_schema) {
-                        Ok(parsed) => Arc::new(parsed),
-                        Err(err) => {
-                            send_fatal_error(
-                                err,
-                                &mut options.schema_tx,
-                                &options.tx,
-                                &options.cancel_tx,
-                            )
-                            .await;
-                            return ReadStreamState::Terminated(TerminationReason::Finished);
-                        },
-                    };
-                    if let Some(sender) = options.schema_tx.take() {
-                        let _ = sender.send(Ok(Some(Arc::new(parsed.schema.clone()))));
-                    }
-                    options.metadata = Some(Arc::clone(&parsed));
-                    parsed
-                },
-            };
+    async fn send_fatal_error(&mut self, err: BigQueryError) {
+        let _ = self.cancel_tx.send_replace(true);
+        if let Some(schema_tx) = self.schema_tx.take() {
+            let _ = schema_tx.send(Err(err));
+        } else {
+            let _ = self.tx.send(Err(err)).await;
+        }
+    }
 
-            let total_estimated_row_count = value.total_estimated_row_count;
-            let (serialized_record_batch, row_count) = match extract_response_arrow_bytes(value) {
-                Ok(Some(pair)) => pair,
-                Ok(None) => return ReadStreamState::Running,
-                Err(err) => {
-                    send_fatal_error(err, &mut options.schema_tx, &options.tx, &options.cancel_tx)
-                        .await;
+    async fn handle_error(
+        &mut self,
+        offset: i64,
+        mut retry_state: RetryState,
+        err: google_cloud_bigquery::Error,
+    ) -> ReadStreamState {
+        retry_state.attempt_count += 1;
+        let flow = self.retry_config.retry_policy.on_error(&retry_state, err);
+        self.retry_config
+            .retry_throttler
+            .lock()
+            .expect("retry throttler lock is poisoned")
+            .on_retry_failure(&flow);
+        let prev_err = match flow {
+            RetryResult::Permanent(e) | RetryResult::Exhausted(e) => {
+                self.send_fatal_error(BigQueryError::Grpc(e)).await;
+                return ReadStreamState::Terminated(TerminationReason::Finished);
+            },
+            RetryResult::Continue(e) => e,
+        };
+
+        let throttled = self
+            .retry_config
+            .retry_throttler
+            .lock()
+            .expect("retry throttler lock is poisoned")
+            .throttle_retry_attempt();
+        let prev_err = if throttled {
+            retry_state.attempt_count += 1;
+            match self
+                .retry_config
+                .retry_policy
+                .on_throttle(&retry_state, prev_err)
+            {
+                ThrottleResult::Exhausted(e) => {
+                    self.send_fatal_error(BigQueryError::Grpc(e)).await;
                     return ReadStreamState::Terminated(TerminationReason::Finished);
                 },
-            };
-
-            if let Some(check) = options.first_page_check.take() {
-                let page_row_count = match u64::try_from(row_count) {
-                    Ok(n) => n,
-                    Err(_) => {
-                        send_fatal_error(
-                            BigQueryError::Protocol(format!(
-                                "Negative row_count in ReadRowsResponse: {row_count}"
-                            )),
-                            &mut options.schema_tx,
-                            &options.tx,
-                            &options.cancel_tx,
-                        )
-                        .await;
-                        return ReadStreamState::Terminated(TerminationReason::Finished);
-                    },
-                };
-                let total_rows = total_estimated_row_count
-                    .and_then(|n| u64::try_from(n).ok())
-                    .filter(|&n| n > 0)
-                    .or_else(|| check.fallback_total_rows.filter(|&n| n > 0));
-
-                if estimate_remaining_bytes(&serialized_record_batch, page_row_count, total_rows)
-                    >= check.threshold_bytes
-                {
-                    return ReadStreamState::Terminated(TerminationReason::SwitchToReadSession);
-                }
+                ThrottleResult::Continue(e) => e,
             }
+        } else {
+            prev_err
+        };
 
-            enqueue_decode_batches(EnqueueDecodeOptions {
-                decode_queue,
-                serialized_record_batch,
-                expected_row_count: row_count,
-                metadata: metadata_arc,
-                current_offset: &mut options.current_offset,
-                tx: &options.tx,
-                cancel_tx: &options.cancel_tx,
-                cancel_rx: &mut options.cancel_rx,
-            })
-            .await
-        },
-        None => {
-            if let Some(sender) = options.schema_tx.take() {
-                // TODO(b/573768143): If the Read API is updated to always send a schema before
-                // closing, this can go beack to being an error condition. Currently, we might
-                // encounter this case for long-running queries.
-                let _ = sender.send(Ok(None));
-            }
-            ReadStreamState::Terminated(TerminationReason::Finished)
-        },
-        Some(Err(err)) => {
-            if bigquery_read_retry::stream_reconnect_predicate(&err) {
-                ReadStreamState::BackingOff(err)
-            } else {
-                send_fatal_error(
-                    BigQueryError::Grpc(err),
-                    &mut options.schema_tx,
-                    &options.tx,
-                    &options.cancel_tx,
-                )
-                .await;
-                ReadStreamState::Terminated(TerminationReason::Finished)
-            }
-        },
+        let delay = self.retry_config.backoff_policy.on_failure(&retry_state);
+        if self
+            .retry_config
+            .retry_policy
+            .remaining_time(&retry_state)
+            .is_some_and(|remaining| remaining <= delay)
+        {
+            self.send_fatal_error(BigQueryError::Grpc(
+                google_cloud_bigquery::Error::exhausted(prev_err),
+            ))
+            .await;
+            return ReadStreamState::Terminated(TerminationReason::Finished);
+        }
+        ReadStreamState::Backoff {
+            offset,
+            retry_state,
+            deadline: Instant::now() + delay,
+        }
     }
-}
 
-/// Layer 3: Orchestrates stream connection, consumption, and mid-stream reconnections as an explicit state machine.
-///
-/// Uses a [`bigquery_read_retry::BackoffSession`] instantiated from `retry_config` to handle backoff delays
-/// upon mid-stream gRPC disconnections.
-///
-/// ### A note regarding the transition from BackingOff to Connecting
-///
-/// If we are able to successfully call ReadRows but don't receive a successful
-/// message, the exponential backoff session state is preserved from the
-/// previous attempt. This ensures that we are able to make progress in the
-/// case of retriable/reconnectable failures.
-///
-/// When we do receive a successful message, the backoff state **is reset**
-/// (`backoff_session.reset()`). This ensures that long-lived data streams
-/// experiencing rare, transient network interruptions separated by minutes or
-/// hours always receive a full retry budget.
-pub(crate) async fn read_stream(options: ReadStreamOptions) -> TerminationReason {
-    let decode_queue = DecodeQueue::new(Arc::clone(&options.decode_pool), options.maintain_order);
-    read_stream_with_initial(options, None, decode_queue).await
-}
-
-async fn read_stream_with_initial(
-    mut options: ReadStreamOptions,
-    mut stream: Option<ResponseStream<ReadRowsResponse>>,
-    decode_queue: DecodeQueue,
-) -> TerminationReason {
-    let mut backoff_session = options.retry_config.make_reconnect_session();
-    let mut state = if stream.is_some() {
-        ReadStreamState::Running
-    } else {
-        ReadStreamState::Connecting
-    };
-
-    loop {
-        if *options.cancel_rx.borrow_and_update() {
-            return TerminationReason::Finished;
+    /// Advances the state machine by a single transition.
+    pub(crate) async fn step(&mut self) {
+        if !matches!(self.state, ReadStreamState::Terminated(_))
+            && *self.cancel_rx.borrow_and_update()
+        {
+            self.state = ReadStreamState::Terminated(TerminationReason::Finished);
+            return;
         }
 
-        state = match state {
-            ReadStreamState::Connecting => {
-                match connect_read_rows_stream(
-                    &options.read_rows,
-                    options.current_offset,
-                    &options.retry_config,
-                    &mut options.cancel_rx,
-                )
-                .await
-                {
-                    ConnectOutcome::Connected(inner_stream) => {
-                        stream = Some(inner_stream);
-                        ReadStreamState::Running
-                    },
-                    ConnectOutcome::Failed(err) => {
-                        send_fatal_error(
-                            BigQueryError::Grpc(err),
-                            &mut options.schema_tx,
-                            &options.tx,
-                            &options.cancel_tx,
-                        )
-                        .await;
-                        ReadStreamState::Terminated(TerminationReason::Finished)
-                    },
-                    ConnectOutcome::Cancelled => {
-                        ReadStreamState::Terminated(TerminationReason::Finished)
-                    },
-                }
-            },
-            ReadStreamState::Running => match stream {
-                Some(ref mut inner_stream) => {
-                    let prev_offset = options.current_offset;
-                    let next_state =
-                        consume_next_message(inner_stream, &mut options, &decode_queue).await;
-                    // Reset backoff state after making data progress so
-                    // future transient errors get a full retry budget.
-                    if options.current_offset > prev_offset {
-                        backoff_session.reset();
+        match &mut self.state {
+            ReadStreamState::Connecting {
+                offset,
+                retry_state,
+            } => {
+                let offset = *offset;
+                let retry_state = retry_state.clone();
+                let req = self.read_rows.clone().set_offset(offset);
+                let res = tokio::select! {
+                    biased;
+                    _ = self.cancel_rx.changed() => {
+                        self.state = ReadStreamState::Terminated(TerminationReason::Finished);
+                        return;
                     }
-                    next_state
-                },
-                None => {
-                    send_fatal_error(
-                        BigQueryError::Other(
-                            "Tried to read from BigQuery stream but not connected".into(),
-                        ),
-                        &mut options.schema_tx,
-                        &options.tx,
-                        &options.cancel_tx,
-                    )
-                    .await;
-                    ReadStreamState::Terminated(TerminationReason::Finished)
-                },
-            },
-            ReadStreamState::BackingOff(last_err) => {
-                match backoff_session
-                    .next_delay(last_err, &mut options.cancel_rx)
-                    .await
-                {
-                    Ok(Some(())) => ReadStreamState::Connecting,
-                    Ok(None) => ReadStreamState::Terminated(TerminationReason::Finished),
+                    res = req.send() => res,
+                };
+                match res {
+                    Ok(stream) => {
+                        self.state = ReadStreamState::Reading {
+                            offset,
+                            retry_state: Some(retry_state),
+                            stream,
+                        };
+                    },
                     Err(err) => {
-                        send_fatal_error(
-                            BigQueryError::Grpc(err),
-                            &mut options.schema_tx,
-                            &options.tx,
-                            &options.cancel_tx,
-                        )
-                        .await;
-                        ReadStreamState::Terminated(TerminationReason::Finished)
+                        self.state = self.handle_error(offset, retry_state, err).await;
                     },
                 }
             },
-            ReadStreamState::Terminated(reason) => return reason,
-        };
+            ReadStreamState::Backoff {
+                offset,
+                retry_state,
+                deadline,
+            } => {
+                let offset = *offset;
+                let retry_state = retry_state.clone();
+                let deadline = *deadline;
+                tokio::select! {
+                    biased;
+                    _ = self.cancel_rx.changed() => {
+                        self.state = ReadStreamState::Terminated(TerminationReason::Finished);
+                    }
+                    _ = tokio::time::sleep_until(deadline) => {
+                        self.state = ReadStreamState::Connecting {
+                            offset,
+                            retry_state,
+                        };
+                    }
+                }
+            },
+            ReadStreamState::Reading {
+                offset,
+                retry_state,
+                stream,
+            } => {
+                let next_item = tokio::select! {
+                    biased;
+                    _ = self.cancel_rx.changed() => {
+                        self.state = ReadStreamState::Terminated(TerminationReason::Finished);
+                        return;
+                    }
+                    item = stream.next() => item,
+                };
+                match next_item {
+                    Some(Ok(mut value)) => {
+                        let metadata_arc = match self.metadata {
+                            Some(ref m) => Arc::clone(m),
+                            None => {
+                                let serialized_schema = match value.schema.take() {
+                                    Some(read_rows_response::Schema::ArrowSchema(arrow_schema)) => {
+                                        arrow_schema.serialized_schema
+                                    },
+                                    None if value.rows.is_none() && value.row_count == 0 => {
+                                        // Empty heartbeat response sent by BigQuery while waiting
+                                        // for a running query job to produce its schema and rows.
+                                        *retry_state = None;
+                                        self.record_success();
+                                        return;
+                                    },
+                                    _ => {
+                                        self.send_fatal_error(BigQueryError::Protocol(
+                                            "Unexpectedly got schema type other than arrow".into(),
+                                        ))
+                                        .await;
+                                        self.state =
+                                            ReadStreamState::Terminated(TerminationReason::Finished);
+                                        return;
+                                    },
+                                };
+                                let parsed = match parse_arrow_schema(&serialized_schema) {
+                                    Ok(parsed) => Arc::new(parsed),
+                                    Err(err) => {
+                                        self.send_fatal_error(err).await;
+                                        self.state =
+                                            ReadStreamState::Terminated(TerminationReason::Finished);
+                                        return;
+                                    },
+                                };
+                                if let Some(sender) = self.schema_tx.take() {
+                                    let _ = sender.send(Ok(Some(Arc::new(parsed.schema.clone()))));
+                                }
+                                self.metadata = Some(Arc::clone(&parsed));
+                                parsed
+                            },
+                        };
+
+                        let total_estimated_row_count = value.total_estimated_row_count;
+                        let (serialized_record_batch, row_count) =
+                            match extract_response_arrow_bytes(value) {
+                                Ok(Some(pair)) => pair,
+                                Ok(None) => {
+                                    *retry_state = None;
+                                    self.record_success();
+                                    return;
+                                },
+                                Err(err) => {
+                                    self.send_fatal_error(err).await;
+                                    self.state =
+                                        ReadStreamState::Terminated(TerminationReason::Finished);
+                                    return;
+                                },
+                            };
+
+                        if let Some(check) = self.first_page_check.take() {
+                            let page_row_count = match u64::try_from(row_count) {
+                                Ok(n) => n,
+                                Err(_) => {
+                                    self.send_fatal_error(BigQueryError::Protocol(format!(
+                                        "Negative row_count in ReadRowsResponse: {row_count}"
+                                    )))
+                                    .await;
+                                    self.state =
+                                        ReadStreamState::Terminated(TerminationReason::Finished);
+                                    return;
+                                },
+                            };
+                            let total_rows = total_estimated_row_count
+                                .and_then(|n| u64::try_from(n).ok())
+                                .filter(|&n| n > 0)
+                                .or_else(|| check.fallback_total_rows.filter(|&n| n > 0));
+
+                            if estimate_remaining_bytes(
+                                &serialized_record_batch,
+                                page_row_count,
+                                total_rows,
+                            ) >= check.threshold_bytes
+                            {
+                                self.state = ReadStreamState::Terminated(
+                                    TerminationReason::SwitchToReadSession,
+                                );
+                                return;
+                            }
+                        }
+
+                        let next_offset = match offset.checked_add(row_count) {
+                            Some(next_offset) => next_offset,
+                            None => {
+                                let current_offset = *offset;
+                                self.send_fatal_error(BigQueryError::Protocol(format!(
+                                    "stream offset overflow: current_offset={current_offset}, row_count={row_count}"
+                                )))
+                                .await;
+                                self.state =
+                                    ReadStreamState::Terminated(TerminationReason::Finished);
+                                return;
+                            },
+                        };
+                        *offset = next_offset;
+                        // Data progress was made: clear `retry_state` so any future
+                        // mid-stream failure starts a fresh `RetryState::new(true)`.
+                        *retry_state = None;
+                        self.record_success();
+
+                        if !enqueue_decode_batch(
+                            &self.decode_queue,
+                            serialized_record_batch,
+                            row_count,
+                            metadata_arc,
+                            &self.tx,
+                            &self.cancel_tx,
+                            &mut self.cancel_rx,
+                        )
+                        .await
+                        {
+                            self.state = ReadStreamState::Terminated(TerminationReason::Finished);
+                        }
+                    },
+                    Some(Err(err)) => {
+                        let offset = *offset;
+                        let retry_state =
+                            retry_state.take().unwrap_or_else(|| RetryState::new(true));
+                        self.state = self.handle_error(offset, retry_state, err).await;
+                    },
+                    None => {
+                        self.record_success();
+                        if let Some(sender) = self.schema_tx.take() {
+                            // TODO(b/573768143): If the Read API is updated to always send a schema before
+                            // closing, this can go beack to being an error condition. Currently, we might
+                            // encounter this case for long-running queries.
+                            let _ = sender.send(Ok(None));
+                        }
+                        self.state = ReadStreamState::Terminated(TerminationReason::Finished);
+                    },
+                }
+            },
+            ReadStreamState::Terminated(_) => {},
+        }
     }
+
+    async fn run(&mut self) -> TerminationReason {
+        loop {
+            if let ReadStreamState::Terminated(reason) = self.state {
+                return reason;
+            }
+            self.step().await;
+        }
+    }
+}
+
+/// Orchestrates stream connection, consumption, and mid-stream reconnections via [`ReadStream::step`].
+pub(crate) async fn read_stream(options: ReadStreamOptions) -> TerminationReason {
+    let decode_queue = DecodeQueue::new(Arc::clone(&options.decode_pool), options.maintain_order);
+    let mut reader = ReadStream::new(options, decode_queue);
+    reader.run().await
 }
 
 /// Enqueues the first page of query results for decoding and streams any remaining rows
@@ -549,45 +595,27 @@ pub(crate) async fn read_query_stream(options: ReadQueryStreamOptions) {
         cancel_tx,
         mut cancel_rx,
     } = options;
-    let mut current_offset = 0;
     let decode_queue = DecodeQueue::new(Arc::clone(&decode_pool), maintain_order);
 
-    let first_page_state = enqueue_decode_batches(EnqueueDecodeOptions {
-        decode_queue: &decode_queue,
-        serialized_record_batch: first_page_bytes,
-        expected_row_count: page_row_count,
-        metadata: Arc::clone(&metadata),
-        current_offset: &mut current_offset,
-        tx: &tx,
-        cancel_tx: &cancel_tx,
-        cancel_rx: &mut cancel_rx,
-    })
-    .await;
-
-    if matches!(first_page_state, ReadStreamState::Terminated(_)) {
+    if !enqueue_decode_batch(
+        &decode_queue,
+        first_page_bytes,
+        page_row_count,
+        Arc::clone(&metadata),
+        &tx,
+        &cancel_tx,
+        &mut cancel_rx,
+    )
+    .await
+    {
         return;
     }
 
     if let Some(read_rows) = read_rows {
-        let initial_stream = match connect_read_rows_stream(
-            &read_rows,
-            page_row_count,
-            &retry_config,
-            &mut cancel_rx,
-        )
-        .await
-        {
-            ConnectOutcome::Connected(stream) => Some(stream),
-            ConnectOutcome::Failed(err) => {
-                send_fatal_error(BigQueryError::Grpc(err), &mut None, &tx, &cancel_tx).await;
-                return;
-            },
-            ConnectOutcome::Cancelled => return,
-        };
-        let _ = read_stream_with_initial(
+        let mut reader = ReadStream::new(
             ReadStreamOptions {
                 read_rows,
-                current_offset,
+                current_offset: page_row_count,
                 metadata: Some(metadata),
                 schema_tx: None,
                 first_page_check: None,
@@ -598,10 +626,9 @@ pub(crate) async fn read_query_stream(options: ReadQueryStreamOptions) {
                 cancel_tx,
                 cancel_rx,
             },
-            initial_stream,
             decode_queue,
-        )
-        .await;
+        );
+        let _ = reader.run().await;
     }
 }
 
@@ -1096,5 +1123,438 @@ pub(crate) mod tests {
             .await
             .expect("cancelled stream should exit promptly")
             .expect("task should not panic");
+    }
+
+    fn transient_error() -> Error {
+        Error::service(
+            Status::default()
+                .set_code(Code::Unavailable)
+                .set_message("transient failure"),
+        )
+    }
+
+    fn permanent_error() -> Error {
+        Error::service(
+            Status::default()
+                .set_code(Code::PermissionDenied)
+                .set_message("permission denied"),
+        )
+    }
+
+    fn make_test_read_stream(
+        streams: Vec<MockStreamResult>,
+        metadata: Option<Arc<StreamMetadata>>,
+        retry_config: StreamRetryConfig,
+    ) -> (
+        ReadStream,
+        Arc<Mutex<Vec<ReadRowsRequest>>>,
+        tokio::sync::mpsc::Receiver<Result<RecordBatch, BigQueryError>>,
+    ) {
+        let requests = Arc::new(Mutex::new(vec![]));
+        let mock_client = MockClient {
+            requests: Arc::clone(&requests),
+            streams: Arc::new(Mutex::new(streams)),
+        };
+        let client = Read::from_stub(mock_client);
+        let read_rows = client.read_rows().set_read_stream("streams/1");
+        let (tx, rx) = tokio::sync::mpsc::channel(10);
+        let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+        let decode_pool = default_decode_pool();
+        let decode_queue = DecodeQueue::new(Arc::clone(&decode_pool), false);
+        let reader = ReadStream::new(
+            ReadStreamOptions {
+                read_rows,
+                current_offset: 0,
+                metadata,
+                schema_tx: None,
+                first_page_check: None,
+                tx,
+                retry_config,
+                decode_pool,
+                maintain_order: false,
+                cancel_tx: Arc::new(cancel_tx),
+                cancel_rx,
+            },
+            decode_queue,
+        );
+        (reader, requests, rx)
+    }
+
+    #[tokio::test]
+    async fn step_connecting_to_reading() {
+        let (mut reader, requests, _rx) =
+            make_test_read_stream(vec![Ok(vec![])], None, test_retry_config(5));
+
+        let initial_retry = RetryState::new(true).set_attempt_count(2_u32);
+        reader.state = ReadStreamState::Connecting {
+            offset: 42,
+            retry_state: initial_retry,
+        };
+        reader.step().await;
+
+        let ReadStreamState::Reading {
+            offset,
+            retry_state: Some(retry_state),
+            ..
+        } = &reader.state
+        else {
+            panic!("expected Reading state with Some(retry_state)");
+        };
+        assert_eq!(*offset, 42);
+        assert_eq!(retry_state.attempt_count, 2);
+        let reqs = requests.lock().unwrap();
+        assert_eq!(reqs.len(), 1);
+        assert_eq!(reqs[0].offset, 42);
+    }
+
+    #[tokio::test]
+    async fn step_connecting_retryable_error() {
+        let (mut reader, _requests, _rx) =
+            make_test_read_stream(vec![Err(transient_error())], None, test_retry_config(5));
+
+        let initial_retry = RetryState::new(true).set_attempt_count(1_u32);
+        reader.state = ReadStreamState::Connecting {
+            offset: 10,
+            retry_state: initial_retry,
+        };
+        let before = Instant::now();
+        reader.step().await;
+
+        let ReadStreamState::Backoff {
+            offset,
+            retry_state,
+            deadline,
+        } = &reader.state
+        else {
+            panic!("expected Backoff state");
+        };
+        assert_eq!(*offset, 10);
+        assert_eq!(retry_state.attempt_count, 2);
+        assert!(*deadline >= before);
+    }
+
+    #[tokio::test]
+    async fn step_connecting_permanent_error() {
+        let (mut reader, _requests, mut rx) =
+            make_test_read_stream(vec![Err(permanent_error())], None, test_retry_config(5));
+
+        reader.state = ReadStreamState::Connecting {
+            offset: 0,
+            retry_state: RetryState::new(true),
+        };
+        reader.step().await;
+
+        assert!(matches!(
+            reader.state,
+            ReadStreamState::Terminated(TerminationReason::Finished)
+        ));
+        let err = rx.recv().await.unwrap().unwrap_err();
+        let BigQueryError::Grpc(gax_err) = err else {
+            panic!("expected Grpc error, got: {err:?}");
+        };
+        assert_eq!(
+            gax_err.status().map(|s| s.code),
+            Some(Code::PermissionDenied)
+        );
+    }
+
+    #[tokio::test]
+    async fn step_connecting_deadline_exhausted() {
+        use google_cloud_gax::retry_throttler::{CircuitBreaker, RetryThrottlerArg};
+
+        #[derive(Debug)]
+        struct FixedBackoff(Duration);
+        impl BackoffPolicy for FixedBackoff {
+            fn on_failure(&self, _state: &RetryState) -> Duration {
+                self.0
+            }
+        }
+
+        let retry_config = StreamRetryConfig::new(
+            Some(Arc::new(
+                RetryableErrors.with_time_limit(Duration::from_secs(1)),
+            )),
+            Some(Arc::new(FixedBackoff(Duration::from_secs(60)))),
+            RetryThrottlerArg::from(CircuitBreaker::default()).into(),
+        );
+
+        let (mut reader, _requests, mut rx) =
+            make_test_read_stream(vec![Err(transient_error())], None, retry_config);
+
+        reader.state = ReadStreamState::Connecting {
+            offset: 0,
+            retry_state: RetryState::new(true),
+        };
+        reader.step().await;
+
+        assert!(matches!(
+            reader.state,
+            ReadStreamState::Terminated(TerminationReason::Finished)
+        ));
+        let err = rx.recv().await.unwrap().unwrap_err();
+        let BigQueryError::Grpc(gax_err) = err else {
+            panic!("expected Grpc error, got: {err:?}");
+        };
+        assert!(gax_err.is_exhausted(), "{gax_err:?}");
+    }
+
+    #[tokio::test]
+    async fn step_backoff_to_connecting() {
+        let (mut reader, requests, _rx) =
+            make_test_read_stream(vec![], None, test_retry_config(5));
+
+        reader.state = ReadStreamState::Backoff {
+            offset: 42,
+            retry_state: RetryState::new(true).set_attempt_count(2_u32),
+            deadline: Instant::now(),
+        };
+        reader.step().await;
+
+        let ReadStreamState::Connecting {
+            offset,
+            retry_state,
+        } = &reader.state
+        else {
+            panic!("expected Connecting state");
+        };
+        assert_eq!(*offset, 42);
+        assert_eq!(retry_state.attempt_count, 2);
+        assert!(requests.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn step_first_message_clears_retry_state() {
+        let (schema_bytes, resp) = create_test_arrow_payload(5);
+        let metadata = Arc::new(parse_arrow_schema(&schema_bytes).unwrap());
+        let (mut reader, _requests, mut rx) =
+            make_test_read_stream(vec![], Some(metadata), test_retry_config(5));
+
+        let (stream_tx, stream_rx) = tokio::sync::mpsc::channel(1);
+        stream_tx.send(Ok(resp)).await.unwrap();
+        let stream = ResponseStream::from(stream_rx);
+
+        reader.state = ReadStreamState::Reading {
+            offset: 10,
+            retry_state: Some(RetryState::new(true).set_attempt_count(3_u32)),
+            stream,
+        };
+        reader.step().await;
+
+        let ReadStreamState::Reading {
+            offset,
+            retry_state,
+            ..
+        } = &reader.state
+        else {
+            panic!("expected Reading state");
+        };
+        assert_eq!(*offset, 15);
+        assert!(
+            retry_state.is_none(),
+            "expected retry_state to be cleared to None after first message, got: {retry_state:?}"
+        );
+        let batch = rx.recv().await.expect("expected decoded batch").unwrap();
+        assert_eq!(batch.len(), 5);
+    }
+
+    #[tokio::test]
+    async fn step_first_message_retryable_error_retains_retry_state() {
+        let (mut reader, _requests, _rx) =
+            make_test_read_stream(vec![], None, test_retry_config(5));
+
+        let (stream_tx, stream_rx) = tokio::sync::mpsc::channel(1);
+        stream_tx.send(Err(transient_error())).await.unwrap();
+        let stream = ResponseStream::from(stream_rx);
+
+        let prior_retry = RetryState::new(true).set_attempt_count(2_u32);
+        reader.state = ReadStreamState::Reading {
+            offset: 7,
+            retry_state: Some(prior_retry),
+            stream,
+        };
+        reader.step().await;
+
+        let ReadStreamState::Backoff {
+            offset,
+            retry_state,
+            ..
+        } = &reader.state
+        else {
+            panic!("expected Backoff state");
+        };
+        assert_eq!(*offset, 7);
+        assert_eq!(retry_state.attempt_count, 3);
+    }
+
+    #[tokio::test]
+    async fn step_reading_to_reading() {
+        let (schema_bytes, resp) = create_test_arrow_payload(3);
+        let metadata = Arc::new(parse_arrow_schema(&schema_bytes).unwrap());
+        let (mut reader, _requests, mut rx) =
+            make_test_read_stream(vec![], Some(metadata), test_retry_config(5));
+
+        let (stream_tx, stream_rx) = tokio::sync::mpsc::channel(1);
+        stream_tx.send(Ok(resp)).await.unwrap();
+        let stream = ResponseStream::from(stream_rx);
+
+        reader.state = ReadStreamState::Reading {
+            offset: 5,
+            retry_state: None,
+            stream,
+        };
+        reader.step().await;
+
+        let ReadStreamState::Reading {
+            offset,
+            retry_state,
+            ..
+        } = &reader.state
+        else {
+            panic!("expected Reading state");
+        };
+        assert_eq!(*offset, 8);
+        assert!(retry_state.is_none());
+        let batch = rx.recv().await.expect("expected decoded batch").unwrap();
+        assert_eq!(batch.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn step_reading_retryable_error_resets_retry_state() {
+        let (mut reader, _requests, _rx) =
+            make_test_read_stream(vec![], None, test_retry_config(5));
+
+        let (stream_tx, stream_rx) = tokio::sync::mpsc::channel(1);
+        stream_tx.send(Err(transient_error())).await.unwrap();
+        let stream = ResponseStream::from(stream_rx);
+
+        reader.state = ReadStreamState::Reading {
+            offset: 12,
+            retry_state: None,
+            stream,
+        };
+        reader.step().await;
+
+        let ReadStreamState::Backoff {
+            offset,
+            retry_state,
+            ..
+        } = &reader.state
+        else {
+            panic!("expected Backoff state");
+        };
+        assert_eq!(*offset, 12);
+        assert_eq!(retry_state.attempt_count, 1);
+    }
+
+    #[tokio::test]
+    async fn step_reading_permanent_error_to_terminated() {
+        let (mut reader, _requests, mut rx) =
+            make_test_read_stream(vec![], None, test_retry_config(5));
+
+        let (stream_tx, stream_rx) = tokio::sync::mpsc::channel(1);
+        stream_tx.send(Err(permanent_error())).await.unwrap();
+        let stream = ResponseStream::from(stream_rx);
+
+        reader.state = ReadStreamState::Reading {
+            offset: 0,
+            retry_state: None,
+            stream,
+        };
+        reader.step().await;
+
+        assert!(matches!(
+            reader.state,
+            ReadStreamState::Terminated(TerminationReason::Finished)
+        ));
+        let err = rx.recv().await.unwrap().unwrap_err();
+        let BigQueryError::Grpc(gax_err) = err else {
+            panic!("expected Grpc error, got: {err:?}");
+        };
+        assert_eq!(
+            gax_err.status().map(|s| s.code),
+            Some(Code::PermissionDenied)
+        );
+    }
+
+    #[tokio::test]
+    async fn step_reading_eof_to_terminated() {
+        let (mut reader, _requests, _rx) =
+            make_test_read_stream(vec![], None, test_retry_config(5));
+
+        let (stream_tx, stream_rx) = tokio::sync::mpsc::channel(1);
+        drop(stream_tx);
+        let stream = ResponseStream::from(stream_rx);
+
+        reader.state = ReadStreamState::Reading {
+            offset: 0,
+            retry_state: None,
+            stream,
+        };
+        reader.step().await;
+
+        assert!(matches!(
+            reader.state,
+            ReadStreamState::Terminated(TerminationReason::Finished)
+        ));
+    }
+
+    #[tokio::test]
+    async fn step_terminated_stays_terminated() {
+        let (mut reader, requests, _rx) =
+            make_test_read_stream(vec![], None, test_retry_config(5));
+
+        reader.state = ReadStreamState::Terminated(TerminationReason::Finished);
+        reader.step().await;
+        assert!(matches!(
+            reader.state,
+            ReadStreamState::Terminated(TerminationReason::Finished)
+        ));
+
+        reader.state = ReadStreamState::Terminated(TerminationReason::SwitchToReadSession);
+        reader.step().await;
+        assert!(matches!(
+            reader.state,
+            ReadStreamState::Terminated(TerminationReason::SwitchToReadSession)
+        ));
+        assert!(requests.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn retry_throttler_stops_retries_when_exhausted() {
+        use google_cloud_gax::retry_throttler::{RetryThrottler, RetryThrottlerArg};
+
+        #[derive(Debug)]
+        struct AlwaysThrottle;
+        impl RetryThrottler for AlwaysThrottle {
+            fn throttle_retry_attempt(&self) -> bool {
+                true
+            }
+            fn on_retry_failure(&mut self, _flow: &RetryResult) {}
+            fn on_success(&mut self) {}
+        }
+
+        // With attempt_limit(2):
+        // - handle_error increments attempt_count to 1 -> on_error returns Continue
+        // - throttler throttles attempt -> attempt_count incremented to 2 -> on_throttle returns Exhausted
+        let retry_config = StreamRetryConfig::new(
+            Some(Arc::new(RetryableErrors.with_attempt_limit(2))),
+            Some(Arc::new(NoBackoff)),
+            RetryThrottlerArg::from(AlwaysThrottle).into(),
+        );
+
+        let (mut reader, requests, mut rx) =
+            make_test_read_stream(vec![Err(transient_error())], None, retry_config);
+
+        reader.step().await;
+        assert!(matches!(
+            reader.state,
+            ReadStreamState::Terminated(TerminationReason::Finished)
+        ));
+        assert_eq!(requests.lock().unwrap().len(), 1);
+        let err = rx.recv().await.unwrap().unwrap_err();
+        let BigQueryError::Grpc(gax_err) = err else {
+            panic!("expected Grpc error, got: {err:?}");
+        };
+        assert_eq!(gax_err.status().map(|s| s.code), Some(Code::Unavailable));
     }
 }
