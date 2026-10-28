@@ -1,17 +1,52 @@
 use std::sync::Arc;
+use std::time::Duration;
 
+use google_cloud_bigquery::query::retry_policy::RetryableErrors;
 use google_cloud_bigquery_v2::model::query_request::{JobCreationMode, QueryResultsFormat};
 use google_cloud_bigquery_v2::model::{
-    arrow_serialization_options, query_response, ArrowSerializationOptions, QueryRequest,
-    QueryResponse,
+    arrow_serialization_options, query_response, ArrowSerializationOptions, JobReference,
+    QueryRequest, QueryResponse,
 };
+use google_cloud_gax::backoff_policy::BackoffPolicy;
+use google_cloud_gax::exponential_backoff::ExponentialBackoffBuilder;
 use google_cloud_gax::options::RequestOptionsBuilder;
+use google_cloud_gax::retry_policy::{RetryPolicy, RetryPolicyExt};
 use polars_arrow::array::{Array, BooleanArray, Int64Array, Utf8Array};
 use polars_arrow::datatypes::{ArrowDataType, ArrowSchema, ArrowSchemaRef, Field, TimeUnit};
 use polars_arrow::record_batch::RecordBatch;
+use uuid::Uuid;
 
 use crate::error::{BigQueryError, JobError, JobFailedError};
 use crate::{BigQueryRecordBatchReceiver, StreamOptions};
+
+pub(crate) const QUERY_REQUEST_ID_PREFIX: &str = "req_";
+
+pub(crate) fn default_retry_policy() -> Arc<dyn RetryPolicy> {
+    Arc::new(RetryableErrors.with_attempt_limit(6))
+}
+
+pub(crate) fn default_backoff_policy() -> Arc<dyn BackoffPolicy> {
+    Arc::new(
+        ExponentialBackoffBuilder::default()
+            .with_initial_delay(Duration::from_secs(1))
+            .with_maximum_delay(Duration::from_secs(32))
+            .with_scaling(2.0)
+            .build()
+            .expect("valid backoff configuration"),
+    )
+}
+
+// Create a random ID with the given prefix and a UUID.
+//
+// BigQuery does not strictly define a format for request and job IDs, just a limit in size.
+// However, request IDs are more restrictive and have a limit of 36 characters.
+// UUID v4 simple format is used to reduce length.
+//
+// See https://docs.cloud.google.com/bigquery/docs/reference/rest/v2/jobs/query#QueryRequest for request ID
+// and https://docs.cloud.google.com/bigquery/docs/reference/rest/v2/JobReference for job ID.
+pub(crate) fn generate_prefixed_id(prefix: &str) -> String {
+    format!("{prefix}{}", Uuid::new_v4().simple())
+}
 
 /// Minimum estimated remaining compressed bytes in the single job stream
 /// (`streams/_default`) before switching to a multi-stream `ReadSession` on the
@@ -120,6 +155,7 @@ impl<'a> Query<'a> {
             bq_to_gapic_compression_codec(self.arrow_buffer_compression()),
         );
         QueryRequest::new()
+            .set_request_id(generate_prefixed_id(QUERY_REQUEST_ID_PREFIX))
             .set_job_creation_mode(JobCreationMode::JobCreationOptional)
             .set_query_results_format(QueryResultsFormat::Arrow)
             .set_arrow_serialization_options(arrow_options)
@@ -215,11 +251,16 @@ impl<'a> Query<'a> {
     pub async fn read(
         &self,
     ) -> Result<(ArrowSchemaRef, BigQueryRecordBatchReceiver), BigQueryError> {
-        let mut response = self
+        let mut response = match self
             .prepare_query(self.build_read_request())
+            .with_idempotency(true)
             .send()
             .await
-            .map_err(map_query_error)?;
+        {
+            Ok(response) => response,
+            Err(err) if is_duplicate_job_error(&err) => self.adopt_duplicate_job(err).await?,
+            Err(err) => return Err(map_query_error(err)),
+        };
 
         if response.job_complete == Some(false) {
             let stream_name = default_job_stream_path(&response)?;
@@ -402,6 +443,115 @@ impl<'a> Query<'a> {
 
         original_err
     }
+
+    // When an RPC-level retry of `jobs.query` with the same `request_id` arrives
+    // after the first attempt already completed and created a job, BigQuery
+    // responds with HTTP 409 ("Already Exists: Job <project>:<location>.<job_id>").
+    // Look up the existing job and read its results.
+    async fn adopt_duplicate_job(
+        &self,
+        err: google_cloud_bigquery_v2::Error,
+    ) -> Result<QueryResponse, BigQueryError> {
+        let Some(parsed_job_ref) = parse_duplicate_job_reference(&err) else {
+            return Err(map_query_error(err));
+        };
+
+        // If get_job fails, discard its error and return the original 409 error
+        // which names the existing job and is more informative for the caller.
+        let Ok(existing_job) = fetch_job(
+            self.client,
+            &parsed_job_ref.project_id,
+            &parsed_job_ref.job_id,
+            parsed_job_ref.location.as_deref(),
+        )
+        .await
+        else {
+            return Err(map_query_error(err));
+        };
+
+        let job_ref = match existing_job.job_reference {
+            Some(jr) => JobReference::new()
+                .set_project_id(non_empty_str(&jr.project_id).unwrap_or(&parsed_job_ref.project_id))
+                .set_job_id(non_empty_str(&jr.job_id).unwrap_or(&parsed_job_ref.job_id))
+                .set_or_clear_location(
+                    jr.location
+                        .as_deref()
+                        .and_then(non_empty_str)
+                        .map(str::to_string)
+                        .or(parsed_job_ref.location),
+                ),
+            None => parsed_job_ref,
+        };
+
+        check_job_status_error(
+            existing_job.status,
+            &job_ref.project_id,
+            job_ref.location.as_deref(),
+            &job_ref.job_id,
+        )?;
+
+        let statement_type = existing_job
+            .statistics
+            .as_ref()
+            .and_then(|s| s.query.as_ref())
+            .and_then(|q| non_empty_str(&q.statement_type))
+            .unwrap_or_default()
+            .to_string();
+
+        Ok(QueryResponse::new()
+            .set_job_complete(false)
+            .set_job_reference(job_ref)
+            .set_statement_type(statement_type))
+    }
+}
+
+fn is_duplicate_job_error(error: &google_cloud_bigquery_v2::Error) -> bool {
+    parse_duplicate_job_reference(error).is_some()
+}
+
+// Parses the `JobReference` from a BigQuery duplicate job error.
+//
+// When a `jobs.query` retry with the same `request_id` arrives after the first
+// attempt already completed and created a job, BigQuery returns HTTP 409
+// (`Code::AlreadyExists`) with a message like:
+//   - `"Already Exists: Job my-project:US.job_123"`
+//   - `"Already exists: Job my-project:job_123"`
+fn parse_duplicate_job_reference(error: &google_cloud_bigquery_v2::Error) -> Option<JobReference> {
+    let status = error.status()?;
+    if status.code != google_cloud_gax::error::rpc::Code::AlreadyExists {
+        return None;
+    }
+    parse_job_name(&status.message)
+}
+
+fn parse_job_name(message: &str) -> Option<JobReference> {
+    // Locate the "Job " marker (case-insensitive) and take the identifier token after it.
+    let lower = message.to_ascii_lowercase();
+    let idx = lower.find("job ")?;
+    let rest = message.get(idx + 4..)?.trim();
+    let token = rest.split_whitespace().next()?;
+    let token = token.trim_end_matches(['.', ',', ';', ')']);
+
+    // Format is `<project_id>:<location>.<job_id>` or `<project_id>:<job_id>`.
+    // Note that legacy domain-scoped project IDs contain a colon (e.g. `example.com:my-project`),
+    // so split on the last colon.
+    let (project_id, job_part) = token.rsplit_once(':')?;
+    if project_id.is_empty() || job_part.is_empty() {
+        return None;
+    }
+
+    let (location, job_id) = match job_part.split_once('.') {
+        Some((loc, id)) if !loc.is_empty() && !id.is_empty() => (Some(loc), id),
+        Some(_) => return None,
+        None => (None, job_part),
+    };
+
+    Some(
+        JobReference::new()
+            .set_project_id(project_id)
+            .set_job_id(job_id)
+            .set_or_clear_location(location.map(str::to_string)),
+    )
 }
 
 fn empty_receiver() -> BigQueryRecordBatchReceiver {
@@ -673,7 +823,7 @@ fn query_response_to_record_batch(response: &QueryResponse) -> Result<RecordBatc
 
 #[cfg(test)]
 mod tests {
-    use google_cloud_bigquery_v2::model::{JobReference, TableFieldSchema, TableSchema};
+    use google_cloud_bigquery_v2::model::{TableFieldSchema, TableSchema};
 
     use super::*;
     use crate::bigquery_read_stream::tests::{
@@ -2896,5 +3046,600 @@ mod tests {
             Ok(_) => panic!("expected JobFailed error when job failed"),
         };
         assert!(matches!(err, BigQueryError::JobFailed(_)));
+    }
+
+    #[tokio::test]
+    async fn test_generate_prefixed_id_and_build_read_request() {
+        let id = generate_prefixed_id(QUERY_REQUEST_ID_PREFIX);
+        assert!(
+            id.starts_with(QUERY_REQUEST_ID_PREFIX),
+            "expected ID to start with {QUERY_REQUEST_ID_PREFIX}, got: {id}"
+        );
+        assert!(
+            id.len() <= 36,
+            "QueryRequest.request_id has a 36-char limit, got len {}: {id}",
+            id.len()
+        );
+        let uuid_part = &id[QUERY_REQUEST_ID_PREFIX.len()..];
+        assert!(
+            Uuid::parse_str(uuid_part).is_ok(),
+            "expected valid UUID after prefix, got: {uuid_part}"
+        );
+
+        let client = crate::Client::new_for_testing(
+            test_bq_client().await,
+            test_read_client().await,
+            "test-quota-proj".to_string(),
+        );
+        let req1 = client.query("SELECT 1").build_read_request();
+        let req2 = client.query("SELECT 1").build_read_request();
+        assert!(req1.request_id.starts_with(QUERY_REQUEST_ID_PREFIX));
+        assert!(req1.request_id.len() <= 36);
+        assert_ne!(req1.request_id, req2.request_id);
+    }
+
+    #[test]
+    fn test_default_retry_and_backoff_policies() {
+        use google_cloud_gax::error::rpc::{Code, Status};
+        use google_cloud_gax::error::Error as GaxError;
+        use google_cloud_gax::retry_result::RetryResult;
+        use google_cloud_gax::retry_state::RetryState;
+
+        let policy = default_retry_policy();
+        let make_err = || {
+            GaxError::service(
+                Status::default()
+                    .set_code(Code::Unavailable)
+                    .set_message("Service Unavailable"),
+            )
+        };
+
+        for attempt in 1_u32..6 {
+            let state = RetryState::new(true).set_attempt_count(attempt);
+            assert!(
+                matches!(
+                    policy.on_error(&state, make_err()),
+                    RetryResult::Continue(_)
+                ),
+                "attempt {attempt} should be retried"
+            );
+        }
+        let state = RetryState::new(true).set_attempt_count(6_u32);
+        assert!(
+            matches!(
+                policy.on_error(&state, make_err()),
+                RetryResult::Exhausted(_)
+            ),
+            "attempt 6 should exhaust the retry policy"
+        );
+
+        let backoff = default_backoff_policy();
+        assert!(
+            backoff.on_failure(&RetryState::new(true).set_attempt_count(1_u32))
+                <= Duration::from_secs(1)
+        );
+        assert!(
+            backoff.on_failure(&RetryState::new(true).set_attempt_count(2_u32))
+                <= Duration::from_secs(2)
+        );
+        assert!(
+            backoff.on_failure(&RetryState::new(true).set_attempt_count(6_u32))
+                <= Duration::from_secs(32)
+        );
+        assert!(
+            backoff.on_failure(&RetryState::new(true).set_attempt_count(7_u32))
+                <= Duration::from_secs(32)
+        );
+    }
+
+    #[test]
+    fn test_parse_duplicate_job_reference() {
+        use google_cloud_gax::error::rpc::{Code, Status};
+        use google_cloud_gax::error::Error as GaxError;
+
+        let make_err = |code: Code, message: &str| -> google_cloud_bigquery_v2::Error {
+            GaxError::service(Status::default().set_code(code).set_message(message))
+        };
+
+        // Standard location-qualified job reference
+        let err = make_err(
+            Code::AlreadyExists,
+            "Already Exists: Job my-project:US.job_123",
+        );
+        assert!(is_duplicate_job_error(&err));
+        let job_ref = parse_duplicate_job_reference(&err).unwrap();
+        assert_eq!(job_ref.project_id, "my-project");
+        assert_eq!(job_ref.location.as_deref(), Some("US"));
+        assert_eq!(job_ref.job_id, "job_123");
+
+        // Without location
+        let err = make_err(
+            Code::AlreadyExists,
+            "Already exists: Job my-project:job_123",
+        );
+        assert!(is_duplicate_job_error(&err));
+        let job_ref = parse_duplicate_job_reference(&err).unwrap();
+        assert_eq!(job_ref.project_id, "my-project");
+        assert_eq!(job_ref.location, None);
+        assert_eq!(job_ref.job_id, "job_123");
+
+        // Legacy domain-scoped project ID
+        let err = make_err(
+            Code::AlreadyExists,
+            "Already Exists: Job example.com:my-project:US.job_123",
+        );
+        let job_ref = parse_duplicate_job_reference(&err).unwrap();
+        assert_eq!(job_ref.project_id, "example.com:my-project");
+        assert_eq!(job_ref.location.as_deref(), Some("US"));
+        assert_eq!(job_ref.job_id, "job_123");
+
+        // Trailing punctuation / context
+        let err = make_err(
+            Code::AlreadyExists,
+            "Already Exists: Job my-project:US.job_123. Please use a different job_id.",
+        );
+        let job_ref = parse_duplicate_job_reference(&err).unwrap();
+        assert_eq!(job_ref.project_id, "my-project");
+        assert_eq!(job_ref.location.as_deref(), Some("US"));
+        assert_eq!(job_ref.job_id, "job_123");
+
+        // Non-AlreadyExists code is rejected
+        let err = make_err(
+            Code::InvalidArgument,
+            "Already Exists: Job my-project:US.job_123",
+        );
+        assert!(!is_duplicate_job_error(&err));
+
+        // Non-Job 409 error or malformed job identifiers are rejected
+        for msg in [
+            "Already Exists: Table my-project:ds.tbl",
+            "Already Exists: Job ",
+            "Already Exists: Job :job_123",
+            "Already Exists: Job my-project:",
+            "Already Exists: Job my-project:.job_123",
+            "Already Exists: Job my-project_no_colon",
+        ] {
+            let err = make_err(Code::AlreadyExists, msg);
+            assert!(
+                !is_duplicate_job_error(&err),
+                "expected is_duplicate_job_error to be false for message: {msg}"
+            );
+        }
+
+        // Non-service error is rejected
+        let io_err = GaxError::io("connection reset");
+        assert!(!is_duplicate_job_error(&io_err));
+    }
+
+    #[tokio::test]
+    async fn test_read_retries_transient_error_with_same_request_id() {
+        use std::sync::Mutex;
+
+        use google_cloud_bigquery_v2::model::{
+            ArrowRecordBatch as BqArrowRecordBatch, ArrowSchema as BqArrowSchema, PostQueryRequest,
+        };
+        use google_cloud_gax::error::rpc::{Code, Status};
+        use google_cloud_gax::error::Error as GaxError;
+        use google_cloud_gax::options::RequestOptions;
+        use google_cloud_gax::response::Response;
+
+        #[derive(Debug)]
+        struct TransientThenSuccessStub {
+            seen_request_ids: Arc<Mutex<Vec<String>>>,
+            schema_bytes: Vec<u8>,
+            batch_bytes: Vec<u8>,
+        }
+
+        impl google_cloud_bigquery_v2::stub::JobService for TransientThenSuccessStub {
+            async fn query(
+                &self,
+                req: PostQueryRequest,
+                options: RequestOptions,
+            ) -> google_cloud_bigquery_v2::Result<Response<QueryResponse>> {
+                assert_eq!(
+                    options.idempotent(),
+                    Some(true),
+                    "jobs.query with request_id must be marked idempotent"
+                );
+                let q = req.query_request.expect("query_request should be set");
+                assert!(
+                    q.request_id.starts_with(QUERY_REQUEST_ID_PREFIX),
+                    "expected request_id with prefix {QUERY_REQUEST_ID_PREFIX}, got: {}",
+                    q.request_id
+                );
+
+                let attempt = {
+                    let mut ids = self.seen_request_ids.lock().unwrap();
+                    ids.push(q.request_id);
+                    ids.len()
+                };
+
+                if attempt == 1 {
+                    return Err(GaxError::service(
+                        Status::default()
+                            .set_code(Code::Unavailable)
+                            .set_message("Backend transiently unavailable"),
+                    ));
+                }
+
+                let resp = QueryResponse::new()
+                    .set_arrow_schema(
+                        BqArrowSchema::new().set_serialized_schema(self.schema_bytes.clone()),
+                    )
+                    .set_arrow_record_batch(
+                        BqArrowRecordBatch::new()
+                            .set_serialized_record_batch(self.batch_bytes.clone()),
+                    )
+                    .set_page_row_count(2);
+                Ok(Response::from(resp))
+            }
+        }
+
+        // Note: `BigQueryJobService::from_stub` bypasses the internal HTTP retry loop,
+        // so we test the full HTTP retry loop via a mock server with `default_retry_policy()`
+        // and also verify `TransientThenSuccessStub` captures `idempotent() == Some(true)`.
+        let seen_ids = Arc::new(Mutex::new(Vec::new()));
+        let (schema_bytes, batch_bytes) = create_test_arrow_payload_with_range(0, 2);
+        let stub_client = crate::BigQueryJobService::from_stub(TransientThenSuccessStub {
+            seen_request_ids: Arc::clone(&seen_ids),
+            schema_bytes: schema_bytes.clone(),
+            batch_bytes: batch_bytes.clone(),
+        });
+        let direct_client = crate::Client::new_for_testing(
+            stub_client,
+            test_read_client().await,
+            "test-quota-proj".to_string(),
+        );
+        // First call on raw stub fails because from_stub has no retry loop, but records idempotency + request_id.
+        let _ = direct_client.query("SELECT 1").read().await;
+        assert_eq!(seen_ids.lock().unwrap().len(), 1);
+
+        // Now test end-to-end HTTP retry with `default_retry_policy()` via mock TCP server:
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server_task = tokio::spawn(async move {
+            let mut captured_request_ids = Vec::new();
+
+            for attempt in 1..=2 {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut buf = vec![0u8; 8192];
+                let n = socket.read(&mut buf).await.unwrap();
+                let req_str = String::from_utf8_lossy(&buf[..n]);
+                let body_start = req_str.find("\r\n\r\n").expect("HTTP headers end") + 4;
+                let json_body: serde_json::Value =
+                    serde_json::from_str(&req_str[body_start..]).expect("valid JSON request body");
+                let request_id = json_body["requestId"]
+                    .as_str()
+                    .expect("requestId must be present in JSON body")
+                    .to_string();
+                captured_request_ids.push(request_id);
+
+                if attempt == 1 {
+                    let err_body = r#"{"error":{"code":503,"message":"Service Unavailable","status":"UNAVAILABLE"}}"#;
+                    let http_resp = format!(
+                        "HTTP/1.1 503 Service Unavailable\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        err_body.len(),
+                        err_body
+                    );
+                    socket.write_all(http_resp.as_bytes()).await.unwrap();
+                } else {
+                    let response_query = QueryResponse::new()
+                        .set_job_reference(
+                            JobReference::new()
+                                .set_project_id("test-quota-proj")
+                                .set_location("US"),
+                        )
+                        .set_arrow_schema(
+                            BqArrowSchema::new().set_serialized_schema(schema_bytes.clone()),
+                        )
+                        .set_arrow_record_batch(
+                            BqArrowRecordBatch::new()
+                                .set_serialized_record_batch(batch_bytes.clone()),
+                        )
+                        .set_page_row_count(2);
+                    let body = serde_json::to_string(&response_query).unwrap();
+                    let http_resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    socket.write_all(http_resp.as_bytes()).await.unwrap();
+                }
+            }
+
+            captured_request_ids
+        });
+
+        let cred = google_cloud_auth::credentials::anonymous::Builder::new().build();
+        let fast_backoff = ExponentialBackoffBuilder::default()
+            .with_initial_delay(Duration::from_millis(1))
+            .with_maximum_delay(Duration::from_millis(5))
+            .with_scaling(2.0)
+            .build()
+            .unwrap();
+        let bq_client = crate::BigQueryJobService::builder()
+            .with_credentials(cred)
+            .with_endpoint(format!("http://{addr}"))
+            .with_retry_policy(default_retry_policy())
+            .with_backoff_policy(fast_backoff)
+            .build()
+            .await
+            .unwrap();
+        let client = crate::Client::new_for_testing(
+            bq_client,
+            test_read_client().await,
+            "test-quota-proj".to_string(),
+        );
+
+        let (schema, mut receiver) = client.query("SELECT col1 FROM tbl").read().await.unwrap();
+        let captured_request_ids = server_task.await.unwrap();
+        assert_eq!(captured_request_ids.len(), 2);
+        assert!(captured_request_ids[0].starts_with(QUERY_REQUEST_ID_PREFIX));
+        assert_eq!(
+            captured_request_ids[0], captured_request_ids[1],
+            "retried jobs.query request must reuse the exact same requestId"
+        );
+
+        let col_names: Vec<&str> = schema.iter_names().map(|s| s.as_str()).collect();
+        assert_eq!(col_names, vec!["col1"]);
+        let batch = receiver.recv().await.unwrap().unwrap();
+        assert_eq!(batch.len(), 2);
+        assert!(receiver.recv().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_read_adopts_duplicate_job_on_409_already_exists() {
+        use std::sync::Mutex;
+
+        use google_cloud_bigquery::client::Read;
+        use google_cloud_bigquery::model::{
+            ArrowRecordBatch as StorageArrowRecordBatch, ArrowSchema as StorageArrowSchema,
+            ReadRowsResponse,
+        };
+        use google_cloud_bigquery_v2::model::{
+            GetJobRequest, Job, JobStatistics, JobStatistics2, JobStatus, PostQueryRequest,
+        };
+        use google_cloud_gax::error::rpc::{Code, Status};
+        use google_cloud_gax::error::Error as GaxError;
+        use google_cloud_gax::options::RequestOptions;
+        use google_cloud_gax::response::Response;
+
+        #[derive(Debug, Default)]
+        struct RecordedGetJob {
+            project_id: String,
+            job_id: String,
+            location: String,
+            quota_project: Option<String>,
+            idempotent: Option<bool>,
+        }
+
+        #[derive(Debug)]
+        struct DuplicateJobStub {
+            recorded_get_job: Arc<Mutex<Option<RecordedGetJob>>>,
+        }
+
+        impl google_cloud_bigquery_v2::stub::JobService for DuplicateJobStub {
+            async fn query(
+                &self,
+                _req: PostQueryRequest,
+                _options: RequestOptions,
+            ) -> google_cloud_bigquery_v2::Result<Response<QueryResponse>> {
+                Err(GaxError::service(
+                    Status::default()
+                        .set_code(Code::AlreadyExists)
+                        .set_message("Already Exists: Job job-proj:EU.dup-job-42"),
+                ))
+            }
+
+            async fn get_job(
+                &self,
+                req: GetJobRequest,
+                options: RequestOptions,
+            ) -> google_cloud_bigquery_v2::Result<Response<Job>> {
+                *self.recorded_get_job.lock().unwrap() = Some(RecordedGetJob {
+                    project_id: req.project_id.clone(),
+                    job_id: req.job_id.clone(),
+                    location: req.location.clone(),
+                    quota_project: options.quota_project().clone(),
+                    idempotent: options.idempotent(),
+                });
+                let job = Job::new()
+                    .set_job_reference(
+                        JobReference::new()
+                            .set_project_id(req.project_id)
+                            .set_job_id(req.job_id)
+                            .set_location(req.location),
+                    )
+                    .set_status(JobStatus::new().set_state("DONE"))
+                    .set_statistics(
+                        JobStatistics::new()
+                            .set_query(JobStatistics2::new().set_statement_type("SELECT")),
+                    );
+                Ok(Response::from(job))
+            }
+        }
+
+        let (schema_bytes, batch_bytes) = create_test_arrow_payload_with_range(10, 3);
+        let resp = ReadRowsResponse::new()
+            .set_arrow_schema(StorageArrowSchema::new().set_serialized_schema(schema_bytes))
+            .set_arrow_record_batch(
+                StorageArrowRecordBatch::new().set_serialized_record_batch(batch_bytes),
+            )
+            .set_row_count(3);
+
+        let recorded_get_job = Arc::new(Mutex::new(None));
+        let bq_client = crate::BigQueryJobService::from_stub(DuplicateJobStub {
+            recorded_get_job: Arc::clone(&recorded_get_job),
+        });
+        let (read_stub, recorded_read) = CannedReadRowsStub::new(vec![resp]);
+        let client = crate::Client::new_for_testing(
+            bq_client,
+            Read::from_stub(read_stub),
+            "test-quota-proj".to_string(),
+        );
+
+        let (schema, mut receiver) = client.query("SELECT col1 FROM tbl").read().await.unwrap();
+        let col_names: Vec<&str> = schema.iter_names().map(|s| s.as_str()).collect();
+        assert_eq!(col_names, vec!["col1"]);
+
+        let batch = receiver.recv().await.unwrap().unwrap();
+        let arr = batch.arrays()[0]
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(arr.values().as_slice(), &[10, 11, 12]);
+        assert!(receiver.recv().await.is_none());
+
+        let get_job_call = recorded_get_job
+            .lock()
+            .unwrap()
+            .take()
+            .expect("get_job must be called to adopt duplicate job");
+        assert_eq!(get_job_call.project_id, "job-proj");
+        assert_eq!(get_job_call.job_id, "dup-job-42");
+        assert_eq!(get_job_call.location, "EU");
+        assert_eq!(
+            get_job_call.quota_project.as_deref(),
+            Some("test-quota-proj")
+        );
+        assert_eq!(get_job_call.idempotent, Some(true));
+
+        let read_rec = recorded_read.lock().unwrap();
+        assert_eq!(
+            read_rec.stream_name.as_deref(),
+            Some("projects/job-proj/locations/EU/jobs/dup-job-42/streams/_default")
+        );
+        assert_eq!(read_rec.offset, Some(0));
+    }
+
+    #[tokio::test]
+    async fn test_read_adopts_duplicate_job_surfaces_job_failure() {
+        use google_cloud_bigquery_v2::model::{
+            ErrorProto, GetJobRequest, Job, JobStatus, PostQueryRequest,
+        };
+        use google_cloud_gax::error::rpc::{Code, Status};
+        use google_cloud_gax::error::Error as GaxError;
+        use google_cloud_gax::options::RequestOptions;
+        use google_cloud_gax::response::Response;
+
+        #[derive(Debug)]
+        struct FailedDuplicateJobStub;
+
+        impl google_cloud_bigquery_v2::stub::JobService for FailedDuplicateJobStub {
+            async fn query(
+                &self,
+                _req: PostQueryRequest,
+                _options: RequestOptions,
+            ) -> google_cloud_bigquery_v2::Result<Response<QueryResponse>> {
+                Err(GaxError::service(
+                    Status::default()
+                        .set_code(Code::AlreadyExists)
+                        .set_message("Already Exists: Job job-proj:US.failed-dup-job"),
+                ))
+            }
+
+            async fn get_job(
+                &self,
+                req: GetJobRequest,
+                _options: RequestOptions,
+            ) -> google_cloud_bigquery_v2::Result<Response<Job>> {
+                let job = Job::new()
+                    .set_job_reference(
+                        JobReference::new()
+                            .set_project_id(req.project_id)
+                            .set_job_id(req.job_id)
+                            .set_location(req.location),
+                    )
+                    .set_status(
+                        JobStatus::new().set_state("DONE").set_error_result(
+                            ErrorProto::new()
+                                .set_reason("invalidQuery")
+                                .set_message("Division by zero"),
+                        ),
+                    );
+                Ok(Response::from(job))
+            }
+        }
+
+        let bq_client = crate::BigQueryJobService::from_stub(FailedDuplicateJobStub);
+        let client = crate::Client::new_for_testing(
+            bq_client,
+            test_read_client().await,
+            "test-quota-proj".to_string(),
+        );
+
+        let err = match client.query("SELECT 1/0").read().await {
+            Err(e) => e,
+            Ok(_) => panic!("expected JobFailed error when adopted job failed"),
+        };
+        match err {
+            BigQueryError::JobFailed(job_failed) => {
+                assert_eq!(job_failed.project_id.as_deref(), Some("job-proj"));
+                assert_eq!(job_failed.location.as_deref(), Some("US"));
+                assert_eq!(job_failed.job_id.as_deref(), Some("failed-dup-job"));
+                assert_eq!(job_failed.error.reason.as_deref(), Some("invalidQuery"));
+                assert_eq!(job_failed.error.message, "Division by zero");
+            },
+            other => panic!("expected BigQueryError::JobFailed, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_read_duplicate_job_get_job_failure_returns_original_409_error() {
+        use google_cloud_bigquery_v2::model::{GetJobRequest, Job, PostQueryRequest};
+        use google_cloud_gax::error::rpc::{Code, Status};
+        use google_cloud_gax::error::Error as GaxError;
+        use google_cloud_gax::options::RequestOptions;
+        use google_cloud_gax::response::Response;
+
+        #[derive(Debug)]
+        struct GetJobFailsOnDuplicateStub;
+
+        impl google_cloud_bigquery_v2::stub::JobService for GetJobFailsOnDuplicateStub {
+            async fn query(
+                &self,
+                _req: PostQueryRequest,
+                _options: RequestOptions,
+            ) -> google_cloud_bigquery_v2::Result<Response<QueryResponse>> {
+                Err(GaxError::service(
+                    Status::default()
+                        .set_code(Code::AlreadyExists)
+                        .set_message("Already Exists: Job job-proj:US.dup-job-99"),
+                ))
+            }
+
+            async fn get_job(
+                &self,
+                _req: GetJobRequest,
+                _options: RequestOptions,
+            ) -> google_cloud_bigquery_v2::Result<Response<Job>> {
+                Err(GaxError::service(
+                    Status::default()
+                        .set_code(Code::PermissionDenied)
+                        .set_message("Access Denied: Job job-proj:US.dup-job-99"),
+                ))
+            }
+        }
+
+        let bq_client = crate::BigQueryJobService::from_stub(GetJobFailsOnDuplicateStub);
+        let client = crate::Client::new_for_testing(
+            bq_client,
+            test_read_client().await,
+            "test-quota-proj".to_string(),
+        );
+
+        let err = match client.query("SELECT 1").read().await {
+            Err(e) => e,
+            Ok(_) => panic!("expected error when get_job fails"),
+        };
+        assert!(
+            err.to_string()
+                .contains("Already Exists: Job job-proj:US.dup-job-99"),
+            "expected original 409 error to be preserved when get_job fails, got: {err}"
+        );
     }
 }
