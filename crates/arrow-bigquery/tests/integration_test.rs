@@ -202,6 +202,9 @@ async fn test_read_long_running_query() {
 
     let (schema, receiver) = client
         .query(sql)
+        // Set a shorter initial wait so that we exercise the ReadRows code path
+        // to wait for this query to finish.
+        .with_initial_wait(chrono::Duration::seconds(5))
         .with_use_query_cache(false)
         .read()
         .await
@@ -267,7 +270,15 @@ async fn test_read_long_running_query_oom_fails_with_job_failed() {
         LIMIT 10000
     "#;
 
-    let err = match client.query(sql).with_use_query_cache(false).read().await {
+    let err = match client
+        .query(sql)
+        // Set a shorter initial wait so that we exercise the ReadRows code path
+        // to wait for this query to finish.
+        .with_initial_wait(chrono::Duration::seconds(5))
+        .with_use_query_cache(false)
+        .read()
+        .await
+    {
         Err(err) => err,
         Ok(_) => panic!("expected long-running OOM query to fail"),
     };
@@ -385,6 +396,9 @@ async fn test_read_long_running_empty_query() {
 
     let (schema, receiver) = client
         .query(sql)
+        // Set a shorter initial wait so that we exercise the ReadRows code path
+        // to wait for this query to finish.
+        .with_initial_wait(chrono::Duration::seconds(5))
         .with_use_query_cache(false)
         .read()
         .await

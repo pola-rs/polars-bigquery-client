@@ -1,13 +1,10 @@
-
 use std::env;
 use std::sync::Arc;
 #[cfg(feature = "tracing")]
 use std::sync::Once;
 use std::time::Duration;
 
-use arrow_bigquery::{
-    BigQueryRecordBatchReceiver, Client, ServiceConfigBuilder,
-};
+use arrow_bigquery::{BigQueryRecordBatchReceiver, Client, ServiceConfigBuilder};
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, SamplingMode};
 use tokio::runtime::Runtime;
 
