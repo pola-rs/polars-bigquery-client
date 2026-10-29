@@ -77,33 +77,6 @@ pub(crate) fn is_retryable_error(error: &Error, idempotent: bool) -> bool {
     false
 }
 
-/// When to retry `create_read_session` requests.
-///
-/// Inspired by the Python configuration at
-/// https://github.com/googleapis/google-cloud-python/blob/c43caeee34e7c0878766d2806f69016c319697e2/packages/google-cloud-bigquery-storage/google/cloud/bigquery_storage_v1/services/big_query_read/transports/base.py#L154-L157
-#[cfg_attr(not(test), allow(dead_code))]
-pub(crate) fn create_read_session_predicate(err: &Error) -> bool {
-    is_retryable_error(err, true)
-}
-
-/// When to retry `read_rows` requests.
-///
-/// Inspired by the Python configuration at
-/// https://github.com/googleapis/google-cloud-python/blob/c43caeee34e7c0878766d2806f69016c319697e2/packages/google-cloud-bigquery-storage/google/cloud/bigquery_storage_v1/services/big_query_read/transports/base.py#L169-L171
-#[cfg_attr(not(test), allow(dead_code))]
-pub(crate) fn read_rows_predicate(err: &Error) -> bool {
-    is_retryable_error(err, true)
-}
-
-/// When to reconnect/resume an active `read_rows` stream after encountering a gRPC error mid-read.
-///
-/// While currently identical to [`read_rows_predicate`], having a dedicated predicate allows fine-tuning
-/// reconnection behavior separately from initial request establishment.
-#[cfg_attr(not(test), allow(dead_code))]
-pub(crate) fn stream_reconnect_predicate(err: &Error) -> bool {
-    is_retryable_error(err, true)
-}
-
 /// Default exponential backoff policy for BigQuery Storage Read API operations.
 ///
 /// - `initial_delay` (100ms): Initial sleep duration before first retry.
@@ -155,82 +128,6 @@ impl StreamRetryConfig {
             retry_policy: retry_policy.unwrap_or_else(stream_reconnect_retry_policy),
             backoff_policy: backoff_policy.unwrap_or_else(default_backoff_policy),
             retry_throttler,
-        }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use google_cloud_gax::error::rpc::Status;
-
-    use super::*;
-
-    fn status_err(code: Code) -> Error {
-        Error::service(Status::default().set_code(code).set_message("test status"))
-    }
-
-    #[test]
-    fn test_reconnect_stream_predicate_retryable_codes() {
-        let retryable_codes = [
-            Code::DeadlineExceeded,
-            Code::Unavailable,
-            Code::Aborted,
-            Code::Internal,
-            Code::ResourceExhausted,
-        ];
-
-        for code in retryable_codes {
-            let err = status_err(code);
-            assert!(
-                stream_reconnect_predicate(&err),
-                "Expected stream_reconnect_predicate to be true for code {:?}",
-                code
-            );
-        }
-    }
-
-    #[test]
-    fn test_reconnect_stream_predicate_non_retryable_codes() {
-        let non_retryable_codes = [
-            Code::Ok,
-            Code::Cancelled,
-            Code::Unknown,
-            Code::InvalidArgument,
-            Code::NotFound,
-            Code::AlreadyExists,
-            Code::PermissionDenied,
-            Code::FailedPrecondition,
-            Code::OutOfRange,
-            Code::Unimplemented,
-            Code::DataLoss,
-            Code::Unauthenticated,
-        ];
-
-        for code in non_retryable_codes {
-            let err = status_err(code);
-            assert!(
-                !stream_reconnect_predicate(&err),
-                "Expected stream_reconnect_predicate to be false for code {:?}",
-                code
-            );
-        }
-    }
-
-    #[test]
-    fn test_read_rows_predicate_matches_reconnect() {
-        let codes = [
-            Code::Unavailable,
-            Code::Aborted,
-            Code::NotFound,
-            Code::InvalidArgument,
-        ];
-        for code in codes {
-            let err = status_err(code);
-            assert_eq!(read_rows_predicate(&err), stream_reconnect_predicate(&err));
-            assert_eq!(
-                create_read_session_predicate(&err),
-                stream_reconnect_predicate(&err)
-            );
         }
     }
 }
