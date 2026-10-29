@@ -18,7 +18,7 @@ members = [
 
 [[package]]
 name = "arrow-bigquery"
-version = "0.2.0"
+version = "0.3.0"
 source = { editable = "py-arrow-bigquery" }
 dependencies = [
     { name = "cachetools" },
@@ -686,7 +686,7 @@ wheels = [
 
 [[package]]
 name = "polars-bigquery"
-version = "0.2.0"
+version = "0.3.0"
 source = { editable = "py-polars-bigquery" }
 dependencies = [
     { name = "arrow-bigquery" },
