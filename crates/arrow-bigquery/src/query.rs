@@ -9,6 +9,7 @@ use google_cloud_gax::options::RequestOptionsBuilder;
 use polars_arrow::array::{Array, BooleanArray, Int64Array, Utf8Array};
 use polars_arrow::datatypes::{ArrowDataType, ArrowSchema, ArrowSchemaRef, Field, TimeUnit};
 use polars_arrow::record_batch::RecordBatch;
+use uuid::Uuid;
 
 use crate::error::{BigQueryError, JobError, JobFailedError};
 use crate::{BigQueryRecordBatchReceiver, StreamOptions};
@@ -49,6 +50,29 @@ const MEDIAN_ROW_SIZE_BYTES: u64 = 8;
 const MULTI_STREAM_THRESHOLD_ROWS: u64 =
     (MULTI_STREAM_THRESHOLD_BYTES as u64) / MEDIAN_ROW_SIZE_BYTES;
 
+pub(crate) const QUERY_REQUEST_ID_PREFIX: &str = "req_";
+
+/// Default wait time for the call to jobs.query.
+///
+/// If the query hasn't finished within this time, BigQuery will return a
+/// QueryResonse with a job ID so that we can continue waiting using the
+/// BigQuery Storage Read API default stream for the job.
+///
+/// See: https://docs.cloud.google.com/bigquery/docs/reference/rest/v2/jobs/query#QueryRequest.FIELDS.timeout_ms
+const INITIAL_WAIT_MS_DEFAULT: u32 = 200 * 1000;
+
+// Create a random ID with the given prefix and a UUID.
+//
+// BigQuery does not strictly define a format for request and job IDs, just a limit in size.
+// However, request IDs are more restrictive and have a limit of 36 characters.
+// UUID v4 simple format is used to reduce length.
+//
+// See https://docs.cloud.google.com/bigquery/docs/reference/rest/v2/jobs/query#QueryRequest for request ID
+// and https://docs.cloud.google.com/bigquery/docs/reference/rest/v2/JobReference for job ID.
+pub(crate) fn generate_prefixed_id(prefix: &str) -> String {
+    format!("{prefix}{}", Uuid::new_v4().simple())
+}
+
 fn bq_to_gapic_compression_codec(
     codec: crate::CompressionCodec,
 ) -> arrow_serialization_options::CompressionCodec {
@@ -78,6 +102,7 @@ pub struct Query<'a> {
     arrow_buffer_compression: Option<crate::CompressionCodec>,
     maintain_order: bool,
     use_query_cache: Option<bool>,
+    initial_wait_ms: u32,
 }
 
 impl<'a> Query<'a> {
@@ -88,6 +113,7 @@ impl<'a> Query<'a> {
             arrow_buffer_compression: None,
             maintain_order: true,
             use_query_cache: None,
+            initial_wait_ms: INITIAL_WAIT_MS_DEFAULT,
         }
     }
 
@@ -96,6 +122,12 @@ impl<'a> Query<'a> {
         codec: impl Into<Option<crate::CompressionCodec>>,
     ) -> Self {
         self.arrow_buffer_compression = codec.into();
+        self
+    }
+
+    pub fn with_initial_wait(mut self, initial_wait: impl Into<chrono::Duration>) -> Self {
+        let duration: chrono::Duration = initial_wait.into();
+        self.initial_wait_ms = duration.num_milliseconds() as u32;
         self
     }
 
@@ -120,10 +152,12 @@ impl<'a> Query<'a> {
             bq_to_gapic_compression_codec(self.arrow_buffer_compression()),
         );
         QueryRequest::new()
+            .set_request_id(generate_prefixed_id(QUERY_REQUEST_ID_PREFIX))
             .set_job_creation_mode(JobCreationMode::JobCreationOptional)
             .set_query_results_format(QueryResultsFormat::Arrow)
             .set_arrow_serialization_options(arrow_options)
             .set_or_clear_use_query_cache(self.use_query_cache)
+            .set_timeout_ms(self.initial_wait_ms)
     }
 
     fn prepare_query(
@@ -217,6 +251,9 @@ impl<'a> Query<'a> {
     ) -> Result<(ArrowSchemaRef, BigQueryRecordBatchReceiver), BigQueryError> {
         let mut response = self
             .prepare_query(self.build_read_request())
+            // We set the request ID, so all queries including DML are
+            // idempotent, at least within the lifetime of the request ID.
+            .with_idempotency(true)
             .send()
             .await
             .map_err(map_query_error)?;

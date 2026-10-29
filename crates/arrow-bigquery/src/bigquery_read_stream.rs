@@ -437,8 +437,9 @@ impl ReadStream {
                                             "Unexpectedly got schema type other than arrow".into(),
                                         ))
                                         .await;
-                                        self.state =
-                                            ReadStreamState::Terminated(TerminationReason::Finished);
+                                        self.state = ReadStreamState::Terminated(
+                                            TerminationReason::Finished,
+                                        );
                                         return;
                                     },
                                 };
@@ -446,8 +447,9 @@ impl ReadStream {
                                     Ok(parsed) => Arc::new(parsed),
                                     Err(err) => {
                                         self.send_fatal_error(err).await;
-                                        self.state =
-                                            ReadStreamState::Terminated(TerminationReason::Finished);
+                                        self.state = ReadStreamState::Terminated(
+                                            TerminationReason::Finished,
+                                        );
                                         return;
                                     },
                                 };
@@ -1300,8 +1302,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn step_backoff_to_connecting() {
-        let (mut reader, requests, _rx) =
-            make_test_read_stream(vec![], None, test_retry_config(5));
+        let (mut reader, requests, _rx) = make_test_read_stream(vec![], None, test_retry_config(5));
 
         reader.state = ReadStreamState::Backoff {
             offset: 42,
@@ -1500,8 +1501,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn step_terminated_stays_terminated() {
-        let (mut reader, requests, _rx) =
-            make_test_read_stream(vec![], None, test_retry_config(5));
+        let (mut reader, requests, _rx) = make_test_read_stream(vec![], None, test_retry_config(5));
 
         reader.state = ReadStreamState::Terminated(TerminationReason::Finished);
         reader.step().await;
