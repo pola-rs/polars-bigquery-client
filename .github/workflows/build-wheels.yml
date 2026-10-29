@@ -4,7 +4,6 @@ on:
   schedule:
     - cron: '0 0 * * *'
   workflow_dispatch:
-  workflow_call:
 
 permissions:
   contents: read
@@ -22,7 +21,7 @@ jobs:
         env:
           EVENT_NAME: ${{ github.event_name }}
         run: |
-          if [ "$EVENT_NAME" != "schedule" ]; then
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
             echo "should_run=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
@@ -37,7 +36,7 @@ jobs:
 
   build_wheels:
     needs: check_commits
-    if: github.event_name != 'schedule' || needs.check_commits.outputs.should_run == 'true'
+    if: github.event_name == 'workflow_dispatch' || needs.check_commits.outputs.should_run == 'true'
     name: Build wheels on ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
     strategy:
@@ -68,7 +67,7 @@ jobs:
 
   build_sdist:
     needs: check_commits
-    if: github.event_name != 'schedule' || needs.check_commits.outputs.should_run == 'true'
+    if: github.event_name == 'workflow_dispatch' || needs.check_commits.outputs.should_run == 'true'
     name: Build source distribution
     runs-on: ubuntu-latest
 
@@ -85,26 +84,4 @@ jobs:
         with:
           name: cibw-sdist
           path: dist/*.tar.gz
-
-  build_polars_bigquery:
-    needs: check_commits
-    if: github.event_name != 'schedule' || needs.check_commits.outputs.should_run == 'true'
-    name: Build polars-bigquery wheel and sdist
-    runs-on: ubuntu-latest
-
-    steps:
-      - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
-        with:
-          persist-credentials: false
-
-      - name: Build wheel and sdist
-        run: pipx run build py-polars-bigquery --outdir dist
-
-      - name: Upload artifacts
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a #v7.0.1
-        with:
-          name: polars-bigquery-dist
-          path: |
-            dist/*.whl
-            dist/*.tar.gz
 
