@@ -198,7 +198,6 @@ pub(crate) struct ReadStreamOptions {
     pub(crate) first_page_check: Option<FirstPageCheck>,
     pub(crate) tx: tokio::sync::mpsc::Sender<Result<RecordBatch, BigQueryError>>,
     pub(crate) retry_config: StreamRetryConfig,
-    pub(crate) decode_pool: Arc<rayon::ThreadPool>,
     pub(crate) maintain_order: bool,
     pub(crate) cancel_tx: Arc<tokio::sync::watch::Sender<bool>>,
     pub(crate) cancel_rx: tokio::sync::watch::Receiver<bool>,
@@ -211,7 +210,6 @@ pub(crate) struct ReadQueryStreamOptions {
     pub(crate) metadata: Arc<StreamMetadata>,
     pub(crate) tx: tokio::sync::mpsc::Sender<Result<RecordBatch, BigQueryError>>,
     pub(crate) retry_config: StreamRetryConfig,
-    pub(crate) decode_pool: Arc<rayon::ThreadPool>,
     pub(crate) maintain_order: bool,
     pub(crate) cancel_tx: Arc<tokio::sync::watch::Sender<bool>>,
     pub(crate) cancel_rx: tokio::sync::watch::Receiver<bool>,
@@ -241,7 +239,6 @@ impl ReadStream {
             first_page_check,
             tx,
             retry_config,
-            decode_pool: _,
             maintain_order: _,
             cancel_tx,
             cancel_rx,
@@ -576,7 +573,7 @@ impl ReadStream {
 
 /// Orchestrates stream connection, consumption, and mid-stream reconnections via [`ReadStream::step`].
 pub(crate) async fn read_stream(options: ReadStreamOptions) -> TerminationReason {
-    let decode_queue = DecodeQueue::new(Arc::clone(&options.decode_pool), options.maintain_order);
+    let decode_queue = DecodeQueue::new(options.maintain_order);
     let mut reader = ReadStream::new(options, decode_queue);
     reader.run().await
 }
@@ -592,12 +589,11 @@ pub(crate) async fn read_query_stream(options: ReadQueryStreamOptions) {
         metadata,
         tx,
         retry_config,
-        decode_pool,
         maintain_order,
         cancel_tx,
         mut cancel_rx,
     } = options;
-    let decode_queue = DecodeQueue::new(Arc::clone(&decode_pool), maintain_order);
+    let decode_queue = DecodeQueue::new(maintain_order);
 
     if !enqueue_decode_batch(
         &decode_queue,
@@ -623,7 +619,6 @@ pub(crate) async fn read_query_stream(options: ReadQueryStreamOptions) {
                 first_page_check: None,
                 tx,
                 retry_config,
-                decode_pool,
                 maintain_order,
                 cancel_tx,
                 cancel_rx,
@@ -651,7 +646,6 @@ pub(crate) mod tests {
 
     use super::*;
     use crate::bigquery_read_retry::RetryableErrors;
-    use crate::decode::default_decode_pool;
 
     #[derive(Debug, Default)]
     pub(crate) struct RecordedReadRows {
@@ -906,7 +900,6 @@ pub(crate) mod tests {
             first_page_check: None,
             tx,
             retry_config: test_retry_config(3),
-            decode_pool: default_decode_pool(),
             maintain_order: true,
             cancel_tx: Arc::new(cancel_tx),
             cancel_rx,
@@ -956,7 +949,6 @@ pub(crate) mod tests {
             first_page_check: None,
             tx,
             retry_config: test_retry_config(3),
-            decode_pool: default_decode_pool(),
             maintain_order: false,
             cancel_tx: Arc::new(cancel_tx),
             cancel_rx,
@@ -999,7 +991,6 @@ pub(crate) mod tests {
             first_page_check: None,
             tx,
             retry_config: test_retry_config(3),
-            decode_pool: default_decode_pool(),
             maintain_order: false,
             cancel_tx: Arc::clone(&cancel_tx),
             cancel_rx,
@@ -1054,7 +1045,6 @@ pub(crate) mod tests {
             first_page_check: None,
             tx,
             retry_config: test_retry_config(3),
-            decode_pool: default_decode_pool(),
             maintain_order: false,
             cancel_tx: Arc::clone(&cancel_tx),
             cancel_rx,
@@ -1112,7 +1102,6 @@ pub(crate) mod tests {
             first_page_check: None,
             tx,
             retry_config: test_retry_config(3),
-            decode_pool: default_decode_pool(),
             maintain_order: false,
             cancel_tx: Arc::clone(&cancel_tx),
             cancel_rx,
@@ -1143,15 +1132,17 @@ pub(crate) mod tests {
         )
     }
 
+    type TestReadStream = (
+        ReadStream,
+        Arc<Mutex<Vec<ReadRowsRequest>>>,
+        tokio::sync::mpsc::Receiver<Result<RecordBatch, BigQueryError>>,
+    );
+
     fn make_test_read_stream(
         streams: Vec<MockStreamResult>,
         metadata: Option<Arc<StreamMetadata>>,
         retry_config: StreamRetryConfig,
-    ) -> (
-        ReadStream,
-        Arc<Mutex<Vec<ReadRowsRequest>>>,
-        tokio::sync::mpsc::Receiver<Result<RecordBatch, BigQueryError>>,
-    ) {
+    ) -> TestReadStream {
         let requests = Arc::new(Mutex::new(vec![]));
         let mock_client = MockClient {
             requests: Arc::clone(&requests),
@@ -1161,8 +1152,7 @@ pub(crate) mod tests {
         let read_rows = client.read_rows().set_read_stream("streams/1");
         let (tx, rx) = tokio::sync::mpsc::channel(10);
         let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
-        let decode_pool = default_decode_pool();
-        let decode_queue = DecodeQueue::new(Arc::clone(&decode_pool), false);
+        let decode_queue = DecodeQueue::new(false);
         let reader = ReadStream::new(
             ReadStreamOptions {
                 read_rows,
@@ -1172,7 +1162,6 @@ pub(crate) mod tests {
                 first_page_check: None,
                 tx,
                 retry_config,
-                decode_pool,
                 maintain_order: false,
                 cancel_tx: Arc::new(cancel_tx),
                 cancel_rx,

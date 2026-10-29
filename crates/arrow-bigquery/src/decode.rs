@@ -1,6 +1,6 @@
 use std::collections::VecDeque;
 use std::io::Cursor;
-use std::sync::{Arc, LazyLock, Mutex};
+use std::sync::{Arc, Mutex};
 
 use polars_arrow::io::ipc::read::{
     read_stream_metadata, StreamMetadata, StreamReader, StreamState,
@@ -8,24 +8,6 @@ use polars_arrow::io::ipc::read::{
 use polars_arrow::record_batch::RecordBatch;
 
 use crate::BigQueryError;
-
-static DEFAULT_DECODE_POOL: LazyLock<Arc<rayon::ThreadPool>> = LazyLock::new(|| {
-    let num_threads = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(1);
-    let pool = rayon::ThreadPoolBuilder::new()
-        .num_threads(num_threads)
-        .thread_name(|i| format!("arrow-bq-decode-{i}"))
-        .build()
-        .expect("failed to build Arrow IPC decode thread pool");
-    Arc::new(pool)
-});
-
-/// Returns a handle to the shared bounded thread pool used for CPU-bound
-/// Arrow IPC (LZ4/ZSTD) decompression.
-pub(crate) fn default_decode_pool() -> Arc<rayon::ThreadPool> {
-    Arc::clone(&DEFAULT_DECODE_POOL)
-}
 
 /// Parses IPC-serialized Arrow schema bytes into [`StreamMetadata`].
 pub(crate) fn parse_arrow_schema(schema_bytes: &[u8]) -> Result<StreamMetadata, BigQueryError> {
@@ -150,14 +132,12 @@ struct OrderedQueueState {
 /// A FIFO decode queue that keeps all decode jobs for a `maintain_order = true`
 /// read in a single worker queue without work-stealing across workers.
 pub(crate) struct OrderedDecodeQueue {
-    decode_pool: Arc<rayon::ThreadPool>,
     state: Mutex<OrderedQueueState>,
 }
 
 impl OrderedDecodeQueue {
-    pub(crate) fn new(decode_pool: Arc<rayon::ThreadPool>) -> Arc<Self> {
+    pub(crate) fn new() -> Arc<Self> {
         Arc::new(Self {
-            decode_pool,
             state: Mutex::new(OrderedQueueState {
                 queue: VecDeque::new(),
                 running: false,
@@ -179,7 +159,7 @@ impl OrderedDecodeQueue {
 
         if should_spawn {
             let queue = Arc::clone(self);
-            self.decode_pool.spawn_fifo(move || {
+            rayon::spawn_fifo(move || {
                 queue.drain();
             });
         }
@@ -204,25 +184,25 @@ impl OrderedDecodeQueue {
 
 #[derive(Clone)]
 pub(crate) enum DecodeQueue {
-    /// Uses Rayon's work-stealing queue when `maintain_order = false`.
-    WorkStealing(Arc<rayon::ThreadPool>),
+    /// Uses Rayon's global work-stealing pool when `maintain_order = false`.
+    WorkStealing,
     /// Keeps all decode jobs in a single sequential queue when `maintain_order = true`.
     Ordered(Arc<OrderedDecodeQueue>),
 }
 
 impl DecodeQueue {
-    pub(crate) fn new(decode_pool: Arc<rayon::ThreadPool>, maintain_order: bool) -> Self {
+    pub(crate) fn new(maintain_order: bool) -> Self {
         if maintain_order {
-            Self::Ordered(OrderedDecodeQueue::new(decode_pool))
+            Self::Ordered(OrderedDecodeQueue::new())
         } else {
-            Self::WorkStealing(decode_pool)
+            Self::WorkStealing
         }
     }
 
     pub(crate) fn push(&self, job: DecodeJob) {
         match self {
-            Self::WorkStealing(pool) => {
-                pool.spawn_fifo(move || job.run());
+            Self::WorkStealing => {
+                rayon::spawn_fifo(move || job.run());
             },
             Self::Ordered(queue) => {
                 queue.push(job);
@@ -240,13 +220,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_ordered_decode_queue_preserves_batch_order() {
-        let pool = Arc::new(
-            rayon::ThreadPoolBuilder::new()
-                .num_threads(4)
-                .build()
-                .unwrap(),
-        );
-        let queue = DecodeQueue::new(pool, true);
+        let queue = DecodeQueue::new(true);
 
         // Earlier batches are much larger than later ones so work-stealing would finish
         // the smaller batches first if they were not kept in the worker's ordered queue.
@@ -302,13 +276,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_work_stealing_decode_queue_decodes_all_batches() {
-        let pool = Arc::new(
-            rayon::ThreadPoolBuilder::new()
-                .num_threads(4)
-                .build()
-                .unwrap(),
-        );
-        let queue = DecodeQueue::new(pool, false);
+        let queue = DecodeQueue::new(false);
 
         let sizes = [20_000, 10, 15_000, 10, 10_000, 10];
         let mut schema_bytes = Vec::new();
@@ -358,13 +326,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_decode_job_error_signals_cancellation_and_pushes_err() {
-        let pool = Arc::new(
-            rayon::ThreadPoolBuilder::new()
-                .num_threads(2)
-                .build()
-                .unwrap(),
-        );
-        let queue = DecodeQueue::new(pool, true);
+        let queue = DecodeQueue::new(true);
 
         let (schema_bytes, valid_batch) = create_test_arrow_payload_with_range(0, 5);
         let metadata = Arc::new(parse_arrow_schema(&schema_bytes).unwrap());
