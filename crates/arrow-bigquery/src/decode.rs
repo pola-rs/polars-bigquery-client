@@ -220,10 +220,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_ordered_decode_queue_preserves_batch_order() {
-        let pool = rayon::ThreadPoolBuilder::new()
-            .num_threads(4)
-            .build()
-            .unwrap();
         let queue = DecodeQueue::new(true);
 
         // Earlier batches are much larger than later ones so work-stealing would finish
@@ -247,10 +243,9 @@ mod tests {
         let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
         let cancel_tx = Arc::new(cancel_tx);
 
-        let mut jobs = Vec::with_capacity(payloads.len());
         for (serialized_record_batch, expected_row_count) in payloads {
             let permit = tx.clone().reserve_owned().await.unwrap();
-            jobs.push(DecodeJob {
+            queue.push(DecodeJob {
                 serialized_record_batch,
                 expected_row_count,
                 metadata: Arc::clone(&metadata),
@@ -260,12 +255,6 @@ mod tests {
             });
         }
         drop(tx);
-
-        pool.install(|| {
-            for job in jobs {
-                queue.push(job);
-            }
-        });
 
         let mut expected_next = 0_i64;
         let mut received_sizes = Vec::new();
