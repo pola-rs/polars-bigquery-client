@@ -282,7 +282,6 @@ pub struct Client {
     user_agent: Option<Arc<str>>,
     retry_throttler: SharedRetryThrottler,
     retry_config: bigquery_read_retry::StreamRetryConfig,
-    pub(crate) decode_pool: Arc<rayon::ThreadPool>,
 }
 
 pub(crate) struct FallbackReadSession {
@@ -290,6 +289,10 @@ pub(crate) struct FallbackReadSession {
     pub(crate) job_id: String,
     pub(crate) location: String,
     pub(crate) read_options: ReadOptions,
+}
+
+fn channel_size() -> usize {
+    rayon::current_num_threads().max(1) * 2
 }
 
 impl Client {
@@ -315,7 +318,6 @@ impl Client {
             user_agent: user_agent.map(Arc::from),
             retry_throttler,
             retry_config,
-            decode_pool: decode::default_decode_pool(),
         }
     }
 
@@ -360,10 +362,6 @@ impl Client {
         self.retry_config.clone()
     }
 
-    pub(crate) fn channel_size(&self) -> usize {
-        self.decode_pool.current_num_threads().max(1) * 2
-    }
-
     pub(crate) fn prepare_read_rows(
         &self,
         stream_name: String,
@@ -391,7 +389,7 @@ impl Client {
         metadata: Arc<polars_arrow::io::ipc::read::StreamMetadata>,
         maintain_order: bool,
     ) -> BigQueryRecordBatchReceiver {
-        let (tx, rx) = tokio::sync::mpsc::channel(self.channel_size());
+        let (tx, rx) = tokio::sync::mpsc::channel(channel_size());
         let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
         let cancel_tx = Arc::new(cancel_tx);
         let handle = tokio::task::spawn(bigquery_read_stream::read_query_stream(
@@ -402,7 +400,6 @@ impl Client {
                 metadata,
                 tx,
                 retry_config: self.stream_retry_config(),
-                decode_pool: Arc::clone(&self.decode_pool),
                 maintain_order,
                 cancel_tx: Arc::clone(&cancel_tx),
                 cancel_rx,
@@ -530,7 +527,6 @@ impl Client {
                     first_page_check: None,
                     tx: tx.clone(),
                     retry_config: retry_config.clone(),
-                    decode_pool: Arc::clone(&self.decode_pool),
                     maintain_order,
                     cancel_tx: Arc::clone(&cancel_tx),
                     cancel_rx: cancel_rx.clone(),
@@ -567,8 +563,7 @@ impl Client {
             },
         };
 
-        let channel_size = self.channel_size();
-        let (tx, rx) = tokio::sync::mpsc::channel(channel_size);
+        let (tx, rx) = tokio::sync::mpsc::channel(channel_size());
         let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
         let cancel_tx = Arc::new(cancel_tx);
         let retry_config = self.stream_retry_config();
@@ -588,7 +583,6 @@ impl Client {
             let schema_tx = schema_tx.take();
             let tx = tx.clone();
             let retry_config = retry_config.clone();
-            let decode_pool = Arc::clone(&self.decode_pool);
             let cancel_tx = Arc::clone(&cancel_tx);
             let cancel_rx = cancel_rx.clone();
             let offset = options.offset;
@@ -602,7 +596,6 @@ impl Client {
                         first_page_check: check,
                         tx: tx.clone(),
                         retry_config,
-                        decode_pool,
                         maintain_order,
                         cancel_tx: Arc::clone(&cancel_tx),
                         cancel_rx: cancel_rx.clone(),
