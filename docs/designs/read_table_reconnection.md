@@ -184,6 +184,12 @@ flowchart TD
 *   **Cons**: Driving gRPC streams, retry loops, and batch iteration through Python contends on the Python Global Interpreter Lock (GIL), incurs per-batch Python object overhead, and couples consumers to a `pyarrow` runtime dependency.
 *   **Reason for Rejection**: Executing gRPC streaming, offset reconnection, and Arrow IPC decompression natively in Rust keeps network I/O and CPU decoding off the Python GIL and enables zero-copy batch export across the Arrow C Stream ABI (`ArrowArrayStream`) without requiring `pyarrow`.
 
+### Alternative D: Migrating to the Apache Arrow Rust crate
+
+*   **Pros**: Uses the "official" Arrow crate, avoiding the semi-privated Polars Arrow implementation.
+*   **Cons**: Decoding to a RecordBatch directly without a schema header is not supported by the Apache Arrow Rust crate. This would result in significant additional logic in our decode step.
+*   **Reason for Rejection**: This project is closely tied to the Polars project, so there isn't significant pressure to move away from its implementation of Arrow. It is easier to patch Polars with features such as RecordBatch decoding outlined above than it is to work with the Apache processes.
+
 --------------------------------------------------------------------------------
 
 ## Non-Functional Requirements
@@ -199,7 +205,6 @@ flowchart TD
 
 ### Future Improvements
 
-1.  **High Priority — Migrate from `polars-arrow` to `arrow-rs` and export the Arrow C Stream ABI (`ArrowArrayStream`) from `arrow-bigquery`**: `arrow-bigquery` currently depends on `polars-arrow` (an internal Polars crate with frequent breaking releases) and returns `polars_arrow::record_batch::RecordBatch`, while `py-arrow-bigquery` builds the `ArrowArrayStream` C ABI iterator interleaved with periodic Python signal polls. Replacing `polars-arrow` with upstream `arrow-rs` (`arrow-ipc` / `arrow-array`) and moving `ArrowArrayStream` construction into `arrow-bigquery` (with an optional interrupt-polling callback so Python callers keep `Ctrl-C` responsiveness) will decouple Rust and FFI callers from `polars-arrow`.
 2.  **Medium Priority — Add per-frame idle read timeouts or HTTP/2 keepalive probes**: Stream readers currently await the next gRPC frame without a per-frame deadline and client construction does not configure HTTP/2 keepalive pings. If a NAT gateway or firewall silently drops an idle connection without sending `RST`, an open stream can stall indefinitely instead of entering `Backoff` and reconnecting.
 3.  **Medium Priority — Gate outbound stream reconnection RPCs on the adaptive retry throttler**: Stream error handling currently checks the client-wide adaptive retry throttler immediately after recording a stream failure and increments the consecutive failure count a second time when throttled, while `Connecting` dispatches `ReadRows` unconditionally once backoff elapses (and removing the second increment alone under an attempt-bounded policy would turn the throttler check into a no-op). Checking the throttler before dispatching `ReadRows` in `Connecting`—and re-entering `Backoff` without sending an RPC while throttled—will suppress outbound reconnection calls during backend overload without halving the 10-attempt reconnect limit.
 4.  **Medium Priority — Decouple SQL query session fallback from core stream readers via a callback boundary**: Out-of-scope SQL query fallback logic currently resides inside the core stream reader and coordinator, creating a cyclic dependency with the query module and duplicating multi-stream task setup. Extracting query fallback heuristics behind a caller-supplied closure/callback (or unidirectional composition from the query layer) and sharing a single multi-stream coordination path will keep the transport reader independent of SQL job execution.
