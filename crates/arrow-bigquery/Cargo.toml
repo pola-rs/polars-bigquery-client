@@ -4,6 +4,10 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+arrow-array = { version = "60.1.0", features = ["ffi"] }
+arrow-buffer = "60.1.0"
+arrow-ipc = { version = "60.1.0", features = ["lz4", "zstd"] }
+arrow-schema = "60.1.0"
 bytes = "1.0"
 chrono = "0.4"
 console-subscriber = { version = "0.5", optional = true }
@@ -12,8 +16,6 @@ google-cloud-bigquery = "0.18.0"
 google-cloud-bigquery-v2 = "1.0.0"
 google-cloud-gax = "1.15.0"
 google-cloud-wkt = "1.9.0"
-polars-arrow = { version = "0.53.0", default-features = false, features = ["io_ipc", "io_ipc_compression"] }
-polars-error = "0.53.0"
 rayon = "1.12"
 rustls = { version = "0.23.37", features = ["aws_lc_rs"] }
 serde_json = "1.0"

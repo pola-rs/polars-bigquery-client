@@ -3,12 +3,16 @@ mod bigquery_read_stream;
 pub mod client_builder;
 mod decode;
 mod error;
+mod ffi;
 pub mod query;
 
 use std::sync::Arc;
 
+pub use arrow_array::RecordBatch;
+pub use arrow_schema::{ArrowError, DataType, Field, Schema, SchemaRef};
 pub use client_builder::*;
 pub use error::{BigQueryError, JobError, JobFailedError};
+pub use ffi::{record_batch_into_arrow_array_stream, ArrowArrayStream, ArrowStreamOptions};
 pub use google_cloud_bigquery::model::arrow_serialization_options::CompressionCodec;
 use google_cloud_bigquery::model::{
     arrow_serialization_options, read_session, ArrowSerializationOptions, CreateReadSessionRequest,
@@ -17,8 +21,6 @@ use google_cloud_bigquery::model::{
 use google_cloud_gax::options::RequestOptionsBuilder;
 use google_cloud_gax::retry_throttler::SharedRetryThrottler;
 use google_cloud_wkt::Timestamp;
-use polars_arrow::datatypes::ArrowSchemaRef;
-use polars_arrow::record_batch::RecordBatch;
 use winnow::combinator::{eof, opt, separated, terminated};
 use winnow::token::take_while;
 use winnow::Parser;
@@ -386,7 +388,7 @@ impl Client {
         first_page_bytes: bytes::Bytes,
         page_row_count: i64,
         read_rows: Option<google_cloud_bigquery::builder::read::ReadRows>,
-        metadata: Arc<polars_arrow::io::ipc::read::StreamMetadata>,
+        schema: SchemaRef,
         maintain_order: bool,
     ) -> BigQueryRecordBatchReceiver {
         let (tx, rx) = tokio::sync::mpsc::channel(channel_size());
@@ -397,7 +399,7 @@ impl Client {
                 first_page_bytes,
                 page_row_count,
                 read_rows,
-                metadata,
+                schema,
                 tx,
                 retry_config: self.stream_retry_config(),
                 maintain_order,
@@ -445,7 +447,7 @@ impl Client {
         &self,
         table: &BigQueryTableId,
         options: ReadOptions,
-    ) -> Result<(ArrowSchemaRef, BigQueryRecordBatchReceiver), BigQueryError> {
+    ) -> Result<(SchemaRef, BigQueryRecordBatchReceiver), BigQueryError> {
         let maintain_order = options.maintain_order;
         let (schema, streams) = self.create_table_read_session(table, options).await?;
         self.read_streams(
@@ -464,7 +466,7 @@ impl Client {
         &self,
         stream: impl Into<String>,
         options: StreamOptions,
-    ) -> Result<(ArrowSchemaRef, BigQueryRecordBatchReceiver), BigQueryError> {
+    ) -> Result<(SchemaRef, BigQueryRecordBatchReceiver), BigQueryError> {
         self.read_streams(vec![stream.into()], options, true).await
     }
 
@@ -474,7 +476,7 @@ impl Client {
         options: StreamOptions,
         maintain_order: bool,
         first_page_check: Option<(bigquery_read_stream::FirstPageCheck, FallbackReadSession)>,
-    ) -> Result<(Option<ArrowSchemaRef>, BigQueryRecordBatchReceiver), BigQueryError> {
+    ) -> Result<(Option<SchemaRef>, BigQueryRecordBatchReceiver), BigQueryError> {
         self.read_streams_inner(vec![stream], options, maintain_order, first_page_check)
             .await
     }
@@ -484,7 +486,7 @@ impl Client {
         streams: Vec<String>,
         options: StreamOptions,
         maintain_order: bool,
-    ) -> Result<(ArrowSchemaRef, BigQueryRecordBatchReceiver), BigQueryError> {
+    ) -> Result<(SchemaRef, BigQueryRecordBatchReceiver), BigQueryError> {
         let (schema_ref, receiver) = self
             .read_streams_inner(streams, options, maintain_order, None)
             .await?;
@@ -512,7 +514,7 @@ impl Client {
         let (schema, streams) = self
             .create_table_read_session(&destination_table, fallback.read_options)
             .await?;
-        let metadata = Arc::new(decode::parse_arrow_schema(&schema)?);
+        let parsed_schema = decode::parse_arrow_schema(&schema)?;
         let retry_config = self.stream_retry_config();
         let mut join_set = tokio::task::JoinSet::new();
 
@@ -522,7 +524,7 @@ impl Client {
                 bigquery_read_stream::ReadStreamOptions {
                     read_rows,
                     current_offset: 0,
-                    metadata: Some(Arc::clone(&metadata)),
+                    schema: Some(Arc::clone(&parsed_schema)),
                     schema_tx: None,
                     first_page_check: None,
                     tx: tx.clone(),
@@ -544,12 +546,11 @@ impl Client {
         options: StreamOptions,
         maintain_order: bool,
         mut first_page_check: Option<(bigquery_read_stream::FirstPageCheck, FallbackReadSession)>,
-    ) -> Result<(Option<ArrowSchemaRef>, BigQueryRecordBatchReceiver), BigQueryError> {
-        let (metadata, schema_ref, mut schema_tx, schema_rx) = match &options.schema {
+    ) -> Result<(Option<SchemaRef>, BigQueryRecordBatchReceiver), BigQueryError> {
+        let (parsed_schema, mut schema_tx, schema_rx) = match &options.schema {
             Some(schema) => {
-                let metadata = Arc::new(decode::parse_arrow_schema(schema)?);
-                let schema_ref = Arc::new(metadata.schema.clone());
-                (Some(metadata), Some(schema_ref), None, None)
+                let parsed = decode::parse_arrow_schema(schema)?;
+                (Some(parsed), None, None)
             },
             None => {
                 if streams.is_empty() {
@@ -559,7 +560,7 @@ impl Client {
                     ));
                 }
                 let (tx, rx) = tokio::sync::oneshot::channel();
-                (None, None, Some(tx), Some(rx))
+                (None, Some(tx), Some(rx))
             },
         };
 
@@ -579,7 +580,7 @@ impl Client {
                 Some((check, fallback)) => (Some(check), Some((self.clone(), fallback))),
                 None => (None, None),
             };
-            let metadata = metadata.clone();
+            let schema = parsed_schema.clone();
             let schema_tx = schema_tx.take();
             let tx = tx.clone();
             let retry_config = retry_config.clone();
@@ -591,7 +592,7 @@ impl Client {
                     bigquery_read_stream::read_stream(bigquery_read_stream::ReadStreamOptions {
                         read_rows,
                         current_offset: offset,
-                        metadata,
+                        schema,
                         schema_tx,
                         first_page_check: check,
                         tx: tx.clone(),
@@ -620,10 +621,11 @@ impl Client {
 
         let receiver = BigQueryRecordBatchReceiver::new(rx, Some(cancel_tx), handles);
 
-        let schema_ref = match schema_ref {
+        let schema_ref = match parsed_schema {
             Some(schema_ref) => Some(schema_ref),
             None => {
-                let schema_rx = schema_rx.expect("schema_rx must be Some when schema_ref is None");
+                let schema_rx =
+                    schema_rx.expect("schema_rx must be Some when parsed_schema is None");
                 schema_rx.await.map_err(|_| {
                     BigQueryError::Other(
                         "ReadRows stream task terminated before sending schema".into(),
@@ -1215,13 +1217,13 @@ pub(crate) mod tests {
             .await
             .unwrap();
 
-        let col_names: Vec<&str> = schema.iter_names().map(|s| s.as_str()).collect();
+        let col_names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
         assert_eq!(col_names, vec!["col1"]);
 
         let batch1 = rx.recv().await.unwrap().unwrap();
-        assert_eq!(batch1.len(), 3);
+        assert_eq!(batch1.num_rows(), 3);
         let batch2 = rx.recv().await.unwrap().unwrap();
-        assert_eq!(batch2.len(), 2);
+        assert_eq!(batch2.num_rows(), 2);
         assert!(rx.recv().await.is_none());
 
         let rec = recorded.lock().unwrap();
@@ -1258,11 +1260,11 @@ pub(crate) mod tests {
             .await
             .unwrap();
 
-        let col_names: Vec<&str> = schema.iter_names().map(|s| s.as_str()).collect();
+        let col_names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
         assert_eq!(col_names, vec!["col1"]);
 
         let batch = rx.recv().await.unwrap().unwrap();
-        assert_eq!(batch.len(), 4);
+        assert_eq!(batch.num_rows(), 4);
         assert!(rx.recv().await.is_none());
         let rec = recorded.lock().unwrap();
         assert_eq!(rec.offset, Some(42));

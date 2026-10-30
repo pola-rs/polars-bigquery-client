@@ -33,15 +33,14 @@
 
 use std::sync::Arc;
 
+use arrow_array::RecordBatch;
+use arrow_schema::SchemaRef;
 use google_cloud_bigquery::builder::read::ReadRows;
 use google_cloud_bigquery::model::{read_rows_response, ReadRowsResponse};
 use google_cloud_gax::retry_result::RetryResult;
 use google_cloud_gax::retry_state::RetryState;
 use google_cloud_gax::streaming::ResponseStream;
 use google_cloud_gax::throttle_result::ThrottleResult;
-use polars_arrow::datatypes::ArrowSchemaRef;
-use polars_arrow::io::ipc::read::StreamMetadata;
-use polars_arrow::record_batch::RecordBatch;
 use tokio::time::Instant;
 
 use super::bigquery_read_retry::StreamRetryConfig;
@@ -49,7 +48,7 @@ use crate::decode::{parse_arrow_schema, validate_non_empty_arrow_bytes, DecodeJo
 use crate::BigQueryError;
 
 pub(crate) type SchemaSender =
-    tokio::sync::oneshot::Sender<Result<Option<ArrowSchemaRef>, BigQueryError>>;
+    tokio::sync::oneshot::Sender<Result<Option<SchemaRef>, BigQueryError>>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TerminationReason {
@@ -110,14 +109,17 @@ fn read_rows_response_to_record_batch(
     let Some((serialized_record_batch, row_count)) = extract_response_arrow_bytes(response)? else {
         return Ok(None);
     };
-    let metadata = parse_arrow_schema(schema)?;
-    let mut batches =
-        crate::decode::decode_arrow_record_batches(serialized_record_batch, row_count, metadata)?;
+    let parsed_schema = parse_arrow_schema(schema)?;
+    let mut batches = crate::decode::decode_arrow_record_batches(
+        serialized_record_batch,
+        row_count,
+        &parsed_schema,
+    )?;
     if batches.is_empty() {
         Ok(None)
     } else {
         let batch = batches.remove(0);
-        let actual_rows = batch.len() as i64;
+        let actual_rows = batch.num_rows() as i64;
         Ok(Some((batch, actual_rows)))
     }
 }
@@ -160,7 +162,7 @@ async fn enqueue_decode_batch(
     decode_queue: &DecodeQueue,
     serialized_record_batch: bytes::Bytes,
     expected_row_count: i64,
-    metadata: Arc<StreamMetadata>,
+    schema: SchemaRef,
     tx: &tokio::sync::mpsc::Sender<Result<RecordBatch, BigQueryError>>,
     cancel_tx: &Arc<tokio::sync::watch::Sender<bool>>,
     cancel_rx: &mut tokio::sync::watch::Receiver<bool>,
@@ -181,7 +183,7 @@ async fn enqueue_decode_batch(
     decode_queue.push(DecodeJob {
         serialized_record_batch,
         expected_row_count,
-        metadata,
+        schema,
         permit,
         cancel_tx: Arc::clone(cancel_tx),
         cancel_rx: cancel_rx.clone(),
@@ -193,7 +195,7 @@ async fn enqueue_decode_batch(
 pub(crate) struct ReadStreamOptions {
     pub(crate) read_rows: ReadRows,
     pub(crate) current_offset: i64,
-    pub(crate) metadata: Option<Arc<StreamMetadata>>,
+    pub(crate) schema: Option<SchemaRef>,
     pub(crate) schema_tx: Option<SchemaSender>,
     pub(crate) first_page_check: Option<FirstPageCheck>,
     pub(crate) tx: tokio::sync::mpsc::Sender<Result<RecordBatch, BigQueryError>>,
@@ -207,7 +209,7 @@ pub(crate) struct ReadQueryStreamOptions {
     pub(crate) first_page_bytes: bytes::Bytes,
     pub(crate) page_row_count: i64,
     pub(crate) read_rows: Option<ReadRows>,
-    pub(crate) metadata: Arc<StreamMetadata>,
+    pub(crate) schema: SchemaRef,
     pub(crate) tx: tokio::sync::mpsc::Sender<Result<RecordBatch, BigQueryError>>,
     pub(crate) retry_config: StreamRetryConfig,
     pub(crate) maintain_order: bool,
@@ -217,7 +219,7 @@ pub(crate) struct ReadQueryStreamOptions {
 
 pub(crate) struct ReadStream {
     read_rows: ReadRows,
-    metadata: Option<Arc<StreamMetadata>>,
+    schema: Option<SchemaRef>,
     schema_tx: Option<SchemaSender>,
     first_page_check: Option<FirstPageCheck>,
     tx: tokio::sync::mpsc::Sender<Result<RecordBatch, BigQueryError>>,
@@ -234,7 +236,7 @@ impl ReadStream {
         let ReadStreamOptions {
             read_rows,
             current_offset,
-            metadata,
+            schema,
             schema_tx,
             first_page_check,
             tx,
@@ -245,7 +247,7 @@ impl ReadStream {
         } = options;
         Self {
             read_rows,
-            metadata,
+            schema,
             schema_tx,
             first_page_check,
             tx,
@@ -415,8 +417,8 @@ impl ReadStream {
                 };
                 match next_item {
                     Some(Ok(mut value)) => {
-                        let metadata_arc = match self.metadata {
-                            Some(ref m) => Arc::clone(m),
+                        let schema_ref = match self.schema {
+                            Some(ref s) => Arc::clone(s),
                             None => {
                                 let serialized_schema = match value.schema.take() {
                                     Some(read_rows_response::Schema::ArrowSchema(arrow_schema)) => {
@@ -441,7 +443,7 @@ impl ReadStream {
                                     },
                                 };
                                 let parsed = match parse_arrow_schema(&serialized_schema) {
-                                    Ok(parsed) => Arc::new(parsed),
+                                    Ok(parsed) => parsed,
                                     Err(err) => {
                                         self.send_fatal_error(err).await;
                                         self.state = ReadStreamState::Terminated(
@@ -451,9 +453,9 @@ impl ReadStream {
                                     },
                                 };
                                 if let Some(sender) = self.schema_tx.take() {
-                                    let _ = sender.send(Ok(Some(Arc::new(parsed.schema.clone()))));
+                                    let _ = sender.send(Ok(Some(Arc::clone(&parsed))));
                                 }
-                                self.metadata = Some(Arc::clone(&parsed));
+                                self.schema = Some(Arc::clone(&parsed));
                                 parsed
                             },
                         };
@@ -529,7 +531,7 @@ impl ReadStream {
                             &self.decode_queue,
                             serialized_record_batch,
                             row_count,
-                            metadata_arc,
+                            schema_ref,
                             &self.tx,
                             &self.cancel_tx,
                             &mut self.cancel_rx,
@@ -586,7 +588,7 @@ pub(crate) async fn read_query_stream(options: ReadQueryStreamOptions) {
         first_page_bytes,
         page_row_count,
         read_rows,
-        metadata,
+        schema,
         tx,
         retry_config,
         maintain_order,
@@ -599,7 +601,7 @@ pub(crate) async fn read_query_stream(options: ReadQueryStreamOptions) {
         &decode_queue,
         first_page_bytes,
         page_row_count,
-        Arc::clone(&metadata),
+        Arc::clone(&schema),
         &tx,
         &cancel_tx,
         &mut cancel_rx,
@@ -614,7 +616,7 @@ pub(crate) async fn read_query_stream(options: ReadQueryStreamOptions) {
             ReadStreamOptions {
                 read_rows,
                 current_offset: page_row_count,
-                metadata: Some(metadata),
+                schema: Some(schema),
                 schema_tx: None,
                 first_page_check: None,
                 tx,
@@ -704,35 +706,31 @@ pub(crate) mod tests {
         start: i64,
         count: usize,
     ) -> (Vec<u8>, Vec<u8>) {
-        use polars_arrow::array::{Array, Int64Array};
-        use polars_arrow::datatypes::{ArrowDataType, ArrowSchema, Field};
-        use polars_arrow::io::ipc::write::{StreamWriter, WriteOptions};
+        use arrow_array::{ArrayRef, Int64Array};
+        use arrow_ipc::writer::StreamWriter;
+        use arrow_schema::{DataType, Field, Schema};
 
-        let field = Field::new("col1".into(), ArrowDataType::Int64, false);
-        let schema = ArrowSchema::from_iter(vec![field]);
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "col1",
+            DataType::Int64,
+            false,
+        )]));
 
         let mut schema_bytes = Vec::new();
         {
-            let mut writer =
-                StreamWriter::new(&mut schema_bytes, WriteOptions { compression: None });
-            writer.start(&schema, None).unwrap();
+            let _writer = StreamWriter::try_new(&mut schema_bytes, &schema).unwrap();
         }
         let schema_len = schema_bytes.len();
 
-        let array = Int64Array::from_slice((start..(start + count as i64)).collect::<Vec<_>>());
-        let batch = RecordBatch::try_new(
-            count,
-            Arc::new(schema.clone()),
-            vec![Box::new(array) as Box<dyn Array>],
-        )
-        .unwrap();
+        let array: ArrayRef = Arc::new(Int64Array::from(
+            (start..(start + count as i64)).collect::<Vec<_>>(),
+        ));
+        let batch = RecordBatch::try_new(Arc::clone(&schema), vec![array]).unwrap();
 
         let mut full_stream_bytes = Vec::new();
         {
-            let mut writer =
-                StreamWriter::new(&mut full_stream_bytes, WriteOptions { compression: None });
-            writer.start(&schema, None).unwrap();
-            writer.write(&batch, None).unwrap();
+            let mut writer = StreamWriter::try_new(&mut full_stream_bytes, &schema).unwrap();
+            writer.write(&batch).unwrap();
         }
 
         let batch_bytes = full_stream_bytes[schema_len..].to_vec();
@@ -790,7 +788,7 @@ pub(crate) mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(rows, 5);
-        assert_eq!(batch.len(), 5);
+        assert_eq!(batch.num_rows(), 5);
 
         // Test row count mismatch
         let bad_response = response.set_row_count(10); // mismatch with 5 decoded rows
@@ -869,7 +867,7 @@ pub(crate) mod tests {
     async fn test_stream_reconnection_offset() {
         let (schema_bytes, resp1) = create_test_arrow_payload(3);
         let (_, resp2) = create_test_arrow_payload(2);
-        let metadata = Arc::new(parse_arrow_schema(&schema_bytes).unwrap());
+        let schema = parse_arrow_schema(&schema_bytes).unwrap();
 
         let stream1 = Ok(vec![
             Ok(resp1),
@@ -895,7 +893,7 @@ pub(crate) mod tests {
         read_stream(ReadStreamOptions {
             read_rows,
             current_offset: 10,
-            metadata: Some(metadata),
+            schema: Some(schema),
             schema_tx: None,
             first_page_check: None,
             tx,
@@ -907,9 +905,9 @@ pub(crate) mod tests {
         .await;
 
         let batch1 = rx.recv().await.unwrap().unwrap();
-        assert_eq!(batch1.len(), 3);
+        assert_eq!(batch1.num_rows(), 3);
         let batch2 = rx.recv().await.unwrap().unwrap();
-        assert_eq!(batch2.len(), 2);
+        assert_eq!(batch2.num_rows(), 2);
         assert!(rx.recv().await.is_none());
 
         let reqs = requests.lock().unwrap();
@@ -921,7 +919,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn test_connect_read_rows_stream_retries_transient_error() {
         let (schema_bytes, resp1) = create_test_arrow_payload(4);
-        let metadata = Arc::new(parse_arrow_schema(&schema_bytes).unwrap());
+        let schema = parse_arrow_schema(&schema_bytes).unwrap();
 
         let requests = Arc::new(Mutex::new(vec![]));
         let mock_client = MockClient {
@@ -944,7 +942,7 @@ pub(crate) mod tests {
         read_stream(ReadStreamOptions {
             read_rows,
             current_offset: 0,
-            metadata: Some(metadata),
+            schema: Some(schema),
             schema_tx: None,
             first_page_check: None,
             tx,
@@ -956,7 +954,7 @@ pub(crate) mod tests {
         .await;
 
         let batch = rx.recv().await.unwrap().unwrap();
-        assert_eq!(batch.len(), 4);
+        assert_eq!(batch.num_rows(), 4);
         assert!(rx.recv().await.is_none());
 
         let reqs = requests.lock().unwrap();
@@ -986,7 +984,7 @@ pub(crate) mod tests {
         read_stream(ReadStreamOptions {
             read_rows,
             current_offset: 0,
-            metadata: None,
+            schema: None,
             schema_tx: None,
             first_page_check: None,
             tx,
@@ -1040,7 +1038,7 @@ pub(crate) mod tests {
         read_stream(ReadStreamOptions {
             read_rows,
             current_offset: 0,
-            metadata: None,
+            schema: None,
             schema_tx: None,
             first_page_check: None,
             tx,
@@ -1097,7 +1095,7 @@ pub(crate) mod tests {
         let task = tokio::spawn(read_stream(ReadStreamOptions {
             read_rows,
             current_offset: 0,
-            metadata: None,
+            schema: None,
             schema_tx: None,
             first_page_check: None,
             tx,
@@ -1140,7 +1138,7 @@ pub(crate) mod tests {
 
     fn make_test_read_stream(
         streams: Vec<MockStreamResult>,
-        metadata: Option<Arc<StreamMetadata>>,
+        schema: Option<SchemaRef>,
         retry_config: StreamRetryConfig,
     ) -> TestReadStream {
         let requests = Arc::new(Mutex::new(vec![]));
@@ -1157,7 +1155,7 @@ pub(crate) mod tests {
             ReadStreamOptions {
                 read_rows,
                 current_offset: 0,
-                metadata,
+                schema,
                 schema_tx: None,
                 first_page_check: None,
                 tx,
@@ -1315,9 +1313,9 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn step_first_message_clears_retry_state() {
         let (schema_bytes, resp) = create_test_arrow_payload(5);
-        let metadata = Arc::new(parse_arrow_schema(&schema_bytes).unwrap());
+        let schema = parse_arrow_schema(&schema_bytes).unwrap();
         let (mut reader, _requests, mut rx) =
-            make_test_read_stream(vec![], Some(metadata), test_retry_config(5));
+            make_test_read_stream(vec![], Some(schema), test_retry_config(5));
 
         let (stream_tx, stream_rx) = tokio::sync::mpsc::channel(1);
         stream_tx.send(Ok(resp)).await.unwrap();
@@ -1344,7 +1342,7 @@ pub(crate) mod tests {
             "expected retry_state to be cleared to None after first message, got: {retry_state:?}"
         );
         let batch = rx.recv().await.expect("expected decoded batch").unwrap();
-        assert_eq!(batch.len(), 5);
+        assert_eq!(batch.num_rows(), 5);
     }
 
     #[tokio::test]
@@ -1379,9 +1377,9 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn step_reading_to_reading() {
         let (schema_bytes, resp) = create_test_arrow_payload(3);
-        let metadata = Arc::new(parse_arrow_schema(&schema_bytes).unwrap());
+        let schema = parse_arrow_schema(&schema_bytes).unwrap();
         let (mut reader, _requests, mut rx) =
-            make_test_read_stream(vec![], Some(metadata), test_retry_config(5));
+            make_test_read_stream(vec![], Some(schema), test_retry_config(5));
 
         let (stream_tx, stream_rx) = tokio::sync::mpsc::channel(1);
         stream_tx.send(Ok(resp)).await.unwrap();
@@ -1405,7 +1403,7 @@ pub(crate) mod tests {
         assert_eq!(*offset, 8);
         assert!(retry_state.is_none());
         let batch = rx.recv().await.expect("expected decoded batch").unwrap();
-        assert_eq!(batch.len(), 3);
+        assert_eq!(batch.num_rows(), 3);
     }
 
     #[tokio::test]

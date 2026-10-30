@@ -32,7 +32,7 @@ pub struct JobFailedError {
 pub enum BigQueryError {
     Grpc(google_cloud_bigquery::Error),
     ClientBuilder(google_cloud_gax::client_builder::Error),
-    Arrow(polars_error::PolarsError),
+    Arrow(arrow_schema::ArrowError),
     JobFailed(Box<JobFailedError>),
     Protocol(String),
     InvalidConfig(String),
@@ -158,8 +158,8 @@ impl From<google_cloud_gax::client_builder::Error> for BigQueryError {
     }
 }
 
-impl From<polars_error::PolarsError> for BigQueryError {
-    fn from(e: polars_error::PolarsError) -> Self {
+impl From<arrow_schema::ArrowError> for BigQueryError {
+    fn from(e: arrow_schema::ArrowError) -> Self {
         Self::Arrow(e)
     }
 }
@@ -250,6 +250,18 @@ mod tests {
         assert_eq!(
             err.format_causal_chain(),
             "BigQuery configuration error: quota_project_id is required"
+        );
+    }
+
+    #[test]
+    fn test_bigquery_error_arrow_causal_chain() {
+        let arrow_err = arrow_schema::ArrowError::IpcError("invalid flatbuffer header".into());
+        let err = BigQueryError::from(arrow_err);
+        let src = err.source().expect("should have ArrowError source");
+        assert!(src.to_string().contains("invalid flatbuffer header"));
+        assert_eq!(
+            err.format_causal_chain(),
+            "Arrow decoding error: Ipc error: invalid flatbuffer header"
         );
     }
 

@@ -39,7 +39,7 @@ async fn setup_client() -> Client {
 async fn consume_receiver(mut receiver: BigQueryRecordBatchReceiver) {
     let mut total_rows = 0;
     while let Some(batch) = receiver.recv().await {
-        total_rows += batch.expect("should receive valid record batch").len();
+        total_rows += batch.expect("should receive valid record batch").num_rows();
     }
     assert!(total_rows > 0);
 }

@@ -15,13 +15,10 @@ impl DropFlag {
     }
 }
 
-fn placeholder_schema() -> polars_arrow::datatypes::ArrowSchemaRef {
-    let field = polars_arrow::datatypes::Field::new(
-        "placeholder".into(),
-        polars_arrow::datatypes::ArrowDataType::Int32,
-        true,
-    );
-    let schema = polars_arrow::datatypes::ArrowSchema::from_iter(vec![field]);
+fn placeholder_schema() -> arrow_bigquery_lib::SchemaRef {
+    let field =
+        arrow_bigquery_lib::Field::new("placeholder", arrow_bigquery_lib::DataType::Int32, true);
+    let schema = arrow_bigquery_lib::Schema::new(vec![field]);
     std::sync::Arc::new(schema)
 }
 

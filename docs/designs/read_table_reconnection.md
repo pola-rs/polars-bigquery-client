@@ -8,7 +8,7 @@
 
 ## Overview
 
-The `arrow-bigquery` Rust crate reads tabular data from Google BigQuery into in-memory `polars_arrow::record_batch::RecordBatch` values so downstream bindings (`py-arrow-bigquery`) can export the stream zero-copy across the Apache Arrow C Data and C Stream Interface (C ABI, `ArrowArrayStream` via `__arrow_c_stream__`) to Polars and other Arrow-compatible consumers without coupling to a specific Arrow runtime version. Internally, `arrow-bigquery` connects to the BigQuery Storage Read API—BigQuery's gRPC streaming interface—to partition a table scan across parallel streams, decompress Arrow Inter-Process Communication (IPC) wire payloads on Rayon's global CPU thread pool, and recover from transient network or server interruptions mid-scan by reconnecting each affected stream at its exact row offset.
+The `arrow-bigquery` Rust crate reads tabular data from Google BigQuery into in-memory `arrow_array::RecordBatch` values (from upstream `arrow-rs`) and directly exports the Apache Arrow C Data and C Stream Interface (`ArrowArrayStream` / `FFI_ArrowArrayStream`), allowing Rust, C FFI, and Python bindings (`py-arrow-bigquery` via `__arrow_c_stream__`) to transfer streams zero-copy to Polars and other Arrow-compatible consumers without coupling to `polars-arrow` or a specific downstream Arrow runtime version. Internally, `arrow-bigquery` connects to the BigQuery Storage Read API—BigQuery's gRPC streaming interface—to partition a table scan across parallel streams, decompress Arrow Inter-Process Communication (IPC) wire payloads on Rayon's global CPU thread pool, and recover from transient network or server interruptions mid-scan by reconnecting each affected stream at its exact row offset.
 
 ## The Problem
 
@@ -19,7 +19,7 @@ Analytical table scans against BigQuery frequently transfer gigabytes of compres
 3. **CPU decompression blocking network I/O**: BigQuery can transmit Arrow batches compressed with LZ4 frame or Zstandard (ZSTD) codecs. Microbenchmarks have shown that LZ4 tends to be optimal for lowering latency. Decompressing payloads synchronously on async network tasks stalls gRPC socket reads, while unbounded parallel decompression can either reorder rows when order matters (`maintain_order = true`) or exhaust memory if consumers read slowly.
 4. **Orphaned background work on cancellation or failure**: Parallel table scans spawn multiple stream tasks and CPU decode jobs. If the caller stops reading early (for example, `LIMIT` pushdown or dropping the receiver) or one stream encounters a permanent error, sibling streams and queued decode jobs must halt immediately rather than continuing to consume network bandwidth and CPU threads in the background.
 
-This design addresses these problems by combining a session-based parallel stream coordinator (`Client::read_table` and `Client::read_stream`) with an explicit per-stream reconnection state machine, pre-decode channel capacity reservation for backpressure, dual-mode CPU decode scheduling (ordered FIFO vs. concurrent multi-worker), and shared cooperative cancellation across all sibling tasks.
+This design addresses these problems by combining a session-based parallel stream coordinator (`Client::read_table` and `Client::read_stream`) with an explicit per-stream reconnection state machine, pre-decode channel capacity reservation for backpressure, dual-mode CPU decode scheduling (ordered FIFO vs. concurrent multi-worker), shared cooperative cancellation across all sibling tasks, and direct Arrow C Stream ABI (`ArrowArrayStream`) export with optional interrupt polling.
 
 ## Goals
 
@@ -29,6 +29,7 @@ This design addresses these problems by combining a session-based parallel strea
 *   **Direct stream reading without session creation**: Support reading directly from a known stream resource path—such as BigQuery's job result stream `projects/{project}/locations/{location}/jobs/{job_id}/streams/_default`—at a caller-specified row offset, accepting either upfront Arrow schema bytes or lazy schema extraction from the first non-heartbeat `ReadRowsResponse`.
 *   **Protocol integrity validation**: Verify that every decoded Arrow IPC payload matches the row count reported by the gRPC `ReadRowsResponse` envelope before delivering batches to the caller, failing immediately on truncation or framing mismatches.
 *   **Bounded memory and immediate teardown**: Bound in-flight undecoded and decoded batches via async channel capacity reservation prior to CPU scheduling, and cancel all sibling stream tasks and queued decode jobs immediately when the consumer drops the receiver or any stream hits an unrecoverable error.
+*   **Zero-copy Arrow C Stream ABI export with cooperative interrupt polling**: Construct `ArrowArrayStream` (`arrow_array::ffi_stream::FFI_ArrowArrayStream`) directly inside `arrow-bigquery` for both streaming `BigQueryRecordBatchReceiver` scans and single-batch results, supporting an optional periodic interrupt-polling callback / runtime poll wrapper so language bindings (such as `py-arrow-bigquery` checking Python `SIGINT` signals while releasing the GIL) remain responsive to `Ctrl-C` and tear down background stream tasks immediately on interrupt, error, or early stream release.
 
 ## Non-Goals
 
@@ -36,7 +37,6 @@ This design addresses these problems by combining a session-based parallel strea
 *   **Table identifier string parsing**: Parsing string table references (including legacy `domain:project` prefixes and multi-segment BigLake/Iceberg catalog namespaces) into a structured table identifier is out of scope and covered in a separate design specification; this design assumes callers provide a pre-constructed `BigQueryTableId`.
 *   **Recreating expired `ReadSession` resources mid-scan**: If an entire BigQuery Storage `ReadSession` expires on the server (returning permanent errors such as `FailedPrecondition` or `NotFound`), the client fails the scan rather than creating a replacement session. BigQuery does not guarantee identical stream partition boundaries or compatible per-stream row offsets across distinct read sessions.
 *   **Writing or mutating BigQuery tables**: Storage Write API ingestion and Data Manipulation Language (DML) mutations are out of scope; this design covers read paths only.
-*   **Exporting the Arrow C Stream ABI directly from `arrow-bigquery` in this document**: Currently, `arrow-bigquery` exposes `polars_arrow::record_batch::RecordBatch` while `py-arrow-bigquery` constructs the `ArrowArrayStream` C ABI iterator. Moving C Stream ABI construction into `arrow-bigquery` (with an interrupt-polling hook so Python callers keep `SIGINT` responsiveness) is out of scope for this as-built specification and is tracked under Future Improvements.
 
 ## Open Questions
 
@@ -48,7 +48,7 @@ None. Scope boundaries and as-built behavioral contracts are aligned.
 
 *   **Given**: An initialized `Client` configured with a billing/quota project ID, a valid `BigQueryTableId`, and `ReadOptions` with `maintain_order = false` (along with optional column projection `selected_fields`, SQL `row_restriction`, `snapshot_time`, or `sample_percentage`).
 *   **When**: The caller invokes `Client::read_table(&table, options)` and repeatedly awaits `BigQueryRecordBatchReceiver::recv()`.
-*   **Then**: `read_table` creates an Arrow-formatted `ReadSession` requesting up to `max_stream_count` streams (defaulting to host CPU parallelism), returns the parsed `ArrowSchemaRef` before batch streaming completes, reads and decompresses batches concurrently off the async I/O runtime, and yields `Ok(RecordBatch)` items until all streams reach end-of-stream (`None`).
+*   **Then**: `read_table` creates an Arrow-formatted `ReadSession` requesting up to `max_stream_count` streams (defaulting to host CPU parallelism), returns the parsed `SchemaRef` before batch streaming completes, reads and decompresses batches concurrently off the async I/O runtime, and yields `Ok(RecordBatch)` items until all streams reach end-of-stream (`None`).
 
 ### CUJ 2: Deterministic Ordered Table Scan
 
@@ -60,7 +60,7 @@ None. Scope boundaries and as-built behavioral contracts are aligned.
 
 *   **Given**: An initialized `Client`, a pre-existing Storage Read stream resource name such as a BigQuery job's default result stream (`projects/{project}/locations/{location}/jobs/{job_id}/streams/_default`), and `StreamOptions` specifying a starting row `offset` (for example, `0` for an in-flight job or `N` to resume past an inline first page), optional serialized Arrow `schema` bytes, and optional `arrow_buffer_compression`.
 *   **When**: The caller invokes `Client::read_stream(stream_name, options)` and consumes batches from `BigQueryRecordBatchReceiver::recv()`.
-*   **Then**: Without issuing a `CreateReadSession` RPC, the client opens `ReadRows` directly on `stream_name` at `offset` (attaching per-request Arrow compression options when set). When `options.schema` is `Some`, `read_stream` parses and returns the `ArrowSchemaRef` immediately; when `options.schema` is `None`, `read_stream` skips leading zero-row heartbeat frames while a running job computes its result, resolves the `ArrowSchemaRef` from the first schema-bearing `ReadRowsResponse`, and yields subsequent `RecordBatch` items in strict stream order.
+*   **Then**: Without issuing a `CreateReadSession` RPC, the client opens `ReadRows` directly on `stream_name` at `offset` (attaching per-request Arrow compression options when set). When `options.schema` is `Some`, `read_stream` parses and returns the `SchemaRef` immediately; when `options.schema` is `None`, `read_stream` skips leading zero-row heartbeat frames while a running job computes its result, resolves the `SchemaRef` from the first schema-bearing `ReadRowsResponse`, and yields subsequent `RecordBatch` items in strict stream order.
 
 ### CUJ 4: Mid-Stream Transient Disconnection and Offset Resumption
 
@@ -74,15 +74,21 @@ None. Scope boundaries and as-built behavioral contracts are aligned.
 *   **When**: Either (a) one stream receives a non-retryable error (such as `PermissionDenied`), exhausts its consecutive reconnection limit without receiving a valid frame, or fails Arrow IPC row-count validation, OR (b) the caller drops `BigQueryRecordBatchReceiver` (or calls `abort()`) early.
 *   **Then**: In case (a), the client cancels all sibling streams and pending decode work and surfaces `Some(Err(BigQueryError))` from `BigQueryRecordBatchReceiver::recv()`, followed by `None` on subsequent calls. In case (b), dropping or aborting the receiver cancels all in-flight stream reads and pending decode work immediately so background network and CPU consumption stops.
 
+### CUJ 6: Zero-Copy Arrow C Stream ABI Export and Interrupt Cancellation
+
+*   **Given**: A `(SchemaRef, BigQueryRecordBatchReceiver)` returned by `Client::read_table` or `Client::read_stream` (or a single `RecordBatch`), plus `ArrowStreamOptions` configured with a `tokio::runtime::Handle` and an optional interrupt check or runtime poll wrapper (such as `py-arrow-bigquery` polling `py.check_signals()` every `100 ms` while detaching from the Python GIL).
+*   **When**: The caller converts the receiver into an `ArrowArrayStream` via `receiver.into_arrow_array_stream(schema, options)` and a downstream Arrow C Stream consumer (such as Polars or `nanoarrow`) pulls batches via `get_next`—or triggers an interrupt / drops the stream early.
+*   **Then**: Batches transfer zero-copy across the C Stream ABI without depending on `polars-arrow`. If an interrupt callback fails, a stream error occurs, or the C consumer invokes `release` early, `arrow-bigquery` drops the underlying `BigQueryRecordBatchReceiver` immediately so all background Tokio tasks and queued Rayon decode jobs abort without waiting for garbage collection.
+
 ## Technical Plan (Architecture)
 
 ### System Architecture and Data Flow
 
-`arrow-bigquery` splits execution across two runtimes: a reusable `Client` runs session setup, parallel gRPC stream consumption, and channel backpressure on **Tokio**, while Arrow IPC decompression and row-count verification run on **Rayon's global CPU thread pool** before delivering `RecordBatch` values through `BigQueryRecordBatchReceiver`:
+`arrow-bigquery` splits execution across two runtimes: a reusable `Client` runs session setup, parallel gRPC stream consumption, and channel backpressure on **Tokio**, while Arrow IPC decompression (`arrow-ipc`) and row-count verification run on **Rayon's global CPU thread pool** before delivering `arrow_array::RecordBatch` values through `BigQueryRecordBatchReceiver` (or exporting them zero-copy across the Arrow C Stream ABI via `ArrowArrayStream`):
 
 ```mermaid
 flowchart TD
-    Caller["Caller\n(Rust or py-arrow-bigquery)"]
+    Caller["Caller\n(Rust, C FFI, or py-arrow-bigquery)"]
 
     subgraph Tokio["Tokio Async Runtime"]
         ReadTable["Client::read_table"]
@@ -99,6 +105,7 @@ flowchart TD
     end
 
     Receiver["BigQueryRecordBatchReceiver"]
+    CStream["ArrowArrayStream (FFI C Stream ABI)\n+ Optional Interrupt/Poll Hook"]
     Cancel["Shared Cooperative Cancellation"]
 
     Caller -->|"table, ReadOptions"| ReadTable
@@ -113,14 +120,16 @@ flowchart TD
     Backpressure -->|"2. schedule batch"| Scheduler
     Scheduler --> Decoder
     Decoder -->|"3. deliver RecordBatch"| Receiver
+    Receiver -->|"into_arrow_array_stream"| CStream
     Receiver -.->|"abort() / Drop"| Cancel
+    CStream -.->|"interrupt / error / release"| Receiver
     Cancel -.->|"halts"| StreamReaders
     Cancel -.->|"skips queued work"| Decoder
 ```
 
 *   **Permit-First Backpressure**: Stream tasks reserve bounded output-channel capacity on Tokio *before* dispatching compressed bytes to Rayon, capping total in-flight undecoded and decoded batches when the caller reads slowly. BigQuery never sends more than one Arrow `RecordBatch` in a single `ReadRowsResponse` message, so reserving one channel slot per non-empty response frame preserves a one-to-one mapping between frames and permits.
 *   **Unordered vs. Ordered Decoding on Rayon's Global Pool**: Bounded channel slots cap memory rather than preserving completion order across concurrent CPU threads. Dispatching fire-and-forget decode jobs onto Rayon's global thread pool shares persistent worker threads across the process instead of allocating a duplicate thread pool, while avoiding short-lived per-batch `oneshot` completion-channel churn observed under `tokio-console`. Unordered scans decompress batches concurrently across Rayon's work-stealing pool via `rayon::spawn_fifo`, whereas ordered scans pair a single stream with a sequential FIFO decode queue on Rayon.
-*   **Symmetric Cancellation**: Unrecoverable stream or decode errors broadcast a shared cancellation signal to halt sibling streams and skip queued decode work; dropping or aborting `BigQueryRecordBatchReceiver` triggers the same signal and aborts all spawned stream tasks.
+*   **Symmetric Cancellation & C Stream ABI Bridging**: Unrecoverable stream or decode errors broadcast a shared cancellation signal to halt sibling streams and skip queued decode work; dropping or aborting `BigQueryRecordBatchReceiver` triggers the same signal and aborts all spawned stream tasks. When exported as an `ArrowArrayStream` (`FFI_ArrowArrayStream`), synchronous `get_next` calls drive `recv()` on a caller-provided `tokio::runtime::Handle` (with optional periodic interrupt polling) and drop the receiver immediately on interrupt, stream error, EOF, or C `release` callback.
 
 ### Separate RPC Retry and Stream Reconnection Policies
 
@@ -199,13 +208,12 @@ flowchart TD
 
 ### Future Improvements
 
-1.  **High Priority — Migrate from `polars-arrow` to `arrow-rs` and export the Arrow C Stream ABI (`ArrowArrayStream`) from `arrow-bigquery`**: `arrow-bigquery` currently depends on `polars-arrow` (an internal Polars crate with frequent breaking releases) and returns `polars_arrow::record_batch::RecordBatch`, while `py-arrow-bigquery` builds the `ArrowArrayStream` C ABI iterator interleaved with periodic Python signal polls. Replacing `polars-arrow` with upstream `arrow-rs` (`arrow-ipc` / `arrow-array`) and moving `ArrowArrayStream` construction into `arrow-bigquery` (with an optional interrupt-polling callback so Python callers keep `Ctrl-C` responsiveness) will decouple Rust and FFI callers from `polars-arrow`.
-2.  **Medium Priority — Add per-frame idle read timeouts or HTTP/2 keepalive probes**: Stream readers currently await the next gRPC frame without a per-frame deadline and client construction does not configure HTTP/2 keepalive pings. If a NAT gateway or firewall silently drops an idle connection without sending `RST`, an open stream can stall indefinitely instead of entering `Backoff` and reconnecting.
-3.  **Medium Priority — Gate outbound stream reconnection RPCs on the adaptive retry throttler**: Stream error handling currently checks the client-wide adaptive retry throttler immediately after recording a stream failure and increments the consecutive failure count a second time when throttled, while `Connecting` dispatches `ReadRows` unconditionally once backoff elapses (and removing the second increment alone under an attempt-bounded policy would turn the throttler check into a no-op). Checking the throttler before dispatching `ReadRows` in `Connecting`—and re-entering `Backoff` without sending an RPC while throttled—will suppress outbound reconnection calls during backend overload without halving the 10-attempt reconnect limit.
-4.  **Medium Priority — Decouple SQL query session fallback from core stream readers via a callback boundary**: Out-of-scope SQL query fallback logic currently resides inside the core stream reader and coordinator, creating a cyclic dependency with the query module and duplicating multi-stream task setup. Extracting query fallback heuristics behind a caller-supplied closure/callback (or unidirectional composition from the query layer) and sharing a single multi-stream coordination path will keep the transport reader independent of SQL job execution.
-5.  **Low Priority — Bound backpressure by byte footprint rather than frame count**: Reserving a fixed number of channel slots per decode worker bounds batch count rather than uncompressed byte size, which can buffer multiple gigabytes on high-core-count hosts scanning wide rows under a slow consumer.
-6.  **Low Priority — Unify background stream-task ownership on `tokio::task::JoinSet`**: `BigQueryRecordBatchReceiver` currently tracks spawned stream tasks in a manual `Vec<tokio::task::JoinHandle<()>>` (aborting handles in a loop on teardown), whereas `Client::switch_to_read_session` manages fallback stream tasks with `tokio::task::JoinSet`. Standardizing background stream-task ownership on `tokio::task::JoinSet` across `BigQueryRecordBatchReceiver` and stream coordinators will eliminate manual handle-vector bookkeeping and guarantee automatic abort-on-drop semantics.
-7.  **Low Priority — Mitigate straggler streams via `SplitReadStream`**: Stream partitions are currently static after `CreateReadSession`; invoking BigQuery's `SplitReadStream` RPC when sibling streams finish early could reduce tail latency from partition skew or per-stream backoff delays.
+1.  **Medium Priority — Add per-frame idle read timeouts or HTTP/2 keepalive probes**: Stream readers currently await the next gRPC frame without a per-frame deadline and client construction does not configure HTTP/2 keepalive pings. If a NAT gateway or firewall silently drops an idle connection without sending `RST`, an open stream can stall indefinitely instead of entering `Backoff` and reconnecting.
+2.  **Medium Priority — Gate outbound stream reconnection RPCs on the adaptive retry throttler**: Stream error handling currently checks the client-wide adaptive retry throttler immediately after recording a stream failure and increments the consecutive failure count a second time when throttled, while `Connecting` dispatches `ReadRows` unconditionally once backoff elapses (and removing the second increment alone under an attempt-bounded policy would turn the throttler check into a no-op). Checking the throttler before dispatching `ReadRows` in `Connecting`—and re-entering `Backoff` without sending an RPC while throttled—will suppress outbound reconnection calls during backend overload without halving the 10-attempt reconnect limit.
+3.  **Medium Priority — Decouple SQL query session fallback from core stream readers via a callback boundary**: Out-of-scope SQL query fallback logic currently resides inside the core stream reader and coordinator, creating a cyclic dependency with the query module and duplicating multi-stream task setup. Extracting query fallback heuristics behind a caller-supplied closure/callback (or unidirectional composition from the query layer) and sharing a single multi-stream coordination path will keep the transport reader independent of SQL job execution.
+4.  **Low Priority — Bound backpressure by byte footprint rather than frame count**: Reserving a fixed number of channel slots per decode worker bounds batch count rather than uncompressed byte size, which can buffer multiple gigabytes on high-core-count hosts scanning wide rows under a slow consumer.
+5.  **Low Priority — Unify background stream-task ownership on `tokio::task::JoinSet`**: `BigQueryRecordBatchReceiver` currently tracks spawned stream tasks in a manual `Vec<tokio::task::JoinHandle<()>>` (aborting handles in a loop on teardown), whereas `Client::switch_to_read_session` manages fallback stream tasks with `tokio::task::JoinSet`. Standardizing background stream-task ownership on `tokio::task::JoinSet` across `BigQueryRecordBatchReceiver` and stream coordinators will eliminate manual handle-vector bookkeeping and guarantee automatic abort-on-drop semantics.
+6.  **Low Priority — Mitigate straggler streams via `SplitReadStream`**: Stream partitions are currently static after `CreateReadSession`; invoking BigQuery's `SplitReadStream` RPC when sibling streams finish early could reduce tail latency from partition skew or per-stream backoff delays.
 
 --------------------------------------------------------------------------------
 
@@ -213,16 +221,16 @@ flowchart TD
 
 ### Target Files to Create/Modify
 
-Because this document specifies an already-implemented subsystem, each entry below records the as-built files, type and function signatures, state invariants, and unit test coverage that implement `read_table` and the stream reconnection state machine in `crates/arrow-bigquery`.
+Because this document specifies an already-implemented subsystem, each entry below records the as-built files, type and function signatures, state invariants, and unit test coverage that implement `read_table`, the stream reconnection state machine, and Arrow C Stream ABI (`ArrowArrayStream`) export in `crates/arrow-bigquery` (along with its Python C Stream consumer in `py-arrow-bigquery`).
 
 #### 1. `crates/arrow-bigquery/Cargo.toml` (As-Built)
 
 *   **Type / Scope**: Rust Crate Manifest and Feature Configuration
-*   **Rationale**: Declares the gRPC Storage Read client, retry primitives, Arrow IPC decompression codecs, async/CPU runtimes, TLS provider, and benchmark target required by the table reader.
+*   **Rationale**: Declares the gRPC Storage Read client, retry primitives, upstream `arrow-rs` IPC codecs and C Stream FFI types, async/CPU runtimes, TLS provider, and benchmark target required by the table reader.
 *   **Proposed Changes**:
     *   Configure runtime dependencies used by the table and stream reader:
         *   `google-cloud-bigquery`, `google-cloud-gax`, and `google-cloud-auth` for the Storage Read gRPC client, retry/backoff/throttler policies, and credentials.
-        *   `polars-arrow` (`default-features = false`, features `["io_ipc", "io_ipc_compression"]`) and `polars-error` for Arrow IPC schema parsing and LZ4/ZSTD record-batch decompression.
+        *   `arrow-array` (feature `["ffi"]`), `arrow-buffer`, `arrow-ipc` (features `["lz4", "zstd"]`), and `arrow-schema` for Arrow IPC schema parsing, zero-copy `Buffer::from(Bytes)` framing, LZ4/ZSTD record-batch decompression, and Arrow C Stream ABI (`FFI_ArrowArrayStream`) export.
         *   `tokio` (features `["macros", "rt", "sync", "time"]`) and `rayon` for async stream tasks, bounded `mpsc`/`watch`/`oneshot` channels, backoff timers, and dispatching CPU decode jobs onto Rayon's global thread pool.
         *   `rustls` (feature `["aws_lc_rs"]`) for gRPC TLS cryptography, `bytes` for zero-copy IPC payload slices, and `chrono` + `google-cloud-wkt` for `ReadOptions::snapshot_time` timestamps.
     *   Expose feature flags `testing` (unlocks `Client::new_for_testing` and `BigQueryRecordBatchReceiver::new_for_testing` for downstream tests) and `tracing` (enables optional `tokio-console` and `tracing` instrumentation).
@@ -236,18 +244,19 @@ Because this document specifies an already-implemented subsystem, each entry bel
     *   Define `pub enum BigQueryError` with variants separated by failure origin:
         *   `Grpc(google_cloud_bigquery::Error)`: Storage Read API RPC and stream errors from `CreateReadSession` and `ReadRows`, including permanent gRPC status codes (`PermissionDenied`, `NotFound`, `InvalidArgument`, etc.), exhausted retry budgets, and underlying transport or token-refresh errors during RPC execution.
         *   `ClientBuilder(google_cloud_gax::client_builder::Error)`: Client initialization errors returned while building underlying Google Cloud service clients in `ServiceConfigBuilder::build()` (for example, invalid endpoint URIs or credential initialization failures).
-        *   `Arrow(polars_error::PolarsError)`: Arrow IPC schema parsing or LZ4/ZSTD record-batch decompression errors raised by `polars-arrow` (`parse_arrow_schema` and `decode_arrow_record_batches`).
+        *   `Arrow(arrow_schema::ArrowError)`: Arrow IPC schema parsing or LZ4/ZSTD record-batch decompression errors raised by `arrow-ipc` / `arrow-schema` (`parse_arrow_schema` and `decode_arrow_record_batches`).
         *   `JobFailed(Box<JobFailedError>)`: Structured BigQuery SQL job execution errors (`project_id`, `location`, `job_id`, primary and additional `JobError` entries); populated by the out-of-scope `query` module rather than `read_table` or `read_stream`.
         *   `Protocol(String)`: Server responses that violate Storage Read API expectations despite valid gRPC framing—specifically non-Arrow schema or row formats, streams closing without sending an expected schema, decoded Arrow row counts not matching `ReadRowsResponse.row_count`, or `i64` row-count/offset overflow.
         *   `InvalidConfig(String)`: Invalid caller configuration rejected locally before making network calls, such as a missing or whitespace-only `quota_project_id` in `ServiceConfigBuilder::build()`.
         *   `Other(Box<dyn std::error::Error + Send + Sync>)`: Client-side errors outside gRPC, Arrow, and server protocol checks, such as unexpected stream-task drops before delivering a schema on `schema_rx` (also wraps `InvalidTableId` from out-of-scope table-ID string parsing).
-    *   Implement `Display`, `std::error::Error` (delegating `source()` for `Grpc`, `ClientBuilder`, `Arrow`, and `Other`), and `From` conversions from `google_cloud_bigquery::Error`, `google_cloud_gax::client_builder::Error`, and `polars_error::PolarsError`.
+    *   Implement `Display`, `std::error::Error` (delegating `source()` for `Grpc`, `ClientBuilder`, `Arrow`, and `Other`), and `From` conversions from `google_cloud_bigquery::Error`, `google_cloud_gax::client_builder::Error`, and `arrow_schema::ArrowError`.
     *   Implement `pub fn format_causal_chain(&self) -> String` to walk `source()` links and append `: caused by: <msg>` segments whenever the child message is non-empty and not already a substring of the parent message.
     *   **Unit tests (by function / trait under test)**:
         *   `BigQueryError` trait bounds: verifies `Send + Sync + 'static` compatibility so errors can cross Tokio and Rayon thread boundaries.
         *   `Error::source()` & `BigQueryError::format_causal_chain()`:
             *   Multi-layer `ClientBuilder` -> `CredentialsError` -> `io::Error` chain: walks each nested cause and deduplicates outer error messages that already embed their direct child's text.
             *   Multi-layer `Grpc` (`Exhausted` -> `Authentication` -> `CredentialsError` -> `io::Error`) chain: preserves root token-refresh and socket causes after retry exhaustion.
+            *   `Arrow(ArrowError::ExternalError)` causal chain: delegates `source()` to `ArrowError` and formats nested root causes via `format_causal_chain()`.
             *   Leaf variants (`InvalidConfig`, `Protocol`): verifies `source()` is `None` and `format_causal_chain()` returns the standalone message without extra separators.
 
 #### 3. `crates/arrow-bigquery/src/client_builder.rs` (As-Built)
@@ -284,12 +293,13 @@ Because this document specifies an already-implemented subsystem, each entry bel
 *   **Type / Scope**: Arrow IPC Deserialization, Row-Count Validation, and Rayon Decode Scheduling
 *   **Rationale**: Offloads LZ4/ZSTD Arrow IPC decompression from Tokio I/O threads onto Rayon's global thread pool (sharing worker threads across the process and avoiding per-batch `oneshot` completion-channel churn observed in `tokio-console`), verifies wire payload row counts before emitting batches, and preserves strict FIFO batch ordering when `maintain_order = true`.
 *   **Proposed Changes**:
-    *   Implement `pub(crate) fn parse_arrow_schema(schema_bytes: &[u8]) -> Result<StreamMetadata, BigQueryError>` via `polars_arrow::io::ipc::read::read_stream_metadata`.
+    *   Implement `pub(crate) fn parse_arrow_schema(schema_bytes: &[u8]) -> Result<SchemaRef, BigQueryError>` via `arrow_ipc::reader::StreamReader::try_new`.
     *   Implement `pub(crate) fn validate_non_empty_arrow_bytes(serialized_record_batch: Option<Bytes>, expected_row_count: i64) -> Result<Option<Bytes>, BigQueryError>` to return `Ok(None)` when bytes are absent/empty and `expected_row_count == 0`, `Err(BigQueryError::Protocol)` when bytes are absent/empty with non-zero `expected_row_count`, and `Ok(Some(bytes))` otherwise.
-    *   Implement `pub(crate) fn decode_arrow_record_batches(serialized_record_batch: Bytes, expected_row_count: i64, metadata: StreamMetadata) -> Result<Vec<RecordBatch>, BigQueryError>` using `StreamReader`, accumulating decoded batch row counts via `i64::checked_add` and returning `BigQueryError::Protocol` on overflow or `actual_rows != expected_row_count` (and `BigQueryError::Arrow` on IPC decode errors).
-    *   Define `pub(crate) struct DecodeJob` holding `serialized_record_batch`, `expected_row_count`, `metadata: Arc<StreamMetadata>`, `permit: OwnedPermit<Result<RecordBatch, BigQueryError>>`, `cancel_tx`, and `cancel_rx`. `DecodeJob::run` short-circuits before and after decoding if `*cancel_rx.borrow()` is `true`, delivers the decoded batch through `permit.send(Ok(first))` (BigQuery never sends more than one `RecordBatch` in a `ReadRowsResponse` message, so the trailing `tx.blocking_send` loop in `DecodeJob::run` is defensive fallback code that never executes on BigQuery responses), and on decode/protocol failure broadcasts `cancel_tx.send_replace(true)` before sending `Err(err)` via `permit`.
+    *   Implement `pub(crate) fn decode_arrow_record_batches(serialized_record_batch: Bytes, expected_row_count: i64, schema: &SchemaRef) -> Result<Vec<RecordBatch>, BigQueryError>` by wrapping `serialized_record_batch` zero-copy into `arrow_buffer::Buffer::from(...)` and parsing encapsulated Arrow IPC messages (`arrow_ipc::root_as_message`, handling both `[0xFF; 4]` continuation markers and legacy 4-byte lengths, plus `DictionaryBatch` and LZ4/ZSTD-compressed `RecordBatch` headers via `arrow_ipc::reader::{read_dictionary, read_record_batch}`), accumulating decoded batch row counts via `i64::checked_add` and returning `BigQueryError::Protocol` on overflow or `actual_rows != expected_row_count` (and `BigQueryError::Arrow` on IPC decode errors).
+    *   Define `pub(crate) struct DecodeJob` holding `serialized_record_batch`, `expected_row_count`, `schema: SchemaRef`, `permit: OwnedPermit<Result<RecordBatch, BigQueryError>>`, `cancel_tx`, and `cancel_rx`. `DecodeJob::run` short-circuits before and after decoding if `*cancel_rx.borrow()` is `true`, delivers the decoded batch through `permit.send(Ok(first))` (BigQuery never sends more than one `RecordBatch` in a `ReadRowsResponse` message, so the trailing `tx.blocking_send` loop in `DecodeJob::run` is defensive fallback code that never executes on BigQuery responses), and on decode/protocol failure broadcasts `cancel_tx.send_replace(true)` before sending `Err(err)` via `permit`.
     *   Define `OrderedDecodeQueue` (`OrderedDecodeQueue::new()`) and `pub(crate) enum DecodeQueue` (`DecodeQueue::new(maintain_order)`) to dispatch `DecodeJob` items onto Rayon via `rayon::spawn_fifo` according to the caller's ordering requirement (see dispatch table below).
     *   **Unit tests (by function / type under test)**:
+        *   `decode_arrow_record_batches` with LZ4 and ZSTD compression: verifies compressed Arrow IPC record batches round-trip into `arrow_array::RecordBatch` with row-count validation.
         *   `DecodeQueue::new(true)` (`OrderedDecodeQueue`): enqueues alternating large (`50_000`-row) and 1-row batches from Tokio onto Rayon's global pool and verifies batches and row values arrive in strict submission order rather than smaller batches overtaking earlier large ones.
         *   `DecodeQueue::new(false)` (`DecodeQueue::WorkStealing`): enqueues variable-sized batches from Tokio onto Rayon's global work-stealing pool and verifies all rows decode without loss or corruption regardless of worker completion order.
         *   `DecodeJob::run`: enqueues a batch with a mismatched `expected_row_count` followed by a valid batch onto Rayon's global pool, verifying the failing job sends `Err(BigQueryError::Protocol)` and sets `cancel_tx` to `true` while the queued follow-up job observes cancellation and drops its permit without emitting a batch.
@@ -312,7 +322,7 @@ When Tokio stream tasks call `rayon::spawn_fifo` directly across multiple worker
         *   `Connecting { offset: i64, retry_state: RetryState }`
         *   `Backoff { offset: i64, retry_state: RetryState, deadline: Instant }`
         *   `Reading { offset: i64, retry_state: Option<RetryState>, stream: ResponseStream<ReadRowsResponse> }`
-        *   `Terminated(TerminationReason)` (where `TerminationReason::Finished` covers normal EOF, fatal error, or receiver cancellation; `SwitchToReadSession` alongside `FirstPageCheck`, `estimate_remaining_bytes`, and `read_query_stream` are out-of-scope `query.rs` fallback hooks currently hosted in this module and tracked for extraction in Future Improvements #4).
+        *   `Terminated(TerminationReason)` (where `TerminationReason::Finished` covers normal EOF, fatal error, or receiver cancellation; `SwitchToReadSession` alongside `FirstPageCheck`, `estimate_remaining_bytes`, and `read_query_stream` are out-of-scope `query.rs` fallback hooks currently hosted in this module and tracked for extraction in Future Improvements #3).
     *   Define `ReadStreamOptions`, `ReadStream`, `extract_response_arrow_bytes(ReadRowsResponse) -> Result<Option<(Bytes, i64)>, BigQueryError>` (rejecting non-Arrow payloads with `BigQueryError::Protocol`), `enqueue_decode_batch(...) -> bool` (racing `cancel_rx.changed()` before `tx.clone().reserve_owned()` via `biased` `tokio::select!`), and task entry point `pub(crate) async fn read_stream(options: ReadStreamOptions) -> TerminationReason`.
     *   Implement `pub(crate) async fn step(&mut self)` on `ReadStream`:
         *   **Cancellation guard**: Check `*self.cancel_rx.borrow_and_update()` before matching `self.state`, transitioning any non-terminated state immediately to `Terminated(Finished)` when cancelled.
@@ -322,7 +332,7 @@ When Tokio stream tasks call `rayon::spawn_fifo` directly across multiple worker
         *   **`Terminated`**: No-op; `ReadStream::run` exits its loop and returns `TerminationReason`.
     *   Implement `ReadStream::handle_error(offset, retry_state, err)` and `send_fatal_error(err)`:
         *   Increment `retry_state.attempt_count`, evaluate `retry_policy.on_error(&retry_state, err)`, and record the outcome on `retry_throttler.on_retry_failure(&flow)`, terminating via `send_fatal_error` on `Permanent` or `Exhausted`.
-        *   Query `retry_throttler.throttle_retry_attempt()`; when throttled, increment `retry_state.attempt_count` a second time and evaluate `retry_policy.on_throttle(&retry_state, err)`, terminating via `send_fatal_error` if `Exhausted` (in the as-built state machine, throttling accelerates exhaustion of the 10-attempt cap inside `handle_error` while `Connecting` dispatches `req.send()` unconditionally after `Backoff`; gating `Connecting` on `throttle_retry_attempt()` is tracked in Future Improvements #3).
+        *   Query `retry_throttler.throttle_retry_attempt()`; when throttled, increment `retry_state.attempt_count` a second time and evaluate `retry_policy.on_throttle(&retry_state, err)`, terminating via `send_fatal_error` if `Exhausted` (in the as-built state machine, throttling accelerates exhaustion of the 10-attempt cap inside `handle_error` while `Connecting` dispatches `req.send()` unconditionally after `Backoff`; gating `Connecting` on `throttle_retry_attempt()` is tracked in Future Improvements #2).
         *   Compute `delay = backoff_policy.on_failure(&retry_state)`. If `retry_policy.remaining_time(&retry_state)` is `<= delay`, terminate with `Error::exhausted`; otherwise return `Backoff { offset, retry_state, deadline: Instant::now() + delay }`.
         *   `send_fatal_error` broadcasts `cancel_tx.send_replace(true)` and sends `Err(err)` to `schema_tx` (if still `Some`) or `tx`.
     *   **Unit tests (by function under test)**:
@@ -347,37 +357,55 @@ When Tokio stream tasks call `rayon::spawn_fifo` directly across multiple worker
 
 **`Reading` State Dispatch (`ReadStream::step`)**
 
-When `self.metadata` is `None` (`Client::read_stream` called with `StreamOptions { schema: None, .. }`), the first non-heartbeat `Some(Ok(resp))` frame must carry an `ArrowSchema`: `step()` parses `StreamMetadata`, caches `self.metadata`, sends `Ok(Some(schema_ref))` over `schema_tx`, and then evaluates the same frame's row payload below.
+When `self.schema` is `None` (`Client::read_stream` called with `StreamOptions { schema: None, .. }`), the first non-heartbeat `Some(Ok(resp))` frame must carry an `ArrowSchema`: `step()` parses `SchemaRef`, caches `self.schema`, sends `Ok(Some(schema_ref))` over `schema_tx`, and then evaluates the same frame's row payload below.
 
 | Select Outcome / Frame Condition | State & Retry-Budget Actions | Next State |
 | :--- | :--- | :--- |
 | `cancel_rx.changed()` (sibling error or receiver drop) | None | `Terminated(Finished)` |
-| `Some(Ok(resp))` — Pre-schema heartbeat (`metadata` is `None`, `schema` is `None`, `rows` is `None`, `row_count == 0`) | Set `*retry_state = None`; call `record_success()` | `Reading` (unchanged `offset`) |
-| `Some(Ok(resp))` — Missing/non-Arrow schema or schema IPC parse error (while `metadata` is `None`) | Call `send_fatal_error(Protocol` or `Arrow)` | `Terminated(Finished)` |
+| `Some(Ok(resp))` — Pre-schema heartbeat (`self.schema` is `None`, `resp.schema` is `None`, `rows` is `None`, `row_count == 0`) | Set `*retry_state = None`; call `record_success()` | `Reading` (unchanged `offset`) |
+| `Some(Ok(resp))` — Missing/non-Arrow schema or schema IPC parse error (while `self.schema` is `None`) | Call `send_fatal_error(Protocol` or `Arrow)` | `Terminated(Finished)` |
 | `Some(Ok(resp))` — Zero-row frame (`extract_response_arrow_bytes` returns `Ok(None)` for empty bytes with `row_count == 0`) | Set `*retry_state = None`; call `record_success()` | `Reading` (unchanged `offset`) |
 | `Some(Ok(resp))` — Framing or offset error (non-Arrow rows, empty bytes with `row_count != 0`, or `offset.checked_add(row_count)` overflow) | Call `send_fatal_error(Protocol)` | `Terminated(Finished)` |
 | `Some(Ok(resp))` — Non-empty Arrow payload (`extract_response_arrow_bytes` returns `Ok(Some((bytes, row_count)))`) | Set `*offset += row_count`; set `*retry_state = None`; call `record_success()`; await `enqueue_decode_batch(...)` | `Reading` if enqueued; `Terminated(Finished)` if receiver closed or cancelled |
 | `Some(Err(err))` — Stream gRPC/transport error | Take `retry_state` (retaining `Connecting` count if `Some`, or `RetryState::new(true)` if `None`) and call `handle_error(...)` | `Backoff` if retryable & within budget; `Terminated(Finished)` otherwise |
 | `None` — End of stream (EOF) | Call `record_success()`; if `schema_tx` is still `Some`, send `Ok(None)` (used by out-of-scope empty/DDL SQL query streams in `query.rs`, whereas `Client::read_streams` maps `None` to `Err(BigQueryError::Protocol)`) | `Terminated(Finished)` |
 
-#### 7. `crates/arrow-bigquery/src/lib.rs` (As-Built)
+#### 7. `crates/arrow-bigquery/src/ffi.rs` (As-Built)
+
+*   **Type / Scope**: Arrow C Stream ABI (`ArrowArrayStream`) Export and Cooperative Interrupt Polling
+*   **Rationale**: Exports `BigQueryRecordBatchReceiver` and single `RecordBatch` values directly across the canonical Arrow C Stream Interface (`struct ArrowArrayStream` / `FFI_ArrowArrayStream`) without coupling Rust or FFI consumers to `polars-arrow`, while allowing language runtimes (such as Python / PyO3) to interleave signal polling and runtime lock detachment (`py.detach`) during blocking `get_next` calls.
+*   **Proposed Changes**:
+    *   Re-export `pub type ArrowArrayStream = arrow_array::ffi_stream::FFI_ArrowArrayStream`.
+    *   Define `pub struct ArrowStreamOptions` (`new(tokio::runtime::Handle)`, `with_poll_interval(Duration)` defaulting to `100 ms`, `with_interrupt_check(FnMut() -> Result<(), E>)`, and `with_poll_wrapper(FnMut(&mut (dyn FnMut() + Send)) -> Result<(), E>)`):
+        *   When no callback is registered, `get_next` drives `runtime_handle.block_on(rx.recv())` directly without timer wakeups.
+        *   When an interrupt check or poll wrapper is registered, each `get_next` call loops over `tokio::time::timeout(poll_interval, rx.recv())` inside `poll_wrapper`, dropping `self.rx = None` immediately (aborting all background Tokio stream tasks and queued Rayon decode work) if the callback returns `Err`.
+    *   Implement `BigQueryRecordBatchReceiver::into_arrow_array_stream(self, schema: SchemaRef, options: ArrowStreamOptions) -> ArrowArrayStream` (backed by `BigQueryRecordBatchStreamReader: RecordBatchReader`) and `pub fn record_batch_into_arrow_array_stream(batch: RecordBatch) -> ArrowArrayStream` (backed by `RecordBatchIterator`).
+    *   Sanitize error strings via `ffi_safe_arrow_error` (replacing any interior `\0` bytes with `\u{FFFD}` before `FFI_ArrowArrayStream`'s `CString` conversion) and clear `self.rx = None` immediately on stream error, interrupt, EOF, or C `release`.
+    *   **Unit tests (by function / type under test)**:
+        *   `record_batch_into_arrow_array_stream`: verifies zero-copy C Stream round-trip of schema and rows via `RecordBatchStreamReader`.
+        *   `BigQueryRecordBatchReceiver::into_arrow_array_stream`: verifies multi-batch and empty-stream C Stream round-trips.
+        *   Immediate error teardown & NUL-byte sanitization: verifies a stream error containing interior `\0` bytes formats cleanly via `format_causal_chain()` without panicking in `CString::new` and aborts sibling Tokio tasks immediately before the reader is dropped.
+        *   `ArrowStreamOptions::with_interrupt_check`: verifies periodic interrupt polling cancels a blocked `recv()` and aborts background Tokio tasks immediately.
+        *   Early `FFI_ArrowArrayStream` drop: verifies dropping the C stream invokes `release` and aborts background Tokio tasks immediately.
+
+#### 8. `crates/arrow-bigquery/src/lib.rs` (As-Built)
 
 *   **Type / Scope**: Public Rust API (`Client`, `BigQueryTableId`, `ReadOptions`, `StreamOptions`, `BigQueryRecordBatchReceiver`) and Multi-Stream Session Coordinator
-*   **Rationale**: Exposes the public table and stream reading entry points, formats table resource paths, creates Arrow-formatted `ReadSession` resources, spawns per-stream tasks wired to bounded backpressure and shared cancellation, and guarantees task cleanup on receiver drop or fatal error.
+*   **Rationale**: Exposes the public table and stream reading entry points, upstream `arrow-rs` and C Stream FFI re-exports, formats table resource paths, creates Arrow-formatted `ReadSession` resources, spawns per-stream tasks wired to bounded backpressure and shared cancellation, and guarantees task cleanup on receiver drop or fatal error.
 *   **Proposed Changes**:
-    *   Define `DEFAULT_COMPRESSION = CompressionCodec::Lz4Frame` and re-export `CompressionCodec`, `ServiceConfigBuilder`, and `BigQueryError`.
+    *   Define `DEFAULT_COMPRESSION = CompressionCodec::Lz4Frame` and re-export `RecordBatch`, `ArrowError`, `DataType`, `Field`, `Schema`, `SchemaRef`, `ArrowArrayStream`, `ArrowStreamOptions`, `record_batch_into_arrow_array_stream`, `CompressionCodec`, `ServiceConfigBuilder`, and `BigQueryError`.
     *   Implement `pub struct BigQueryTableId { pub project_id: String, pub dataset_id: String, pub table_id: String }` with `new(...)`, `Display`, and `to_table_path(&self) -> String` (`projects/{project_id}/datasets/{dataset_id}/tables/{table_id}`). (`FromStr` / `TryFrom<&str>` string parsing via `parse_table_id` is out of scope and covered in a separate design specification.)
     *   Define `pub struct ReadOptions` (`maintain_order`, `snapshot_time`, `selected_fields`, `row_restriction`, `arrow_buffer_compression`, `sample_percentage`, `max_stream_count`) with `build_request(self, table_path: String, quota_project_id: &str) -> CreateReadSessionRequest` setting `DataFormat::Arrow`, defaulting compression to `DEFAULT_COMPRESSION`, clamping `snapshot_time` via `Timestamp::clamp`, and resolving `max_stream_count` to `1` when `maintain_order == true` or `max_stream_count.unwrap_or(available_parallelism())` when `false`.
     *   Define `pub struct StreamOptions` (`offset: i64`, `schema: Option<bytes::Bytes>`, `arrow_buffer_compression: Option<CompressionCodec>`).
-    *   Implement `pub struct BigQueryRecordBatchReceiver` wrapping `rx: mpsc::Receiver<Result<RecordBatch, BigQueryError>>`, `cancel_tx: Option<Arc<watch::Sender<bool>>>`, and `handles: Vec<JoinHandle<()>>` (migrating manual handle vectors to `tokio::task::JoinSet` is tracked in Future Improvements #6):
+    *   Implement `pub struct BigQueryRecordBatchReceiver` wrapping `rx: mpsc::Receiver<Result<RecordBatch, BigQueryError>>`, `cancel_tx: Option<Arc<watch::Sender<bool>>>`, and `handles: Vec<JoinHandle<()>>` (migrating manual handle vectors to `tokio::task::JoinSet` is tracked in Future Improvements #5):
         *   `pub async fn recv(&mut self) -> Option<Result<RecordBatch, BigQueryError>>`: awaits `self.rx.recv()` and calls `self.abort()` immediately on `None` or `Some(Err(_))`.
         *   `pub fn abort(&mut self)` (also invoked from `Drop::drop`): sends `true` on `cancel_tx`, calls `self.rx.close()`, and aborts every `JoinHandle` in `self.handles`.
     *   Implement `pub struct Client` (holding `bq_client`, `read_client`, `quota_project_id`, `user_agent`, `retry_throttler: SharedRetryThrottler`, and `retry_config: StreamRetryConfig` containing a cloned handle to the same `SharedRetryThrottler`) along with read methods and helpers:
         *   `create_table_read_session(&self, table: &BigQueryTableId, options: ReadOptions) -> Result<(Bytes, Vec<String>), BigQueryError>`: sends an idempotent `CreateReadSession` RPC (`with_idempotency(true)`) carrying `x-goog-user-project` and optional `user_agent`, attaching `create_read_session_retry_policy()` (`600 s` RPC retry policy), `default_backoff_policy()`, and `self.retry_throttler.clone()` per request so unary session creation enforces the 600-second GAX RPC retry policy in both production and `Client::from_parts` / `Client::new_for_testing` stubs.
         *   `prepare_read_rows(&self, stream_name: String, offset: i64, arrow_buffer_compression: Option<CompressionCodec>) -> ReadRows`: builds a `ReadRows` request at `offset` with optional `ArrowSerializationOptions` and request headers (`quota_project` and `user_agent`), leaving `ReadRows` opening retries, mid-stream offset resumption, and reconnection backoff to `ReadStream`'s separate `StreamRetryConfig`.
-        *   `pub async fn read_table(&self, table: &BigQueryTableId, options: ReadOptions) -> Result<(ArrowSchemaRef, BigQueryRecordBatchReceiver), BigQueryError>`: calls `create_table_read_session(table, options)` and delegates the returned `(schema, streams)` to `read_streams(..., StreamOptions { offset: 0, schema: Some(schema), arrow_buffer_compression: None }, maintain_order)`.
-        *   `pub async fn read_stream(&self, stream: impl Into<String>, options: StreamOptions) -> Result<(ArrowSchemaRef, BigQueryRecordBatchReceiver), BigQueryError>`: delegates a single stream to `read_streams(vec![stream.into()], options, true)`.
-        *   `read_streams` / `read_streams_inner`: sizes the `mpsc` channel to `rayon::current_num_threads().max(1) * 2` (via `channel_size()`), creates the shared `watch::channel(false)` cancellation pair, either parses `options.schema` upfront or attaches a `oneshot` `schema_tx` to the first stream task (failing with `BigQueryError::Protocol` if `streams.is_empty()` and `options.schema.is_none()`, or if the stream closes before yielding a schema), spawns one `bigquery_read_stream::read_stream` Tokio task per stream, and wraps `rx`, `cancel_tx`, and `handles` in `BigQueryRecordBatchReceiver` before awaiting `schema_rx` so cancellation while waiting for the first response still aborts spawned tasks. (`read_streams_inner` also accepts optional out-of-scope query fallback state via `FallbackReadSession` and `switch_to_read_session`, which currently calls `query::get_destination_table` and duplicates the `ReadStreamOptions` task-spawning loop; tracked in Future Improvements #4.)
+        *   `pub async fn read_table(&self, table: &BigQueryTableId, options: ReadOptions) -> Result<(SchemaRef, BigQueryRecordBatchReceiver), BigQueryError>`: calls `create_table_read_session(table, options)` and delegates the returned `(schema, streams)` to `read_streams(..., StreamOptions { offset: 0, schema: Some(schema), arrow_buffer_compression: None }, maintain_order)`.
+        *   `pub async fn read_stream(&self, stream: impl Into<String>, options: StreamOptions) -> Result<(SchemaRef, BigQueryRecordBatchReceiver), BigQueryError>`: delegates a single stream to `read_streams(vec![stream.into()], options, true)`.
+        *   `read_streams` / `read_streams_inner`: sizes the `mpsc` channel to `rayon::current_num_threads().max(1) * 2` (via `channel_size()`), creates the shared `watch::channel(false)` cancellation pair, either parses `options.schema` upfront or attaches a `oneshot` `schema_tx` to the first stream task (failing with `BigQueryError::Protocol` if `streams.is_empty()` and `options.schema.is_none()`, or if the stream closes before yielding a schema), spawns one `bigquery_read_stream::read_stream` Tokio task per stream, and wraps `rx`, `cancel_tx`, and `handles` in `BigQueryRecordBatchReceiver` before awaiting `schema_rx` so cancellation while waiting for the first response still aborts spawned tasks. (`read_streams_inner` also accepts optional out-of-scope query fallback state via `FallbackReadSession` and `switch_to_read_session`, which currently calls `query::get_destination_table` and duplicates the `ReadStreamOptions` task-spawning loop; tracked in Future Improvements #3.)
     *   **Unit tests (by function / type under test)**:
         *   `BigQueryTableId::to_table_path()`: formats `projects/{project_id}/datasets/{dataset_id}/tables/{table_id}` resource paths for standard and domain-prefixed project IDs (`FromStr` string-parsing tests belong to the separate table-ID parsing design).
         *   `ReadOptions::build_request`:
@@ -392,7 +420,15 @@ When `self.metadata` is `None` (`Client::read_stream` called with `StreamOptions
             *   Caller-provided schema & options: parses upfront `StreamOptions.schema` bytes immediately and forwards custom `offset` and `arrow_buffer_compression` (`Zstd`) to `ReadRows`.
             *   Pre-schema vs. post-schema error routing: returns `Err(BigQueryError::Protocol)` directly from `read_stream()` if the stream yields only a heartbeat or closes at EOF without sending a schema; returns `Err(BigQueryError::Arrow)` immediately for invalid `StreamOptions.schema` bytes; returns `Err(BigQueryError::Grpc)` from `read_stream()` when `ReadRows` fails before schema resolution, or via `receiver.recv()` when `StreamOptions.schema` was provided upfront.
 
-#### 8. `crates/arrow-bigquery/tests/integration_test.rs` & `crates/arrow-bigquery/benches/read.rs` (As-Built)
+#### 9. `py-arrow-bigquery/Cargo.toml` & `py-arrow-bigquery/src/stream.rs` (As-Built)
+
+*   **Type / Scope**: Python PyCapsule Arrow C Stream Bridge (`__arrow_c_stream__`)
+*   **Rationale**: Decouples `py-arrow-bigquery` from `polars-arrow` and `pyo3-polars` by delegating `ArrowArrayStream` construction directly to `arrow-bigquery` while preserving Python `Ctrl-C` signal handling and GIL release during blocking reads.
+*   **Proposed Changes**:
+    *   Remove `polars-arrow` and `pyo3-polars` dependencies from `py-arrow-bigquery/Cargo.toml`.
+    *   In `py-arrow-bigquery/src/stream.rs`, `ArrowStreamExporter::__arrow_c_stream__` converts `StreamSource::Receiver(schema, rx)` via `rx.into_arrow_array_stream(schema, options)` using `ArrowStreamOptions::new(rt.handle().clone()).with_poll_wrapper(...)` (attaching to Python to run `py.check_signals()`—restoring any raised `KeyboardInterrupt`—and calling `py.detach(wait_fn)` around each `100 ms` Tokio wait) and converts `StreamSource::Batch(batch)` via `record_batch_into_arrow_array_stream(batch)`, returning the `ArrowArrayStream` inside a `PyCapsule` named `"arrow_array_stream"`.
+
+#### 10. `crates/arrow-bigquery/tests/integration_test.rs` & `crates/arrow-bigquery/benches/read.rs` (As-Built)
 
 *   **Type / Scope**: Live BigQuery Integration Test and Criterion Throughput/Latency Benchmarks
 *   **Rationale**: Validates end-to-end authentication, `CreateReadSession`, multi-stream `ReadRows` consumption, and LZ4 Arrow IPC decoding against public BigQuery datasets across small and multi-gigabyte scan sizes.
@@ -403,9 +439,9 @@ When `self.metadata` is `None` (`Client::read_stream` called with `StreamOptions
 ### Verification Plan
 
 *   **Compilation/Build**: `cargo build -p arrow-bigquery --all-targets`
-*   **Unit Tests**: `cargo test -p arrow-bigquery --lib` (and full workspace Rust tests via `cargo test`; Python binding tests via `uv run pytest py-arrow-bigquery`)
-*   **Static Analysis & Linting**: `cargo clippy -p arrow-bigquery --all-targets -- -D warnings` and `cargo fmt --all -- --check`
-*   **Test Coverage Requirement**: Unit tests in `decode`, `bigquery_read_stream`, `client_builder`, `error`, and `lib` cover every `ReadStreamState` edge (`Connecting`, `Backoff`, `Reading`, `Terminated`), retryable vs. permanent status classification, adaptive throttler exhaustion, ordered vs. work-stealing decode queues, row-count mismatch protocol errors, and sibling cancellation on error or receiver drop.
+*   **Unit Tests**: `cargo test -p arrow-bigquery --lib` (and full workspace Rust tests via `cargo test`; Python binding and client tests via `uv run pytest py-arrow-bigquery` and `uv run pytest py-polars-bigquery`)
+*   **Static Analysis & Linting**: `cargo clippy --workspace --all-targets -- -D warnings` and `cargo fmt --all -- --check`
+*   **Test Coverage Requirement**: Unit tests in `decode`, `bigquery_read_stream`, `ffi`, `client_builder`, `error`, and `lib` cover every `ReadStreamState` edge (`Connecting`, `Backoff`, `Reading`, `Terminated`), retryable vs. permanent status classification, adaptive throttler exhaustion, LZ4/ZSTD IPC decoding, ordered vs. work-stealing decode queues, row-count mismatch protocol errors, sibling cancellation on error or receiver drop, and `ArrowArrayStream` FFI round-trips, interrupt cancellation, NUL-byte error sanitization, and early stream release teardown.
 *   **E2E/Integration**: With Application Default Credentials and `GOOGLE_CLOUD_PROJECT` configured:
     *   Live table scan test: `GOOGLE_CLOUD_PROJECT=<project-id> cargo test -p arrow-bigquery --test integration_test test_read_small_public_table`
     *   Throughput/latency benchmark: `GOOGLE_CLOUD_PROJECT=<project-id> cargo bench -p arrow-bigquery --bench read`

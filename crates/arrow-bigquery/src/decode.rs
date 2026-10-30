@@ -1,18 +1,21 @@
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::io::Cursor;
 use std::sync::{Arc, Mutex};
 
-use polars_arrow::io::ipc::read::{
-    read_stream_metadata, StreamMetadata, StreamReader, StreamState,
-};
-use polars_arrow::record_batch::RecordBatch;
+use arrow_array::{ArrayRef, RecordBatch};
+use arrow_buffer::Buffer;
+use arrow_ipc::reader::{read_dictionary, read_record_batch, StreamReader};
+use arrow_ipc::{root_as_message, MessageHeader};
+use arrow_schema::{ArrowError, SchemaRef};
 
 use crate::BigQueryError;
 
-/// Parses IPC-serialized Arrow schema bytes into [`StreamMetadata`].
-pub(crate) fn parse_arrow_schema(schema_bytes: &[u8]) -> Result<StreamMetadata, BigQueryError> {
-    let mut cursor = Cursor::new(schema_bytes);
-    Ok(read_stream_metadata(&mut cursor)?)
+const IPC_CONTINUATION_MARKER: [u8; 4] = [0xFF; 4];
+
+/// Parses IPC-serialized Arrow schema bytes into a [`SchemaRef`].
+pub(crate) fn parse_arrow_schema(schema_bytes: &[u8]) -> Result<SchemaRef, BigQueryError> {
+    let reader = StreamReader::try_new(Cursor::new(schema_bytes), None)?;
+    Ok(reader.schema())
 }
 
 /// Validates that an optional serialized Arrow record batch payload is consistent
@@ -35,23 +38,105 @@ pub(crate) fn validate_non_empty_arrow_bytes(
 pub(crate) fn decode_arrow_record_batches(
     serialized_record_batch: bytes::Bytes,
     expected_row_count: i64,
-    metadata: StreamMetadata,
+    schema: &SchemaRef,
 ) -> Result<Vec<RecordBatch>, BigQueryError> {
-    let cursor = Cursor::new(serialized_record_batch);
-    let mut reader = StreamReader::new(cursor, metadata, None);
+    let mut buf = Buffer::from(serialized_record_batch);
+    let mut dictionaries_by_id: HashMap<i64, ArrayRef> = HashMap::new();
     let mut batches = Vec::with_capacity(1);
     let mut actual_rows: i64 = 0;
 
-    for result in &mut reader {
-        match result {
-            Ok(StreamState::Some(batch)) => {
-                actual_rows = actual_rows.checked_add(batch.len() as i64).ok_or_else(|| {
+    while !buf.is_empty() {
+        if buf.len() < 4 {
+            return Err(
+                ArrowError::ParseError("Unexpected EOF reading IPC message prefix".into()).into(),
+            );
+        }
+        let mut len_bytes: [u8; 4] = buf[..4].try_into().unwrap();
+        buf.advance(4);
+
+        if len_bytes == IPC_CONTINUATION_MARKER {
+            if buf.len() < 4 {
+                return Err(ArrowError::ParseError(
+                    "Unexpected EOF reading IPC metadata length".into(),
+                )
+                .into());
+            }
+            len_bytes = buf[..4].try_into().unwrap();
+            buf.advance(4);
+        }
+
+        let raw_meta_len = i32::from_le_bytes(len_bytes);
+        if raw_meta_len == 0 {
+            break;
+        }
+        let meta_len = usize::try_from(raw_meta_len).map_err(|_| {
+            ArrowError::ParseError(format!("Negative IPC metadata length: {raw_meta_len}"))
+        })?;
+        if buf.len() < meta_len {
+            return Err(ArrowError::ParseError(
+                "Unexpected EOF reading IPC message metadata".into(),
+            )
+            .into());
+        }
+
+        let meta_buf = buf.slice_with_length(0, meta_len);
+        buf.advance(meta_len);
+        let message = root_as_message(&meta_buf)
+            .map_err(|e| ArrowError::ParseError(format!("Unable to get root as message: {e:?}")))?;
+
+        let raw_body_len = message.bodyLength();
+        let body_len = usize::try_from(raw_body_len).map_err(|_| {
+            ArrowError::ParseError(format!("Negative IPC body length: {raw_body_len}"))
+        })?;
+        if buf.len() < body_len {
+            return Err(
+                ArrowError::ParseError("Unexpected EOF reading IPC message body".into()).into(),
+            );
+        }
+
+        let body = buf.slice_with_length(0, body_len);
+        buf.advance(body_len);
+
+        match message.header_type() {
+            MessageHeader::RecordBatch => {
+                let ipc_batch = message.header_as_record_batch().ok_or_else(|| {
+                    ArrowError::ParseError("Unable to read IPC message as record batch".into())
+                })?;
+                let batch = read_record_batch(
+                    &body,
+                    ipc_batch,
+                    Arc::clone(schema),
+                    &dictionaries_by_id,
+                    None,
+                    &message.version(),
+                )?;
+                let batch_rows = i64::try_from(batch.num_rows()).map_err(|_| {
+                    BigQueryError::Protocol("Decoded batch row count overflow".into())
+                })?;
+                actual_rows = actual_rows.checked_add(batch_rows).ok_or_else(|| {
                     BigQueryError::Protocol("Decoded batch row count overflow".into())
                 })?;
                 batches.push(batch);
             },
-            Ok(StreamState::Waiting) => break,
-            Err(e) => return Err(BigQueryError::Arrow(e)),
+            MessageHeader::DictionaryBatch => {
+                let dict_batch = message.header_as_dictionary_batch().ok_or_else(|| {
+                    ArrowError::ParseError("Unable to read IPC message as dictionary batch".into())
+                })?;
+                read_dictionary(
+                    &body,
+                    dict_batch,
+                    schema,
+                    &mut dictionaries_by_id,
+                    &message.version(),
+                )?;
+            },
+            MessageHeader::NONE => {},
+            other => {
+                return Err(ArrowError::IpcError(format!(
+                    "Unexpected IPC message header type in record batch payload: {other:?}"
+                ))
+                .into());
+            },
         }
     }
 
@@ -68,7 +153,7 @@ pub(crate) fn decode_arrow_record_batches(
 pub(crate) struct DecodeJob {
     pub(crate) serialized_record_batch: bytes::Bytes,
     pub(crate) expected_row_count: i64,
-    pub(crate) metadata: Arc<StreamMetadata>,
+    pub(crate) schema: SchemaRef,
     pub(crate) permit: tokio::sync::mpsc::OwnedPermit<Result<RecordBatch, BigQueryError>>,
     pub(crate) cancel_tx: Arc<tokio::sync::watch::Sender<bool>>,
     pub(crate) cancel_rx: tokio::sync::watch::Receiver<bool>,
@@ -79,7 +164,7 @@ impl DecodeJob {
         let Self {
             serialized_record_batch,
             expected_row_count,
-            metadata,
+            schema,
             permit,
             cancel_tx,
             cancel_rx,
@@ -91,11 +176,7 @@ impl DecodeJob {
             return;
         }
 
-        let res = decode_arrow_record_batches(
-            serialized_record_batch,
-            expected_row_count,
-            Arc::unwrap_or_clone(metadata),
-        );
+        let res = decode_arrow_record_batches(serialized_record_batch, expected_row_count, &schema);
 
         if *cancel_rx.borrow() {
             return;
@@ -213,10 +294,54 @@ impl DecodeQueue {
 
 #[cfg(test)]
 mod tests {
-    use polars_arrow::array::Int64Array;
+    use arrow_array::Int64Array;
+    use arrow_ipc::writer::{IpcWriteOptions, StreamWriter};
+    use arrow_ipc::CompressionType;
+    use arrow_schema::{DataType, Field, Schema};
 
     use super::*;
     use crate::bigquery_read_stream::tests::create_test_arrow_payload_with_range;
+
+    #[test]
+    fn test_decode_compressed_arrow_record_batches_lz4_and_zstd() {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let values: Vec<i64> = (0..1_000).collect();
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int64Array::from(values.clone()))],
+        )
+        .unwrap();
+
+        for compression in [CompressionType::LZ4_FRAME, CompressionType::ZSTD] {
+            let write_opts = IpcWriteOptions::default()
+                .try_with_compression(Some(compression))
+                .unwrap();
+
+            let mut schema_only = Vec::new();
+            let _ =
+                StreamWriter::try_new_with_options(&mut schema_only, &schema, write_opts.clone())
+                    .unwrap();
+
+            let mut full_stream = Vec::new();
+            let mut writer =
+                StreamWriter::try_new_with_options(&mut full_stream, &schema, write_opts).unwrap();
+            writer.write(&batch).unwrap();
+            let batch_bytes = full_stream[schema_only.len()..].to_vec();
+
+            let parsed_schema = parse_arrow_schema(&schema_only).unwrap();
+            let decoded =
+                decode_arrow_record_batches(bytes::Bytes::from(batch_bytes), 1_000, &parsed_schema)
+                    .unwrap();
+            assert_eq!(decoded.len(), 1);
+            assert_eq!(decoded[0].num_rows(), 1_000);
+            let col = decoded[0]
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap();
+            assert_eq!(col.values(), &values[..]);
+        }
+    }
 
     #[tokio::test]
     async fn test_ordered_decode_queue_preserves_batch_order() {
@@ -238,7 +363,7 @@ mod tests {
             payloads.push((bytes::Bytes::from(batch_bytes), count as i64));
         }
 
-        let metadata = Arc::new(parse_arrow_schema(&schema_bytes).unwrap());
+        let schema = parse_arrow_schema(&schema_bytes).unwrap();
         let (tx, mut rx) = tokio::sync::mpsc::channel(sizes.len() + 2);
         let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
         let cancel_tx = Arc::new(cancel_tx);
@@ -248,7 +373,7 @@ mod tests {
             queue.push(DecodeJob {
                 serialized_record_batch,
                 expected_row_count,
-                metadata: Arc::clone(&metadata),
+                schema: Arc::clone(&schema),
                 permit,
                 cancel_tx: Arc::clone(&cancel_tx),
                 cancel_rx: cancel_rx.clone(),
@@ -260,12 +385,13 @@ mod tests {
         let mut received_sizes = Vec::new();
         while let Some(res) = rx.recv().await {
             let batch = res.unwrap();
-            received_sizes.push(batch.len());
-            let col = batch.arrays()[0]
+            received_sizes.push(batch.num_rows());
+            let col = batch
+                .column(0)
                 .as_any()
                 .downcast_ref::<Int64Array>()
                 .unwrap();
-            for &val in col.values().as_slice() {
+            for &val in col.values() {
                 assert_eq!(val, expected_next);
                 expected_next += 1;
             }
@@ -292,7 +418,7 @@ mod tests {
             payloads.push((bytes::Bytes::from(batch_bytes), count as i64));
         }
 
-        let metadata = Arc::new(parse_arrow_schema(&schema_bytes).unwrap());
+        let schema = parse_arrow_schema(&schema_bytes).unwrap();
         let (tx, mut rx) = tokio::sync::mpsc::channel(sizes.len() + 2);
         let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
         let cancel_tx = Arc::new(cancel_tx);
@@ -302,7 +428,7 @@ mod tests {
             queue.push(DecodeJob {
                 serialized_record_batch,
                 expected_row_count,
-                metadata: Arc::clone(&metadata),
+                schema: Arc::clone(&schema),
                 permit,
                 cancel_tx: Arc::clone(&cancel_tx),
                 cancel_rx: cancel_rx.clone(),
@@ -313,11 +439,12 @@ mod tests {
         let mut all_values = Vec::with_capacity(next_start as usize);
         while let Some(res) = rx.recv().await {
             let batch = res.unwrap();
-            let col = batch.arrays()[0]
+            let col = batch
+                .column(0)
                 .as_any()
                 .downcast_ref::<Int64Array>()
                 .unwrap();
-            all_values.extend_from_slice(col.values().as_slice());
+            all_values.extend_from_slice(col.values());
         }
         all_values.sort_unstable();
         let expected: Vec<i64> = (0..next_start).collect();
@@ -329,7 +456,7 @@ mod tests {
         let queue = DecodeQueue::new(true);
 
         let (schema_bytes, valid_batch) = create_test_arrow_payload_with_range(0, 5);
-        let metadata = Arc::new(parse_arrow_schema(&schema_bytes).unwrap());
+        let schema = parse_arrow_schema(&schema_bytes).unwrap();
 
         let (tx, mut rx) = tokio::sync::mpsc::channel(4);
         let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
@@ -340,7 +467,7 @@ mod tests {
         queue.push(DecodeJob {
             serialized_record_batch: bytes::Bytes::from(valid_batch.clone()),
             expected_row_count: 999,
-            metadata: Arc::clone(&metadata),
+            schema: Arc::clone(&schema),
             permit: permit1,
             cancel_tx: Arc::clone(&cancel_tx),
             cancel_rx: cancel_rx.clone(),
@@ -350,7 +477,7 @@ mod tests {
         queue.push(DecodeJob {
             serialized_record_batch: bytes::Bytes::from(valid_batch),
             expected_row_count: 5,
-            metadata,
+            schema,
             permit: permit2,
             cancel_tx: Arc::clone(&cancel_tx),
             cancel_rx: cancel_rx.clone(),

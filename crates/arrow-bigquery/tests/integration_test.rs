@@ -1,7 +1,7 @@
 use std::env;
 
+use arrow_array::{Int64Array, StringArray, TimestampMillisecondArray};
 use arrow_bigquery::*;
-use polars_arrow::array::{Int64Array, Utf8Array};
 
 async fn setup_client() -> Client {
     let quota_project_id = env::var("GOOGLE_CLOUD_PROJECT")
@@ -19,7 +19,7 @@ async fn setup_client() -> Client {
 async fn consume_receiver(mut receiver: BigQueryRecordBatchReceiver) -> usize {
     let mut total_rows = 0;
     while let Some(batch) = receiver.recv().await {
-        total_rows += batch.expect("should receive valid record batch").len();
+        total_rows += batch.expect("should receive valid record batch").num_rows();
     }
     total_rows
 }
@@ -60,8 +60,9 @@ async fn test_dry_run_query() {
         .await
         .expect("dry_run should succeed");
 
-    assert_eq!(batch.len(), 1);
-    let col_names: Vec<&str> = batch.schema().iter_names().map(|s| s.as_str()).collect();
+    assert_eq!(batch.num_rows(), 1);
+    let schema = batch.schema();
+    let col_names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
     assert_eq!(
         col_names,
         vec![
@@ -76,31 +77,35 @@ async fn test_dry_run_query() {
         ]
     );
 
-    let bq_schema = batch.arrays()[0]
+    let bq_schema = batch
+        .column(0)
         .as_any()
-        .downcast_ref::<Utf8Array<i32>>()
+        .downcast_ref::<StringArray>()
         .unwrap()
         .value(0);
     assert!(bq_schema.contains("name"));
     assert!(bq_schema.contains("number"));
 
-    let total_bytes_processed = batch.arrays()[4]
+    let total_bytes_processed = batch
+        .column(4)
         .as_any()
         .downcast_ref::<Int64Array>()
         .unwrap()
         .value(0);
     assert!(total_bytes_processed > 0);
 
-    let statement_type = batch.arrays()[6]
+    let statement_type = batch
+        .column(6)
         .as_any()
-        .downcast_ref::<Utf8Array<i32>>()
+        .downcast_ref::<StringArray>()
         .unwrap()
         .value(0);
     assert_eq!(statement_type, "SELECT");
 
-    let creation_time = batch.arrays()[7]
+    let creation_time = batch
+        .column(7)
         .as_any()
-        .downcast_ref::<Int64Array>()
+        .downcast_ref::<TimestampMillisecondArray>()
         .unwrap()
         .value(0);
     assert!(creation_time > 0);
@@ -117,7 +122,7 @@ async fn test_read_query() {
         .await
         .expect("query read should succeed");
 
-    let col_names: Vec<&str> = schema.iter_names().map(|s| s.as_str()).collect();
+    let col_names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
     assert_eq!(col_names, vec!["one", "greeting"]);
     assert_eq!(consume_receiver(receiver).await, 1);
 
@@ -128,7 +133,11 @@ async fn test_read_query() {
         .read()
         .await
         .expect("empty query read should succeed");
-    let empty_col_names: Vec<&str> = empty_schema.iter_names().map(|s| s.as_str()).collect();
+    let empty_col_names: Vec<&str> = empty_schema
+        .fields()
+        .iter()
+        .map(|f| f.name().as_str())
+        .collect();
     assert_eq!(empty_col_names, vec!["one", "greeting"]);
     assert!(empty_receiver.recv().await.is_none());
 
@@ -210,7 +219,7 @@ async fn test_read_long_running_query() {
         .await
         .expect("long running query read should succeed");
 
-    let col_names: Vec<&str> = schema.iter_names().map(|s| s.as_str()).collect();
+    let col_names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
     assert_eq!(col_names, vec!["id1", "match_count", "max_digest"]);
     assert_eq!(consume_receiver(receiver).await, 10_000);
 }
@@ -404,7 +413,7 @@ async fn test_read_long_running_empty_query() {
         .await
         .expect("long running empty query read should succeed");
 
-    let col_names: Vec<&str> = schema.iter_names().map(|s| s.as_str()).collect();
+    let col_names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
     assert_eq!(col_names, vec!["id1", "match_count", "max_digest"]);
     assert_eq!(consume_receiver(receiver).await, 0);
 }
@@ -428,7 +437,7 @@ async fn test_read_ddl_queries() {
         .read()
         .await
         .expect("CREATE SCHEMA query().read() should succeed");
-    assert_eq!(schema.len(), 0);
+    assert_eq!(schema.fields().len(), 0);
     assert_eq!(consume_receiver(receiver).await, 0);
 
     let test_result = async {
@@ -455,7 +464,7 @@ async fn test_read_ddl_queries() {
             .read()
             .await
             .expect("CREATE MODEL query().read() should succeed");
-        assert_eq!(model_schema.len(), 0);
+        assert_eq!(model_schema.fields().len(), 0);
         assert_eq!(consume_receiver(model_receiver).await, 0);
     }
     .await;
@@ -467,7 +476,7 @@ async fn test_read_ddl_queries() {
         .read()
         .await
         .expect("DROP SCHEMA query().read() should succeed");
-    assert_eq!(drop_schema.len(), 0);
+    assert_eq!(drop_schema.fields().len(), 0);
     assert_eq!(consume_receiver(drop_receiver).await, 0);
 
     let () = test_result;

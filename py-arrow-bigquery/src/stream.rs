@@ -1,133 +1,36 @@
-use polars_arrow::datatypes::ArrowSchemaRef;
-use polars_arrow::record_batch::RecordBatch;
+use arrow_bigquery_lib::{
+    record_batch_into_arrow_array_stream, ArrowArrayStream, ArrowStreamOptions,
+    BigQueryRecordBatchReceiver, RecordBatch, SchemaRef,
+};
 use pyo3::prelude::*;
 
 enum StreamSource {
-    Receiver(arrow_bigquery_lib::BigQueryRecordBatchReceiver),
+    Receiver(SchemaRef, BigQueryRecordBatchReceiver),
     Batch(RecordBatch),
-}
-
-fn record_batch_to_struct_array(
-    batch: RecordBatch,
-    dtype: polars_arrow::datatypes::ArrowDataType,
-) -> Box<dyn polars_arrow::array::Array> {
-    let len = batch.len();
-    let (_, arrays) = batch.into_schema_and_arrays();
-    let struct_array = polars_arrow::array::StructArray::new(dtype, len, arrays, None);
-    Box::new(struct_array) as Box<dyn polars_arrow::array::Array>
 }
 
 /// A Python-exposed class that implements the Arrow C Stream interface.
 ///
-/// This class acts as a bridge between the Rust BigQuery reader and Python Polars,
-/// allowing Polars to consume the data stream directly via the Arrow C Data Interface
-/// (`__arrow_c_stream__`) without copying data.
+/// This class acts as a bridge between the Rust BigQuery reader and Python Arrow
+/// consumers (such as Polars and nanoarrow), allowing them to consume the data stream
+/// directly via the Arrow C Stream Interface (`__arrow_c_stream__`) without copying data.
 #[pyclass]
 pub struct ArrowStreamExporter {
-    /// The schema of the Arrow stream.
-    schema: ArrowSchemaRef,
     /// The underlying BigQuery record batch source, wrapped in a mutex.
     /// It is an `Option` because the stream can only be consumed once.
     source: std::sync::Mutex<Option<StreamSource>>,
 }
 
 impl ArrowStreamExporter {
-    pub(crate) fn new(
-        schema: ArrowSchemaRef,
-        receiver: arrow_bigquery_lib::BigQueryRecordBatchReceiver,
-    ) -> Self {
+    pub(crate) fn new(schema: SchemaRef, receiver: BigQueryRecordBatchReceiver) -> Self {
         Self {
-            schema,
-            source: std::sync::Mutex::new(Some(StreamSource::Receiver(receiver))),
+            source: std::sync::Mutex::new(Some(StreamSource::Receiver(schema, receiver))),
         }
     }
 
     pub(crate) fn from_record_batch(batch: RecordBatch) -> Self {
-        let schema = std::sync::Arc::new(batch.schema().clone());
         Self {
-            schema,
             source: std::sync::Mutex::new(Some(StreamSource::Batch(batch))),
-        }
-    }
-}
-
-/// An iterator that adapts the asynchronous [`arrow_bigquery_lib::BigQueryRecordBatchReceiver`] into
-/// a synchronous iterator yielding Arrow arrays.
-///
-/// This is used internally by [`ArrowStreamExporter`] to feed the Arrow C Stream.
-/// Each iteration blocks on the Tokio runtime to receive the next batch.
-struct ReceiverIterator {
-    /// The receiver yielding record batches from the BigQuery Storage Read API.
-    /// Held in an `Option` so it can be dropped immediately upon fatal error or interrupt
-    /// to abort sibling background stream tasks without waiting for iterator GC.
-    rx: Option<arrow_bigquery_lib::BigQueryRecordBatchReceiver>,
-    /// The Arrow datatype (specifically a `Struct` type) matching the schema of the batches.
-    dtype: polars_arrow::datatypes::ArrowDataType,
-}
-
-impl Iterator for ReceiverIterator {
-    type Item =
-        pyo3_polars::export::polars_error::PolarsResult<Box<dyn polars_arrow::array::Array>>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        let rt = pyo3_async_runtimes::tokio::get_runtime();
-        let timeout_duration = std::time::Duration::from_millis(100);
-
-        loop {
-            let rx = self.rx.as_mut()?;
-
-            let step = Python::attach(|py| {
-                // We need to be able to stop if the Python side decides to, so
-                // occasionally check to see if there were any interrupts.
-                if let Err(py_err) = py.check_signals() {
-                    py_err.restore(py);
-                    return Err(());
-                }
-
-                Ok(py.detach(|| {
-                    rt.block_on(async { tokio::time::timeout(timeout_duration, rx.recv()).await })
-                }))
-            });
-
-            let result = match step {
-                Ok(res) => res,
-                Err(()) => {
-                    self.rx = None;
-                    return Some(Err(
-                        pyo3_polars::export::polars_error::PolarsError::ComputeError(
-                            "Python interrupt".into(),
-                        ),
-                    ));
-                },
-            };
-
-            match result {
-                Ok(Some(Ok(batch))) => {
-                    return Some(Ok(record_batch_to_struct_array(batch, self.dtype.clone())));
-                },
-                Ok(Some(Err(err))) => {
-                    // Drop the receiver immediately so sibling background streams are aborted now.
-                    self.rx = None;
-                    return Some(Err(
-                        pyo3_polars::export::polars_error::PolarsError::ComputeError(
-                            format!(
-                                "BigQuery Storage API read error: {}",
-                                err.format_causal_chain()
-                            )
-                            .into(),
-                        ),
-                    ));
-                },
-                Ok(None) => {
-                    // Stream finished
-                    self.rx = None;
-                    return None;
-                },
-                Err(_) => {
-                    // Timeout elapsed, loop again to check signals
-                    continue;
-                },
-            }
         }
     }
 }
@@ -148,29 +51,27 @@ impl ArrowStreamExporter {
             .take()
             .ok_or_else(|| pyo3::exceptions::PyValueError::new_err("Stream already consumed"))?;
 
-        let fields: Vec<polars_arrow::datatypes::Field> =
-            self.schema.iter().map(|(_, field)| field.clone()).collect();
-        let dtype = polars_arrow::datatypes::ArrowDataType::Struct(fields);
+        let stream: ArrowArrayStream = match source {
+            StreamSource::Receiver(schema, rx) => {
+                let rt = pyo3_async_runtimes::tokio::get_runtime();
+                let options =
+                    ArrowStreamOptions::new(rt.handle().clone()).with_poll_wrapper(|wait_fn| {
+                        Python::attach(|py| {
+                            // We need to be able to stop if the Python side decides to, so
+                            // occasionally check to see if there were any interrupts.
+                            if let Err(py_err) = py.check_signals() {
+                                py_err.restore(py);
+                                return Err("Python interrupt");
+                            }
 
-        let box_iter: Box<
-            dyn Iterator<
-                Item = pyo3_polars::export::polars_error::PolarsResult<
-                    Box<dyn polars_arrow::array::Array>,
-                >,
-            >,
-        > = match source {
-            StreamSource::Receiver(rx) => Box::new(ReceiverIterator {
-                rx: Some(rx),
-                dtype: dtype.clone(),
-            }),
-            StreamSource::Batch(batch) => Box::new(std::iter::once(Ok(
-                record_batch_to_struct_array(batch, dtype.clone()),
-            ))),
+                            py.detach(wait_fn);
+                            Ok(())
+                        })
+                    });
+                rx.into_arrow_array_stream(schema, options)
+            },
+            StreamSource::Batch(batch) => record_batch_into_arrow_array_stream(batch),
         };
-
-        let field = polars_arrow::datatypes::Field::new("".into(), dtype, false);
-
-        let stream = polars_arrow::ffi::export_iterator(box_iter, field);
 
         let capsule = pyo3::types::PyCapsule::new(py, stream, Some(c"arrow_array_stream".into()))?;
         Ok(capsule.into())

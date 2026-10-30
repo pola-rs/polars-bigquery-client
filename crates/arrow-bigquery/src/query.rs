@@ -1,14 +1,15 @@
 use std::sync::Arc;
 
+use arrow_array::{
+    ArrayRef, BooleanArray, Int64Array, RecordBatch, StringArray, TimestampMillisecondArray,
+};
+use arrow_schema::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use google_cloud_bigquery_v2::model::query_request::{JobCreationMode, QueryResultsFormat};
 use google_cloud_bigquery_v2::model::{
     arrow_serialization_options, query_response, ArrowSerializationOptions, QueryRequest,
     QueryResponse,
 };
 use google_cloud_gax::options::RequestOptionsBuilder;
-use polars_arrow::array::{Array, BooleanArray, Int64Array, Utf8Array};
-use polars_arrow::datatypes::{ArrowDataType, ArrowSchema, ArrowSchemaRef, Field, TimeUnit};
-use polars_arrow::record_batch::RecordBatch;
 use uuid::Uuid;
 
 use crate::error::{BigQueryError, JobError, JobFailedError};
@@ -176,7 +177,7 @@ impl<'a> Query<'a> {
     async fn read_destination_table(
         &self,
         response: &QueryResponse,
-    ) -> Result<(ArrowSchemaRef, BigQueryRecordBatchReceiver), BigQueryError> {
+    ) -> Result<(SchemaRef, BigQueryRecordBatchReceiver), BigQueryError> {
         let (project_id, job_id, location) = extract_required_job_reference(response)?;
         let destination_table =
             get_destination_table(self.client, project_id, job_id, location).await?;
@@ -198,7 +199,7 @@ impl<'a> Query<'a> {
         stream_name: String,
         offset: i64,
         serialized_schema: Option<bytes::Bytes>,
-    ) -> Result<(Option<ArrowSchemaRef>, BigQueryRecordBatchReceiver), BigQueryError> {
+    ) -> Result<(Option<SchemaRef>, BigQueryRecordBatchReceiver), BigQueryError> {
         let first_page_check = if !self.maintain_order {
             let (project_id, job_id, location) = extract_required_job_reference(response)?;
             Some((
@@ -246,9 +247,7 @@ impl<'a> Query<'a> {
         query_response_to_record_batch(&response)
     }
 
-    pub async fn read(
-        &self,
-    ) -> Result<(ArrowSchemaRef, BigQueryRecordBatchReceiver), BigQueryError> {
+    pub async fn read(&self) -> Result<(SchemaRef, BigQueryRecordBatchReceiver), BigQueryError> {
         let mut response = self
             .prepare_query(self.build_read_request())
             // We set the request ID, so all queries including DML are
@@ -330,7 +329,7 @@ impl<'a> Query<'a> {
                 && response.total_rows.is_none()
                 && response.statement_type != "SELECT"
             {
-                return Ok((Arc::new(ArrowSchema::default()), empty_receiver()));
+                return Ok((Arc::new(Schema::empty()), empty_receiver()));
             }
             return Err(BigQueryError::Protocol(
                 "QueryResponse is missing Arrow schema".into(),
@@ -339,8 +338,8 @@ impl<'a> Query<'a> {
 
         match (first_page_bytes, stream_name) {
             (None, None) => {
-                let metadata = crate::decode::parse_arrow_schema(&serialized_schema)?;
-                Ok((Arc::new(metadata.schema), empty_receiver()))
+                let schema_ref = crate::decode::parse_arrow_schema(&serialized_schema)?;
+                Ok((schema_ref, empty_receiver()))
             },
             (None, Some(stream_name)) => {
                 let (schema_ref, receiver) = self
@@ -356,7 +355,7 @@ impl<'a> Query<'a> {
                 Ok((schema_ref, receiver))
             },
             (Some(first_page_bytes), stream_name) => {
-                let metadata = crate::decode::parse_arrow_schema(&serialized_schema)?;
+                let schema_ref = crate::decode::parse_arrow_schema(&serialized_schema)?;
                 let read_rows = stream_name.map(|name| {
                     self.client.prepare_read_rows(
                         name,
@@ -364,12 +363,11 @@ impl<'a> Query<'a> {
                         Some(self.arrow_buffer_compression()),
                     )
                 });
-                let schema_ref = Arc::new(metadata.schema.clone());
                 let receiver = self.client.spawn_query_stream(
                     first_page_bytes,
                     response.page_row_count,
                     read_rows,
-                    Arc::new(metadata),
+                    Arc::clone(&schema_ref),
                     self.maintain_order,
                 );
                 Ok((schema_ref, receiver))
@@ -380,7 +378,7 @@ impl<'a> Query<'a> {
     async fn resolve_empty_job_stream(
         &self,
         response: &QueryResponse,
-    ) -> Result<(ArrowSchemaRef, BigQueryRecordBatchReceiver), BigQueryError> {
+    ) -> Result<(SchemaRef, BigQueryRecordBatchReceiver), BigQueryError> {
         let (project_id, job_id, location) = extract_required_job_reference(response)?;
         let job = fetch_job(self.client, project_id, job_id, Some(location)).await?;
         check_job_status_error(job.status, project_id, Some(location), job_id)?;
@@ -394,7 +392,7 @@ impl<'a> Query<'a> {
             .is_some();
 
         if is_ddl || statement_type.is_some_and(|st| st != "SELECT") {
-            return Ok((Arc::new(ArrowSchema::default()), empty_receiver()));
+            return Ok((Arc::new(Schema::empty()), empty_receiver()));
         }
 
         let Some(destination_table) = extract_destination_table(job.configuration)? else {
@@ -403,7 +401,7 @@ impl<'a> Query<'a> {
                     "Job response is missing configuration.query.destination_table".into(),
                 ));
             }
-            return Ok((Arc::new(ArrowSchema::default()), empty_receiver()));
+            return Ok((Arc::new(Schema::empty()), empty_receiver()));
         };
 
         let (serialized_schema, _streams) = self
@@ -418,8 +416,8 @@ impl<'a> Query<'a> {
                 },
             )
             .await?;
-        let metadata = crate::decode::parse_arrow_schema(&serialized_schema)?;
-        Ok((Arc::new(metadata.schema), empty_receiver()))
+        let schema_ref = crate::decode::parse_arrow_schema(&serialized_schema)?;
+        Ok((schema_ref, empty_receiver()))
     }
 
     async fn resolve_job_error(
@@ -658,43 +656,44 @@ fn query_response_to_record_batch(response: &QueryResponse) -> Result<RecordBatc
         .map(serde_json::to_string)
         .transpose()
         .map_err(|e| BigQueryError::Other(Box::new(e)))?;
-    let bigquery_schema_arr = Utf8Array::<i32>::from([bigquery_schema.as_deref()]).boxed();
+    let bigquery_schema_arr: ArrayRef =
+        Arc::new(StringArray::from(vec![bigquery_schema.as_deref()]));
 
     // 2. jobReference fields: projectId, jobId, location
     let (project_id, job_id, location) = extract_job_reference(response);
 
-    let project_id_arr = Utf8Array::<i32>::from([project_id]).boxed();
-    let job_id_arr = Utf8Array::<i32>::from([job_id]).boxed();
-    let location_arr = Utf8Array::<i32>::from([location]).boxed();
+    let project_id_arr: ArrayRef = Arc::new(StringArray::from(vec![project_id]));
+    let job_id_arr: ArrayRef = Arc::new(StringArray::from(vec![job_id]));
+    let location_arr: ArrayRef = Arc::new(StringArray::from(vec![location]));
 
     // 3. query response statistics fields: totalBytesProcessed, cacheHit, statementType
     let total_bytes_processed = response.total_bytes_processed.unwrap_or(0);
-    let total_bytes_processed_arr = Int64Array::from_slice([total_bytes_processed]).boxed();
+    let total_bytes_processed_arr: ArrayRef =
+        Arc::new(Int64Array::from(vec![total_bytes_processed]));
 
-    let cache_hit_arr = BooleanArray::from([response.cache_hit]).boxed();
+    let cache_hit_arr: ArrayRef = Arc::new(BooleanArray::from(vec![response.cache_hit]));
 
     let statement_type = non_empty_str(&response.statement_type);
-    let statement_type_arr = Utf8Array::<i32>::from([statement_type]).boxed();
+    let statement_type_arr: ArrayRef = Arc::new(StringArray::from(vec![statement_type]));
 
     // 4. creationTime (ms, UTC)
-    let creation_time_dtype = ArrowDataType::Timestamp(TimeUnit::Millisecond, Some("UTC".into()));
+    let creation_time_dtype = DataType::Timestamp(TimeUnit::Millisecond, Some("UTC".into()));
     let creation_time = response.creation_time.filter(|&t| t > 0);
-    let creation_time_arr = Int64Array::from([creation_time])
-        .to(creation_time_dtype.clone())
-        .boxed();
+    let creation_time_arr: ArrayRef =
+        Arc::new(TimestampMillisecondArray::from(vec![creation_time]).with_timezone("UTC"));
 
-    let arrow_schema = ArrowSchema::from_iter([
-        Field::new("bigquerySchema".into(), ArrowDataType::Utf8, true),
-        Field::new("projectId".into(), ArrowDataType::Utf8, true),
-        Field::new("jobId".into(), ArrowDataType::Utf8, true),
-        Field::new("location".into(), ArrowDataType::Utf8, true),
-        Field::new("totalBytesProcessed".into(), ArrowDataType::Int64, false),
-        Field::new("cacheHit".into(), ArrowDataType::Boolean, true),
-        Field::new("statementType".into(), ArrowDataType::Utf8, true),
-        Field::new("creationTime".into(), creation_time_dtype, true),
+    let arrow_schema = Schema::new(vec![
+        Field::new("bigquerySchema", DataType::Utf8, true),
+        Field::new("projectId", DataType::Utf8, true),
+        Field::new("jobId", DataType::Utf8, true),
+        Field::new("location", DataType::Utf8, true),
+        Field::new("totalBytesProcessed", DataType::Int64, false),
+        Field::new("cacheHit", DataType::Boolean, true),
+        Field::new("statementType", DataType::Utf8, true),
+        Field::new("creationTime", creation_time_dtype, true),
     ]);
 
-    let columns: Vec<Box<dyn Array>> = vec![
+    let columns: Vec<ArrayRef> = vec![
         bigquery_schema_arr,
         project_id_arr,
         job_id_arr,
@@ -705,11 +704,12 @@ fn query_response_to_record_batch(response: &QueryResponse) -> Result<RecordBatc
         creation_time_arr,
     ];
 
-    Ok(RecordBatch::try_new(1, Arc::new(arrow_schema), columns)?)
+    Ok(RecordBatch::try_new(Arc::new(arrow_schema), columns)?)
 }
 
 #[cfg(test)]
 mod tests {
+    use arrow_array::Array;
     use google_cloud_bigquery_v2::model::{JobReference, TableFieldSchema, TableSchema};
 
     use super::*;
@@ -719,27 +719,39 @@ mod tests {
     use crate::tests::{test_bq_client, test_read_client};
 
     fn utf8_val(batch: &RecordBatch, col_idx: usize) -> Option<&str> {
-        let arr = batch.arrays()[col_idx]
+        let arr = batch
+            .column(col_idx)
             .as_any()
-            .downcast_ref::<Utf8Array<i32>>()
-            .expect("expected Utf8Array<i32>");
-        arr.iter().next().unwrap()
+            .downcast_ref::<StringArray>()
+            .expect("expected StringArray");
+        (!arr.is_null(0)).then(|| arr.value(0))
     }
 
     fn bool_val(batch: &RecordBatch, col_idx: usize) -> Option<bool> {
-        let arr = batch.arrays()[col_idx]
+        let arr = batch
+            .column(col_idx)
             .as_any()
             .downcast_ref::<BooleanArray>()
             .expect("expected BooleanArray");
-        arr.iter().next().unwrap()
+        (!arr.is_null(0)).then(|| arr.value(0))
     }
 
     fn int64_val(batch: &RecordBatch, col_idx: usize) -> Option<i64> {
-        let arr = batch.arrays()[col_idx]
+        let arr = batch
+            .column(col_idx)
             .as_any()
             .downcast_ref::<Int64Array>()
             .expect("expected Int64Array");
-        arr.iter().next().unwrap().copied()
+        (!arr.is_null(0)).then(|| arr.value(0))
+    }
+
+    fn timestamp_ms_val(batch: &RecordBatch, col_idx: usize) -> Option<i64> {
+        let arr = batch
+            .column(col_idx)
+            .as_any()
+            .downcast_ref::<TimestampMillisecondArray>()
+            .expect("expected TimestampMillisecondArray");
+        (!arr.is_null(0)).then(|| arr.value(0))
     }
 
     #[test]
@@ -765,9 +777,10 @@ mod tests {
             .set_creation_time(1_767_037_135_155i64);
 
         let batch = query_response_to_record_batch(&response).unwrap();
-        assert_eq!(batch.len(), 1);
+        assert_eq!(batch.num_rows(), 1);
 
-        let col_names: Vec<&str> = batch.schema().iter_names().map(|s| s.as_str()).collect();
+        let schema = batch.schema();
+        let col_names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
         assert_eq!(
             col_names,
             vec![
@@ -789,10 +802,10 @@ mod tests {
         assert_eq!(int64_val(&batch, 4), Some(15));
         assert_eq!(bool_val(&batch, 5), Some(true));
         assert_eq!(utf8_val(&batch, 6), Some("SELECT"));
-        assert_eq!(int64_val(&batch, 7), Some(1_767_037_135_155));
+        assert_eq!(timestamp_ms_val(&batch, 7), Some(1_767_037_135_155));
         assert_eq!(
-            batch.arrays()[7].dtype(),
-            &ArrowDataType::Timestamp(TimeUnit::Millisecond, Some("UTC".into()))
+            batch.column(7).data_type(),
+            &DataType::Timestamp(TimeUnit::Millisecond, Some("UTC".into()))
         );
     }
 
@@ -809,7 +822,7 @@ mod tests {
             .set_statement_type("SELECT");
 
         let batch = query_response_to_record_batch(&response).unwrap();
-        assert_eq!(batch.len(), 1);
+        assert_eq!(batch.num_rows(), 1);
 
         assert_eq!(utf8_val(&batch, 0), None);
         assert_eq!(utf8_val(&batch, 1), Some("project-id"));
@@ -818,7 +831,7 @@ mod tests {
         assert_eq!(int64_val(&batch, 4), Some(0));
         assert_eq!(bool_val(&batch, 5), Some(true));
         assert_eq!(utf8_val(&batch, 6), Some("SELECT"));
-        assert_eq!(int64_val(&batch, 7), None);
+        assert_eq!(timestamp_ms_val(&batch, 7), None);
     }
 
     #[tokio::test]
@@ -884,7 +897,7 @@ mod tests {
         let batch = client.query("SELECT 1 AS one").dry_run().await.unwrap();
         server_task.await.unwrap();
 
-        assert_eq!(batch.len(), 1);
+        assert_eq!(batch.num_rows(), 1);
         assert_eq!(
             utf8_val(&batch, 0),
             Some(r#"{"fields":[{"name":"one","type":"INT64"}]}"#)
@@ -895,7 +908,7 @@ mod tests {
         assert_eq!(int64_val(&batch, 4), Some(0));
         assert_eq!(bool_val(&batch, 5), Some(false));
         assert_eq!(utf8_val(&batch, 6), Some("SELECT"));
-        assert_eq!(int64_val(&batch, 7), Some(1_767_037_135_155));
+        assert_eq!(timestamp_ms_val(&batch, 7), Some(1_767_037_135_155));
     }
 
     #[tokio::test]
@@ -972,16 +985,17 @@ mod tests {
         let (schema, mut receiver) = client.query("SELECT col1 FROM tbl").read().await.unwrap();
         server_task.await.unwrap();
 
-        let col_names: Vec<&str> = schema.iter_names().map(|s| s.as_str()).collect();
+        let col_names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
         assert_eq!(col_names, vec!["col1"]);
 
         let batch = receiver.recv().await.unwrap().unwrap();
-        assert_eq!(batch.len(), 3);
-        let arr = batch.arrays()[0]
+        assert_eq!(batch.num_rows(), 3);
+        let arr = batch
+            .column(0)
             .as_any()
             .downcast_ref::<Int64Array>()
             .unwrap();
-        assert_eq!(arr.values().as_slice(), &[0, 1, 2]);
+        assert_eq!(arr.values(), &[0, 1, 2]);
         assert!(receiver.recv().await.is_none());
     }
 
@@ -1037,7 +1051,7 @@ mod tests {
             .read()
             .await
             .unwrap();
-        let col_names: Vec<&str> = schema.iter_names().map(|s| s.as_str()).collect();
+        let col_names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
         assert_eq!(col_names, vec!["col1"]);
         assert!(receiver.recv().await.is_none());
     }
@@ -1149,10 +1163,10 @@ mod tests {
         );
 
         let (schema, mut receiver) = client.query("SELECT col1 FROM tbl").read().await.unwrap();
-        let col_names: Vec<&str> = schema.iter_names().map(|s| s.as_str()).collect();
+        let col_names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
         assert_eq!(col_names, vec!["col1"]);
         let batch = receiver.recv().await.unwrap().unwrap();
-        assert_eq!(batch.len(), 2);
+        assert_eq!(batch.num_rows(), 2);
         assert!(receiver.recv().await.is_none());
     }
 
@@ -1393,17 +1407,18 @@ mod tests {
             .await
             .unwrap();
 
-        let col_names: Vec<&str> = schema.iter_names().map(|s| s.as_str()).collect();
+        let col_names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
         assert_eq!(col_names, vec!["col1"]);
 
         let mut all_values = Vec::new();
         while let Some(batch) = receiver.recv().await {
             let batch = batch.unwrap();
-            let arr = batch.arrays()[0]
+            let arr = batch
+                .column(0)
                 .as_any()
                 .downcast_ref::<Int64Array>()
                 .unwrap();
-            all_values.extend_from_slice(arr.values().as_slice());
+            all_values.extend_from_slice(arr.values());
         }
         assert_eq!(all_values, vec![0, 1, 2, 3, 4, 5, 6, 7]);
 
@@ -1488,7 +1503,7 @@ mod tests {
 
         let (_, mut receiver) = client.query("SELECT col1 FROM tbl").read().await.unwrap();
         let batch = receiver.recv().await.unwrap().unwrap();
-        assert_eq!(batch.len(), 3);
+        assert_eq!(batch.num_rows(), 3);
         assert!(receiver.recv().await.is_none());
     }
 
@@ -1591,17 +1606,18 @@ mod tests {
             crate::Client::new_for_testing(bq_client, read_client, "test-quota-proj".to_string());
 
         let (schema, mut receiver) = client.query("SELECT col1 FROM tbl").read().await.unwrap();
-        let col_names: Vec<&str> = schema.iter_names().map(|s| s.as_str()).collect();
+        let col_names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
         assert_eq!(col_names, vec!["col1"]);
 
         let mut all_values = Vec::new();
         while let Some(batch) = receiver.recv().await {
             let batch = batch.unwrap();
-            let arr = batch.arrays()[0]
+            let arr = batch
+                .column(0)
                 .as_any()
                 .downcast_ref::<Int64Array>()
                 .unwrap();
-            all_values.extend_from_slice(arr.values().as_slice());
+            all_values.extend_from_slice(arr.values());
         }
         assert_eq!(all_values, vec![0, 1, 2, 3, 4]);
 
@@ -1685,7 +1701,7 @@ mod tests {
             .unwrap();
 
         let batch = receiver.recv().await.unwrap().unwrap();
-        assert_eq!(batch.len(), 3);
+        assert_eq!(batch.num_rows(), 3);
         assert!(receiver.recv().await.is_none());
 
         let rec = recorded.lock().unwrap();
@@ -1964,11 +1980,12 @@ mod tests {
         let mut all_values = Vec::new();
         while let Some(batch) = receiver.recv().await {
             let batch = batch.unwrap();
-            let arr = batch.arrays()[0]
+            let arr = batch
+                .column(0)
                 .as_any()
                 .downcast_ref::<Int64Array>()
                 .unwrap();
-            all_values.extend_from_slice(arr.values().as_slice());
+            all_values.extend_from_slice(arr.values());
         }
         all_values.sort_unstable();
         assert_eq!(all_values, vec![0, 1, 2, 3]);
@@ -2166,11 +2183,12 @@ mod tests {
         let mut all_values = Vec::new();
         while let Some(batch) = receiver.recv().await {
             let batch = batch.unwrap();
-            let arr = batch.arrays()[0]
+            let arr = batch
+                .column(0)
                 .as_any()
                 .downcast_ref::<Int64Array>()
                 .unwrap();
-            all_values.extend_from_slice(arr.values().as_slice());
+            all_values.extend_from_slice(arr.values());
         }
         // Job stream first page [900, 901] was discarded; only [10, 11, 12] from destination table are returned.
         assert_eq!(all_values, vec![10, 11, 12]);
@@ -2285,11 +2303,12 @@ mod tests {
         let mut all_values = Vec::new();
         while let Some(batch) = receiver.recv().await {
             let batch = batch.unwrap();
-            let arr = batch.arrays()[0]
+            let arr = batch
+                .column(0)
                 .as_any()
                 .downcast_ref::<Int64Array>()
                 .unwrap();
-            all_values.extend_from_slice(arr.values().as_slice());
+            all_values.extend_from_slice(arr.values());
         }
         all_values.sort_unstable();
         assert_eq!(all_values, vec![0, 1, 2, 3, 4]);
@@ -2327,11 +2346,12 @@ mod tests {
         let mut all_values = Vec::new();
         while let Some(batch) = receiver.recv().await {
             let batch = batch.unwrap();
-            let arr = batch.arrays()[0]
+            let arr = batch
+                .column(0)
                 .as_any()
                 .downcast_ref::<Int64Array>()
                 .unwrap();
-            all_values.extend_from_slice(arr.values().as_slice());
+            all_values.extend_from_slice(arr.values());
         }
         assert_eq!(all_values, vec![0, 1, 2, 3, 4]);
     }
@@ -2579,7 +2599,7 @@ mod tests {
             .read()
             .await
             .unwrap();
-        assert_eq!(schema.len(), 0);
+        assert_eq!(schema.fields().len(), 0);
         assert!(receiver.recv().await.is_none());
     }
 
@@ -2697,7 +2717,7 @@ mod tests {
             .read()
             .await
             .unwrap();
-        assert_eq!(schema.len(), 0);
+        assert_eq!(schema.fields().len(), 0);
         assert!(receiver.recv().await.is_none());
         assert_eq!(*get_job_calls.lock().unwrap(), 1);
     }
@@ -2834,7 +2854,7 @@ mod tests {
             .read()
             .await
             .unwrap();
-        let col_names: Vec<&str> = schema.iter_names().map(|s| s.as_str()).collect();
+        let col_names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
         assert_eq!(col_names, vec!["col1"]);
         assert!(receiver.recv().await.is_none());
 
