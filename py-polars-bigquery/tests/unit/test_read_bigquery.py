@@ -125,6 +125,99 @@ def test_client_read_query_propagates_errors(mock_arrow_client):
         client.read_query(query="SELECT 1")
 
 
+def test_client_scan_query_with_schema_pushes_projection_and_filter(mock_arrow_client):
+    mock_arrow_client.read_query.return_value = MagicMock(name="arrow_stream")
+    source_frame = pl.LazyFrame({"visible": ["a", "b"], "hidden": [5, 15]})
+
+    with patch("polars.scan_arrow_c_stream", return_value=source_frame):
+        client = Client(quota_project_id="q")
+        lf = client.scan_query(
+            "SELECT visible, hidden, unused FROM `p.d.t`",
+            schema={
+                "visible": pl.String(),
+                "hidden": pl.Int64(),
+                "unused": pl.String(),
+            },
+        )
+        result = lf.filter(pl.col("hidden") > 10).select("visible").collect()
+
+    mock_arrow_client.read_query.assert_called_once_with(
+        "SELECT `visible`, `hidden` FROM (SELECT visible, hidden, unused FROM `p.d.t`) "
+        "AS _polars_bigquery_source WHERE (`hidden` > 10)",
+        arrow_buffer_compression="lz4frame",
+        dry_run=False,
+        maintain_order=False,
+        use_query_cache=None,
+    )
+    assert result.to_dict(as_series=False) == {"visible": ["b"]}
+
+
+def test_client_scan_query_without_schema_dry_runs_then_filters_locally(
+    mock_arrow_client,
+):
+    exporter = MagicMock(name="arrow_stream")
+    mock_arrow_client.read_query.side_effect = [
+        pl.DataFrame(
+            {
+                "bigquerySchema": [
+                    '{"fields": [{"name": "visible", "type": "STRING"}, '
+                    '{"name": "hidden", "type": "INTEGER"}]}'
+                ],
+                "statementType": ["SELECT"],
+            }
+        ),
+        exporter,
+    ]
+    source_frame = pl.LazyFrame({"visible": ["a", "b"], "hidden": [5, 15]})
+
+    with patch("polars.scan_arrow_c_stream", return_value=source_frame):
+        client = Client(quota_project_id="q")
+        lf = client.scan_query("SELECT visible, hidden FROM `p.d.t`")
+        result = lf.filter(pl.col("hidden") > 10).select("visible").collect()
+
+    assert mock_arrow_client.read_query.call_args_list[0].args == (
+        "SELECT visible, hidden FROM `p.d.t`",
+    )
+    assert mock_arrow_client.read_query.call_args_list[0].kwargs == {
+        "arrow_buffer_compression": "lz4frame",
+        "dry_run": True,
+        "maintain_order": False,
+        "use_query_cache": None,
+    }
+    assert mock_arrow_client.read_query.call_args_list[1].args == (
+        "SELECT visible, hidden FROM `p.d.t`",
+    )
+    assert mock_arrow_client.read_query.call_args_list[1].kwargs == {
+        "arrow_buffer_compression": "lz4frame",
+        "dry_run": False,
+        "maintain_order": False,
+        "use_query_cache": None,
+    }
+    assert result.to_dict(as_series=False) == {"visible": ["b"]}
+
+
+def test_client_scan_query_with_schema_handles_empty_results(mock_arrow_client):
+    mock_arrow_client.read_query.return_value = MagicMock(name="arrow_stream")
+    source_frame = pl.LazyFrame(schema={"value": pl.Int64})
+
+    with patch("polars.scan_arrow_c_stream", return_value=source_frame):
+        client = Client(quota_project_id="q")
+        result = client.scan_query(
+            "SELECT value FROM `p.d.t`", schema={"value": pl.Int64}
+        ).collect()
+
+    assert result.schema == pl.Schema({"value": pl.Int64})
+    assert result.is_empty()
+
+
+def test_client_scan_query_propagates_dry_run_errors(mock_arrow_client):
+    mock_arrow_client.read_query.side_effect = RuntimeError("invalid query")
+    client = Client(quota_project_id="q")
+
+    with pytest.raises(RuntimeError, match="invalid query"):
+        client.scan_query("SELECT broken")
+
+
 def test_client_read_bigquery_handles_bigquery_objects(mock_arrow_client):
     mock_exporter = MagicMock()
     mock_arrow_client.read_table.return_value = mock_exporter

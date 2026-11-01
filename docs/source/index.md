@@ -62,6 +62,21 @@ with polars_bigquery.Client(quota_project_id="my-gcp-project") as client:
     print(df)
 ```
 
+To run a custom GoogleSQL query lazily and stream its result to Parquet, use
+[`Client.scan_query`](api/index.md#polars_bigquery.Client.scan_query). Pass the
+result schema to enable supported projection and predicate pushdown; otherwise
+the schema is discovered with a BigQuery dry run and those operations run in
+Polars:
+
+```python
+with polars_bigquery.Client(quota_project_id="my-gcp-project") as client:
+    lf = client.scan_query(
+        "SELECT customer_id, total FROM `project.dataset.sales`",
+        schema={"customer_id": pl.Int64, "total": pl.Float64},
+    )
+    lf.sink_parquet("sales.parquet", engine="streaming")
+```
+
 Need to run a custom SQL query? Use [`Client.read_query`](api/index.md#polars_bigquery.Client.read_query):
 
 ```python

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from collections.abc import Iterator, Mapping
 from typing import Any
 
@@ -220,6 +221,131 @@ class Client:
             use_query_cache=use_query_cache,
         )
         return pl.DataFrame(arrow_stream_exporter)
+
+    def scan_query(
+        self,
+        query: str,
+        *,
+        schema: pl.Schema | Mapping[str, DataType | DataTypeClass] | None = None,
+        arrow_buffer_compression: str = "lz4frame",
+        maintain_order: bool = False,
+        use_query_cache: bool | None = None,
+    ) -> pl.LazyFrame:
+        """Lazily execute a GoogleSQL SELECT query into a Polars `LazyFrame`.
+
+        When `schema` is provided, supported projections and predicates are
+        pushed into an outer query around the supplied SQL. Without a schema,
+        the query is dry-run during construction to discover its output schema;
+        projections and predicates are then applied locally in Polars.
+
+        Pushdown is disabled when `maintain_order=True` so the original query's
+        ordering is not wrapped in another SELECT.
+
+        The query itself is executed when the returned `LazyFrame` is collected
+        or sunk. Only SELECT queries are supported.
+
+        Parameters
+        ----------
+        query
+            GoogleSQL SELECT query.
+        schema
+            Optional result schema. Providing it enables projection and
+            supported predicate pushdown. When omitted, BigQuery dry-run
+            metadata is used to infer the schema.
+        arrow_buffer_compression
+            Compression codec for Arrow record batch buffers. Defaults to
+            `"lz4frame"`.
+        maintain_order
+            Whether to preserve query result order by using a single stream.
+            Defaults to `False` for parallel reads.
+        use_query_cache
+            Whether BigQuery should use the query cache. Defaults to BigQuery's
+            API behavior.
+
+        Returns
+        -------
+        pl.LazyFrame
+            A lazy query-result scan backed by the BigQuery Storage Read API.
+        """
+        query = query.strip().removesuffix(";").strip()
+        if not query:
+            raise ValueError("query must be a non-empty SELECT statement")
+
+        schema_provided = schema is not None
+        if schema is None:
+            metadata = self.read_query(query, dry_run=True)
+            schema_json = metadata["bigquerySchema"][0]
+            statement_type = metadata["statementType"][0]
+            if statement_type not in (None, "SELECT"):
+                raise ValueError("scan_query only supports SELECT statements")
+            if schema_json is None:
+                raise ValueError(
+                    "BigQuery dry run did not return a result schema; pass schema explicitly"
+                )
+            schema = polars_bigquery.core.schema.extract_polars_schema(
+                {"schema": json.loads(schema_json)}
+            )
+        elif not isinstance(schema, pl.Schema):
+            schema = pl.Schema(schema)
+
+        polars_schema = schema
+
+        def source_generator(
+            with_columns: list[str] | None,
+            predicate: pl.Expr | None,
+            n_rows: int | None,
+            batch_size: int | None,
+        ) -> Iterator[pl.DataFrame]:
+            output_columns = (
+                with_columns if with_columns is not None else list(polars_schema.keys())
+            )
+
+            query_columns = list(output_columns)
+            row_restriction = ""
+            if schema_provided and not maintain_order:
+                if predicate is not None:
+                    predicate_columns = predicate.meta.root_names()
+                    query_columns = list(
+                        dict.fromkeys([*query_columns, *predicate_columns])
+                    )
+                    row_restriction = compiler.predicate_to_row_restriction(predicate)
+
+            # With an inferred schema, deliberately read the complete query
+            # result and let the Polars plan evaluate projections and filters.
+            # With a caller-provided schema, wrap the SQL so translated
+            # operations are applied by BigQuery. The local operations remain
+            # in place as a correctness safeguard and for unsupported filters.
+            if schema_provided and not maintain_order:
+                selections = ", ".join(
+                    f"`{column.replace('`', '``')}`" for column in query_columns
+                )
+                wrapped_query = (
+                    f"SELECT {selections} FROM ({query}) AS _polars_bigquery_source"
+                )
+                if row_restriction:
+                    wrapped_query += f" WHERE {row_restriction}"
+            else:
+                wrapped_query = query
+
+            arrow_stream_exporter = self._arrow_client.read_query(
+                wrapped_query,
+                arrow_buffer_compression=arrow_buffer_compression,
+                dry_run=False,
+                maintain_order=maintain_order,
+                use_query_cache=use_query_cache,
+            )
+            lazyframe = pl.scan_arrow_c_stream(arrow_stream_exporter)
+            if predicate is not None:
+                lazyframe = lazyframe.filter(predicate)
+            lazyframe = lazyframe.select(output_columns)
+            if n_rows is not None:
+                lazyframe = lazyframe.limit(n_rows)
+            yield from lazyframe.collect_batches(chunk_size=batch_size)
+
+        return polars.io.plugins.register_io_source(
+            io_source=source_generator,
+            schema=polars_schema,
+        )
 
     def scan_table(
         self,
