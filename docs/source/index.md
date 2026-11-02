@@ -78,10 +78,14 @@ with polars_bigquery.Client(quota_project_id="my-gcp-project") as client:
     )
 ```
 
+For query results that are larger than memory or over 10 GB, see [Scanning large query results](guides/large-query-results.md).
+
 ## Documentation
 
 - **[Python API Reference (`polars_bigquery`)](api/index.md)**: Full reference for [`Client`](api/index.md#polars_bigquery.Client), its methods, and [`BigQueryError`](api/index.md#polars_bigquery.exceptions.BigQueryError).
 - **[Row Predicate Pushdown](api/predicate-pushdown.md)**: Complete list of Polars expressions and data types supported for server-side filtering in [`Client.scan_table`](api/index.md#polars_bigquery.Client.scan_table).
+
+- **[Scanning Large Query Results](guides/large-query-results.md)**: Lazily scan query results that are larger than memory or over 10 GB with [`Client.scan_table`](api/index.md#polars_bigquery.Client.scan_table).
 
 ## Development
 

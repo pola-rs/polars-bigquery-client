@@ -162,6 +162,9 @@ class Client:
         `JOB_CREATION_OPTIONAL` and streams the Arrow results via the BigQuery
         Storage Read API.
 
+        The whole result is read into memory. To process larger results lazily,
+        see [Scanning large query results](../guides/large-query-results.md).
+
         Parameters
         ----------
         query

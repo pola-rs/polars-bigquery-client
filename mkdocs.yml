@@ -11,6 +11,8 @@ docs_dir: docs/source
 # Documentation layout
 nav:
   - Home: index.md
+  - Guides:
+    - Scanning large query results: guides/large-query-results.md
   - API reference:
     - api/index.md
     - Row predicate pushdown: api/predicate-pushdown.md
