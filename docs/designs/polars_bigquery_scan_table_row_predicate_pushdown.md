@@ -9,7 +9,7 @@
 
 ## Overview
 
-This document is a sub-project of the overall go/polars-bigquery-design . The goal of this document is to expand on the work done in [Milestone 6: LazyFrame predicate pushdown](?tab=t.0#bookmark=id.cqjwmia3pssa) to support more Polars expressions and eventually even BigQuery APIs that aren't yet supported in Polars.
+The goal of this document is to expand on the work done in [PR #35 -- add `scan_table` support](https://github.com/pola-rs/polars-bigquery-client/pull/35) to support more Polars expressions and eventually even BigQuery APIs that aren't yet supported in Polars.
 
 
 ## Background
