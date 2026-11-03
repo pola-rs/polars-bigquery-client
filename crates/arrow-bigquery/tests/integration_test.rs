@@ -145,6 +145,48 @@ async fn test_read_query() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn test_read_completed_large_results_query() {
+    let client = setup_client().await;
+
+    let base_sql = "SELECT id, CONCAT(TO_HEX(SHA256(CONCAT('a:', CAST(id AS STRING)))), TO_HEX(SHA256(CONCAT('b:', CAST(id AS STRING))))) AS payload FROM UNNEST(GENERATE_ARRAY(1, 50000)) AS id";
+
+    let (unordered_schema, unordered_receiver) = client
+        .query(base_sql)
+        .with_maintain_order(false)
+        .with_use_query_cache(false)
+        .read()
+        .await
+        .expect("unordered completed LARGE_RESULTS query should succeed");
+
+    let unordered_cols: Vec<&str> = unordered_schema.iter_names().map(|s| s.as_str()).collect();
+    assert_eq!(unordered_cols, vec!["id", "payload"]);
+    assert_eq!(consume_receiver(unordered_receiver).await, 50_000);
+
+    let ordered_sql = format!("{base_sql} ORDER BY id ASC");
+    let (ordered_schema, mut ordered_receiver) = client
+        .query(ordered_sql)
+        .with_use_query_cache(false)
+        .read()
+        .await
+        .expect("ordered completed LARGE_RESULTS query should succeed");
+
+    let ordered_cols: Vec<&str> = ordered_schema.iter_names().map(|s| s.as_str()).collect();
+    assert_eq!(ordered_cols, vec!["id", "payload"]);
+
+    let mut ids = Vec::with_capacity(50_000);
+    while let Some(batch) = ordered_receiver.recv().await {
+        let batch = batch.expect("should receive valid ordered record batch");
+        let id_arr = batch.arrays()[0]
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("id column should be Int64Array");
+        ids.extend_from_slice(id_arr.values().as_slice());
+    }
+    let expected_ids: Vec<i64> = (1..=50_000).collect();
+    assert_eq!(ids, expected_ids);
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn test_read_long_running_query() {
     let client = setup_client().await;
 
