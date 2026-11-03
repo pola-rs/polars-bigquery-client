@@ -95,6 +95,52 @@ fn bq_to_gapic_compression_codec(
     }
 }
 
+/// Deferred specification for reading a completed query job's temporary
+/// destination table via a parallel multi-stream `ReadSession`.
+///
+/// Shared by both destination-table read paths:
+/// 1. Upfront in [`Query::read`] (via [`Self::read`]) when `jobs.query` has
+///    already finished with `total_rows >= MULTI_STREAM_THRESHOLD_ROWS`.
+/// 2. Mid-flight in [`crate::Client::switch_to_read_session`] (via
+///    [`Self::resolve`]) when a query that started on `streams/_default`
+///    (either an incomplete `job_complete == Some(false)` job or a completed
+///    zero-first-page `LARGE_RESULTS` job) yields a first batch whose
+///    estimated remaining payload is `>= MULTI_STREAM_THRESHOLD_BYTES`.
+pub(crate) struct DestinationTableRead {
+    project_id: String,
+    job_id: String,
+    location: String,
+    read_options: crate::ReadOptions,
+}
+
+impl DestinationTableRead {
+    /// Fetches `configuration.query.destination_table` for the completed job
+    /// via `jobs.get` and returns it alongside the configured
+    /// [`crate::ReadOptions`].
+    pub(crate) async fn resolve(
+        self,
+        client: &crate::Client,
+    ) -> Result<(crate::BigQueryTableId, crate::ReadOptions), BigQueryError> {
+        let job = fetch_job(client, &self.project_id, &self.job_id, Some(&self.location)).await?;
+        let destination_table = extract_destination_table(job.configuration)?.ok_or_else(|| {
+            BigQueryError::Protocol(
+                "Job response is missing configuration.query.destination_table".into(),
+            )
+        })?;
+        Ok((destination_table, self.read_options))
+    }
+
+    /// Resolves the job's destination table and opens a parallel multi-stream
+    /// reader via [`crate::Client::read_table`].
+    pub(crate) async fn read(
+        self,
+        client: &crate::Client,
+    ) -> Result<(ArrowSchemaRef, BigQueryRecordBatchReceiver), BigQueryError> {
+        let (destination_table, read_options) = self.resolve(client).await?;
+        client.read_table(&destination_table, read_options).await
+    }
+}
+
 #[derive(Debug)]
 pub struct Query<'a> {
     client: &'a crate::Client,
@@ -173,30 +219,37 @@ impl<'a> Query<'a> {
         )
     }
 
-    /// Skips the single `streams/_default` job stream and reads the query's
-    /// temporary destination table across parallel `ReadSession` streams via
-    /// `jobs.get` + `CreateReadSession`.
+    /// Returns `true` when this query response is eligible for a parallel
+    /// multi-stream `ReadSession` on its temporary destination table (unordered
+    /// and not a `SCRIPT` parent job, which omits `destination_table`).
+    fn can_read_destination_table(&self, response: &QueryResponse) -> bool {
+        !self.maintain_order && response.statement_type != "SCRIPT"
+    }
+
+    /// Builds the [`DestinationTableRead`] specification for reading this query
+    /// job's temporary destination table via a multi-stream `ReadSession`.
     ///
-    /// Used when an unordered non-`SCRIPT` query completes within `jobs.query`
-    /// and reports `total_rows >= MULTI_STREAM_THRESHOLD_ROWS`, avoiding the
-    /// extra `streams/_default` probe round-trip.
-    async fn read_destination_table(
+    /// Used both upfront in [`Self::read`] when `jobs.query` already finished
+    /// above `MULTI_STREAM_THRESHOLD_ROWS`, and deferred in
+    /// [`Self::read_job_stream_or_table`] so [`crate::Client::switch_to_read_session`]
+    /// can execute the identical destination-table read mid-flight once
+    /// `streams/_default` delivers its first batch above
+    /// `MULTI_STREAM_THRESHOLD_BYTES`.
+    fn destination_table_read(
         &self,
         response: &QueryResponse,
-    ) -> Result<(ArrowSchemaRef, BigQueryRecordBatchReceiver), BigQueryError> {
+    ) -> Result<DestinationTableRead, BigQueryError> {
         let (project_id, job_id, location) = extract_required_job_reference(response)?;
-        let destination_table =
-            get_destination_table(self.client, project_id, job_id, location).await?;
-        self.client
-            .read_table(
-                &destination_table,
-                crate::ReadOptions {
-                    maintain_order: false,
-                    arrow_buffer_compression: Some(self.arrow_buffer_compression()),
-                    ..Default::default()
-                },
-            )
-            .await
+        Ok(DestinationTableRead {
+            project_id: project_id.to_string(),
+            job_id: job_id.to_string(),
+            location: location.to_string(),
+            read_options: crate::ReadOptions {
+                maintain_order: false,
+                arrow_buffer_compression: Some(self.arrow_buffer_compression()),
+                ..Default::default()
+            },
+        })
     }
 
     /// Reads query results starting at `offset = 0` from the job's single
@@ -219,12 +272,13 @@ impl<'a> Query<'a> {
     ///   `ArrowSchema` lazily from the first non-heartbeat `ReadRowsResponse`
     ///   frame on `streams/_default`.
     /// - For unordered non-`SCRIPT` queries, attaches a [`FirstPageCheck`](crate::bigquery_read_stream::FirstPageCheck)
-    ///   so that if estimated remaining compressed bytes on `streams/_default`
-    ///   are `>= MULTI_STREAM_THRESHOLD_BYTES` (250 MiB), the stream task
-    ///   returns the extracted schema immediately, discards the first stream
-    ///   page, and switches asynchronously to a multi-stream `ReadSession` on
-    ///   the destination table (`SCRIPT` parent jobs omit `destination_table`
-    ///   and therefore stay on `streams/_default`).
+    ///   and [`DestinationTableRead`] so that if estimated remaining compressed
+    ///   bytes on `streams/_default` are `>= MULTI_STREAM_THRESHOLD_BYTES`
+    ///   (250 MiB), the stream task returns the extracted schema immediately,
+    ///   discards the first stream page, and switches asynchronously to a
+    ///   multi-stream `ReadSession` on the destination table (`SCRIPT` parent
+    ///   jobs omit `destination_table` and therefore stay on
+    ///   `streams/_default`).
     /// - If `streams/_default` reaches EOF without sending a schema, delegates
     ///   to [`Self::resolve_empty_job_stream`] to recover job metadata/schema.
     /// - If `streams/_default` fails before yielding a schema, delegates to
@@ -235,23 +289,13 @@ impl<'a> Query<'a> {
         stream_name: String,
         serialized_schema: Option<bytes::Bytes>,
     ) -> Result<(ArrowSchemaRef, BigQueryRecordBatchReceiver), BigQueryError> {
-        let first_page_check = if !self.maintain_order && response.statement_type != "SCRIPT" {
-            let (project_id, job_id, location) = extract_required_job_reference(response)?;
+        let first_page_check = if self.can_read_destination_table(response) {
             Some((
                 crate::bigquery_read_stream::FirstPageCheck {
                     threshold_bytes: MULTI_STREAM_THRESHOLD_BYTES,
                     fallback_total_rows: response.total_rows,
                 },
-                crate::FallbackReadSession {
-                    project_id: project_id.to_string(),
-                    job_id: job_id.to_string(),
-                    location: location.to_string(),
-                    read_options: crate::ReadOptions {
-                        maintain_order: false,
-                        arrow_buffer_compression: Some(self.arrow_buffer_compression()),
-                        ..Default::default()
-                    },
-                },
+                self.destination_table_read(response)?,
             ))
         } else {
             None
@@ -297,7 +341,7 @@ impl<'a> Query<'a> {
     ///   the Arrow schema lazily from the stream.
     /// - **Large unordered non-`SCRIPT` job (`total_rows >= MULTI_STREAM_THRESHOLD_ROWS`)**:
     ///   Skips `streams/_default` and opens a multi-stream `ReadSession` on the
-    ///   destination table via `Self::read_destination_table`.
+    ///   destination table via `Self::destination_table_read`.
     /// - **Inline batch present (`(Some(first_page_bytes), _)`)**: Parses the
     ///   required inline `arrowSchema` immediately, decodes the inline batch
     ///   off the async runtime, and optionally tails remaining rows from
@@ -366,13 +410,15 @@ impl<'a> Query<'a> {
         let first_page_bytes =
             crate::decode::validate_non_empty_arrow_bytes(raw_first_page, response.page_row_count)?;
 
-        if !self.maintain_order
-            && response.statement_type != "SCRIPT"
+        if self.can_read_destination_table(&response)
             && response
                 .total_rows
                 .is_some_and(|total_rows| total_rows >= MULTI_STREAM_THRESHOLD_ROWS)
         {
-            return self.read_destination_table(&response).await;
+            return self
+                .destination_table_read(&response)?
+                .read(self.client)
+                .await;
         }
 
         let has_remaining_rows = response
@@ -587,20 +633,6 @@ fn extract_destination_table(
         destination_table.dataset_id,
         destination_table.table_id,
     )))
-}
-
-pub(crate) async fn get_destination_table(
-    client: &crate::Client,
-    project_id: &str,
-    job_id: &str,
-    location: &str,
-) -> Result<crate::BigQueryTableId, BigQueryError> {
-    let job = fetch_job(client, project_id, job_id, Some(location)).await?;
-    extract_destination_table(job.configuration)?.ok_or_else(|| {
-        BigQueryError::Protocol(
-            "Job response is missing configuration.query.destination_table".into(),
-        )
-    })
 }
 
 fn job_failed_from_gax_status(status: &google_cloud_gax::error::rpc::Status) -> JobFailedError {
