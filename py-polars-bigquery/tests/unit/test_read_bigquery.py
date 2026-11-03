@@ -82,7 +82,7 @@ def test_client_read_query(mock_arrow_client):
             "SELECT 1",
             arrow_buffer_compression="lz4frame",
             dry_run=False,
-            maintain_order=False,
+            maintain_order=True,
             use_query_cache=None,
         )
         mock_df_cls.assert_called_once_with(mock_exporter)
@@ -102,7 +102,7 @@ def test_client_read_query_passes_additional_parameters(mock_arrow_client):
             query="SELECT 1",
             arrow_buffer_compression="zstd",
             dry_run=True,
-            maintain_order=True,
+            maintain_order=False,
             use_query_cache=False,
         )
 
@@ -110,7 +110,7 @@ def test_client_read_query_passes_additional_parameters(mock_arrow_client):
             "SELECT 1",
             arrow_buffer_compression="zstd",
             dry_run=True,
-            maintain_order=True,
+            maintain_order=False,
             use_query_cache=False,
         )
         mock_df_cls.assert_called_once_with(mock_exporter)

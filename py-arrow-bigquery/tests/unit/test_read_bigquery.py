@@ -215,6 +215,16 @@ def test_client_read_bigquery_propagates_errors(mock_rust_client):
         client.read_table(table=BigQueryTableId("p", "d", "t"))
 
 
+def test_native_client_default_maintain_order_signatures():
+    import inspect
+
+    read_table_sig = inspect.signature(_native.Client.read_table)
+    assert read_table_sig.parameters["maintain_order"].default is False
+
+    read_query_sig = inspect.signature(_native.Client.read_query)
+    assert read_query_sig.parameters["maintain_order"].default is True
+
+
 def test_client_read_query_calls_rust(mock_rust_client):
     placeholder = object()
     mock_rust_client.read_query.return_value = placeholder
@@ -226,7 +236,7 @@ def test_client_read_query_calls_rust(mock_rust_client):
         "SELECT 1",
         arrow_buffer_compression="lz4frame",
         dry_run=False,
-        maintain_order=False,
+        maintain_order=True,
         use_query_cache=None,
     )
     assert result is placeholder
@@ -241,7 +251,7 @@ def test_client_read_query_passes_additional_parameters(mock_rust_client):
         "SELECT 1",
         arrow_buffer_compression="zstd",
         dry_run=True,
-        maintain_order=True,
+        maintain_order=False,
         use_query_cache=False,
     )
 
@@ -249,7 +259,7 @@ def test_client_read_query_passes_additional_parameters(mock_rust_client):
         "SELECT 1",
         arrow_buffer_compression="zstd",
         dry_run=True,
-        maintain_order=True,
+        maintain_order=False,
         use_query_cache=False,
     )
     assert result is placeholder

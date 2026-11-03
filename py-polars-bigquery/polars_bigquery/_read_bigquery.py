@@ -153,7 +153,7 @@ class Client:
         *,
         arrow_buffer_compression: str = "lz4frame",
         dry_run: bool = False,
-        maintain_order: bool = False,
+        maintain_order: bool = True,
         use_query_cache: bool | None = None,
     ) -> pl.DataFrame:
         """Execute a GoogleSQL query and read the result into a Polars `DataFrame`.
@@ -181,8 +181,8 @@ class Client:
         maintain_order
             Whether to preserve the row order produced by an `ORDER BY` clause
             by reading from a single Storage Read API stream. Defaults to
-            `False`, which switches to parallel multi-stream reads for large
-            result sets.
+            `True`. Set to `False` to switch to parallel multi-stream reads for
+            large result sets when row order does not matter.
         use_query_cache
             Whether to look for the result in the query cache. If `None`, the
             BigQuery API default (`True`) is used.
@@ -208,8 +208,7 @@ class Client:
             GROUP BY name
             ORDER BY total_born DESC
             LIMIT 100
-            \"\"\",
-            maintain_order=True,
+            \"\"\"
         )
         ```
         """

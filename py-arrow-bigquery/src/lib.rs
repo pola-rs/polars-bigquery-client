@@ -117,7 +117,7 @@ impl Client {
         *,
         arrow_buffer_compression="lz4frame",
         dry_run=false,
-        maintain_order=false,
+        maintain_order=true,
         use_query_cache=None
     ))]
     pub fn read_query(

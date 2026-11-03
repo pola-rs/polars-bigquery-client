@@ -22,7 +22,6 @@ def test_read_bigquery_public_data_ordered(client):
         ORDER BY total_born DESC
         LIMIT 100
         """,
-        maintain_order=True,
     )
     assert isinstance(df, pl.DataFrame)
     # Make sure we got all of the expected data, not just a subset.
@@ -81,7 +80,7 @@ def test_read_bigquery_large_results(client):
         ) AS payload
     FROM UNNEST(GENERATE_ARRAY(1, 50000)) AS id
     """
-    df = client.read_query(sql, use_query_cache=False)
+    df = client.read_query(sql, maintain_order=False, use_query_cache=False)
     assert isinstance(df, pl.DataFrame)
     assert df.height == 50_000
     assert df.schema == pl.Schema({"id": pl.Int64, "payload": pl.String})
