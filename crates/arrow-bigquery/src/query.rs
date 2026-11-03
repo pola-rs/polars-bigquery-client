@@ -305,11 +305,11 @@ impl<'a> Query<'a> {
             .read_stream_with_first_page_check(
                 stream_name,
                 StreamOptions {
+                    maintain_order: self.maintain_order,
                     offset: 0,
                     schema: serialized_schema,
                     arrow_buffer_compression: Some(self.arrow_buffer_compression()),
                 },
-                self.maintain_order,
                 first_page_check,
             )
             .await;

@@ -176,6 +176,7 @@ impl ReadOptions {
 
 #[derive(Clone, Debug, Default)]
 pub struct StreamOptions {
+    pub maintain_order: bool,
     pub offset: i64,
     /// Optional IPC-serialized Arrow schema bytes.
     ///
@@ -499,13 +500,15 @@ impl Client {
         ))
     }
 
+    /// Reads a single BigQuery Storage Read API stream using the provided
+    /// [`StreamOptions`].
     pub async fn read_stream(
         &self,
         stream: impl Into<String>,
         options: StreamOptions,
     ) -> Result<(ArrowSchemaRef, BigQueryRecordBatchReceiver), BigQueryError> {
         let (schema_ref, receiver) = self
-            .read_stream_with_first_page_check(stream.into(), options, true, None)
+            .read_stream_with_first_page_check(stream.into(), options, None)
             .await?;
         let schema_ref = schema_ref.ok_or_else(|| {
             BigQueryError::Protocol("ReadRows stream closed without sending an Arrow schema".into())
@@ -551,7 +554,6 @@ impl Client {
         &self,
         stream: String,
         options: StreamOptions,
-        maintain_order: bool,
         first_page_check: Option<(
             bigquery_read_stream::FirstPageCheck,
             query::DestinationTableRead,
@@ -573,8 +575,9 @@ impl Client {
         let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
         let cancel_tx = Arc::new(cancel_tx);
         let retry_config = self.stream_retry_config();
-        let read_rows =
-            self.prepare_read_rows(stream, options.offset, options.arrow_buffer_compression);
+        let maintain_order = options.maintain_order;
+        let offset = options.offset;
+        let read_rows = self.prepare_read_rows(stream, offset, options.arrow_buffer_compression);
         let (check, fallback) = match first_page_check {
             Some((check, destination_table_read)) => {
                 (Some(check), Some((self.clone(), destination_table_read)))
@@ -582,7 +585,6 @@ impl Client {
             None => (None, None),
         };
         let task_cancel_tx = Arc::clone(&cancel_tx);
-        let offset = options.offset;
         let handle = tokio::task::spawn(async move {
             let reason =
                 bigquery_read_stream::read_stream(bigquery_read_stream::ReadStreamOptions {
@@ -1208,9 +1210,12 @@ pub(crate) mod tests {
             client_builder::default_retry_throttler(),
         );
 
+        let default_options = StreamOptions::default();
+        assert!(!default_options.maintain_order);
+
         let stream_name = "projects/p/locations/us/sessions/s/streams/0";
         let (schema, mut rx) = client
-            .read_stream(stream_name, StreamOptions::default())
+            .read_stream(stream_name, default_options)
             .await
             .unwrap();
 
@@ -1218,10 +1223,11 @@ pub(crate) mod tests {
         assert_eq!(col_names, vec!["col1"]);
 
         let batch1 = rx.recv().await.unwrap().unwrap();
-        assert_eq!(batch1.len(), 3);
         let batch2 = rx.recv().await.unwrap().unwrap();
-        assert_eq!(batch2.len(), 2);
         assert!(rx.recv().await.is_none());
+        let mut batch_lens = [batch1.len(), batch2.len()];
+        batch_lens.sort_unstable();
+        assert_eq!(batch_lens, [2, 3]);
 
         let rec = recorded.lock().unwrap();
         assert_eq!(rec.stream_name.as_deref(), Some(stream_name));
@@ -1236,7 +1242,8 @@ pub(crate) mod tests {
         use google_cloud_bigquery::client::Read;
 
         let (schema_bytes, resp1) = create_test_arrow_payload(4);
-        let (stub, recorded) = CannedReadRowsStub::new(vec![resp1]);
+        let (_, resp2) = create_test_arrow_payload(1);
+        let (stub, recorded) = CannedReadRowsStub::new(vec![resp1, resp2]);
         let client = Client::new_for_testing(
             test_bq_client().await,
             Read::from_stub(stub),
@@ -1247,6 +1254,7 @@ pub(crate) mod tests {
             .read_stream(
                 "streams/s1",
                 StreamOptions {
+                    maintain_order: true,
                     offset: 42,
                     schema: Some(bytes::Bytes::from(schema_bytes)),
                     arrow_buffer_compression: Some(
@@ -1260,8 +1268,10 @@ pub(crate) mod tests {
         let col_names: Vec<&str> = schema.iter_names().map(|s| s.as_str()).collect();
         assert_eq!(col_names, vec!["col1"]);
 
-        let batch = rx.recv().await.unwrap().unwrap();
-        assert_eq!(batch.len(), 4);
+        let batch1 = rx.recv().await.unwrap().unwrap();
+        assert_eq!(batch1.len(), 4);
+        let batch2 = rx.recv().await.unwrap().unwrap();
+        assert_eq!(batch2.len(), 1);
         assert!(rx.recv().await.is_none());
         let rec = recorded.lock().unwrap();
         assert_eq!(rec.offset, Some(42));
@@ -1373,9 +1383,8 @@ pub(crate) mod tests {
             .read_stream(
                 "streams/s1",
                 StreamOptions {
-                    offset: 0,
                     schema: Some(bytes::Bytes::new()),
-                    arrow_buffer_compression: None,
+                    ..Default::default()
                 },
             )
             .await
@@ -1390,9 +1399,8 @@ pub(crate) mod tests {
             .read_stream(
                 "streams/s1",
                 StreamOptions {
-                    offset: 0,
                     schema: Some(bytes::Bytes::from(schema_bytes)),
-                    arrow_buffer_compression: None,
+                    ..Default::default()
                 },
             )
             .await
