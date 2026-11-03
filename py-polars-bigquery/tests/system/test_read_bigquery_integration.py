@@ -71,7 +71,7 @@ def test_read_bigquery_dry_run(client):
 
 
 def test_read_bigquery_large_results(client):
-    """Verify completed >1 MB compressed LARGE_RESULTS queries resolve schema via Storage Read API."""
+    """Verify completed >1 MB compressed LARGE_RESULTS queries stream all rows end-to-end."""
     sql = """
     SELECT
         id,

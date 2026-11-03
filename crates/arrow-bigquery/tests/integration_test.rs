@@ -145,9 +145,10 @@ async fn test_read_query() {
 }
 
 /// Verifies that queries finishing within `jobs.query` whose output exceeds
-/// BigQuery's ~1 MB compressed inline response limit (`LARGE_RESULTS`, no
-/// inline `arrowSchema`) resolve the Arrow schema from `streams/_default` and
-/// return all rows across both unordered and ordered reads.
+/// BigQuery's ~1 MB compressed inline response limit (`LARGE_RESULTS`, where
+/// narrow rows may include an inline first page and wide rows omit inline
+/// `arrowSchema` in favor of `streams/_default`) return all rows across both
+/// unordered and ordered reads.
 #[tokio::test(flavor = "multi_thread")]
 async fn test_read_completed_large_results_query() {
     let client = setup_client().await;
