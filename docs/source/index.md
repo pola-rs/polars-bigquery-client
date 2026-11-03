@@ -73,8 +73,7 @@ with polars_bigquery.Client(quota_project_id="my-gcp-project") as client:
         GROUP BY name
         ORDER BY total_born DESC
         LIMIT 10
-        """,
-        maintain_order=True,
+        """
     )
 ```
 

@@ -80,7 +80,7 @@ class Client:
         *,
         arrow_buffer_compression: str = "lz4frame",
         dry_run: bool = False,
-        maintain_order: bool = False,
+        maintain_order: bool = True,
         use_query_cache: bool | None = None,
     ) -> arrow_bigquery._native.ArrowStreamExporter:
         return self._client.read_query(
