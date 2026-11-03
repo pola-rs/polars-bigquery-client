@@ -173,6 +173,13 @@ impl<'a> Query<'a> {
         )
     }
 
+    /// Skips the single `streams/_default` job stream and reads the query's
+    /// temporary destination table across parallel `ReadSession` streams via
+    /// `jobs.get` + `CreateReadSession`.
+    ///
+    /// Used when an unordered non-`SCRIPT` query completes within `jobs.query`
+    /// and reports `total_rows >= MULTI_STREAM_THRESHOLD_ROWS`, avoiding the
+    /// extra `streams/_default` probe round-trip.
     async fn read_destination_table(
         &self,
         response: &QueryResponse,
@@ -192,6 +199,36 @@ impl<'a> Query<'a> {
             .await
     }
 
+    /// Reads query results starting at `offset = 0` from the job's single
+    /// Storage Read API stream (`streams/_default`), optionally cutting over to
+    /// a parallel destination-table `ReadSession` if the first batch indicates
+    /// a large payload.
+    ///
+    /// This unifies the two query paths that have zero inline rows in
+    /// `QueryResponse`:
+    /// 1. Incomplete jobs (`job_complete == Some(false)`), where `jobs.query`
+    ///    timed out waiting and `streams/_default` blocks until the job
+    ///    produces its schema and rows (or closes/fails).
+    /// 2. Completed zero-first-page responses with remaining rows (such as
+    ///    `jobCreationReason = LARGE_RESULTS`), where `jobs.query` finished
+    ///    within `timeoutMs` and omitted inline rows (and typically omitted
+    ///    inline `arrowSchema`).
+    ///
+    /// Behavior:
+    /// - Uses `serialized_schema` upfront if present, or extracts the
+    ///   `ArrowSchema` lazily from the first non-heartbeat `ReadRowsResponse`
+    ///   frame on `streams/_default`.
+    /// - For unordered non-`SCRIPT` queries, attaches a [`FirstPageCheck`](crate::bigquery_read_stream::FirstPageCheck)
+    ///   so that if estimated remaining compressed bytes on `streams/_default`
+    ///   are `>= MULTI_STREAM_THRESHOLD_BYTES` (250 MiB), the stream task
+    ///   returns the extracted schema immediately, discards the first stream
+    ///   page, and switches asynchronously to a multi-stream `ReadSession` on
+    ///   the destination table (`SCRIPT` parent jobs omit `destination_table`
+    ///   and therefore stay on `streams/_default`).
+    /// - If `streams/_default` reaches EOF without sending a schema, delegates
+    ///   to [`Self::resolve_empty_job_stream`] to recover job metadata/schema.
+    /// - If `streams/_default` fails before yielding a schema, delegates to
+    ///   [`Self::resolve_job_error`] to surface underlying job failures.
     async fn read_job_stream_or_table(
         &self,
         response: &QueryResponse,
@@ -251,6 +288,30 @@ impl<'a> Query<'a> {
         query_response_to_record_batch(&response)
     }
 
+    /// Executes the query via `jobs.query` (`JOB_CREATION_OPTIONAL`, `ARROW`
+    /// format) and routes the response to the appropriate schema and batch
+    /// reader:
+    ///
+    /// - **Incomplete job (`job_complete == Some(false)`)**: Streams from
+    ///   `streams/_default` via `Self::read_job_stream_or_table`, extracting
+    ///   the Arrow schema lazily from the stream.
+    /// - **Large unordered non-`SCRIPT` job (`total_rows >= MULTI_STREAM_THRESHOLD_ROWS`)**:
+    ///   Skips `streams/_default` and opens a multi-stream `ReadSession` on the
+    ///   destination table via `Self::read_destination_table`.
+    /// - **Inline batch present (`(Some(first_page_bytes), _)`)**: Parses the
+    ///   required inline `arrowSchema` immediately, decodes the inline batch
+    ///   off the async runtime, and optionally tails remaining rows from
+    ///   `streams/_default` at `offset = page_row_count`.
+    /// - **No inline batch, remaining stream (`(None, Some(stream_name))`)**:
+    ///   Handles completed `LARGE_RESULTS` jobs by streaming from
+    ///   `streams/_default` at `offset = 0` via `Self::read_job_stream_or_table`,
+    ///   resolving the Arrow schema lazily when omitted inline.
+    /// - **Empty result (`(None, None)`)**: Returns the parsed inline
+    ///   `arrowSchema` when present (e.g. stateless `SELECT ... LIMIT 0`);
+    ///   otherwise requires a complete `job_reference`, returning a 0-column
+    ///   schema with zero extra RPCs for non-`SELECT` statements or delegating
+    ///   to `Self::resolve_empty_job_stream` for `"SELECT"` / unspecified
+    ///   statement types.
     pub async fn read(
         &self,
     ) -> Result<(ArrowSchemaRef, BigQueryRecordBatchReceiver), BigQueryError> {
@@ -369,6 +430,15 @@ impl<'a> Query<'a> {
         }
     }
 
+    /// Recovers the result schema (or surfaces a job error) when a job-backed
+    /// query produces zero rows and no Arrow schema was received inline or on
+    /// `streams/_default`.
+    ///
+    /// Inspects `jobs.get` to return [`BigQueryError::JobFailed`] if the job
+    /// failed, returns a 0-column `ArrowSchema` for DDL or non-`SELECT`
+    /// statements, and otherwise opens a single-stream (`max_stream_count = 1`)
+    /// `CreateReadSession` on the job's destination table to fetch the typed
+    /// `ArrowSchema` for an empty `SELECT` result.
     async fn resolve_empty_job_stream(
         &self,
         response: &QueryResponse,
@@ -414,6 +484,12 @@ impl<'a> Query<'a> {
         Ok((Arc::new(metadata.schema), empty_receiver()))
     }
 
+    /// Translates pre-schema `ReadRows` gRPC errors on `streams/_default` into
+    /// [`BigQueryError::JobFailed`] when the underlying BigQuery job failed.
+    ///
+    /// Non-gRPC errors (such as local Arrow IPC schema parse errors or stream
+    /// protocol errors) are returned immediately without issuing a `jobs.get`
+    /// REST call.
     async fn resolve_job_error(
         &self,
         response: &QueryResponse,
@@ -617,6 +693,14 @@ fn extract_job_reference(response: &QueryResponse) -> (Option<&str>, Option<&str
     (project_id, job_id, location)
 }
 
+/// Extracts a complete `(project_id, job_id, location)` job reference from
+/// `response` (falling back from `job_reference.location` to
+/// `response.location`), or returns [`BigQueryError::Protocol`] if any field is
+/// missing or empty.
+///
+/// Required whenever a `QueryResponse` omits inline data/schema and must be
+/// resolved against a created BigQuery job (via `streams/_default` or
+/// `jobs.get`).
 fn extract_required_job_reference(
     response: &QueryResponse,
 ) -> Result<(&str, &str, &str), BigQueryError> {
@@ -2984,6 +3068,10 @@ mod tests {
         assert!(matches!(err, BigQueryError::JobFailed(_)));
     }
 
+    /// Verifies that a zero-first-page response with an upfront inline
+    /// `arrowSchema` parses that schema immediately without requiring a schema
+    /// frame on `streams/_default`, and surfaces `BigQueryError::Arrow` without
+    /// calling `jobs.get` when inline schema bytes are corrupt.
     #[tokio::test]
     async fn test_read_empty_first_page_with_inline_schema_streams_from_read_rows() {
         use google_cloud_bigquery::client::Read;
@@ -3092,6 +3180,9 @@ mod tests {
         assert!(matches!(err, BigQueryError::Arrow(_)));
     }
 
+    /// Verifies that a `QueryResponse` carrying non-empty inline
+    /// `arrowRecordBatch` bytes without an inline `arrowSchema` fails
+    /// immediately with `BigQueryError::Protocol`.
     #[tokio::test]
     async fn test_read_inline_batch_missing_arrow_schema_error() {
         use google_cloud_bigquery_v2::model::{
@@ -3151,6 +3242,12 @@ mod tests {
         }
     }
 
+    /// Verifies completed zero-row responses without inline `arrowSchema`:
+    /// - `"SELECT"` or `""` with a complete `job_reference` recovers the typed
+    ///   schema via `jobs.get` + single-stream `CreateReadSession`.
+    /// - Non-`SELECT` statements with a complete `job_reference` return a
+    ///   0-column schema with zero extra RPCs (even when `total_rows = Some(0)`).
+    /// - Missing or incomplete `job_reference` returns `BigQueryError::Protocol`.
     #[tokio::test]
     async fn test_read_completed_empty_job_without_inline_schema() {
         use std::sync::Mutex;
@@ -3392,6 +3489,10 @@ mod tests {
         }
     }
 
+    /// Verifies pre-schema termination and error paths on `streams/_default` for
+    /// completed `LARGE_RESULTS` jobs without inline `arrowSchema` (clean EOF
+    /// schema recovery, gRPC error translation to `BigQueryError::JobFailed`,
+    /// and missing-schema `BigQueryError::Protocol` without calling `jobs.get`).
     #[tokio::test]
     async fn test_read_completed_large_results_stream_eof_and_grpc_failure() {
         use std::sync::Mutex;
