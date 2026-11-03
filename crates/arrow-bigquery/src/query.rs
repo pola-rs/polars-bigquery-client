@@ -41,12 +41,15 @@ const MEDIAN_ROW_SIZE_BYTES: u64 = 8;
 /// is `false`.
 ///
 /// When `jobs.query` completes and creates a job (`job_creation_reason = LargeResults`),
-/// it returns 0 inline Arrow rows, so we cannot estimate bytes per row from an
-/// inline batch. However, skipping `streams/_default` entirely avoids the ~0.90 s
-/// `_default` stream connection cost, reducing the net multi-stream setup overhead
-/// to ~0.53 s (`jobs.get` ~0.18 s + `CreateReadSession` ~1.25 s - 0.90 s), which
-/// breaks even at ~70 MB compressed (~250 MB uncompressed). Assuming a median row
-/// size of ~8 bytes uncompressed yields 250 MiB / 8 B = 32,768,000 rows.
+/// wide-row queries omit the inline first page (returning 0 inline Arrow rows
+/// and no inline `arrowSchema`), while narrow-row queries with only a few small
+/// columns may still include an inline first page. Because an inline batch is
+/// not guaranteed, we cannot always estimate bytes per row upfront. However,
+/// skipping `streams/_default` entirely avoids the ~0.90 s `_default` stream
+/// connection cost, reducing the net multi-stream setup overhead to ~0.53 s
+/// (`jobs.get` ~0.18 s + `CreateReadSession` ~1.25 s - 0.90 s), which breaks
+/// even at ~70 MB compressed (~250 MB uncompressed). Assuming a median row size
+/// of ~8 bytes uncompressed yields 250 MiB / 8 B = 32,768,000 rows.
 const MULTI_STREAM_THRESHOLD_ROWS: u64 =
     (MULTI_STREAM_THRESHOLD_BYTES as u64) / MEDIAN_ROW_SIZE_BYTES;
 
@@ -92,6 +95,53 @@ fn bq_to_gapic_compression_codec(
                 V2::CompressionUnspecified
             }
         },
+    }
+}
+
+/// Deferred specification for reading a completed query job's temporary
+/// destination table via a parallel multi-stream `ReadSession`.
+///
+/// Shared by both destination-table read paths:
+/// 1. Upfront in [`Query::read`] (via [`Self::read`]) when `jobs.query` has
+///    already finished with `total_rows >= MULTI_STREAM_THRESHOLD_ROWS`.
+/// 2. Mid-flight in [`crate::Client::switch_to_read_session`] (via
+///    [`Self::resolve`]) when a query that started on `streams/_default`
+///    (either an incomplete `job_complete == Some(false)` job, or a completed
+///    wide-row `LARGE_RESULTS` job whose `QueryResponse` omitted the inline
+///    first page and `arrowSchema`) yields a first batch whose estimated
+///    remaining payload is `>= MULTI_STREAM_THRESHOLD_BYTES`.
+pub(crate) struct DestinationTableRead {
+    project_id: String,
+    job_id: String,
+    location: String,
+    read_options: crate::ReadOptions,
+}
+
+impl DestinationTableRead {
+    /// Fetches `configuration.query.destination_table` for the completed job
+    /// via `jobs.get` and returns it alongside the configured
+    /// [`crate::ReadOptions`].
+    pub(crate) async fn resolve(
+        self,
+        client: &crate::Client,
+    ) -> Result<(crate::BigQueryTableId, crate::ReadOptions), BigQueryError> {
+        let job = fetch_job(client, &self.project_id, &self.job_id, Some(&self.location)).await?;
+        let destination_table = extract_destination_table(job.configuration)?.ok_or_else(|| {
+            BigQueryError::Protocol(
+                "Job response is missing configuration.query.destination_table".into(),
+            )
+        })?;
+        Ok((destination_table, self.read_options))
+    }
+
+    /// Resolves the job's destination table and opens a parallel multi-stream
+    /// reader via [`crate::Client::read_table`].
+    pub(crate) async fn read(
+        self,
+        client: &crate::Client,
+    ) -> Result<(ArrowSchemaRef, BigQueryRecordBatchReceiver), BigQueryError> {
+        let (destination_table, read_options) = self.resolve(client).await?;
+        client.read_table(&destination_table, read_options).await
     }
 }
 
@@ -173,65 +223,108 @@ impl<'a> Query<'a> {
         )
     }
 
-    async fn read_destination_table(
-        &self,
-        response: &QueryResponse,
-    ) -> Result<(ArrowSchemaRef, BigQueryRecordBatchReceiver), BigQueryError> {
-        let (project_id, job_id, location) = extract_required_job_reference(response)?;
-        let destination_table =
-            get_destination_table(self.client, project_id, job_id, location).await?;
-        self.client
-            .read_table(
-                &destination_table,
-                crate::ReadOptions {
-                    maintain_order: false,
-                    arrow_buffer_compression: Some(self.arrow_buffer_compression()),
-                    ..Default::default()
-                },
-            )
-            .await
+    /// Returns `true` when this query response is eligible for a parallel
+    /// multi-stream `ReadSession` on its temporary destination table (unordered
+    /// and not a `SCRIPT` parent job, which omits `destination_table`).
+    fn can_read_destination_table(&self, response: &QueryResponse) -> bool {
+        !self.maintain_order && response.statement_type != "SCRIPT"
     }
 
+    /// Builds the [`DestinationTableRead`] specification for reading this query
+    /// job's temporary destination table via a multi-stream `ReadSession`.
+    ///
+    /// Used both upfront in [`Self::read`] when `jobs.query` already finished
+    /// above `MULTI_STREAM_THRESHOLD_ROWS`, and deferred in
+    /// [`Self::read_job_stream_or_table`] so [`crate::Client::switch_to_read_session`]
+    /// can execute the identical destination-table read mid-flight once
+    /// `streams/_default` delivers its first batch above
+    /// `MULTI_STREAM_THRESHOLD_BYTES`.
+    fn destination_table_read(
+        &self,
+        response: &QueryResponse,
+    ) -> Result<DestinationTableRead, BigQueryError> {
+        let (project_id, job_id, location) = extract_required_job_reference(response)?;
+        Ok(DestinationTableRead {
+            project_id: project_id.to_string(),
+            job_id: job_id.to_string(),
+            location: location.to_string(),
+            read_options: crate::ReadOptions {
+                maintain_order: false,
+                arrow_buffer_compression: Some(self.arrow_buffer_compression()),
+                ..Default::default()
+            },
+        })
+    }
+
+    /// Reads query results starting at `offset = 0` from the job's single
+    /// Storage Read API stream (`streams/_default`), optionally cutting over to
+    /// a parallel destination-table `ReadSession` if the first batch indicates
+    /// a large payload.
+    ///
+    /// This unifies the two query paths that have zero inline rows in
+    /// `QueryResponse`:
+    /// 1. Incomplete jobs (`job_complete == Some(false)`), where `jobs.query`
+    ///    timed out waiting and `streams/_default` blocks until the job
+    ///    produces its schema and rows (or closes/fails).
+    /// 2. Completed zero-first-page responses with remaining rows, such as
+    ///    `jobCreationReason = LARGE_RESULTS` queries with wide rows where
+    ///    `jobs.query` finished within `timeoutMs` and omitted both the inline
+    ///    first page and inline `arrowSchema` (by contrast, `LARGE_RESULTS`
+    ///    queries with only a few small columns still include an inline first
+    ///    page and `arrowSchema` in `QueryResponse`, and tail remaining rows
+    ///    via [`Self::read`]).
+    ///
+    /// Behavior:
+    /// - Uses `serialized_schema` upfront if present, or extracts the
+    ///   `ArrowSchema` lazily from the first non-heartbeat `ReadRowsResponse`
+    ///   frame on `streams/_default`.
+    /// - For unordered non-`SCRIPT` queries, attaches a [`FirstPageCheck`](crate::bigquery_read_stream::FirstPageCheck)
+    ///   and [`DestinationTableRead`] so that if estimated remaining compressed
+    ///   bytes on `streams/_default` are `>= MULTI_STREAM_THRESHOLD_BYTES`
+    ///   (250 MiB), the stream task returns the extracted schema immediately,
+    ///   discards the first stream page, and switches asynchronously to a
+    ///   multi-stream `ReadSession` on the destination table (`SCRIPT` parent
+    ///   jobs omit `destination_table` and therefore stay on
+    ///   `streams/_default`).
+    /// - If `streams/_default` reaches EOF without sending a schema, delegates
+    ///   to [`Self::resolve_empty_job_stream`] to recover job metadata/schema.
+    /// - If `streams/_default` fails before yielding a schema, delegates to
+    ///   [`Self::resolve_job_error`] to surface underlying job failures.
     async fn read_job_stream_or_table(
         &self,
         response: &QueryResponse,
         stream_name: String,
-        offset: i64,
         serialized_schema: Option<bytes::Bytes>,
-    ) -> Result<(Option<ArrowSchemaRef>, BigQueryRecordBatchReceiver), BigQueryError> {
-        let first_page_check = if !self.maintain_order {
-            let (project_id, job_id, location) = extract_required_job_reference(response)?;
+    ) -> Result<(ArrowSchemaRef, BigQueryRecordBatchReceiver), BigQueryError> {
+        let first_page_check = if self.can_read_destination_table(response) {
             Some((
                 crate::bigquery_read_stream::FirstPageCheck {
                     threshold_bytes: MULTI_STREAM_THRESHOLD_BYTES,
                     fallback_total_rows: response.total_rows,
                 },
-                crate::FallbackReadSession {
-                    project_id: project_id.to_string(),
-                    job_id: job_id.to_string(),
-                    location: location.to_string(),
-                    read_options: crate::ReadOptions {
-                        maintain_order: false,
-                        arrow_buffer_compression: Some(self.arrow_buffer_compression()),
-                        ..Default::default()
-                    },
-                },
+                self.destination_table_read(response)?,
             ))
         } else {
             None
         };
-        self.client
+        let res = self
+            .client
             .read_stream_with_first_page_check(
                 stream_name,
                 StreamOptions {
-                    offset,
+                    maintain_order: self.maintain_order,
+                    offset: 0,
                     schema: serialized_schema,
                     arrow_buffer_compression: Some(self.arrow_buffer_compression()),
                 },
-                self.maintain_order,
                 first_page_check,
             )
-            .await
+            .await;
+        match res {
+            Ok((Some(schema_ref), receiver)) => Ok((schema_ref, receiver)),
+            Ok((None, _receiver)) => self.resolve_empty_job_stream(response).await,
+            Err(err) => Err(self.resolve_job_error(response, err).await),
+        }
     }
 
     pub async fn dry_run(&self) -> Result<RecordBatch, BigQueryError> {
@@ -246,6 +339,33 @@ impl<'a> Query<'a> {
         query_response_to_record_batch(&response)
     }
 
+    /// Executes the query via `jobs.query` (`JOB_CREATION_OPTIONAL`, `ARROW`
+    /// format) and routes the response to the appropriate schema and batch
+    /// reader:
+    ///
+    /// - **Incomplete job (`job_complete == Some(false)`)**: Streams from
+    ///   `streams/_default` via `Self::read_job_stream_or_table`, extracting
+    ///   the Arrow schema lazily from the stream.
+    /// - **Large unordered non-`SCRIPT` job (`total_rows >= MULTI_STREAM_THRESHOLD_ROWS`)**:
+    ///   Skips `streams/_default` and opens a multi-stream `ReadSession` on the
+    ///   destination table via `Self::destination_table_read`.
+    /// - **Inline batch present (`(Some(first_page_bytes), _)`)**: Parses the
+    ///   required inline `arrowSchema` immediately, decodes the inline first
+    ///   page off the async runtime, and—when remaining rows exist (e.g.
+    ///   `LARGE_RESULTS` queries with only a few small columns whose first page
+    ///   still fits in `QueryResponse`)—tails the rest from `streams/_default`
+    ///   at `offset = page_row_count`.
+    /// - **No inline batch, remaining stream (`(None, Some(stream_name))`)**:
+    ///   Handles completed `LARGE_RESULTS` jobs with wide rows where BigQuery
+    ///   omits the inline first page and inline `arrowSchema`, streaming from
+    ///   `streams/_default` at `offset = 0` via `Self::read_job_stream_or_table`
+    ///   and resolving the Arrow schema lazily when omitted inline.
+    /// - **Empty result (`(None, None)`)**: Returns the parsed inline
+    ///   `arrowSchema` when present (e.g. stateless `SELECT ... LIMIT 0`);
+    ///   otherwise requires a complete `job_reference`, returning a 0-column
+    ///   schema with zero extra RPCs for non-`SELECT` statements or delegating
+    ///   to `Self::resolve_empty_job_stream` for `"SELECT"` / unspecified
+    ///   statement types.
     pub async fn read(
         &self,
     ) -> Result<(ArrowSchemaRef, BigQueryRecordBatchReceiver), BigQueryError> {
@@ -260,14 +380,9 @@ impl<'a> Query<'a> {
 
         if response.job_complete == Some(false) {
             let stream_name = default_job_stream_path(&response)?;
-            let res = self
-                .read_job_stream_or_table(&response, stream_name, 0, None)
+            return self
+                .read_job_stream_or_table(&response, stream_name, None)
                 .await;
-            return match res {
-                Ok((Some(schema_ref), receiver)) => Ok((schema_ref, receiver)),
-                Ok((None, _receiver)) => self.resolve_empty_job_stream(&response).await,
-                Err(err) => Err(self.resolve_job_error(&response, err).await),
-            };
         }
 
         let serialized_schema = match response.results_schema.take() {
@@ -305,12 +420,15 @@ impl<'a> Query<'a> {
         let first_page_bytes =
             crate::decode::validate_non_empty_arrow_bytes(raw_first_page, response.page_row_count)?;
 
-        if !self.maintain_order
+        if self.can_read_destination_table(&response)
             && response
                 .total_rows
                 .is_some_and(|total_rows| total_rows >= MULTI_STREAM_THRESHOLD_ROWS)
         {
-            return self.read_destination_table(&response).await;
+            return self
+                .destination_table_read(&response)?
+                .read(self.client)
+                .await;
         }
 
         let has_remaining_rows = response
@@ -324,38 +442,29 @@ impl<'a> Query<'a> {
             None
         };
 
-        let Some(serialized_schema) = serialized_schema else {
-            if first_page_bytes.is_none()
-                && stream_name.is_none()
-                && response.total_rows.is_none()
-                && response.statement_type != "SELECT"
-            {
-                return Ok((Arc::new(ArrowSchema::default()), empty_receiver()));
-            }
-            return Err(BigQueryError::Protocol(
-                "QueryResponse is missing Arrow schema".into(),
-            ));
-        };
-
         match (first_page_bytes, stream_name) {
             (None, None) => {
-                let metadata = crate::decode::parse_arrow_schema(&serialized_schema)?;
-                Ok((Arc::new(metadata.schema), empty_receiver()))
+                if let Some(serialized_schema) = serialized_schema {
+                    let metadata = crate::decode::parse_arrow_schema(&serialized_schema)?;
+                    return Ok((Arc::new(metadata.schema), empty_receiver()));
+                }
+                extract_required_job_reference(&response)?;
+                if !response.statement_type.is_empty() && response.statement_type != "SELECT" {
+                    Ok((Arc::new(ArrowSchema::default()), empty_receiver()))
+                } else {
+                    self.resolve_empty_job_stream(&response).await
+                }
             },
             (None, Some(stream_name)) => {
-                let (schema_ref, receiver) = self
-                    .read_job_stream_or_table(
-                        &response,
-                        stream_name,
-                        response.page_row_count,
-                        Some(serialized_schema),
-                    )
-                    .await?;
-                let schema_ref =
-                    schema_ref.expect("schema_ref must be Some when serialized_schema is Some");
-                Ok((schema_ref, receiver))
+                self.read_job_stream_or_table(&response, stream_name, serialized_schema)
+                    .await
             },
             (Some(first_page_bytes), stream_name) => {
+                let Some(serialized_schema) = serialized_schema else {
+                    return Err(BigQueryError::Protocol(
+                        "QueryResponse is missing Arrow schema".into(),
+                    ));
+                };
                 let metadata = crate::decode::parse_arrow_schema(&serialized_schema)?;
                 let read_rows = stream_name.map(|name| {
                     self.client.prepare_read_rows(
@@ -377,6 +486,15 @@ impl<'a> Query<'a> {
         }
     }
 
+    /// Recovers the result schema (or surfaces a job error) when a job-backed
+    /// query produces zero rows and no Arrow schema was received inline or on
+    /// `streams/_default`.
+    ///
+    /// Inspects `jobs.get` to return [`BigQueryError::JobFailed`] if the job
+    /// failed, returns a 0-column `ArrowSchema` for DDL or non-`SELECT`
+    /// statements, and otherwise opens a single-stream (`max_stream_count = 1`)
+    /// `CreateReadSession` on the job's destination table to fetch the typed
+    /// `ArrowSchema` for an empty `SELECT` result.
     async fn resolve_empty_job_stream(
         &self,
         response: &QueryResponse,
@@ -422,11 +540,21 @@ impl<'a> Query<'a> {
         Ok((Arc::new(metadata.schema), empty_receiver()))
     }
 
+    /// Translates pre-schema `ReadRows` gRPC errors on `streams/_default` into
+    /// [`BigQueryError::JobFailed`] when the underlying BigQuery job failed.
+    ///
+    /// Non-gRPC errors (such as local Arrow IPC schema parse errors or stream
+    /// protocol errors) are returned immediately without issuing a `jobs.get`
+    /// REST call.
     async fn resolve_job_error(
         &self,
         response: &QueryResponse,
         original_err: BigQueryError,
     ) -> BigQueryError {
+        if !matches!(original_err, BigQueryError::Grpc(_)) {
+            return original_err;
+        }
+
         let (Some(project_id), Some(job_id), location) = extract_job_reference(response) else {
             return original_err;
         };
@@ -515,20 +643,6 @@ fn extract_destination_table(
         destination_table.dataset_id,
         destination_table.table_id,
     )))
-}
-
-pub(crate) async fn get_destination_table(
-    client: &crate::Client,
-    project_id: &str,
-    job_id: &str,
-    location: &str,
-) -> Result<crate::BigQueryTableId, BigQueryError> {
-    let job = fetch_job(client, project_id, job_id, Some(location)).await?;
-    extract_destination_table(job.configuration)?.ok_or_else(|| {
-        BigQueryError::Protocol(
-            "Job response is missing configuration.query.destination_table".into(),
-        )
-    })
 }
 
 fn job_failed_from_gax_status(status: &google_cloud_gax::error::rpc::Status) -> JobFailedError {
@@ -621,23 +735,32 @@ fn extract_job_reference(response: &QueryResponse) -> (Option<&str>, Option<&str
     (project_id, job_id, location)
 }
 
+/// Extracts a complete `(project_id, job_id, location)` job reference from
+/// `response` (falling back from `job_reference.location` to
+/// `response.location`), or returns [`BigQueryError::Protocol`] if any field is
+/// missing or empty.
+///
+/// Required whenever a `QueryResponse` omits inline data/schema and must be
+/// resolved against a created BigQuery job (via `streams/_default` or
+/// `jobs.get`).
 fn extract_required_job_reference(
     response: &QueryResponse,
 ) -> Result<(&str, &str, &str), BigQueryError> {
     let (project_id, job_id, location) = extract_job_reference(response);
     let project_id = project_id.ok_or_else(|| {
         BigQueryError::Protocol(
-            "QueryResponse has remaining rows, but job_reference.project_id is missing".into(),
+            "QueryResponse requires a job reference, but job_reference.project_id is missing"
+                .into(),
         )
     })?;
     let location = location.ok_or_else(|| {
         BigQueryError::Protocol(
-            "QueryResponse has remaining rows, but job location is missing".into(),
+            "QueryResponse requires a job reference, but job location is missing".into(),
         )
     })?;
     let job_id = job_id.ok_or_else(|| {
         BigQueryError::Protocol(
-            "QueryResponse has remaining rows, but job_reference.job_id is missing".into(),
+            "QueryResponse requires a job reference, but job_reference.job_id is missing".into(),
         )
     })?;
     Ok((project_id, job_id, location))
@@ -1494,14 +1617,12 @@ mod tests {
 
     #[tokio::test]
     async fn test_read_remaining_rows_missing_job_reference_error() {
-        use google_cloud_bigquery_v2::model::{ArrowSchema as BqArrowSchema, PostQueryRequest};
+        use google_cloud_bigquery_v2::model::PostQueryRequest;
         use google_cloud_gax::options::RequestOptions;
         use google_cloud_gax::response::Response;
 
         #[derive(Debug)]
-        struct MissingJobRefStub {
-            schema_bytes: Vec<u8>,
-        }
+        struct MissingJobRefStub;
 
         impl google_cloud_bigquery_v2::stub::JobService for MissingJobRefStub {
             async fn query(
@@ -1510,17 +1631,13 @@ mod tests {
                 _options: RequestOptions,
             ) -> google_cloud_bigquery_v2::Result<Response<QueryResponse>> {
                 let resp = QueryResponse::new()
-                    .set_arrow_schema(
-                        BqArrowSchema::new().set_serialized_schema(self.schema_bytes.clone()),
-                    )
                     .set_page_row_count(0)
                     .set_total_rows(5_u64);
                 Ok(Response::from(resp))
             }
         }
 
-        let (schema_bytes, _) = create_test_arrow_payload_with_range(0, 0);
-        let bq_client = crate::BigQueryJobService::from_stub(MissingJobRefStub { schema_bytes });
+        let bq_client = crate::BigQueryJobService::from_stub(MissingJobRefStub);
         let client = crate::Client::new_for_testing(
             bq_client,
             test_read_client().await,
@@ -1621,16 +1738,15 @@ mod tests {
     async fn test_read_empty_first_page_with_remaining_rows_streams_from_read_rows() {
         use google_cloud_bigquery::client::Read;
         use google_cloud_bigquery::model::{
-            ArrowRecordBatch as StorageArrowRecordBatch, ReadRowsResponse,
+            ArrowRecordBatch as StorageArrowRecordBatch, ArrowSchema as StorageArrowSchema,
+            ReadRowsResponse,
         };
-        use google_cloud_bigquery_v2::model::{ArrowSchema as BqArrowSchema, PostQueryRequest};
+        use google_cloud_bigquery_v2::model::PostQueryRequest;
         use google_cloud_gax::options::RequestOptions;
         use google_cloud_gax::response::Response;
 
         #[derive(Debug)]
-        struct EmptyFirstPageQueryStub {
-            schema_bytes: Vec<u8>,
-        }
+        struct EmptyFirstPageQueryStub;
 
         impl google_cloud_bigquery_v2::stub::JobService for EmptyFirstPageQueryStub {
             async fn query(
@@ -1654,9 +1770,6 @@ mod tests {
                             .set_location("US")
                             .set_job_id("job-empty-first-page"),
                     )
-                    .set_arrow_schema(
-                        BqArrowSchema::new().set_serialized_schema(self.schema_bytes.clone()),
-                    )
                     .set_page_row_count(0)
                     .set_total_rows(3_u64);
                 Ok(Response::from(resp))
@@ -1665,24 +1778,27 @@ mod tests {
 
         let (schema_bytes, stream_batch_bytes) = create_test_arrow_payload_with_range(0, 3);
         let resp = ReadRowsResponse::new()
+            .set_arrow_schema(StorageArrowSchema::new().set_serialized_schema(schema_bytes))
             .set_arrow_record_batch(
                 StorageArrowRecordBatch::new().set_serialized_record_batch(stream_batch_bytes),
             )
             .set_row_count(3);
 
-        let bq_client =
-            crate::BigQueryJobService::from_stub(EmptyFirstPageQueryStub { schema_bytes });
+        let bq_client = crate::BigQueryJobService::from_stub(EmptyFirstPageQueryStub);
         let (read_stub, recorded) = CannedReadRowsStub::new(vec![resp]);
         let read_client = Read::from_stub(read_stub);
         let client =
             crate::Client::new_for_testing(bq_client, read_client, "test-quota-proj".to_string());
 
-        let (_, mut receiver) = client
+        let (schema, mut receiver) = client
             .query("SELECT col1 FROM tbl")
             .with_arrow_buffer_compression(crate::CompressionCodec::CompressionUnspecified)
             .read()
             .await
             .unwrap();
+
+        let col_names: Vec<&str> = schema.iter_names().map(|s| s.as_str()).collect();
+        assert_eq!(col_names, vec!["col1"]);
 
         let batch = receiver.recv().await.unwrap().unwrap();
         assert_eq!(batch.len(), 3);
@@ -1795,8 +1911,8 @@ mod tests {
             ReadRowsResponse, ReadSession, ReadStream,
         };
         use google_cloud_bigquery_v2::model::{
-            ArrowSchema as BqArrowSchema, GetJobRequest, Job, JobConfiguration,
-            JobConfigurationQuery, PostQueryRequest, TableReference,
+            GetJobRequest, Job, JobConfiguration, JobConfigurationQuery, PostQueryRequest,
+            TableReference,
         };
         use google_cloud_gax::options::RequestOptions;
         use google_cloud_gax::response::Response;
@@ -1816,7 +1932,6 @@ mod tests {
 
         #[derive(Debug)]
         struct LargeQueryJobStub {
-            schema_bytes: Vec<u8>,
             recorded: Arc<Mutex<RecordedCalls>>,
         }
 
@@ -1826,17 +1941,14 @@ mod tests {
                 _req: PostQueryRequest,
                 _options: RequestOptions,
             ) -> google_cloud_bigquery_v2::Result<Response<QueryResponse>> {
-                // Query finishes in jobs.query with 0 inline Arrow rows and
-                // total_rows >= MULTI_STREAM_THRESHOLD_ROWS.
+                // Query finishes in jobs.query with 0 inline Arrow rows, no inline
+                // Arrow schema, and total_rows >= MULTI_STREAM_THRESHOLD_ROWS.
                 let resp = QueryResponse::new()
                     .set_job_reference(
                         JobReference::new()
                             .set_project_id("job-proj")
                             .set_location("US")
                             .set_job_id("large-job-1"),
-                    )
-                    .set_arrow_schema(
-                        BqArrowSchema::new().set_serialized_schema(self.schema_bytes.clone()),
                     )
                     .set_page_row_count(0)
                     .set_total_rows(MULTI_STREAM_THRESHOLD_ROWS);
@@ -1941,7 +2053,6 @@ mod tests {
         let recorded = Arc::new(Mutex::new(RecordedCalls::default()));
 
         let bq_client = crate::BigQueryJobService::from_stub(LargeQueryJobStub {
-            schema_bytes: schema_bytes.clone(),
             recorded: Arc::clone(&recorded),
         });
         let read_client = Read::from_stub(MultiStreamReadStub {
@@ -1953,13 +2064,16 @@ mod tests {
         let client =
             crate::Client::new_for_testing(bq_client, read_client, "test-quota-proj".to_string());
 
-        let (_, mut receiver) = client
+        let (schema, mut receiver) = client
             .query("SELECT col1 FROM big_tbl")
             .with_maintain_order(false)
             .with_arrow_buffer_compression(crate::CompressionCodec::Zstd)
             .read()
             .await
             .unwrap();
+
+        let col_names: Vec<&str> = schema.iter_names().map(|s| s.as_str()).collect();
+        assert_eq!(col_names, vec!["col1"]);
 
         let mut all_values = Vec::new();
         while let Some(batch) = receiver.recv().await {
@@ -2003,8 +2117,8 @@ mod tests {
             ReadRowsResponse, ReadSession, ReadStream,
         };
         use google_cloud_bigquery_v2::model::{
-            ArrowSchema as BqArrowSchema, GetJobRequest, Job, JobConfiguration,
-            JobConfigurationQuery, PostQueryRequest, TableReference,
+            GetJobRequest, Job, JobConfiguration, JobConfigurationQuery, PostQueryRequest,
+            TableReference,
         };
         use google_cloud_gax::options::RequestOptions;
         use google_cloud_gax::response::Response;
@@ -2021,7 +2135,6 @@ mod tests {
 
         #[derive(Debug)]
         struct EmptyFirstPageLargeJobStub {
-            schema_bytes: Vec<u8>,
             recorded: Arc<Mutex<RecordedCalls>>,
         }
 
@@ -2031,16 +2144,14 @@ mod tests {
                 _req: PostQueryRequest,
                 _options: RequestOptions,
             ) -> google_cloud_bigquery_v2::Result<Response<QueryResponse>> {
-                // Real BigQuery multi-page Arrow QueryResponse: page_row_count=0, total_rows=0, non-empty page_token.
+                // Wide-row BigQuery LARGE_RESULTS Arrow QueryResponse: no inline schema,
+                // page_row_count=0, non-empty page_token.
                 let resp = QueryResponse::new()
                     .set_job_reference(
                         JobReference::new()
                             .set_project_id("job-proj")
                             .set_location("US")
                             .set_job_id("large-job-2"),
-                    )
-                    .set_arrow_schema(
-                        BqArrowSchema::new().set_serialized_schema(self.schema_bytes.clone()),
                     )
                     .set_page_row_count(0)
                     .set_total_rows(0_u64)
@@ -2117,6 +2228,10 @@ mod tests {
                         .arrow_serialization_options()
                         .map(|o| o.buffer_compression.clone());
                     let resp = ReadRowsResponse::new()
+                        .set_arrow_schema(
+                            StorageArrowSchema::new()
+                                .set_serialized_schema(self.schema_bytes.clone()),
+                        )
                         .set_arrow_record_batch(
                             StorageArrowRecordBatch::new()
                                 .set_serialized_record_batch(self.job_first_page_bytes.clone()),
@@ -2143,7 +2258,6 @@ mod tests {
         let recorded = Arc::new(Mutex::new(RecordedCalls::default()));
 
         let bq_client = crate::BigQueryJobService::from_stub(EmptyFirstPageLargeJobStub {
-            schema_bytes: schema_bytes.clone(),
             recorded: Arc::clone(&recorded),
         });
         let read_client = Read::from_stub(JobStreamThenTableReadStub {
@@ -2155,13 +2269,16 @@ mod tests {
         let client =
             crate::Client::new_for_testing(bq_client, read_client, "test-quota-proj".to_string());
 
-        let (_, mut receiver) = client
+        let (schema, mut receiver) = client
             .query("SELECT col1 FROM big_tbl")
             .with_maintain_order(false)
             .with_arrow_buffer_compression(crate::CompressionCodec::Zstd)
             .read()
             .await
             .unwrap();
+
+        let col_names: Vec<&str> = schema.iter_names().map(|s| s.as_str()).collect();
+        assert_eq!(col_names, vec!["col1"]);
 
         let mut all_values = Vec::new();
         while let Some(batch) = receiver.recv().await {
@@ -2202,17 +2319,17 @@ mod tests {
     async fn test_read_maintain_order_below_threshold_or_default_true_keeps_single_stream() {
         use google_cloud_bigquery::client::Read;
         use google_cloud_bigquery::model::{
-            ArrowRecordBatch as StorageArrowRecordBatch, ReadRowsResponse,
+            ArrowRecordBatch as StorageArrowRecordBatch, ArrowSchema as StorageArrowSchema,
+            ReadRowsResponse,
         };
-        use google_cloud_bigquery_v2::model::{
-            ArrowSchema as BqArrowSchema, GetJobRequest, Job, PostQueryRequest,
-        };
+        use google_cloud_bigquery_v2::model::{GetJobRequest, Job, PostQueryRequest};
         use google_cloud_gax::options::RequestOptions;
         use google_cloud_gax::response::Response;
 
         #[derive(Debug)]
         struct PanicOnGetJobStub {
-            schema_bytes: Vec<u8>,
+            total_rows: u64,
+            statement_type: &'static str,
         }
 
         impl google_cloud_bigquery_v2::stub::JobService for PanicOnGetJobStub {
@@ -2228,11 +2345,9 @@ mod tests {
                             .set_location("US")
                             .set_job_id("job-single-stream"),
                     )
-                    .set_arrow_schema(
-                        BqArrowSchema::new().set_serialized_schema(self.schema_bytes.clone()),
-                    )
+                    .set_statement_type(self.statement_type)
                     .set_page_row_count(0)
-                    .set_total_rows(0_u64)
+                    .set_total_rows(self.total_rows)
                     .set_page_token("token-1");
                 Ok(Response::from(resp))
             }
@@ -2243,7 +2358,7 @@ mod tests {
                 _options: RequestOptions,
             ) -> google_cloud_bigquery_v2::Result<Response<Job>> {
                 panic!(
-                    "get_job should not be called when maintain_order is true or below threshold"
+                    "get_job should not be called when maintain_order is true, SCRIPT, or below threshold"
                 );
             }
         }
@@ -2254,6 +2369,7 @@ mod tests {
         // Case 1: maintain_order = false, but total_estimated_row_count is 5 (< 250 MB threshold).
         // Must keep batch1 and continue reading batch2 from the same _default stream.
         let resp1 = ReadRowsResponse::new()
+            .set_arrow_schema(StorageArrowSchema::new().set_serialized_schema(schema_bytes.clone()))
             .set_arrow_record_batch(
                 StorageArrowRecordBatch::new().set_serialized_record_batch(batch1_bytes.clone()),
             )
@@ -2266,7 +2382,8 @@ mod tests {
             .set_row_count(3);
 
         let bq_client = crate::BigQueryJobService::from_stub(PanicOnGetJobStub {
-            schema_bytes: schema_bytes.clone(),
+            total_rows: 0,
+            statement_type: "SELECT",
         });
         let (read_stub, recorded) = CannedReadRowsStub::new(vec![resp1, resp2]);
         let client = crate::Client::new_for_testing(
@@ -2275,12 +2392,15 @@ mod tests {
             "test-quota-proj".to_string(),
         );
 
-        let (_, mut receiver) = client
+        let (schema, mut receiver) = client
             .query("SELECT col1 FROM small_tbl")
             .with_maintain_order(false)
             .read()
             .await
             .unwrap();
+
+        let col_names: Vec<&str> = schema.iter_names().map(|s| s.as_str()).collect();
+        assert_eq!(col_names, vec!["col1"]);
 
         let mut all_values = Vec::new();
         while let Some(batch) = receiver.recv().await {
@@ -2298,32 +2418,39 @@ mod tests {
             Some(crate::CompressionCodec::Lz4Frame)
         );
 
-        // Case 2: default maintain_order = true, even with total_estimated_row_count above threshold.
-        let large_resp1 = ReadRowsResponse::new()
+        // Case 2: default maintain_order = true, with total_rows >= MULTI_STREAM_THRESHOLD_ROWS
+        // and total_estimated_row_count above the 250 MiB threshold, and results_schema = None.
+        let ordered_resp1 = ReadRowsResponse::new()
+            .set_arrow_schema(StorageArrowSchema::new().set_serialized_schema(schema_bytes.clone()))
             .set_arrow_record_batch(
-                StorageArrowRecordBatch::new().set_serialized_record_batch(batch1_bytes),
+                StorageArrowRecordBatch::new().set_serialized_record_batch(batch1_bytes.clone()),
             )
             .set_row_count(2)
-            .set_total_estimated_row_count(10_000_000);
-        let large_resp2 = ReadRowsResponse::new()
+            .set_total_estimated_row_count(MULTI_STREAM_THRESHOLD_ROWS as i64);
+        let ordered_resp2 = ReadRowsResponse::new()
             .set_arrow_record_batch(
-                StorageArrowRecordBatch::new().set_serialized_record_batch(batch2_bytes),
+                StorageArrowRecordBatch::new().set_serialized_record_batch(batch2_bytes.clone()),
             )
             .set_row_count(3);
 
-        let bq_client = crate::BigQueryJobService::from_stub(PanicOnGetJobStub { schema_bytes });
-        let (read_stub, _) = CannedReadRowsStub::new(vec![large_resp1, large_resp2]);
+        let bq_client = crate::BigQueryJobService::from_stub(PanicOnGetJobStub {
+            total_rows: MULTI_STREAM_THRESHOLD_ROWS,
+            statement_type: "SELECT",
+        });
+        let (read_stub, _) = CannedReadRowsStub::new(vec![ordered_resp1, ordered_resp2]);
         let client = crate::Client::new_for_testing(
             bq_client,
             Read::from_stub(read_stub),
             "test-quota-proj".to_string(),
         );
 
-        let (_, mut receiver) = client
-            .query("SELECT col1 FROM big_tbl")
+        let (schema, mut receiver) = client
+            .query("SELECT col1 FROM big_tbl ORDER BY col1")
             .read()
             .await
             .unwrap();
+        let col_names: Vec<&str> = schema.iter_names().map(|s| s.as_str()).collect();
+        assert_eq!(col_names, vec!["col1"]);
         let mut all_values = Vec::new();
         while let Some(batch) = receiver.recv().await {
             let batch = batch.unwrap();
@@ -2333,6 +2460,54 @@ mod tests {
                 .unwrap();
             all_values.extend_from_slice(arr.values().as_slice());
         }
+        assert_eq!(all_values, vec![0, 1, 2, 3, 4]);
+
+        // Case 3: maintain_order = false and statement_type = "SCRIPT", with
+        // results_schema = None, total_rows >= MULTI_STREAM_THRESHOLD_ROWS, and
+        // large batch density (>= 250 MiB estimated remaining bytes). Must stay on
+        // streams/_default without calling get_job.
+        let script_resp1 = ReadRowsResponse::new()
+            .set_arrow_schema(StorageArrowSchema::new().set_serialized_schema(schema_bytes))
+            .set_arrow_record_batch(
+                StorageArrowRecordBatch::new().set_serialized_record_batch(batch1_bytes),
+            )
+            .set_row_count(2)
+            .set_total_estimated_row_count(MULTI_STREAM_THRESHOLD_ROWS as i64);
+        let script_resp2 = ReadRowsResponse::new()
+            .set_arrow_record_batch(
+                StorageArrowRecordBatch::new().set_serialized_record_batch(batch2_bytes),
+            )
+            .set_row_count(3);
+
+        let bq_client = crate::BigQueryJobService::from_stub(PanicOnGetJobStub {
+            total_rows: MULTI_STREAM_THRESHOLD_ROWS,
+            statement_type: "SCRIPT",
+        });
+        let (read_stub, _) = CannedReadRowsStub::new(vec![script_resp1, script_resp2]);
+        let client = crate::Client::new_for_testing(
+            bq_client,
+            Read::from_stub(read_stub),
+            "test-quota-proj".to_string(),
+        );
+
+        let (schema, mut receiver) = client
+            .query("DECLARE x INT64 DEFAULT 1; SELECT col1 FROM big_tbl;")
+            .with_maintain_order(false)
+            .read()
+            .await
+            .unwrap();
+        let col_names: Vec<&str> = schema.iter_names().map(|s| s.as_str()).collect();
+        assert_eq!(col_names, vec!["col1"]);
+        let mut all_values = Vec::new();
+        while let Some(batch) = receiver.recv().await {
+            let batch = batch.unwrap();
+            let arr = batch.arrays()[0]
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap();
+            all_values.extend_from_slice(arr.values().as_slice());
+        }
+        all_values.sort_unstable();
         assert_eq!(all_values, vec![0, 1, 2, 3, 4]);
     }
 
@@ -2933,5 +3108,635 @@ mod tests {
             Ok(_) => panic!("expected JobFailed error when job failed"),
         };
         assert!(matches!(err, BigQueryError::JobFailed(_)));
+    }
+
+    /// Verifies that a zero-first-page response with an upfront inline
+    /// `arrowSchema` parses that schema immediately without requiring a schema
+    /// frame on `streams/_default`, and surfaces `BigQueryError::Arrow` without
+    /// calling `jobs.get` when inline schema bytes are corrupt.
+    #[tokio::test]
+    async fn test_read_empty_first_page_with_inline_schema_streams_from_read_rows() {
+        use google_cloud_bigquery::client::Read;
+        use google_cloud_bigquery::model::{
+            ArrowRecordBatch as StorageArrowRecordBatch, ReadRowsResponse,
+        };
+        use google_cloud_bigquery_v2::model::{
+            ArrowSchema as BqArrowSchema, GetJobRequest, Job, PostQueryRequest,
+        };
+        use google_cloud_gax::options::RequestOptions;
+        use google_cloud_gax::response::Response;
+
+        #[derive(Debug)]
+        struct InlineSchemaStreamStub {
+            schema_bytes: Vec<u8>,
+        }
+
+        impl google_cloud_bigquery_v2::stub::JobService for InlineSchemaStreamStub {
+            async fn query(
+                &self,
+                _req: PostQueryRequest,
+                _options: RequestOptions,
+            ) -> google_cloud_bigquery_v2::Result<Response<QueryResponse>> {
+                let resp = QueryResponse::new()
+                    .set_job_complete(true)
+                    .set_job_reference(
+                        JobReference::new()
+                            .set_project_id("job-proj")
+                            .set_location("US")
+                            .set_job_id("job-inline-schema-stream"),
+                    )
+                    .set_arrow_schema(
+                        BqArrowSchema::new().set_serialized_schema(self.schema_bytes.clone()),
+                    )
+                    .set_page_row_count(0)
+                    .set_total_rows(3_u64);
+                Ok(Response::from(resp))
+            }
+
+            async fn get_job(
+                &self,
+                _req: GetJobRequest,
+                _options: RequestOptions,
+            ) -> google_cloud_bigquery_v2::Result<Response<Job>> {
+                panic!(
+                    "get_job should not be called on upfront inline schema or local Arrow error"
+                );
+            }
+        }
+
+        // Case 1: Valid upfront inline schema parses immediately without requiring
+        // ReadRowsResponse.schema on streams/_default.
+        let (schema_bytes, stream_batch_bytes) = create_test_arrow_payload_with_range(0, 3);
+        let resp = ReadRowsResponse::new()
+            .set_arrow_record_batch(
+                StorageArrowRecordBatch::new().set_serialized_record_batch(stream_batch_bytes),
+            )
+            .set_row_count(3);
+
+        let bq_client =
+            crate::BigQueryJobService::from_stub(InlineSchemaStreamStub { schema_bytes });
+        let (read_stub, recorded) = CannedReadRowsStub::new(vec![resp]);
+        let client = crate::Client::new_for_testing(
+            bq_client,
+            Read::from_stub(read_stub),
+            "test-quota-proj".to_string(),
+        );
+
+        let (schema, mut receiver) = client.query("SELECT col1 FROM tbl").read().await.unwrap();
+        let col_names: Vec<&str> = schema.iter_names().map(|s| s.as_str()).collect();
+        assert_eq!(col_names, vec!["col1"]);
+
+        let batch = receiver.recv().await.unwrap().unwrap();
+        let arr = batch.arrays()[0]
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(arr.values().as_slice(), &[0, 1, 2]);
+        assert!(receiver.recv().await.is_none());
+
+        {
+            let rec = recorded.lock().unwrap();
+            assert_eq!(
+                rec.stream_name.as_deref(),
+                Some(
+                    "projects/job-proj/locations/US/jobs/job-inline-schema-stream/streams/_default"
+                )
+            );
+            assert_eq!(rec.offset, Some(0));
+        }
+
+        // Case 2: Non-empty corrupt inline serialized_schema bytes return
+        // BigQueryError::Arrow without calling get_job.
+        let bq_client = crate::BigQueryJobService::from_stub(InlineSchemaStreamStub {
+            schema_bytes: vec![0x00, 0x01, 0x02, 0x03],
+        });
+        let client = crate::Client::new_for_testing(
+            bq_client,
+            test_read_client().await,
+            "test-quota-proj".to_string(),
+        );
+        let err = match client.query("SELECT col1 FROM tbl").read().await {
+            Err(e) => e,
+            Ok(_) => panic!("expected Arrow error on corrupt inline schema bytes"),
+        };
+        assert!(matches!(err, BigQueryError::Arrow(_)));
+    }
+
+    /// Verifies that a `QueryResponse` carrying non-empty inline
+    /// `arrowRecordBatch` bytes without an inline `arrowSchema` fails
+    /// immediately with `BigQueryError::Protocol`.
+    #[tokio::test]
+    async fn test_read_inline_batch_missing_arrow_schema_error() {
+        use google_cloud_bigquery_v2::model::{
+            ArrowRecordBatch as BqArrowRecordBatch, PostQueryRequest,
+        };
+        use google_cloud_gax::options::RequestOptions;
+        use google_cloud_gax::response::Response;
+
+        #[derive(Debug)]
+        struct InlineBatchNoSchemaStub {
+            batch_bytes: Vec<u8>,
+            page_token: &'static str,
+        }
+
+        impl google_cloud_bigquery_v2::stub::JobService for InlineBatchNoSchemaStub {
+            async fn query(
+                &self,
+                _req: PostQueryRequest,
+                _options: RequestOptions,
+            ) -> google_cloud_bigquery_v2::Result<Response<QueryResponse>> {
+                let resp = QueryResponse::new()
+                    .set_job_complete(true)
+                    .set_job_reference(
+                        JobReference::new()
+                            .set_project_id("job-proj")
+                            .set_location("US")
+                            .set_job_id("job-inline-no-schema"),
+                    )
+                    .set_arrow_record_batch(
+                        BqArrowRecordBatch::new()
+                            .set_serialized_record_batch(self.batch_bytes.clone()),
+                    )
+                    .set_page_row_count(2)
+                    .set_page_token(self.page_token);
+                Ok(Response::from(resp))
+            }
+        }
+
+        let (_, first_page_bytes) = create_test_arrow_payload_with_range(0, 2);
+
+        for page_token in ["", "next-token"] {
+            let bq_client = crate::BigQueryJobService::from_stub(InlineBatchNoSchemaStub {
+                batch_bytes: first_page_bytes.clone(),
+                page_token,
+            });
+            let client = crate::Client::new_for_testing(
+                bq_client,
+                test_read_client().await,
+                "test-quota-proj".to_string(),
+            );
+
+            let err = match client.query("SELECT col1 FROM tbl").read().await {
+                Err(e) => e,
+                Ok(_) => panic!("expected Protocol error when inline batch lacks Arrow schema"),
+            };
+            assert!(matches!(err, BigQueryError::Protocol(_)));
+        }
+    }
+
+    /// Verifies completed zero-row responses without inline `arrowSchema`:
+    /// - `"SELECT"` or `""` with a complete `job_reference` recovers the typed
+    ///   schema via `jobs.get` + single-stream `CreateReadSession`.
+    /// - Non-`SELECT` statements with a complete `job_reference` return a
+    ///   0-column schema with zero extra RPCs (even when `total_rows = Some(0)`).
+    /// - Missing or incomplete `job_reference` returns `BigQueryError::Protocol`.
+    #[tokio::test]
+    async fn test_read_completed_empty_job_without_inline_schema() {
+        use std::sync::Mutex;
+
+        use google_cloud_bigquery::client::Read;
+        use google_cloud_bigquery::model::{
+            ArrowSchema as StorageArrowSchema, CreateReadSessionRequest, ReadRowsRequest,
+            ReadRowsResponse, ReadSession, ReadStream,
+        };
+        use google_cloud_bigquery_v2::model::{
+            GetJobRequest, Job, JobConfiguration, JobConfigurationQuery, JobStatistics,
+            JobStatistics2, JobStatus, PostQueryRequest, TableReference,
+        };
+        use google_cloud_gax::options::RequestOptions;
+        use google_cloud_gax::response::Response;
+        use google_cloud_gax::streaming::ResponseStream;
+
+        #[derive(Debug, Default)]
+        struct Recorded {
+            get_job_calls: usize,
+            create_session_calls: usize,
+            max_stream_count: Option<i32>,
+            table_path: Option<String>,
+        }
+
+        #[derive(Debug)]
+        struct CompletedEmptyJobStub {
+            statement_type: &'static str,
+            total_rows: Option<u64>,
+            job_ref: Option<JobReference>,
+            recorded: Arc<Mutex<Recorded>>,
+        }
+
+        impl google_cloud_bigquery_v2::stub::JobService for CompletedEmptyJobStub {
+            async fn query(
+                &self,
+                _req: PostQueryRequest,
+                _options: RequestOptions,
+            ) -> google_cloud_bigquery_v2::Result<Response<QueryResponse>> {
+                let mut resp = QueryResponse::new()
+                    .set_job_complete(true)
+                    .set_statement_type(self.statement_type)
+                    .set_page_row_count(0);
+                if let Some(total_rows) = self.total_rows {
+                    resp = resp.set_total_rows(total_rows);
+                }
+                if let Some(job_ref) = &self.job_ref {
+                    resp = resp.set_job_reference(job_ref.clone());
+                }
+                Ok(Response::from(resp))
+            }
+
+            async fn get_job(
+                &self,
+                req: GetJobRequest,
+                _options: RequestOptions,
+            ) -> google_cloud_bigquery_v2::Result<Response<Job>> {
+                let mut rec = self.recorded.lock().unwrap();
+                rec.get_job_calls += 1;
+                assert_eq!(req.project_id, "job-proj");
+                assert_eq!(req.job_id, "empty-completed-job");
+                assert_eq!(req.location, "US");
+
+                let job = Job::new()
+                    .set_status(JobStatus::new().set_state("DONE"))
+                    .set_statistics(
+                        JobStatistics::new()
+                            .set_query(JobStatistics2::new().set_statement_type("SELECT")),
+                    )
+                    .set_configuration(
+                        JobConfiguration::new().set_query(
+                            JobConfigurationQuery::new().set_destination_table(
+                                TableReference::new()
+                                    .set_project_id("dest-proj")
+                                    .set_dataset_id("_anon_ds")
+                                    .set_table_id("empty_select_tbl"),
+                            ),
+                        ),
+                    );
+                Ok(Response::from(job))
+            }
+        }
+
+        #[derive(Debug)]
+        struct EmptyDestSessionStub {
+            schema_bytes: Vec<u8>,
+            recorded: Arc<Mutex<Recorded>>,
+        }
+
+        impl google_cloud_bigquery::stub::Read for EmptyDestSessionStub {
+            async fn create_read_session(
+                &self,
+                req: CreateReadSessionRequest,
+                _options: RequestOptions,
+            ) -> google_cloud_bigquery::Result<Response<ReadSession>> {
+                let mut rec = self.recorded.lock().unwrap();
+                rec.create_session_calls += 1;
+                rec.max_stream_count = Some(req.max_stream_count);
+                rec.table_path = req.read_session.map(|rs| rs.table);
+
+                let session = ReadSession::new()
+                    .set_arrow_schema(
+                        StorageArrowSchema::new().set_serialized_schema(self.schema_bytes.clone()),
+                    )
+                    .set_streams([ReadStream::new().set_name("streams/unused")]);
+                Ok(Response::from(session))
+            }
+
+            async fn read_rows(
+                &self,
+                _req: ReadRowsRequest,
+                _options: RequestOptions,
+            ) -> google_cloud_bigquery::Result<ResponseStream<ReadRowsResponse>> {
+                panic!("read_rows must not be called for completed zero-row jobs");
+            }
+        }
+
+        let (schema_bytes, _) = create_test_arrow_payload_with_range(0, 0);
+        let complete_job_ref = JobReference::new()
+            .set_project_id("job-proj")
+            .set_location("US")
+            .set_job_id("empty-completed-job");
+
+        // Sub-case 1: Complete job_reference with statement_type = "SELECT" or ""
+        // resolves typed ArrowSchema via get_job + create_read_session (max_stream_count = 1).
+        for (stmt_type, total_rows) in [("SELECT", Some(0_u64)), ("", None)] {
+            let recorded = Arc::new(Mutex::new(Recorded::default()));
+            let bq_client = crate::BigQueryJobService::from_stub(CompletedEmptyJobStub {
+                statement_type: stmt_type,
+                total_rows,
+                job_ref: Some(complete_job_ref.clone()),
+                recorded: Arc::clone(&recorded),
+            });
+            let read_client = Read::from_stub(EmptyDestSessionStub {
+                schema_bytes: schema_bytes.clone(),
+                recorded: Arc::clone(&recorded),
+            });
+            let client = crate::Client::new_for_testing(
+                bq_client,
+                read_client,
+                "test-quota-proj".to_string(),
+            );
+
+            let (schema, mut receiver) = client
+                .query("SELECT col1 FROM tbl WHERE FALSE")
+                .read()
+                .await
+                .unwrap();
+            let col_names: Vec<&str> = schema.iter_names().map(|s| s.as_str()).collect();
+            assert_eq!(col_names, vec!["col1"]);
+            assert!(receiver.recv().await.is_none());
+
+            let rec = recorded.lock().unwrap();
+            assert_eq!(rec.get_job_calls, 1);
+            assert_eq!(rec.create_session_calls, 1);
+            assert_eq!(rec.max_stream_count, Some(1));
+            assert_eq!(
+                rec.table_path.as_deref(),
+                Some("projects/dest-proj/datasets/_anon_ds/tables/empty_select_tbl")
+            );
+        }
+
+        // Sub-case 2: Complete job_reference with statement_type = "INSERT" or "SCRIPT"
+        // and total_rows = Some(0) returns a 0-column ArrowSchema with zero get_job calls.
+        for stmt_type in ["INSERT", "SCRIPT"] {
+            let recorded = Arc::new(Mutex::new(Recorded::default()));
+            let bq_client = crate::BigQueryJobService::from_stub(CompletedEmptyJobStub {
+                statement_type: stmt_type,
+                total_rows: Some(0),
+                job_ref: Some(complete_job_ref.clone()),
+                recorded: Arc::clone(&recorded),
+            });
+            let client = crate::Client::new_for_testing(
+                bq_client,
+                test_read_client().await,
+                "test-quota-proj".to_string(),
+            );
+
+            let (schema, mut receiver) = client
+                .query("INSERT INTO tbl VALUES (1)")
+                .read()
+                .await
+                .unwrap();
+            assert_eq!(schema.len(), 0);
+            assert!(receiver.recv().await.is_none());
+            assert_eq!(recorded.lock().unwrap().get_job_calls, 0);
+        }
+
+        // Sub-case 3: Absent or incomplete job_reference (even with statement_type = "" or "INSERT")
+        // returns BigQueryError::Protocol.
+        let invalid_cases = [
+            ("", None),
+            ("INSERT", None),
+            (
+                "INSERT",
+                Some(
+                    JobReference::new()
+                        .set_project_id("job-proj")
+                        .set_location("US"),
+                ),
+            ),
+            (
+                "SELECT",
+                Some(
+                    JobReference::new()
+                        .set_project_id("job-proj")
+                        .set_job_id("missing-loc-job"),
+                ),
+            ),
+            (
+                "",
+                Some(
+                    JobReference::new()
+                        .set_location("US")
+                        .set_job_id("missing-proj-job"),
+                ),
+            ),
+        ];
+        for (stmt_type, job_ref) in invalid_cases {
+            let recorded = Arc::new(Mutex::new(Recorded::default()));
+            let bq_client = crate::BigQueryJobService::from_stub(CompletedEmptyJobStub {
+                statement_type: stmt_type,
+                total_rows: Some(0),
+                job_ref,
+                recorded: Arc::clone(&recorded),
+            });
+            let client = crate::Client::new_for_testing(
+                bq_client,
+                test_read_client().await,
+                "test-quota-proj".to_string(),
+            );
+
+            let err = match client.query("SELECT 1").read().await {
+                Err(e) => e,
+                Ok(_) => panic!("expected Protocol error for absent/incomplete job_reference"),
+            };
+            assert!(matches!(err, BigQueryError::Protocol(_)));
+            assert_eq!(recorded.lock().unwrap().get_job_calls, 0);
+        }
+    }
+
+    /// Verifies pre-schema termination and error paths on `streams/_default` for
+    /// completed wide-row `LARGE_RESULTS` jobs that omit inline `arrowSchema`
+    /// (clean EOF schema recovery, gRPC error translation to
+    /// `BigQueryError::JobFailed`, and missing-schema `BigQueryError::Protocol`
+    /// without calling `jobs.get`).
+    #[tokio::test]
+    async fn test_read_completed_large_results_stream_eof_and_grpc_failure() {
+        use std::sync::Mutex;
+
+        use google_cloud_bigquery::client::Read;
+        use google_cloud_bigquery::model::{
+            ArrowRecordBatch as StorageArrowRecordBatch, ArrowSchema as StorageArrowSchema,
+            CreateReadSessionRequest, ReadRowsRequest, ReadRowsResponse, ReadSession, ReadStream,
+        };
+        use google_cloud_bigquery_v2::model::{
+            ErrorProto, GetJobRequest, Job, JobConfiguration, JobConfigurationQuery, JobStatistics,
+            JobStatistics2, JobStatus, PostQueryRequest, TableReference,
+        };
+        use google_cloud_gax::error::rpc::{Code, Status};
+        use google_cloud_gax::error::Error as GaxError;
+        use google_cloud_gax::options::RequestOptions;
+        use google_cloud_gax::response::Response;
+        use google_cloud_gax::streaming::ResponseStream;
+
+        #[derive(Debug)]
+        struct CompletedLargeResultsJobStub {
+            job: Mutex<Option<Job>>,
+            get_job_calls: Arc<Mutex<usize>>,
+        }
+
+        impl google_cloud_bigquery_v2::stub::JobService for CompletedLargeResultsJobStub {
+            async fn query(
+                &self,
+                _req: PostQueryRequest,
+                _options: RequestOptions,
+            ) -> google_cloud_bigquery_v2::Result<Response<QueryResponse>> {
+                let resp = QueryResponse::new()
+                    .set_job_complete(true)
+                    .set_statement_type("SELECT")
+                    .set_job_reference(
+                        JobReference::new()
+                            .set_project_id("job-proj")
+                            .set_location("US")
+                            .set_job_id("completed-large-job"),
+                    )
+                    .set_page_row_count(0)
+                    .set_page_token("large-results-page-token");
+                Ok(Response::from(resp))
+            }
+
+            async fn get_job(
+                &self,
+                _req: GetJobRequest,
+                _options: RequestOptions,
+            ) -> google_cloud_bigquery_v2::Result<Response<Job>> {
+                *self.get_job_calls.lock().unwrap() += 1;
+                let job = self
+                    .job
+                    .lock()
+                    .unwrap()
+                    .take()
+                    .expect("unexpected get_job call");
+                Ok(Response::from(job))
+            }
+        }
+
+        // Sub-case 1: Clean streams/_default EOF delegates to resolve_empty_job_stream
+        // (get_job + 1-stream create_read_session) to recover the typed ArrowSchema.
+        #[derive(Debug)]
+        struct EofStreamThenSessionStub {
+            schema_bytes: Vec<u8>,
+            max_stream_count: Arc<Mutex<Option<i32>>>,
+        }
+
+        impl google_cloud_bigquery::stub::Read for EofStreamThenSessionStub {
+            async fn create_read_session(
+                &self,
+                req: CreateReadSessionRequest,
+                _options: RequestOptions,
+            ) -> google_cloud_bigquery::Result<Response<ReadSession>> {
+                *self.max_stream_count.lock().unwrap() = Some(req.max_stream_count);
+                let session = ReadSession::new()
+                    .set_arrow_schema(
+                        StorageArrowSchema::new().set_serialized_schema(self.schema_bytes.clone()),
+                    )
+                    .set_streams([ReadStream::new().set_name("streams/unused")]);
+                Ok(Response::from(session))
+            }
+
+            async fn read_rows(
+                &self,
+                req: ReadRowsRequest,
+                _options: RequestOptions,
+            ) -> google_cloud_bigquery::Result<ResponseStream<ReadRowsResponse>> {
+                assert_eq!(
+                    req.read_stream,
+                    "projects/job-proj/locations/US/jobs/completed-large-job/streams/_default"
+                );
+                let (_tx, rx) = tokio::sync::mpsc::channel(1);
+                Ok(ResponseStream::from(rx))
+            }
+        }
+
+        let (schema_bytes, batch_bytes) = create_test_arrow_payload_with_range(0, 2);
+        let get_job_calls = Arc::new(Mutex::new(0));
+        let max_stream_count = Arc::new(Mutex::new(None));
+        let empty_select_job = Job::new()
+            .set_status(JobStatus::new().set_state("DONE"))
+            .set_statistics(
+                JobStatistics::new().set_query(JobStatistics2::new().set_statement_type("SELECT")),
+            )
+            .set_configuration(
+                JobConfiguration::new().set_query(
+                    JobConfigurationQuery::new().set_destination_table(
+                        TableReference::new()
+                            .set_project_id("dest-proj")
+                            .set_dataset_id("_anon_ds")
+                            .set_table_id("eof_dest_tbl"),
+                    ),
+                ),
+            );
+        let bq_client = crate::BigQueryJobService::from_stub(CompletedLargeResultsJobStub {
+            job: Mutex::new(Some(empty_select_job)),
+            get_job_calls: Arc::clone(&get_job_calls),
+        });
+        let read_client = Read::from_stub(EofStreamThenSessionStub {
+            schema_bytes,
+            max_stream_count: Arc::clone(&max_stream_count),
+        });
+        let client =
+            crate::Client::new_for_testing(bq_client, read_client, "test-quota-proj".to_string());
+
+        let (schema, mut receiver) = client.query("SELECT col1 FROM tbl").read().await.unwrap();
+        let col_names: Vec<&str> = schema.iter_names().map(|s| s.as_str()).collect();
+        assert_eq!(col_names, vec!["col1"]);
+        assert!(receiver.recv().await.is_none());
+        assert_eq!(*get_job_calls.lock().unwrap(), 1);
+        assert_eq!(*max_stream_count.lock().unwrap(), Some(1));
+
+        // Sub-case 2: Non-retryable ReadRows gRPC error (Code::InvalidArgument) on a
+        // failed job maps to BigQueryError::JobFailed via resolve_job_error.
+        #[derive(Debug)]
+        struct InvalidArgReadStub;
+
+        impl google_cloud_bigquery::stub::Read for InvalidArgReadStub {
+            async fn read_rows(
+                &self,
+                _req: ReadRowsRequest,
+                _options: RequestOptions,
+            ) -> google_cloud_bigquery::Result<ResponseStream<ReadRowsResponse>> {
+                let (tx, rx) = tokio::sync::mpsc::channel(1);
+                let status = Status::default()
+                    .set_code(Code::InvalidArgument)
+                    .set_message("Job completed-large-job failed");
+                let _ = tx.send(Err(GaxError::service(status))).await;
+                Ok(ResponseStream::from(rx))
+            }
+        }
+
+        let get_job_calls = Arc::new(Mutex::new(0));
+        let failed_job = Job::new().set_status(
+            JobStatus::new().set_state("DONE").set_error_result(
+                ErrorProto::new()
+                    .set_reason("resourcesExceeded")
+                    .set_message("Resources exceeded"),
+            ),
+        );
+        let bq_client = crate::BigQueryJobService::from_stub(CompletedLargeResultsJobStub {
+            job: Mutex::new(Some(failed_job)),
+            get_job_calls: Arc::clone(&get_job_calls),
+        });
+        let client = crate::Client::new_for_testing(
+            bq_client,
+            Read::from_stub(InvalidArgReadStub),
+            "test-quota-proj".to_string(),
+        );
+        let err = match client.query("SELECT col1 FROM tbl").read().await {
+            Err(e) => e,
+            Ok(_) => panic!("expected JobFailed error on failed job ReadRows gRPC error"),
+        };
+        assert!(matches!(err, BigQueryError::JobFailed(_)));
+        assert_eq!(*get_job_calls.lock().unwrap(), 1);
+
+        // Sub-case 3: First ReadRowsResponse carrying batch rows with schema = None
+        // returns BigQueryError::Protocol with zero get_job calls.
+        let get_job_calls = Arc::new(Mutex::new(0));
+        let bq_client = crate::BigQueryJobService::from_stub(CompletedLargeResultsJobStub {
+            job: Mutex::new(None),
+            get_job_calls: Arc::clone(&get_job_calls),
+        });
+        let schema_less_batch = ReadRowsResponse::new()
+            .set_arrow_record_batch(
+                StorageArrowRecordBatch::new().set_serialized_record_batch(batch_bytes),
+            )
+            .set_row_count(2);
+        let (read_stub, _) = CannedReadRowsStub::new(vec![schema_less_batch]);
+        let client = crate::Client::new_for_testing(
+            bq_client,
+            Read::from_stub(read_stub),
+            "test-quota-proj".to_string(),
+        );
+        let err = match client.query("SELECT col1 FROM tbl").read().await {
+            Err(e) => e,
+            Ok(_) => panic!("expected Protocol error when ReadRowsResponse omits schema"),
+        };
+        assert!(matches!(err, BigQueryError::Protocol(_)));
+        assert_eq!(*get_job_calls.lock().unwrap(), 0);
     }
 }

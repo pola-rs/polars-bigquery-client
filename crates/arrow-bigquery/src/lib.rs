@@ -176,6 +176,7 @@ impl ReadOptions {
 
 #[derive(Clone, Debug, Default)]
 pub struct StreamOptions {
+    pub maintain_order: bool,
     pub offset: i64,
     /// Optional IPC-serialized Arrow schema bytes.
     ///
@@ -282,13 +283,6 @@ pub struct Client {
     user_agent: Option<Arc<str>>,
     retry_throttler: SharedRetryThrottler,
     retry_config: bigquery_read_retry::StreamRetryConfig,
-}
-
-pub(crate) struct FallbackReadSession {
-    pub(crate) project_id: String,
-    pub(crate) job_id: String,
-    pub(crate) location: String,
-    pub(crate) read_options: ReadOptions,
 }
 
 fn channel_size() -> usize {
@@ -441,52 +435,80 @@ impl Client {
         Ok((schema, streams))
     }
 
+    /// Opens a Storage Read API `ReadSession` for `table`, parses its Arrow IPC
+    /// schema, and prepares [`bigquery_read_stream::ReadStreamOptions`] for each
+    /// session stream wired to `(tx, cancel_tx, cancel_rx)`.
+    ///
+    /// Shared by [`Self::read_table`] (upfront table and destination-table reads)
+    /// and [`Self::switch_to_read_session`] (mid-flight cutover from a query job's
+    /// `streams/_default` into an already-open batch channel).
+    async fn prepare_table_read_session(
+        &self,
+        table: &BigQueryTableId,
+        options: ReadOptions,
+        tx: &tokio::sync::mpsc::Sender<Result<RecordBatch, BigQueryError>>,
+        cancel_tx: &Arc<tokio::sync::watch::Sender<bool>>,
+        cancel_rx: &tokio::sync::watch::Receiver<bool>,
+    ) -> Result<(ArrowSchemaRef, Vec<bigquery_read_stream::ReadStreamOptions>), BigQueryError> {
+        let maintain_order = options.maintain_order;
+        let (schema, streams) = self.create_table_read_session(table, options).await?;
+        let metadata = Arc::new(decode::parse_arrow_schema(&schema)?);
+        let schema_ref = Arc::new(metadata.schema.clone());
+        let retry_config = self.stream_retry_config();
+        let stream_options = streams
+            .into_iter()
+            .map(|stream_name| bigquery_read_stream::ReadStreamOptions {
+                read_rows: self.prepare_read_rows(stream_name, 0, None),
+                current_offset: 0,
+                metadata: Some(Arc::clone(&metadata)),
+                schema_tx: None,
+                first_page_check: None,
+                tx: tx.clone(),
+                retry_config: retry_config.clone(),
+                maintain_order,
+                cancel_tx: Arc::clone(cancel_tx),
+                cancel_rx: cancel_rx.clone(),
+            })
+            .collect();
+        Ok((schema_ref, stream_options))
+    }
+
+    /// Reads a BigQuery table using a Storage Read API `ReadSession`, spawning a
+    /// background reader task per session stream.
     pub async fn read_table(
         &self,
         table: &BigQueryTableId,
         options: ReadOptions,
     ) -> Result<(ArrowSchemaRef, BigQueryRecordBatchReceiver), BigQueryError> {
-        let maintain_order = options.maintain_order;
-        let (schema, streams) = self.create_table_read_session(table, options).await?;
-        self.read_streams(
-            streams,
-            StreamOptions {
-                offset: 0,
-                schema: Some(schema),
-                arrow_buffer_compression: None,
-            },
-            maintain_order,
-        )
-        .await
+        let (tx, rx) = tokio::sync::mpsc::channel(channel_size());
+        let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+        let cancel_tx = Arc::new(cancel_tx);
+        let (schema_ref, stream_options) = self
+            .prepare_table_read_session(table, options, &tx, &cancel_tx, &cancel_rx)
+            .await?;
+        let handles = stream_options
+            .into_iter()
+            .map(|opts| {
+                tokio::task::spawn(async move {
+                    let _ = bigquery_read_stream::read_stream(opts).await;
+                })
+            })
+            .collect();
+        Ok((
+            schema_ref,
+            BigQueryRecordBatchReceiver::new(rx, Some(cancel_tx), handles),
+        ))
     }
 
+    /// Reads a single BigQuery Storage Read API stream using the provided
+    /// [`StreamOptions`].
     pub async fn read_stream(
         &self,
         stream: impl Into<String>,
         options: StreamOptions,
     ) -> Result<(ArrowSchemaRef, BigQueryRecordBatchReceiver), BigQueryError> {
-        self.read_streams(vec![stream.into()], options, true).await
-    }
-
-    pub(crate) async fn read_stream_with_first_page_check(
-        &self,
-        stream: String,
-        options: StreamOptions,
-        maintain_order: bool,
-        first_page_check: Option<(bigquery_read_stream::FirstPageCheck, FallbackReadSession)>,
-    ) -> Result<(Option<ArrowSchemaRef>, BigQueryRecordBatchReceiver), BigQueryError> {
-        self.read_streams_inner(vec![stream], options, maintain_order, first_page_check)
-            .await
-    }
-
-    async fn read_streams(
-        &self,
-        streams: Vec<String>,
-        options: StreamOptions,
-        maintain_order: bool,
-    ) -> Result<(ArrowSchemaRef, BigQueryRecordBatchReceiver), BigQueryError> {
         let (schema_ref, receiver) = self
-            .read_streams_inner(streams, options, maintain_order, None)
+            .read_stream_with_first_page_check(stream.into(), options, None)
             .await?;
         let schema_ref = schema_ref.ok_or_else(|| {
             BigQueryError::Protocol("ReadRows stream closed without sending an Arrow schema".into())
@@ -494,70 +516,56 @@ impl Client {
         Ok((schema_ref, receiver))
     }
 
+    /// Cuts over mid-flight from a query job's single `streams/_default` stream
+    /// to a parallel multi-stream `ReadSession` on the job's destination table,
+    /// streaming batches into the already-open `(tx, cancel_tx, cancel_rx)`
+    /// channel owned by the caller's [`BigQueryRecordBatchReceiver`].
+    ///
+    /// Resolves the destination table via [`query::DestinationTableRead::resolve`]
+    /// and prepares the session streams via [`Self::prepare_table_read_session`]
+    /// (matching [`query::DestinationTableRead::read`] / [`Self::read_table`]),
+    /// running the stream tasks inside a [`tokio::task::JoinSet`] so aborting the
+    /// outer receiver task also aborts all child stream tasks.
     async fn switch_to_read_session(
         &self,
-        fallback: FallbackReadSession,
-        tx: tokio::sync::mpsc::Sender<Result<RecordBatch, BigQueryError>>,
-        cancel_tx: Arc<tokio::sync::watch::Sender<bool>>,
-        cancel_rx: tokio::sync::watch::Receiver<bool>,
+        destination_table_read: query::DestinationTableRead,
+        tx: &tokio::sync::mpsc::Sender<Result<RecordBatch, BigQueryError>>,
+        cancel_tx: &Arc<tokio::sync::watch::Sender<bool>>,
+        cancel_rx: &tokio::sync::watch::Receiver<bool>,
     ) -> Result<(), BigQueryError> {
-        let maintain_order = fallback.read_options.maintain_order;
-        let destination_table = query::get_destination_table(
-            self,
-            &fallback.project_id,
-            &fallback.job_id,
-            &fallback.location,
-        )
-        .await?;
-        let (schema, streams) = self
-            .create_table_read_session(&destination_table, fallback.read_options)
+        let (destination_table, options) = destination_table_read.resolve(self).await?;
+        let (_schema_ref, stream_options) = self
+            .prepare_table_read_session(&destination_table, options, tx, cancel_tx, cancel_rx)
             .await?;
-        let metadata = Arc::new(decode::parse_arrow_schema(&schema)?);
-        let retry_config = self.stream_retry_config();
         let mut join_set = tokio::task::JoinSet::new();
-
-        for stream_name in streams {
-            let read_rows = self.prepare_read_rows(stream_name, 0, None);
-            join_set.spawn(bigquery_read_stream::read_stream(
-                bigquery_read_stream::ReadStreamOptions {
-                    read_rows,
-                    current_offset: 0,
-                    metadata: Some(Arc::clone(&metadata)),
-                    schema_tx: None,
-                    first_page_check: None,
-                    tx: tx.clone(),
-                    retry_config: retry_config.clone(),
-                    maintain_order,
-                    cancel_tx: Arc::clone(&cancel_tx),
-                    cancel_rx: cancel_rx.clone(),
-                },
-            ));
+        for opts in stream_options {
+            join_set.spawn(bigquery_read_stream::read_stream(opts));
         }
-        drop(tx);
         while join_set.join_next().await.is_some() {}
         Ok(())
     }
 
-    async fn read_streams_inner(
+    /// Reads a single BigQuery Storage Read API stream, optionally extracting
+    /// the Arrow schema from the first non-heartbeat `ReadRowsResponse` and
+    /// optionally cutting over to a multi-stream destination-table
+    /// `ReadSession` via [`Self::switch_to_read_session`] if `first_page_check`
+    /// triggers.
+    pub(crate) async fn read_stream_with_first_page_check(
         &self,
-        streams: Vec<String>,
+        stream: String,
         options: StreamOptions,
-        maintain_order: bool,
-        mut first_page_check: Option<(bigquery_read_stream::FirstPageCheck, FallbackReadSession)>,
+        first_page_check: Option<(
+            bigquery_read_stream::FirstPageCheck,
+            query::DestinationTableRead,
+        )>,
     ) -> Result<(Option<ArrowSchemaRef>, BigQueryRecordBatchReceiver), BigQueryError> {
-        let (metadata, schema_ref, mut schema_tx, schema_rx) = match &options.schema {
+        let (metadata, schema_ref, schema_tx, schema_rx) = match &options.schema {
             Some(schema) => {
                 let metadata = Arc::new(decode::parse_arrow_schema(schema)?);
                 let schema_ref = Arc::new(metadata.schema.clone());
                 (Some(metadata), Some(schema_ref), None, None)
             },
             None => {
-                if streams.is_empty() {
-                    return Err(BigQueryError::Protocol(
-                        "Cannot determine schema when there are no streams and no schema was provided"
-                            .into(),
-                    ));
-                }
                 let (tx, rx) = tokio::sync::oneshot::channel();
                 (None, None, Some(tx), Some(rx))
             },
@@ -567,58 +575,51 @@ impl Client {
         let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
         let cancel_tx = Arc::new(cancel_tx);
         let retry_config = self.stream_retry_config();
-        let mut handles = Vec::with_capacity(streams.len());
+        let maintain_order = options.maintain_order;
+        let offset = options.offset;
+        let read_rows = self.prepare_read_rows(stream, offset, options.arrow_buffer_compression);
+        let (check, fallback) = match first_page_check {
+            Some((check, destination_table_read)) => {
+                (Some(check), Some((self.clone(), destination_table_read)))
+            },
+            None => (None, None),
+        };
+        let task_cancel_tx = Arc::clone(&cancel_tx);
+        let handle = tokio::task::spawn(async move {
+            let reason =
+                bigquery_read_stream::read_stream(bigquery_read_stream::ReadStreamOptions {
+                    read_rows,
+                    current_offset: offset,
+                    metadata,
+                    schema_tx,
+                    first_page_check: check,
+                    tx: tx.clone(),
+                    retry_config,
+                    maintain_order,
+                    cancel_tx: Arc::clone(&task_cancel_tx),
+                    cancel_rx: cancel_rx.clone(),
+                })
+                .await;
 
-        for stream_name in streams {
-            let read_rows = self.prepare_read_rows(
-                stream_name,
-                options.offset,
-                options.arrow_buffer_compression.clone(),
-            );
-            let (check, fallback) = match first_page_check.take() {
-                Some((check, fallback)) => (Some(check), Some((self.clone(), fallback))),
-                None => (None, None),
-            };
-            let metadata = metadata.clone();
-            let schema_tx = schema_tx.take();
-            let tx = tx.clone();
-            let retry_config = retry_config.clone();
-            let cancel_tx = Arc::clone(&cancel_tx);
-            let cancel_rx = cancel_rx.clone();
-            let offset = options.offset;
-            let handle = tokio::task::spawn(async move {
-                let reason =
-                    bigquery_read_stream::read_stream(bigquery_read_stream::ReadStreamOptions {
-                        read_rows,
-                        current_offset: offset,
-                        metadata,
-                        schema_tx,
-                        first_page_check: check,
-                        tx: tx.clone(),
-                        retry_config,
-                        maintain_order,
-                        cancel_tx: Arc::clone(&cancel_tx),
-                        cancel_rx: cancel_rx.clone(),
-                    })
-                    .await;
-
-                if reason == bigquery_read_stream::TerminationReason::SwitchToReadSession {
-                    if let Some((client, fallback)) = fallback {
-                        let tx_err = tx.clone();
-                        if let Err(err) = client
-                            .switch_to_read_session(fallback, tx, Arc::clone(&cancel_tx), cancel_rx)
-                            .await
-                        {
-                            let _ = cancel_tx.send_replace(true);
-                            let _ = tx_err.send(Err(err)).await;
-                        }
+            if reason == bigquery_read_stream::TerminationReason::SwitchToReadSession {
+                if let Some((client, destination_table_read)) = fallback {
+                    if let Err(err) = client
+                        .switch_to_read_session(
+                            destination_table_read,
+                            &tx,
+                            &task_cancel_tx,
+                            &cancel_rx,
+                        )
+                        .await
+                    {
+                        let _ = task_cancel_tx.send_replace(true);
+                        let _ = tx.send(Err(err)).await;
                     }
                 }
-            });
-            handles.push(handle);
-        }
+            }
+        });
 
-        let receiver = BigQueryRecordBatchReceiver::new(rx, Some(cancel_tx), handles);
+        let receiver = BigQueryRecordBatchReceiver::new(rx, Some(cancel_tx), vec![handle]);
 
         let schema_ref = match schema_ref {
             Some(schema_ref) => Some(schema_ref),
@@ -1209,9 +1210,12 @@ pub(crate) mod tests {
             client_builder::default_retry_throttler(),
         );
 
+        let default_options = StreamOptions::default();
+        assert!(!default_options.maintain_order);
+
         let stream_name = "projects/p/locations/us/sessions/s/streams/0";
         let (schema, mut rx) = client
-            .read_stream(stream_name, StreamOptions::default())
+            .read_stream(stream_name, default_options)
             .await
             .unwrap();
 
@@ -1219,10 +1223,11 @@ pub(crate) mod tests {
         assert_eq!(col_names, vec!["col1"]);
 
         let batch1 = rx.recv().await.unwrap().unwrap();
-        assert_eq!(batch1.len(), 3);
         let batch2 = rx.recv().await.unwrap().unwrap();
-        assert_eq!(batch2.len(), 2);
         assert!(rx.recv().await.is_none());
+        let mut batch_lens = [batch1.len(), batch2.len()];
+        batch_lens.sort_unstable();
+        assert_eq!(batch_lens, [2, 3]);
 
         let rec = recorded.lock().unwrap();
         assert_eq!(rec.stream_name.as_deref(), Some(stream_name));
@@ -1237,7 +1242,8 @@ pub(crate) mod tests {
         use google_cloud_bigquery::client::Read;
 
         let (schema_bytes, resp1) = create_test_arrow_payload(4);
-        let (stub, recorded) = CannedReadRowsStub::new(vec![resp1]);
+        let (_, resp2) = create_test_arrow_payload(1);
+        let (stub, recorded) = CannedReadRowsStub::new(vec![resp1, resp2]);
         let client = Client::new_for_testing(
             test_bq_client().await,
             Read::from_stub(stub),
@@ -1248,6 +1254,7 @@ pub(crate) mod tests {
             .read_stream(
                 "streams/s1",
                 StreamOptions {
+                    maintain_order: true,
                     offset: 42,
                     schema: Some(bytes::Bytes::from(schema_bytes)),
                     arrow_buffer_compression: Some(
@@ -1261,8 +1268,10 @@ pub(crate) mod tests {
         let col_names: Vec<&str> = schema.iter_names().map(|s| s.as_str()).collect();
         assert_eq!(col_names, vec!["col1"]);
 
-        let batch = rx.recv().await.unwrap().unwrap();
-        assert_eq!(batch.len(), 4);
+        let batch1 = rx.recv().await.unwrap().unwrap();
+        assert_eq!(batch1.len(), 4);
+        let batch2 = rx.recv().await.unwrap().unwrap();
+        assert_eq!(batch2.len(), 1);
         assert!(rx.recv().await.is_none());
         let rec = recorded.lock().unwrap();
         assert_eq!(rec.offset, Some(42));
@@ -1374,9 +1383,8 @@ pub(crate) mod tests {
             .read_stream(
                 "streams/s1",
                 StreamOptions {
-                    offset: 0,
                     schema: Some(bytes::Bytes::new()),
-                    arrow_buffer_compression: None,
+                    ..Default::default()
                 },
             )
             .await
@@ -1391,9 +1399,8 @@ pub(crate) mod tests {
             .read_stream(
                 "streams/s1",
                 StreamOptions {
-                    offset: 0,
                     schema: Some(bytes::Bytes::from(schema_bytes)),
-                    arrow_buffer_compression: None,
+                    ..Default::default()
                 },
             )
             .await
