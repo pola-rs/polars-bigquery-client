@@ -84,3 +84,76 @@ def test_read_bigquery_large_results(client):
     assert isinstance(df, pl.DataFrame)
     assert df.height == 50_000
     assert df.schema == pl.Schema({"id": pl.Int64, "payload": pl.String})
+
+
+def test_scan_query_public_data_unordered(client):
+    lf = client.scan_query(
+        query="""
+        SELECT * FROM `bigquery-public-data.utility_us.country_code_iso`
+        """,
+        maintain_order=False,
+    )
+    assert isinstance(lf, pl.LazyFrame)
+    df = lf.collect()
+    assert isinstance(df, pl.DataFrame)
+    assert df.height > 200
+    assert df.width > 0
+
+
+def test_scan_query_public_data_ordered(client):
+    lf = client.scan_query(
+        query="""
+        SELECT SUM(number) AS total_born,
+        name
+        FROM `bigquery-public-data.usa_names.usa_1910_2013`
+        GROUP BY name
+        ORDER BY total_born DESC
+        LIMIT 100
+        """,
+        maintain_order=True,
+    )
+    df = lf.collect()
+    assert df.height == 100
+    assert df.width > 0
+    assert df["total_born"].is_sorted(descending=True)
+
+
+def test_scan_query_with_schema_pushes_projection_and_filter(client):
+    lf = client.scan_query(
+        query="""
+        SELECT name, number, state
+        FROM `bigquery-public-data.usa_names.usa_1910_2013`
+        WHERE year = 2013
+        """,
+        schema={
+            "name": pl.String,
+            "number": pl.Int64,
+            "state": pl.String,
+        },
+    )
+    df = lf.filter(pl.col("state") == "WA").select("name").limit(10).collect()
+    assert df.height == 10
+    assert df.columns == ["name"]
+    assert df["name"].null_count() == 0
+
+
+def test_scan_query_without_schema_infers_schema_and_filters_locally(client):
+    lf = client.scan_query(
+        query="""
+        SELECT * FROM `bigquery-public-data.utility_us.country_code_iso`
+        """
+    )
+    df = lf.select(pl.first()).limit(5).collect()
+    assert df.height == 5
+    assert df.width == 1
+    assert df.schema.names()[0] in lf.collect_schema().names()
+
+
+def test_scan_query_empty_results(client):
+    lf = client.scan_query(
+        query="SELECT 1 AS value LIMIT 0",
+        schema={"value": pl.Int64},
+    )
+    df = lf.collect()
+    assert df.schema == pl.Schema({"value": pl.Int64})
+    assert df.is_empty()
