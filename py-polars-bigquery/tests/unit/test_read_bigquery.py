@@ -138,6 +138,7 @@ def test_client_scan_query_with_schema_pushes_projection_and_filter(mock_arrow_c
                 "hidden": pl.Int64(),
                 "unused": pl.String(),
             },
+            maintain_order=False,
         )
         result = lf.filter(pl.col("hidden") > 10).select("visible").collect()
 
@@ -181,7 +182,7 @@ def test_client_scan_query_without_schema_dry_runs_then_filters_locally(
     assert mock_arrow_client.read_query.call_args_list[0].kwargs == {
         "arrow_buffer_compression": "lz4frame",
         "dry_run": True,
-        "maintain_order": False,
+        "maintain_order": True,
         "use_query_cache": None,
     }
     assert mock_arrow_client.read_query.call_args_list[1].args == (
@@ -190,7 +191,7 @@ def test_client_scan_query_without_schema_dry_runs_then_filters_locally(
     assert mock_arrow_client.read_query.call_args_list[1].kwargs == {
         "arrow_buffer_compression": "lz4frame",
         "dry_run": False,
-        "maintain_order": False,
+        "maintain_order": True,
         "use_query_cache": None,
     }
     assert result.to_dict(as_series=False) == {"visible": ["b"]}

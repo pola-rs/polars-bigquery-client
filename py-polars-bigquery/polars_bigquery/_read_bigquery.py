@@ -228,7 +228,7 @@ class Client:
         *,
         schema: pl.Schema | Mapping[str, DataType | DataTypeClass] | None = None,
         arrow_buffer_compression: str = "lz4frame",
-        maintain_order: bool = False,
+        maintain_order: bool = True,
         use_query_cache: bool | None = None,
     ) -> pl.LazyFrame:
         """Lazily execute a GoogleSQL SELECT query into a Polars `LazyFrame`.
@@ -257,7 +257,8 @@ class Client:
             `"lz4frame"`.
         maintain_order
             Whether to preserve query result order by using a single stream.
-            Defaults to `False` for parallel reads.
+            Defaults to `True`. Set to `False` to switch to parallel
+            multi-stream reads when row order does not matter.
         use_query_cache
             Whether BigQuery should use the query cache. Defaults to BigQuery's
             API behavior.
@@ -273,7 +274,9 @@ class Client:
 
         schema_provided = schema is not None
         if schema is None:
-            metadata = self.read_query(query, dry_run=True)
+            metadata = self.read_query(
+                query, dry_run=True, maintain_order=maintain_order
+            )
             schema_json = metadata["bigquerySchema"][0]
             statement_type = metadata["statementType"][0]
             if statement_type not in (None, "SELECT"):

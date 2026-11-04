@@ -130,6 +130,7 @@ def test_scan_query_with_schema_pushes_projection_and_filter(client):
             "number": pl.Int64,
             "state": pl.String,
         },
+        maintain_order=False,
     )
     df = lf.filter(pl.col("state") == "WA").select("name").limit(10).collect()
     assert df.height == 10
