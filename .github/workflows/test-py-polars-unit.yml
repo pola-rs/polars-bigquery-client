@@ -44,7 +44,7 @@ jobs:
         os: [ubuntu-latest]
         # Skip 3.14t for now, until we don't have to build quite as many
         # dependencies from scratch.
-        python-version: ['3.10', '3.12', '3.13', '3.14']
+        python-version: ['3.11', '3.12', '3.13', '3.14']
         include:
           - os: windows-latest
             python-version: '3.14'
@@ -85,5 +85,5 @@ jobs:
       - name: Run unit tests
         run: |
           pip install uv
-          mask py-polars-expressions-testing test unit ${{ matrix.python-version == '3.10' && '--resolution lowest' || '--resolution highest --upgrade' }}
-          mask py-polars-bigquery test unit ${{ matrix.python-version == '3.10' && '--resolution lowest' || '--resolution highest --upgrade' }}
+          mask py-polars-expressions-testing test unit ${{ matrix.python-version == '3.11' && '--resolution lowest' || '--resolution highest --upgrade' }}
+          mask py-polars-bigquery test unit ${{ matrix.python-version == '3.11' && '--resolution lowest' || '--resolution highest --upgrade' }}
