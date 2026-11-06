@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import copy
+import collections
 import functools
 
 from polars_bigquery.core.compiler.ir.base import (
@@ -19,7 +19,7 @@ from polars_bigquery.core.compiler.ir.boolean import (
     Ternary,
     When,
 )
-from polars_bigquery.core.compiler.rewriter.base import rewrite_tree
+from polars_bigquery.core.compiler.rewriter.base import replace_children, rewrite_tree
 
 _FALSY_LITERALS = (BoolLiteral(False), NullLiteral())
 
@@ -40,83 +40,84 @@ def _is_valid_boolean_ternary(node: Ternary) -> bool:
     return has_non_null_leaf
 
 
-def _is_falsy_boolean_branch(expr: Expr) -> bool:
-    """Return True if `expr` is a falsy literal or a valid `Ternary` tree with only falsy leaves."""
-    if expr in _FALSY_LITERALS:
-        return True
-    if not isinstance(expr, Ternary) or not _is_valid_boolean_ternary(expr):
-        return False
-    stack: list[Expr] = [expr]
-    while stack:
-        curr = stack.pop()
-        if isinstance(curr, Ternary):
-            stack.append(curr.falsy)
-            stack.append(curr.truthy)
-        elif curr not in _FALSY_LITERALS:
-            return False
-    return True
-
-
-def rewrite_boolean_when_node(node: Expr, boolean_nodes: set[int]) -> Expr:
+def rewrite_boolean_when_node(node: Expr) -> Expr:
     """Rewrite a `Ternary` node into boolean conditionals when its output is used as a boolean.
 
-    Propagates boolean context top-down from the filter root through `And`, `Or`,
-    and `Ternary` predicates and branches. In a positive boolean context:
+    In a positive boolean context:
     - If both `truthy` and `falsy` are falsy (`False` or `Null`), rewrites to `False`.
     - If `falsy` is falsy, rewrites `Ternary(p, t, f)` to `p & t`.
     - If `truthy` is falsy, rewrites `Ternary(p, t, f)` to `~COALESCE(p, False) & f`.
     - If `node` contains an `Unsupported` descendant, rewrites `Ternary(p, t, f)` to
       `(p & t) | (~COALESCE(p, False) & f)` to enable partial pushdown.
     """
-    in_boolean_context = id(node) in boolean_nodes
-
-    if isinstance(node, (And, Or)) and in_boolean_context:
-        boolean_nodes.update((id(node.left), id(node.right)))
+    if not isinstance(node, Ternary) or not _is_valid_boolean_ternary(node):
         return node
-
-    if isinstance(node, Ternary):
-        boolean_nodes.add(id(node.predicate))
-        if not in_boolean_context or not _is_valid_boolean_ternary(node):
-            return node
-        boolean_nodes.update((id(node.truthy), id(node.falsy)))
-        truthy_is_falsy = _is_falsy_boolean_branch(node.truthy)
-        falsy_is_falsy = _is_falsy_boolean_branch(node.falsy)
-        if truthy_is_falsy and falsy_is_falsy:
-            return BoolLiteral(value=False)
-        if falsy_is_falsy:
-            rewritten: Expr = And(left=node.predicate, right=node.truthy)
-            boolean_nodes.add(id(rewritten))
-            return rewritten
-        negated_pred = Not(
-            expr=Coalesce(operands=(node.predicate, BoolLiteral(value=False)))
+    truthy_is_falsy = node.truthy in _FALSY_LITERALS
+    falsy_is_falsy = node.falsy in _FALSY_LITERALS
+    if truthy_is_falsy and falsy_is_falsy:
+        return BoolLiteral(value=False)
+    if falsy_is_falsy:
+        return And(left=node.predicate, right=node.truthy)
+    negated_pred: Expr = Not(
+        expr=Coalesce(operands=(node.predicate, BoolLiteral(value=False)))
+    )
+    if truthy_is_falsy:
+        return And(left=negated_pred, right=node.falsy)
+    if node.has_descendant(Unsupported):
+        if node.predicate.has_descendant(Unsupported):
+            negated_pred = Unsupported()
+        return Or(
+            left=And(left=node.predicate, right=node.truthy),
+            right=And(left=negated_pred, right=node.falsy),
         )
-        if truthy_is_falsy:
-            rewritten = And(left=negated_pred, right=node.falsy)
-            boolean_nodes.add(id(rewritten))
-            return rewritten
-        if node.has_descendant(Unsupported):
-            if node.predicate.has_descendant(Unsupported) and not isinstance(
-                node.predicate, Or
-            ):
-                negated_pred = Unsupported()
-            rewritten = Or(
-                left=And(left=node.predicate, right=node.truthy),
-                right=And(left=negated_pred, right=node.falsy),
-            )
-            boolean_nodes.add(id(rewritten))
-            return rewritten
-        return node
-
     return node
 
 
 def rewrite_boolean_when(root: Expr) -> Expr:
-    """Rewrite boolean-valued `Ternary` IR nodes across an IR tree into boolean conditionals."""
-    boolean_nodes: set[int] = {id(root)}
-    return rewrite_tree(
-        root,
-        functools.partial(rewrite_boolean_when_node, boolean_nodes=boolean_nodes),
-    )
+    """Rewrite boolean-valued `Ternary` IR nodes across an IR tree into boolean conditionals.
+
+    Propagates boolean context top-down by node index from the filter root
+    through `And`, `Or`, and `Ternary` predicates and branches, then rewrites
+    boolean-context `Ternary` nodes bottom-up.
+    """
+    nodes: list[Expr] = [root]
+    children_map: list[tuple[int, ...]] = [()]
+    boolean_nodes: set[int] = {0}
+    queue: collections.deque[int] = collections.deque([0])
+
+    while queue:
+        curr_idx = queue.popleft()
+        node = nodes[curr_idx]
+        node_children = node.children()
+        if not node_children:
+            continue
+
+        child_indices: list[int] = []
+        for child in node_children:
+            c_idx = len(nodes)
+            nodes.append(child)
+            children_map.append(())
+            queue.append(c_idx)
+            child_indices.append(c_idx)
+        children_map[curr_idx] = tuple(child_indices)
+
+        in_boolean_context = curr_idx in boolean_nodes
+        if isinstance(node, (And, Or)) and in_boolean_context:
+            boolean_nodes.update(child_indices)
+        elif isinstance(node, Ternary):
+            boolean_nodes.add(child_indices[0])
+            if in_boolean_context and _is_valid_boolean_ternary(node):
+                boolean_nodes.update(child_indices[1:])
+
+    for idx in range(len(nodes) - 1, -1, -1):
+        child_indices = children_map[idx]
+        if child_indices:
+            child_nodes = tuple(nodes[c_idx] for c_idx in child_indices)
+            nodes[idx] = replace_children(nodes[idx], child_nodes)
+        if idx in boolean_nodes:
+            nodes[idx] = rewrite_boolean_when_node(nodes[idx])
+
+    return nodes[0]
 
 
 def rewrite_boolean_literals_node(node: Expr) -> Expr:
@@ -239,6 +240,6 @@ def rewrite_drop_nulls(root: Expr) -> Expr:
     )
     result = rewrite_tree(root, node_rewriter)
     for expr in not_null_exprs:
-        cleaned_expr = copy.deepcopy(rewrite_tree(expr, _strip_drop_nulls_node))
+        cleaned_expr = rewrite_tree(expr, _strip_drop_nulls_node)
         result = And(left=result, right=IsNotNull(expr=cleaned_expr))
     return result

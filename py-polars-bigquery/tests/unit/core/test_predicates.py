@@ -2255,6 +2255,19 @@ def test_emit_coalesce_sql_rejects_invalid_inputs(
             "IFNULL(IF((`a` = 1), (`b` = 2), NULL), (`c` = 3))",
             id="when_without_otherwise_inside_fill_null_not_rewritten",
         ),
+        pytest.param(
+            pl.when(
+                pl.when(pl.col("a") == 1)
+                .then(False)
+                .when(pl.col("b") == 2)
+                .then(pl.col("c") == 3)
+                .otherwise(False)
+            )
+            .then(True)
+            .is_null(),
+            "(IF(((NOT COALESCE((`a` = 1), FALSE)) AND ((`b` = 2) AND (`c` = 3))), TRUE, NULL) IS NULL)",
+            id="when_with_nested_boolean_when_predicate_inside_is_null_not_rewritten",
+        ),
     ],
 )
 def test_when_then_otherwise_pushdown(expr: pl.Expr, expected_sql: str) -> None:
