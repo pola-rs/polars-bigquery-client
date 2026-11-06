@@ -58,6 +58,12 @@ def rewrite_boolean_when_node(node: Expr) -> Expr:
         return BoolLiteral(value=False)
     if falsy_is_falsy:
         return And(left=node.predicate, right=node.truthy)
+    # In a Ternary (`WHEN p THEN t ELSE f`), a NULL predicate falls through to
+    # the `falsy` (`ELSE`) branch just like FALSE does. Under 3-valued logic,
+    # plain `NOT p` evaluates to NULL (which acts like FALSE in a filter) when
+    # `p` is NULL, failing to activate `f`. Wrapping `p` in `COALESCE(p, FALSE)`
+    # maps NULL -> FALSE before negation so `NOT COALESCE(p, FALSE)` is TRUE
+    # whenever `p` is FALSE or NULL.
     negated_pred: Expr = Not(
         expr=Coalesce(operands=(node.predicate, BoolLiteral(value=False)))
     )
@@ -188,6 +194,12 @@ def rewrite_de_morgan_node(node: Expr) -> Expr:
                 left=Not(expr=node.expr.left),
                 right=Not(expr=node.expr.right),
             )
+        # `rewrite_boolean_when_node` wraps negated Ternary predicates in
+        # `Coalesce(p, False)` so NULL predicates evaluate to TRUE when negated.
+        # Distribute `Coalesce(..., False)` across `Or` operands so De Morgan's
+        # law can still split negated `Or` predicates into `And` while
+        # preserving 3-valued logic when either operand is NULL:
+        # NOT COALESCE(a OR b, FALSE) <=> NOT COALESCE(a, FALSE) AND NOT COALESCE(b, FALSE)
         if (
             isinstance(node.expr, Coalesce)
             and len(node.expr.operands) == 2
