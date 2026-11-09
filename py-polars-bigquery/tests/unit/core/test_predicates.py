@@ -1994,7 +1994,7 @@ def test_emit_coalesce_sql_rejects_invalid_inputs(
             pl.when(pl.col("a") == 1)
             .then(pl.col("b") == 2)
             .otherwise(pl.col("c") == 3),
-            "(((`a` = 1) AND (`b` = 2)) OR ((NOT (`a` = 1)) AND (`c` = 3)))",
+            "IF((`a` = 1), (`b` = 2), (`c` = 3))",
             id="single_when_then_otherwise_boolean",
         ),
         pytest.param(
@@ -2088,7 +2088,7 @@ def test_emit_coalesce_sql_rejects_invalid_inputs(
                 .otherwise(True)
             )
             .otherwise(False),
-            "((`a` = 1) AND ((`b` = 2) OR ((NOT (`b` = 2)) AND (NOT (`c` = 3)))))",
+            "((`a` = 1) AND IF((`b` = 2), TRUE, (NOT COALESCE((`c` = 3), FALSE))))",
             id="nested_chained_when_in_truthy_branch",
         ),
         pytest.param(
@@ -2120,27 +2120,27 @@ def test_emit_coalesce_sql_rejects_invalid_inputs(
         ),
         pytest.param(
             pl.when(pl.col("a") == 1).then(False).otherwise(True),
-            "(NOT (`a` = 1))",
+            "(NOT COALESCE((`a` = 1), FALSE))",
             id="boolean_when_truthy_false_falsy_true",
         ),
         pytest.param(
             pl.when(pl.col("a") == 1).then(False).otherwise(pl.col("b") == 2),
-            "((NOT (`a` = 1)) AND (`b` = 2))",
+            "((NOT COALESCE((`a` = 1), FALSE)) AND (`b` = 2))",
             id="boolean_when_truthy_false_falsy_expr",
         ),
         pytest.param(
             pl.when(pl.col("a") == 1).then(pl.col("b") == 2).otherwise(True),
-            "(((`a` = 1) AND (`b` = 2)) OR (NOT (`a` = 1)))",
+            "IF((`a` = 1), (`b` = 2), TRUE)",
             id="boolean_when_truthy_expr_falsy_true",
         ),
         pytest.param(
             pl.when(pl.col("a") == 1).then(True).otherwise(pl.col("b") == 2),
-            "((`a` = 1) OR ((NOT (`a` = 1)) AND (`b` = 2)))",
+            "IF((`a` = 1), TRUE, (`b` = 2))",
             id="boolean_when_truthy_true_falsy_expr",
         ),
         pytest.param(
             pl.when(pl.col("a") == 1).then(True).otherwise(True),
-            "((`a` = 1) OR (NOT (`a` = 1)))",
+            "IF((`a` = 1), TRUE, TRUE)",
             id="boolean_when_both_branches_true",
         ),
         pytest.param(
@@ -2159,7 +2159,7 @@ def test_emit_coalesce_sql_rejects_invalid_inputs(
             pl.when(pl.col("a") == 1)
             .then(False)
             .otherwise(unsupported(pl.col("b")) > 0.5),
-            "(NOT (`a` = 1))",
+            "(NOT COALESCE((`a` = 1), FALSE))",
             id="partial_pushdown_truthy_false_with_unsupported_falsy",
         ),
         pytest.param(
@@ -2180,14 +2180,14 @@ def test_emit_coalesce_sql_rejects_invalid_inputs(
             pl.when(pl.col("a") == 1)
             .then(False)
             .otherwise((pl.col("b") == 2) & (unsupported(pl.col("c")) > 0.5)),
-            "((NOT (`a` = 1)) AND (`b` = 2))",
+            "((NOT COALESCE((`a` = 1), FALSE)) AND (`b` = 2))",
             id="partial_pushdown_relaxed_and_in_falsy_with_truthy_false",
         ),
         pytest.param(
             pl.when(pl.col("a") == 1)
             .then(True)
             .otherwise((pl.col("b") == 2) & (unsupported(pl.col("c")) > 0.5)),
-            "((`a` = 1) OR ((NOT (`a` = 1)) AND (`b` = 2)))",
+            "((`a` = 1) OR ((NOT COALESCE((`a` = 1), FALSE)) AND (`b` = 2)))",
             id="partial_pushdown_relaxed_and_in_falsy_disjunction",
         ),
         pytest.param(
@@ -2201,7 +2201,7 @@ def test_emit_coalesce_sql_rejects_invalid_inputs(
             pl.when((pl.col("a") == 1) | (unsupported(pl.col("b")) > 0.5))
             .then(False)
             .otherwise(pl.col("c") == 3),
-            "((NOT (`a` = 1)) AND (`c` = 3))",
+            "((NOT COALESCE((`a` = 1), FALSE)) AND (`c` = 3))",
             id="partial_pushdown_de_morgan_on_negated_when_predicate",
         ),
         pytest.param(
@@ -2223,7 +2223,7 @@ def test_emit_coalesce_sql_rejects_invalid_inputs(
             pl.when(pl.col("a") == 1)
             .then(pl.when(pl.col("b") == 2).then(False).otherwise(None))
             .otherwise(pl.col("c") == 3),
-            "((NOT (`a` = 1)) AND (`c` = 3))",
+            "((NOT COALESCE((`a` = 1), FALSE)) AND (`c` = 3))",
             id="nested_falsy_when_in_truthy_branch",
         ),
         pytest.param(
@@ -2237,7 +2237,7 @@ def test_emit_coalesce_sql_rejects_invalid_inputs(
             pl.when(pl.col("a") == 1)
             .then(pl.when(pl.col("b") == 2).then(True).otherwise(True))
             .otherwise(pl.col("c") == 3),
-            "(((`a` = 1) AND ((`b` = 2) OR (NOT (`b` = 2)))) OR ((NOT (`a` = 1)) AND (`c` = 3)))",
+            "IF((`a` = 1), IF((`b` = 2), TRUE, TRUE), (`c` = 3))",
             id="nested_truthy_when_in_truthy_branch",
         ),
         pytest.param(
@@ -2254,6 +2254,19 @@ def test_emit_coalesce_sql_rejects_invalid_inputs(
             .fill_null(pl.col("c") == 3),
             "IFNULL(IF((`a` = 1), (`b` = 2), NULL), (`c` = 3))",
             id="when_without_otherwise_inside_fill_null_not_rewritten",
+        ),
+        pytest.param(
+            pl.when(
+                pl.when(pl.col("a") == 1)
+                .then(False)
+                .when(pl.col("b") == 2)
+                .then(pl.col("c") == 3)
+                .otherwise(False)
+            )
+            .then(True)
+            .is_null(),
+            "(IF(((NOT COALESCE((`a` = 1), FALSE)) AND ((`b` = 2) AND (`c` = 3))), TRUE, NULL) IS NULL)",
+            id="when_with_nested_boolean_when_predicate_inside_is_null_not_rewritten",
         ),
     ],
 )
@@ -2471,17 +2484,74 @@ def test_validate_parse_record_ternary(
                 truthy=compiler.ir.Column("t"),
                 falsy=compiler.ir.Column("f"),
             ),
+            compiler.ir.Ternary(
+                predicate=compiler.ir.Column("p"),
+                truthy=compiler.ir.Column("t"),
+                falsy=compiler.ir.Column("f"),
+            ),
+            id="supported_exact_boolean_ternary_not_rewritten",
+        ),
+        pytest.param(
+            compiler.ir.Ternary(
+                predicate=compiler.ir.Column("p"),
+                truthy=compiler.ir.Column("t"),
+                falsy=compiler.ir.BoolLiteral(False),
+            ),
+            compiler.ir.And(
+                left=compiler.ir.Column("p"),
+                right=compiler.ir.Column("t"),
+            ),
+            id="falsy_branch_false_rewritten_to_and",
+        ),
+        pytest.param(
+            compiler.ir.Ternary(
+                predicate=compiler.ir.Column("p"),
+                truthy=compiler.ir.BoolLiteral(False),
+                falsy=compiler.ir.Column("f"),
+            ),
+            compiler.ir.And(
+                left=compiler.ir.Not(
+                    expr=compiler.ir.Coalesce(
+                        operands=(
+                            compiler.ir.Column("p"),
+                            compiler.ir.BoolLiteral(False),
+                        )
+                    )
+                ),
+                right=compiler.ir.Column("f"),
+            ),
+            id="truthy_branch_false_rewritten_to_null_safe_negated_and",
+        ),
+        pytest.param(
+            compiler.ir.Ternary(
+                predicate=compiler.ir.Column("p"),
+                truthy=compiler.ir.Column("t"),
+                falsy=compiler.ir.And(
+                    left=compiler.ir.Column("f"),
+                    right=compiler.ir.Unsupported(),
+                ),
+            ),
             compiler.ir.Or(
                 left=compiler.ir.And(
                     left=compiler.ir.Column("p"),
                     right=compiler.ir.Column("t"),
                 ),
                 right=compiler.ir.And(
-                    left=compiler.ir.Not(expr=compiler.ir.Column("p")),
-                    right=compiler.ir.Column("f"),
+                    left=compiler.ir.Not(
+                        expr=compiler.ir.Coalesce(
+                            operands=(
+                                compiler.ir.Column("p"),
+                                compiler.ir.BoolLiteral(False),
+                            )
+                        )
+                    ),
+                    right=compiler.ir.And(
+                        left=compiler.ir.Column("f"),
+                        right=compiler.ir.Unsupported(),
+                    ),
                 ),
             ),
-            id="general_boolean_ternary_rewritten_to_or_of_ands",
+            id="boolean_ternary_with_unsupported_descendant_rewritten_to_or_of_ands",
         ),
         pytest.param(
             compiler.ir.Ternary(
@@ -2560,8 +2630,11 @@ def test_rewrite_boolean_when(
                 left=compiler.ir.Column("p"),
                 right=compiler.ir.NullLiteral(),
             ),
-            compiler.ir.BoolLiteral(False),
-            id="and_right_null_collapses_to_false",
+            compiler.ir.And(
+                left=compiler.ir.Column("p"),
+                right=compiler.ir.NullLiteral(),
+            ),
+            id="and_right_null_preserved",
         ),
         pytest.param(
             compiler.ir.Or(
@@ -2584,8 +2657,11 @@ def test_rewrite_boolean_when(
                 left=compiler.ir.Column("p"),
                 right=compiler.ir.NullLiteral(),
             ),
-            compiler.ir.Column("p"),
-            id="or_right_null_collapses_to_left",
+            compiler.ir.Or(
+                left=compiler.ir.Column("p"),
+                right=compiler.ir.NullLiteral(),
+            ),
+            id="or_right_null_preserved",
         ),
         pytest.param(
             compiler.ir.Or(
@@ -3186,6 +3262,21 @@ def test_parse_fill_null_rejects_invalid_inputs(
             "(((NOT (`a` = 1)) AND (NOT (`b` = 2))) IS NOT NULL)",
             id="de_morgan_rewrite_inside_is_not_null",
         ),
+        pytest.param(
+            ((pl.col("flag") == True) & pl.lit(None, dtype=pl.Boolean)).is_null(),
+            "(((`flag` = TRUE) AND NULL) IS NULL)",
+            id="conjunction_with_boolean_null_literal_inside_is_null",
+        ),
+        pytest.param(
+            ((pl.col("flag") == True) & pl.lit(None, dtype=pl.Boolean)).is_not_null(),
+            "(((`flag` = TRUE) AND NULL) IS NOT NULL)",
+            id="conjunction_with_boolean_null_literal_inside_is_not_null",
+        ),
+        pytest.param(
+            ((pl.col("flag") == False) | pl.lit(None, dtype=pl.Boolean)).is_null(),
+            "(((`flag` = FALSE) OR NULL) IS NULL)",
+            id="disjunction_with_boolean_null_literal_inside_is_null",
+        ),
     ],
 )
 def test_is_null_and_is_not_null_expression_pushdown(
@@ -3319,6 +3410,11 @@ def test_is_null_and_is_not_null_unsupported_and_degraded_cases(
             (~((pl.col("a") == 1) | (pl.col("b") == 2))).drop_nulls(),
             "(((NOT (`a` = 1)) AND (NOT (`b` = 2))) AND (((NOT (`a` = 1)) AND (NOT (`b` = 2))) IS NOT NULL))",
             id="de_morgan_rewrite_inside_drop_nulls",
+        ),
+        pytest.param(
+            pl.when(pl.col("a") == 1).then(pl.col("b") == 2).drop_nulls(),
+            "(((`a` = 1) AND (`b` = 2)) AND (IF((`a` = 1), (`b` = 2), NULL) IS NOT NULL))",
+            id="when_without_otherwise_inside_drop_nulls",
         ),
     ],
 )
