@@ -501,3 +501,27 @@ def test_client_read_query_dry_run_returns_polars_dataframe():
     assert df["totalBytesProcessed"].to_list() == [128]
     assert df["cacheHit"].to_list() == [True]
     assert df["statementType"].to_list() == ["SELECT"]
+
+
+def test_client_read_and_scan_reject_malicious_table_ids(mock_arrow_client):
+    class FakeTable:
+        project = "proj/../../evil"
+        dataset_id = "ds"
+        table_id = "tab?fields=all#"
+
+    with patch(
+        "polars_bigquery.core.bigquery_rest.get_table_metadata"
+    ) as mock_get_metadata:
+        client = Client(
+            quota_project_id="q",
+            credentials_provider=lambda: ({"bearer_token": "tok"}, None),
+        )
+
+        for bad_table in ("proj.ds.tab?fields=etag#frag", FakeTable()):
+            with pytest.raises(ValueError, match="Invalid table ID"):
+                client.read_table(bad_table)
+            with pytest.raises(ValueError, match="Invalid table ID"):
+                client.scan_table(bad_table)
+
+        mock_arrow_client.read_table.assert_not_called()
+        mock_get_metadata.assert_not_called()

@@ -638,11 +638,13 @@ fn extract_destination_table(
         ));
     }
 
-    Ok(Some(crate::BigQueryTableId::new(
+    let table_id = crate::BigQueryTableId::new(
         destination_table.project_id,
         destination_table.dataset_id,
         destination_table.table_id,
-    )))
+    )
+    .map_err(|err| BigQueryError::Protocol(format!("Job destination_table is invalid: {err}")))?;
+    Ok(Some(table_id))
 }
 
 fn job_failed_from_gax_status(status: &google_cloud_gax::error::rpc::Status) -> JobFailedError {
@@ -3738,5 +3740,21 @@ mod tests {
         };
         assert!(matches!(err, BigQueryError::Protocol(_)));
         assert_eq!(*get_job_calls.lock().unwrap(), 0);
+    }
+
+    #[test]
+    fn test_extract_destination_table_rejects_invalid_identifiers() {
+        let config = google_cloud_bigquery_v2::model::JobConfiguration::new().set_query(
+            google_cloud_bigquery_v2::model::JobConfigurationQuery::new().set_destination_table(
+                google_cloud_bigquery_v2::model::TableReference::new()
+                    .set_project_id("proj/../../evil")
+                    .set_dataset_id("_temp_dataset")
+                    .set_table_id("anon_table"),
+            ),
+        );
+        let err = extract_destination_table(Some(config))
+            .expect_err("invalid destination_table should fail");
+        assert!(matches!(err, BigQueryError::Protocol(_)));
+        assert!(err.to_string().contains("destination_table is invalid"));
     }
 }
