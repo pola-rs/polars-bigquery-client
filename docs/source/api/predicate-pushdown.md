@@ -1,6 +1,6 @@
 # Row Predicate Pushdown
 
-When scanning a table with [`Client.scan_table`][polars_bigquery.Client.scan_table], Polars passes `.filter()` predicates to `polars_bigquery`, which compiles supported Polars expressions into a BigQuery Storage Read API `row_restriction` SQL filter.
+When scanning a table with [`Client.scan_table`][polars_bigquery.Client.scan_table], Polars passes `.filter()` predicates to `polars_bigquery`, which compiles supported Polars expressions into a BigQuery Storage Read API `row_restriction` SQL filter. [`Client.scan_query`][polars_bigquery.Client.scan_query] (with `maintain_order=False`) uses the same expression compiler to push filters into an outer SQL `WHERE` clause.
 
 !!! note "Safe fallback and exact filtering"
     `polars_bigquery` always applies the original `.filter()` predicate in Polars after streaming batches from BigQuery. If an expression (or a branch of a conjunctive `&` filter) uses an unsupported operation or literal, `polars_bigquery` safely falls back to evaluating the unsupported portion in memory without data loss.

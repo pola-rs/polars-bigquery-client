@@ -96,8 +96,19 @@ def extract_polars_schema(table_metadata: dict) -> pl.Schema:
     See: https://docs.cloud.google.com/bigquery/docs/reference/rest/v2/tables#Table
     """
     pl_schema = {}
+    duplicates: list[str] = []
     for field in table_metadata.get("schema", {}).get("fields", []):
-        pl_schema[field.get("name", "")] = _extract_data_type(field)
+        name = field.get("name", "")
+        if name in pl_schema:
+            if name not in duplicates:
+                duplicates.append(name)
+            continue
+        pl_schema[name] = _extract_data_type(field)
+
+    if duplicates:
+        dup_list = ", ".join(repr(name) for name in duplicates)
+        msg = f"BigQuery schema contains duplicate column name(s): {dup_list}."
+        raise ValueError(msg)
 
     # If table is ingestion time partitioned, add pseudocolumns for _PARTITIONDATE
     # and _PARTITIONTIME to allow for partition filters. See:

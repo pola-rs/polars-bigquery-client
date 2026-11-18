@@ -3,6 +3,7 @@ import os
 import polars as pl
 import polars_bigquery
 import pytest
+from polars_bigquery.exceptions import BigQueryError
 
 
 @pytest.fixture(scope="module")
@@ -158,3 +159,45 @@ def test_scan_query_empty_results(client):
     df = lf.collect()
     assert df.schema == pl.Schema({"value": pl.Int64})
     assert df.is_empty()
+
+
+def test_scan_query_without_schema_pushes_projection_and_filter(client):
+    lf = client.scan_query(
+        query="""
+        SELECT name, number, state
+        FROM `bigquery-public-data.usa_names.usa_1910_2013`
+        WHERE year = 2013 -- trailing comment
+        """,
+        maintain_order=False,
+    )
+    df = lf.filter(pl.col("state") == "WA").select("name").limit(10).collect()
+    assert df.height == 10
+    assert df.columns == ["name"]
+    assert df["name"].null_count() == 0
+
+
+def test_scan_query_anonymous_column_unordered(client):
+    # Plain scan without pruning/filter should not wrap, so anonymous f0_ works.
+    lf = client.scan_query(query="SELECT 1", maintain_order=False)
+    df = lf.collect()
+    assert df.to_dict(as_series=False) == {"f0_": [1]}
+
+    # Filter without column pruning uses SELECT *, preserving anonymous f0_.
+    lf_filtered = client.scan_query(
+        query="""
+        SELECT COUNT(*), state
+        FROM `bigquery-public-data.usa_names.usa_1910_2013`
+        WHERE year = 2013
+        GROUP BY state
+        """,
+        maintain_order=False,
+    )
+    df_wa = lf_filtered.filter(pl.col("state") == "WA").collect()
+    assert df_wa.height == 1
+    assert df_wa["state"].to_list() == ["WA"]
+    assert df_wa["f0_"][0] > 0
+
+
+def test_scan_query_invalid_sql_raises_bigquery_error(client):
+    with pytest.raises(BigQueryError):
+        client.scan_query("SELECT FROM WHERE")

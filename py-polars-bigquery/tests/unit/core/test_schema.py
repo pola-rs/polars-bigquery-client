@@ -119,3 +119,22 @@ def test_extract_polars_schema_unexpected_type():
     metadata = {"schema": {"fields": [{"name": "bad", "type": "UNKNOWN_TYPE"}]}}
     with pytest.raises(TypeError, match="got unexpected BigQuery type: unknown_type"):
         extract_polars_schema(metadata)
+
+
+def test_extract_polars_schema_duplicate_column_names():
+    metadata = {
+        "schema": {
+            "fields": [
+                {"name": "a", "type": "INTEGER"},
+                {"name": "b", "type": "STRING"},
+                {"name": "a", "type": "STRING"},
+                {"name": "a", "type": "FLOAT"},
+                {"name": "b", "type": "BOOLEAN"},
+            ]
+        }
+    }
+    with pytest.raises(
+        ValueError,
+        match=r"BigQuery schema contains duplicate column name\(s\): 'a', 'b'\.",
+    ):
+        extract_polars_schema(metadata)

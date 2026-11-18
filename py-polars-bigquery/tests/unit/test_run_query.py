@@ -1,6 +1,7 @@
 from unittest.mock import MagicMock, patch
 
 import arrow_bigquery.api.resources
+import arrow_bigquery.exceptions
 import pytest
 import requests
 from polars_bigquery.core.bigquery_rest import (
@@ -10,6 +11,11 @@ from polars_bigquery.core.bigquery_rest import (
     get_table_metadata,
 )
 from polars_bigquery.exceptions import BigQueryError
+
+
+def test_bigquery_error_is_unified_with_arrow_bigquery():
+    assert BigQueryError is arrow_bigquery.exceptions.BigQueryError
+    assert issubclass(BigQueryError, RuntimeError)
 
 
 def test_create_resilient_session_configures_retries_and_pooling():

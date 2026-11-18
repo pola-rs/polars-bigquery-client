@@ -8,7 +8,8 @@ from polars_bigquery import (
     Client,
     __version__,
 )
-from polars_bigquery._read_bigquery import _get_user_agent
+from polars_bigquery._read_bigquery import _get_user_agent, _wrap_query_for_pushdown
+from polars_bigquery.exceptions import BigQueryError
 
 
 @pytest.fixture
@@ -132,7 +133,7 @@ def test_client_scan_query_with_schema_pushes_projection_and_filter(mock_arrow_c
     with patch("polars.scan_arrow_c_stream", return_value=source_frame):
         client = Client(quota_project_id="q")
         lf = client.scan_query(
-            "SELECT visible, hidden, unused FROM `p.d.t`",
+            "SELECT visible, hidden, unused FROM `p.d.t`;",
             schema={
                 "visible": pl.String(),
                 "hidden": pl.Int64(),
@@ -143,8 +144,9 @@ def test_client_scan_query_with_schema_pushes_projection_and_filter(mock_arrow_c
         result = lf.filter(pl.col("hidden") > 10).select("visible").collect()
 
     mock_arrow_client.read_query.assert_called_once_with(
-        "SELECT `visible`, `hidden` FROM (SELECT visible, hidden, unused FROM `p.d.t`) "
-        "AS _polars_bigquery_source WHERE (`hidden` > 10)",
+        "SELECT `visible`, `hidden` FROM (\n"
+        "SELECT visible, hidden, unused FROM `p.d.t`\n"
+        ") AS _polars_bigquery_source WHERE (`hidden` > 10)",
         arrow_buffer_compression="lz4frame",
         dry_run=False,
         maintain_order=False,
@@ -153,17 +155,225 @@ def test_client_scan_query_with_schema_pushes_projection_and_filter(mock_arrow_c
     assert result.to_dict(as_series=False) == {"visible": ["b"]}
 
 
-def test_client_scan_query_without_schema_dry_runs_then_filters_locally(
+def test_client_scan_query_without_schema_pushes_projection_and_filter_when_unordered(
     mock_arrow_client,
 ):
     exporter = MagicMock(name="arrow_stream")
+    schema_json = (
+        '{"fields": [{"name": "visible", "type": "STRING"}, '
+        '{"name": "hidden", "type": "INTEGER"}, '
+        '{"name": "unused", "type": "STRING"}]}'
+    )
     mock_arrow_client.read_query.side_effect = [
         pl.DataFrame(
             {
-                "bigquerySchema": [
-                    '{"fields": [{"name": "visible", "type": "STRING"}, '
-                    '{"name": "hidden", "type": "INTEGER"}]}'
-                ],
+                "bigquerySchema": [schema_json],
+                "statementType": ["SELECT"],
+            }
+        ),
+        exporter,
+    ]
+    source_frame = pl.LazyFrame({"visible": ["a", "b"], "hidden": [5, 15]})
+
+    with patch("polars.scan_arrow_c_stream", return_value=source_frame):
+        client = Client(quota_project_id="q")
+        lf = client.scan_query(
+            "SELECT visible, hidden, unused FROM `p.d.t`",
+            maintain_order=False,
+        )
+        result = lf.filter(pl.col("hidden") > 10).select("visible").collect()
+
+    assert mock_arrow_client.read_query.call_args_list[0].args == (
+        "SELECT visible, hidden, unused FROM `p.d.t`",
+    )
+    assert mock_arrow_client.read_query.call_args_list[0].kwargs == {
+        "arrow_buffer_compression": "lz4frame",
+        "dry_run": True,
+        "maintain_order": True,
+        "use_query_cache": None,
+    }
+    expected_sql = (
+        "SELECT `visible`, `hidden` FROM (\n"
+        "SELECT visible, hidden, unused FROM `p.d.t`\n"
+        ") AS _polars_bigquery_source WHERE (`hidden` > 10)"
+    )
+    assert mock_arrow_client.read_query.call_args_list[1].args == (expected_sql,)
+    assert mock_arrow_client.read_query.call_args_list[1].kwargs == {
+        "arrow_buffer_compression": "lz4frame",
+        "dry_run": False,
+        "maintain_order": False,
+        "use_query_cache": None,
+    }
+    assert result.to_dict(as_series=False) == {"visible": ["b"]}
+
+
+def test_client_scan_query_filter_without_column_pruning_uses_select_star(
+    mock_arrow_client,
+):
+    exporter = MagicMock(name="arrow_stream")
+    schema_json = (
+        '{"fields": [{"name": "f0_", "type": "INTEGER"}, '
+        '{"name": "state", "type": "STRING"}]}'
+    )
+    mock_arrow_client.read_query.side_effect = [
+        pl.DataFrame(
+            {
+                "bigquerySchema": [schema_json],
+                "statementType": ["SELECT"],
+            }
+        ),
+        exporter,
+    ]
+    source_frame = pl.LazyFrame({"f0_": [10, 20], "state": ["OR", "WA"]})
+
+    with patch("polars.scan_arrow_c_stream", return_value=source_frame):
+        client = Client(quota_project_id="q")
+        lf = client.scan_query(
+            "SELECT COUNT(*), state FROM `p.d.t` GROUP BY state",
+            maintain_order=False,
+        )
+        result = lf.filter(pl.col("state") == "WA").collect()
+
+    expected_sql = (
+        "SELECT * FROM (\n"
+        "SELECT COUNT(*), state FROM `p.d.t` GROUP BY state\n"
+        ") AS _polars_bigquery_source WHERE (`state` = 'WA')"
+    )
+    assert mock_arrow_client.read_query.call_args_list[1].args == (expected_sql,)
+    assert result.to_dict(as_series=False) == {"f0_": [20], "state": ["WA"]}
+
+
+def test_client_scan_query_skips_wrapping_when_no_pushdown_needed(mock_arrow_client):
+    mock_arrow_client.read_query.return_value = MagicMock(name="arrow_stream")
+    source_frame = pl.LazyFrame({"a": [1, 2], "b": ["x", "y"]})
+
+    with patch("polars.scan_arrow_c_stream", return_value=source_frame):
+        client = Client(quota_project_id="q")
+        lf = client.scan_query(
+            "SELECT 1, 'x'",
+            schema={"a": pl.Int64, "b": pl.String},
+            maintain_order=False,
+        )
+        assert lf.collect().to_dict(as_series=False) == {"a": [1, 2], "b": ["x", "y"]}
+        # Column reorder alone does not prune columns, so it should not wrap.
+        assert lf.select(["b", "a"]).collect().columns == ["b", "a"]
+
+    assert [call.args[0] for call in mock_arrow_client.read_query.call_args_list] == [
+        "SELECT 1, 'x'",
+        "SELECT 1, 'x'",
+    ]
+
+
+def test_client_scan_query_skips_wrapping_for_unpushable_predicate_and_all_columns(
+    mock_arrow_client,
+):
+    mock_arrow_client.read_query.return_value = MagicMock(name="arrow_stream")
+    source_frame = pl.LazyFrame({"a": [1, 2, 1]})
+
+    with patch("polars.scan_arrow_c_stream", return_value=source_frame):
+        client = Client(quota_project_id="q")
+        lf = client.scan_query(
+            "SELECT a FROM `p.d.t`",
+            schema={"a": pl.Int64},
+            maintain_order=False,
+        )
+        result = lf.filter(pl.col("a").is_duplicated()).collect()
+
+    mock_arrow_client.read_query.assert_called_once_with(
+        "SELECT a FROM `p.d.t`",
+        arrow_buffer_compression="lz4frame",
+        dry_run=False,
+        maintain_order=False,
+        use_query_cache=None,
+    )
+    assert result.to_dict(as_series=False) == {"a": [1, 1]}
+
+
+def test_client_scan_query_projection_only_without_filter(mock_arrow_client):
+    mock_arrow_client.read_query.return_value = MagicMock(name="arrow_stream")
+    source_frame = pl.LazyFrame({"visible": ["a", "b"]})
+
+    with patch("polars.scan_arrow_c_stream", return_value=source_frame):
+        client = Client(quota_project_id="q")
+        lf = client.scan_query(
+            "SELECT visible, unused FROM `p.d.t` -- trailing comment",
+            schema={"visible": pl.String, "unused": pl.String},
+            maintain_order=False,
+        )
+        result = lf.select("visible").collect()
+
+    mock_arrow_client.read_query.assert_called_once_with(
+        "SELECT `visible` FROM (\n"
+        "SELECT visible, unused FROM `p.d.t` -- trailing comment\n"
+        ") AS _polars_bigquery_source",
+        arrow_buffer_compression="lz4frame",
+        dry_run=False,
+        maintain_order=False,
+        use_query_cache=None,
+    )
+    assert result.to_dict(as_series=False) == {"visible": ["a", "b"]}
+
+
+def test_client_scan_query_validates_column_identifiers_on_projection(
+    mock_arrow_client,
+):
+    with pytest.raises(ValueError, match="Invalid BigQuery column name"):
+        _wrap_query_for_pushdown(
+            "SELECT 1",
+            query_columns=["bad`col"],
+            all_columns={"bad`col", "unused"},
+            row_restriction="",
+        )
+
+    assert (
+        _wrap_query_for_pushdown(
+            "SELECT 1 AS `first name`, 2 AS unused",
+            query_columns=["first name"],
+            all_columns={"first name", "unused"},
+            row_restriction="",
+        )
+        == "SELECT `first name` FROM (\n"
+        "SELECT 1 AS `first name`, 2 AS unused\n"
+        ") AS _polars_bigquery_source"
+    )
+
+    assert (
+        _wrap_query_for_pushdown(
+            "SELECT 1 AS a",
+            query_columns=[],
+            all_columns={"a"},
+            row_restriction="FALSE",
+        )
+        == "SELECT * FROM (\nSELECT 1 AS a\n) AS _polars_bigquery_source WHERE FALSE"
+    )
+
+    client = Client(quota_project_id="q")
+    lf = client.scan_query(
+        "SELECT `a` FROM `p.d.t`",
+        schema={"bad`col": pl.Int64, "unused": pl.Int64},
+        maintain_order=False,
+    )
+
+    with pytest.raises(
+        pl.exceptions.ComputeError, match="Invalid BigQuery column name"
+    ):
+        lf.select("bad`col").collect()
+
+    mock_arrow_client.read_query.assert_not_called()
+
+
+def test_client_scan_query_maintain_order_true_runs_verbatim_and_filters_locally(
+    mock_arrow_client,
+):
+    exporter = MagicMock(name="arrow_stream")
+    schema_json = (
+        '{"fields": [{"name": "visible", "type": "STRING"}, '
+        '{"name": "hidden", "type": "INTEGER"}]}'
+    )
+    mock_arrow_client.read_query.side_effect = [
+        pl.DataFrame(
+            {
+                "bigquerySchema": [schema_json],
                 "statementType": ["SELECT"],
             }
         ),
@@ -211,12 +421,143 @@ def test_client_scan_query_with_schema_handles_empty_results(mock_arrow_client):
     assert result.is_empty()
 
 
-def test_client_scan_query_propagates_dry_run_errors(mock_arrow_client):
-    mock_arrow_client.read_query.side_effect = RuntimeError("invalid query")
+def test_client_scan_query_rejects_empty_query(mock_arrow_client):
     client = Client(quota_project_id="q")
 
-    with pytest.raises(RuntimeError, match="invalid query"):
+    for bad_query in ("", "   ", " ; "):
+        with pytest.raises(ValueError, match="non-empty SELECT statement"):
+            client.scan_query(bad_query)
+
+
+@pytest.mark.parametrize("stmt_type", ["INSERT", "CREATE_TABLE", "SCRIPT"])
+def test_client_scan_query_rejects_non_select_statement_type(
+    mock_arrow_client, stmt_type
+):
+    mock_arrow_client.read_query.return_value = pl.DataFrame(
+        {
+            "bigquerySchema": pl.Series([None], dtype=pl.String),
+            "statementType": [stmt_type],
+        }
+    )
+    client = Client(quota_project_id="q")
+
+    with pytest.raises(
+        ValueError,
+        match=f"scan_query only supports SELECT statements, got {stmt_type!r}",
+    ):
+        client.scan_query("CREATE TABLE p.d.t (x INT64)")
+
+
+def test_client_scan_query_raises_bigquery_error_on_missing_schema_for_select(
+    mock_arrow_client,
+):
+    mock_arrow_client.read_query.return_value = pl.DataFrame(
+        {
+            "bigquerySchema": pl.Series([None], dtype=pl.String),
+            "statementType": ["SELECT"],
+        }
+    )
+    client = Client(quota_project_id="q")
+
+    with pytest.raises(
+        BigQueryError,
+        match="Invalid response from BigQuery: dry run for SELECT query did not return a result schema",
+    ):
+        client.scan_query("SELECT 1")
+
+
+def test_client_scan_query_raises_bigquery_error_on_missing_schema_and_statement_type(
+    mock_arrow_client,
+):
+    mock_arrow_client.read_query.return_value = pl.DataFrame(
+        {
+            "bigquerySchema": pl.Series([None], dtype=pl.String),
+            "statementType": pl.Series([None], dtype=pl.String),
+        }
+    )
+    client = Client(quota_project_id="q")
+
+    with pytest.raises(
+        BigQueryError,
+        match="Invalid response from BigQuery: dry run did not return a statement type or result schema",
+    ):
+        client.scan_query("SELECT 1")
+
+
+def test_client_scan_query_rejects_duplicate_column_names(mock_arrow_client):
+    schema_json = (
+        '{"fields": [{"name": "a", "type": "INTEGER"}, '
+        '{"name": "b", "type": "STRING"}, '
+        '{"name": "a", "type": "STRING"}]}'
+    )
+    mock_arrow_client.read_query.return_value = pl.DataFrame(
+        {
+            "bigquerySchema": [schema_json],
+            "statementType": ["SELECT"],
+        }
+    )
+    client = Client(quota_project_id="q")
+
+    with pytest.raises(
+        ValueError,
+        match=r"BigQuery schema contains duplicate column name\(s\): 'a'\.",
+    ):
+        client.scan_query("SELECT 1 AS a, 'x' AS b, 'y' AS a")
+
+
+def test_client_scan_query_propagates_dry_run_errors(mock_arrow_client):
+    mock_arrow_client.read_query.side_effect = BigQueryError("invalid query")
+    client = Client(quota_project_id="q")
+
+    with pytest.raises(BigQueryError, match="invalid query"):
         client.scan_query("SELECT broken")
+
+
+def test_client_scan_query_invalid_sql_raises_polars_bigquery_error():
+    import json
+    import threading
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self):
+            length = int(self.headers.get("Content-Length", "0"))
+            _ = self.rfile.read(length)
+            payload = json.dumps(
+                {
+                    "error": {
+                        "code": 400,
+                        "message": 'Syntax error: Unexpected identifier "BROKEN"',
+                        "status": "INVALID_ARGUMENT",
+                    }
+                }
+            ).encode("utf-8")
+            self.send_response(400)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+        def log_message(self, format, *args):
+            pass
+
+    server = HTTPServer(("127.0.0.1", 0), Handler)
+    port = server.server_port
+    server_thread = threading.Thread(target=server.handle_request)
+    server_thread.start()
+
+    try:
+        creds = lambda: ({"bearer_token": "fake-tok"}, None)
+        client = Client(quota_project_id="test-proj", credentials_provider=creds)
+        client._arrow_client = arrow_bigquery.Client(
+            quota_project_id="test-proj",
+            credentials_provider=creds,
+            bq_endpoint=f"http://127.0.0.1:{port}",
+        )
+        with pytest.raises(BigQueryError, match="Syntax error"):
+            client.scan_query("SELECT BROKEN")
+    finally:
+        server_thread.join()
+        server.server_close()
 
 
 def test_client_read_bigquery_handles_bigquery_objects(mock_arrow_client):
