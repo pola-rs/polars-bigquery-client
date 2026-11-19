@@ -1,8 +1,9 @@
 # `Client.scan_query()`: Lazy GoogleSQL Query Scans in `polars-bigquery`
 
-*   **Author:** `@tswast`
+*   **Author:** @tswast
 *   **Status:** Proposed
-*   **Date:** 2026-11-19
+*   **Created:** 2026-11-19
+*   **Last updated:** 2026-11-19
 
 --------------------------------------------------------------------------------
 
@@ -17,55 +18,42 @@ By default (`maintain_order=True`), `scan_query()` executes the SQL verbatim and
 ## The Problem
 
 1.  **`Client.read_query()` materializes the full result in memory**: Because `read_query()` returns an eager `pl.DataFrame`, callers cannot stream results larger than available RAM (for example, 1–10 GB compressed) to `sink_parquet()` or `collect_batches()`, nor can downstream Polars code attach runtime `.filter()`, `.select()`, or `.limit()` operations before execution.
-2.  **The existing lazy workaround requires an extra client library and Storage Read session setup**: [docs/source/guides/large-query-results.md](../source/guides/large-query-results.md) directs callers to install `google-cloud-bigquery`, execute the query eagerly into a temporary table, scan `job.destination` via `Client.scan_table`, and manage dataset/table cleanup. On small and medium queries, that forces job creation and `CreateReadSession` startup instead of using `jobs.query` inline Arrow responses, and Storage Read API filters only prune bytes transferred from the materialized result table rather than base-table scans during query execution.
-3.  **Edge cases and constraints a lazy SQL scan must handle**:
-    *   **Query cache and error-position fidelity**: BigQuery keys its 24-hour query cache on the exact top-level SQL string, and error coordinates reference the submitted line and column numbers. Altering whitespace or trailing semicolons on verbatim queries, prepending wrapper lines, or changing projected column order across equivalent selections causes avoidable cache misses and shifted error locations.
-    *   **Ordering and upstream Polars stream semantics**: Pushing filters onto a query does not guarantee preservation of an inner `ORDER BY`, so pushdown is restricted to `maintain_order=False`. Locally, Polars' Arrow C stream reader currently has two upstream pushdown issues on `polars 2.1.0`: evaluating filters before limits ([pola-rs/polars#30916](https://github.com/pola-rs/polars/issues/30916), affecting `maintain_order=True` with `limit().filter()`) and collapsing zero-column `.drop(pl.all())` batches to zero rows under default `projection_pushdown`.
-    *   **SQL rewrite limits and column projections**: Pushdown rewrites must stay below BigQuery's 1 MB unresolved query length limit (which large `is_in` filters can cross), support top-level GoogleSQL constructs such as `WITH RECURSIVE`, and handle zero-column projections without fetching every column from BigQuery.
-    *   **Validation, diagnostics, and documentation alignment**: Invalid parameters and malformed dry-run schema responses should fail at scan construction rather than late during collection; query plans and logs need to show whether server-side pushdown is active without exposing raw SQL literals; and existing documentation, IAM prerequisites (`roles/bigquery.jobUser`), and workspace Polars dependency bounds need alignment.
+2.  **The existing lazy workaround requires an extra client library and Storage Read session setup**: [Scanning Large Query Results](../source/guides/large-query-results.md) directs callers to install `google-cloud-bigquery`, execute the query eagerly into a temporary table, scan `job.destination` via `Client.scan_table`, and manage dataset/table cleanup. On small and medium queries, that forces job creation and `CreateReadSession` startup instead of using `jobs.query` inline Arrow responses, and Storage Read API filters only prune bytes transferred from the materialized result table rather than base-table scans during query execution.
+3.  **Lazy SQL pushdown introduces correctness, cache, and usability hazards if handled naively**:
+    *   **Query cache misses and shifted error coordinates**: BigQuery keys its 24-hour query cache on the exact top-level SQL string, and error `[line:col]` coordinates reference the submitted text. Altering whitespace or trailing semicolons on verbatim queries, prepending `SELECT ... FROM (\n` wrapper lines, stripping leading newlines, or emitting projected columns in caller-dependent order causes avoidable cache misses and misreported error locations.
+    *   **Ordering guarantees and SQL syntax boundaries**: Pushing filters onto a query does not guarantee preservation of an inner `ORDER BY`, standard subquery wrapping breaks on top-level-only GoogleSQL constructs such as `WITH RECURSIVE` and `CREATE TEMP FUNCTION ...; SELECT ...`, and large `is_in()` filters can exceed BigQuery's 1 MB unresolved query length limit.
+    *   **Late error detection and opaque query plans**: Without eager parameter and dry-run schema validation, malformed queries or non-`SELECT` statements fail late inside `.collect()` (wrapped in `ComputeError`); without structured plan metadata, `lf.explain()` cannot show whether server-side pushdown is active without risking raw SQL or literal leakage into logs.
 
 ## Goals
 
 *   **Add `Client.scan_query()`**: Expose `Client.scan_query(query, *, schema=None, arrow_buffer_compression="lz4frame", maintain_order=True, use_query_cache=None) -> pl.LazyFrame` backed by `jobs.query` (`JOB_CREATION_OPTIONAL`) for results up to BigQuery's ~10 GB compressed anonymous table cap.
 *   **Verbatim sequential default execution (`maintain_order=True`)**: Send `raw_query` unmodified (preserving leading/trailing whitespace and semicolons) sequentially over a single stream with pushdown disabled, matching `Client.read_query()` defaults and preserving `ORDER BY` and exact-string query cache keys.
-*   **Shared logical plan tree and backend executors**: Model scan operations as an immutable `PlanNode` tree (`QueryScan`, `TableScan`, `Filter`, `Slice(offset, length)`, `Project`) executed by separate `QueryExecutor` and `ReadApiExecutor` backends that share one local Polars residual evaluator. This decouples logical operator ordering from Polars' current `register_io_source` callback signature in anticipation of newer Polars I/O plugin APIs (such as `FileReader` / `LazyFrameResolver` in [pola-rs/polars#30583](https://github.com/pola-rs/polars/pull/30583)).
-*   **GoogleSQL pipe pushdown when `maintain_order=False`**: Allow parallel multi-stream reads and append GoogleSQL pipe operators (`|> WHERE`, `|> SELECT`, `|> LIMIT [OFFSET]`) to `inner_query` when filtering, pruning, or slicing, keeping user SQL starting on line 1 (no `+1` error line shift) without subquery wrapper parentheses or aliases:
-    *   **Predicate pushdown**: Reuse `core/compiler/` expression compilation with no `f[0-9]+_` regex or `casefold()` exclusion heuristics, exposing existing `_compile_ir_to_sql`'s `(sql, is_exact)` pair via `compile_predicate()` so `QueryExecutor` knows when a `Filter` is exact vs. partial. Treat trivial `"TRUE"` as no filter. Emit `|> WHERE {sql}` before `|> SELECT` so filters see all columns of the inner query.
-    *   **Projection pushdown**: Emit projected columns via `|> SELECT ...` in `polars_schema` declaration order so `lf.select(["a", "b"])` and `lf.select(["b", "a"])` produce the same SQL string and share BigQuery's query cache. Omit `|> SELECT` when all columns are required so anonymous computed columns (`f0_`, `f1_`) flow through on all-column filtered or sliced scans.
-    *   **`Slice(offset, length)` / `LIMIT` pushdown**: Validate `0 <= offset, length <= (1 << 63) - 1`. For `Slice(0, n)` followed by `Filter(p)` under `maintain_order=False` (Polars' current `register_io_source` contract for `lf.limit(n).filter(p)`), push `|> WHERE {p_sql}` and `|> LIMIT {n}` together: because `maintain_order=False` disclaims row order and `p => p_sql`, every row set produced by `|> WHERE p_sql` + `|> LIMIT n` followed by local exact `filter(p)` is achievable by slicing `n` rows from some permutation and then filtering by `p`. For general `PlanNode` trees, `Filter(p) -> Slice(offset, length)` pushes `|> LIMIT length [OFFSET offset]` only when all preceding filters compiled with `is_exact=True`, and pushed `offset > 0` slices clear `offset` in the residual local plan so local Polars never double-skips rows.
-*   **Single verbatim dry run (`schema=None`)**: Execute one dry run against unmodified `raw_query` with no rewritten-first probe and no second dry run on errors. This preserves exact `[line:col]` error coordinates, rejects non-`SELECT` statements with `ValueError`, and rejects exact duplicate column names with `ValueError`.
-*   **1,000,000-byte UTF-8 guard on rewritten SQL**: Keep rewritten SQL below BigQuery's 1,024,000-character / 1,048,576-byte unresolved query limit by stepping down in tiers: drop `|> WHERE` first (keeping `|> SELECT` and `|> LIMIT` pushdown), and fall back to verbatim `raw_query` only if projection/limit pipe clauses alone exceed the ceiling. Log a `WARNING` on degradation.
-*   **Zero-column projection SQL pruning (`with_columns == []`)**: Append `|> SELECT 1 AS <dummy>` (collision-safe alias) when no output or predicate columns are needed, or `|> SELECT <predicate_columns>` when filtering, and drop all columns locally via `.drop(pl.all())` instead of `.select([])`.
-*   **Eager input validation and Polars defaults**: Validate `arrow_buffer_compression` (`Literal["lz4frame", "zstd", "unspecified"]`), empty `query`, empty `schema={}`, and `bigquerySchema` JSON parsing (`BigQueryError`). Keep Polars defaults (`validate_schema=False`, `is_pure=False`, and default `collect_batches()` optimizations without custom `QueryOptFlags` workarounds).
-*   **Diagnostics without raw SQL leakage**: Add `logging.getLogger(__name__)` (`DEBUG` dry-run and execution summaries, `WARNING` on 1 MB step-down) and pass single-line, metadata-only `explain_name` and `explain_detail` strings (no raw SQL or literals) to `register_io_source` in both `scan_query` and `scan_table`.
-*   **Synchronized dependency floors**: Raise the Polars dependency in both `py-polars-bigquery/pyproject.toml` and `py-polars-expressions-testing/pyproject.toml` to `polars >= 2.0.0, < 3.0.0` (updating `uv.lock` to `2.1.0`), and add a minimum bound on `arrow-bigquery` (`>= 0.3.2`) in `py-polars-bigquery/pyproject.toml`.
-*   **Documentation and verification coverage**:
-    *   Update docs and docstrings (`index.md` IAM roles adding `roles/bigquery.jobUser`, runnable quickstart table, `predicate-pushdown.md`, `Client` docstrings removing `"purely an optimization"` and raw MkDocs `!!! note` syntax, documenting construction vs. `.collect()` `ComputeError` behavior, upstream known issues, and the ~10 GB limit). Keep `docs/source/guides/large-query-results.md` filename unchanged to preserve published URLs, renaming only its `def scan_query` helper.
-    *   Verify SQL pushdown planning, real Arrow C stream execution, and live BigQuery GoogleSQL pipe-syntax compatibility (`WITH` and `WITH RECURSIVE` CTEs, unparenthesized `UNION ALL` / set operations precedence with `|> WHERE`, `CREATE TEMP FUNCTION ...; SELECT ...` + `|>`, trailing `ORDER BY ... LIMIT ...` + `|>`, user pipe queries, value tables `SELECT AS STRUCT` / `SELECT AS VALUE`, `SELECT 1 AS a, 2 AS A` on inline and `LARGE_RESULTS` queries, and partition/column pruning `totalBytesProcessed` parity with `FROM (...)`).
+*   **Shared logical plan tree and backend executors**: Model scan operations as an immutable logical plan tree (`QueryScan`, `TableScan`, `Filter`, `Slice(offset, length)`, `Project`) executed by separate query and Storage Read API backends sharing one local Polars residual evaluator. This decouples logical operator ordering from Polars' current `register_io_source` callback signature in preparation for newer Polars I/O plugin APIs (such as `FileReader` / `LazyFrameResolver` in [pola-rs/polars#30583](https://github.com/pola-rs/polars/pull/30583)).
+*   **GoogleSQL pipe pushdown when `maintain_order=False`**: Allow adaptive parallel multi-stream reads and append GoogleSQL pipe operators (`|> WHERE`, `|> SELECT`, `|> LIMIT [OFFSET]`) after the right-trimmed user query (preserving leading whitespace/newlines so `[line:col]` error coordinates stay unshifted) without subquery wrapper parentheses or aliases:
+    *   **Predicate pushdown**: Reuse `core/compiler/` expression compilation with no column-name heuristics (`f[0-9]+_` regex or `casefold()` exclusions), exposing compiler exactness (`is_exact`) to gate post-filter `Slice` pushdown on general logical plans. Treat trivial `"TRUE"` as no filter and emit `|> WHERE` before `|> SELECT` so filters see all inner columns.
+    *   **Projection pushdown**: Emit projected columns via `|> SELECT ...` in schema declaration order so equivalent selections (`lf.select(["a", "b"])` vs. `lf.select(["b", "a"])`) produce identical SQL strings and share BigQuery's query cache. Omit `|> SELECT` when all columns are required so anonymous computed columns (`f0_`, `f1_`) flow through on all-column filtered or sliced scans.
+    *   **`Slice(offset, length)` / `LIMIT` pushdown**: For unordered `Slice(0, n)` followed by `Filter(p)` (`register_io_source`'s contract for `lf.limit(n).filter(p)`), push `|> WHERE {p_sql}` and `|> LIMIT {n}` together (sound because `maintain_order=False` disclaims row order and `p => p_sql`). For general logical plans, push `Filter(p) -> Slice(offset, length)` only when all preceding filters compiled with `is_exact=True`, clear `offset` in the residual local plan whenever `OFFSET` is pushed, and keep out-of-range slices (`> (1 << 63) - 1`) local rather than failing.
+*   **Single verbatim dry run (`schema=None`)**: Execute one dry run against unmodified `raw_query` with no rewritten-first probe and no second dry run on errors, preserving exact `[line:col]` error coordinates while rejecting non-`SELECT` statements, malformed/empty schema metadata, and exact duplicate column names at construction time.
+*   **1,000,000-byte UTF-8 guard on rewritten SQL**: Stay below BigQuery's 1,024,000-character / 1,048,576-byte unresolved query limit by stepping down in tiers: drop `|> WHERE` (and post-filter slices) first while retaining `|> SELECT` and pre-filter `|> LIMIT`, falling back to verbatim `raw_query` only if remaining pipe clauses still exceed the ceiling, and emitting a single `WARNING` on degradation.
+*   **Zero-column projection pruning across both scan APIs**: For `scan_query`, emit `|> SELECT 1 AS <dummy>` (collision-safe alias, verified live to scan `0` bytes) when no output or predicate columns are needed, or `|> SELECT <predicate_columns>` when filtering, and drop columns locally via `.drop(pl.all())`. For `scan_table`, select a single column rather than an empty `selected_fields` list (which tells Storage Read API to read every column) and drop locally via `.drop(pl.all())`.
+*   **Eager input validation and Polars defaults**: Validate compression codec, non-empty `query`, non-empty `schema`, and dry-run schema JSON eagerly; keep Polars defaults (`validate_schema=False`, `is_pure=False`, and default `collect_batches()` optimizer flags).
+*   **PII-safe diagnostics and synchronized documentation**: Emit structured `DEBUG`/`WARNING` logs and single-line metadata-only `explain_name`/`explain_detail` strings (never exposing raw SQL or predicate literals) for both `scan_query` and `scan_table`. Document IAM prerequisites (`roles/bigquery.jobUser` alongside `roles/bigquery.readSessionUser`), explicit-`schema` behavioral trade-offs, `ComputeError` wrapping on `.collect()`, the ~10 GB anonymous table cap, and Polars `>= 2.0.0, < 3.0.0` / `arrow-bigquery >= 0.3.2` requirements while preserving the published URL of [Scanning Large Query Results](../source/guides/large-query-results.md).
 
 ## Non-Goals
 
-*   **Working around upstream Polars `pl.scan_arrow_c_stream` pushdown bugs (known upstream issues)**: Rather than disabling Polars optimizer flags locally in `scan_query` or `scan_table`, both upstream `polars/io/arrow_c_stream.py` bugs on `polars 2.1.0` are documented as known upstream issues to be fixed in Polars:
-    *   [pola-rs/polars#30916](https://github.com/pola-rs/polars/issues/30916): `pl.scan_arrow_c_stream` evaluates `filter` before `limit` when both are pushed down, affecting ordered `maintain_order=True` scans with `lf.limit(n).filter(p)` (returns `[3, 4, 5]` instead of `[3]` on `[1..6].limit(3).filter(a > 2)`).
-    *   Zero-column `projection_pushdown` bug: `pl.scan_arrow_c_stream(...).drop(pl.all()).collect_batches()` pushes `PROJECT 0/1 COLUMNS` (`with_columns=[]`) into `arrow_c_stream.py`, which runs `df.select([])` and returns `[]` instead of `[(N, 0)]` (file a companion upstream Polars issue).
-*   **Fixing `core/schema.py` type mappings and schema-unaware compiler crashes**: Shared with `scan_table` and tracked separately. Known issues:
-    *   `BIGNUMERIC` maps to `Decimal(precision=76, scale=38)`, which raises `InvalidOperationError: precision must be between 1 and 38` inside `register_io_source` (verified live on `polars 2.1.0`).
-    *   `JSON` and `GEOGRAPHY` map to `pl.String`; pushing string predicates (`=`, `STARTS_WITH`, `REGEXP_CONTAINS`) fails in BigQuery with `No matching signature`.
-    *   `IS_NAN`/`IS_INF` on non-`FLOAT64` columns and `BOOL.fill_null(strategy="zero"|"one")` (`IFNULL(bool, 0)`) produce GoogleSQL type errors.
-    *   `TIMESTAMP` uses lowercase `time_zone="utc"` instead of Arrow's `"UTC"` (`pl.Datetime("us", "utc") != pl.Datetime("us", "UTC")` in Python equality, though Rust canonicalizes under `validate_schema=True`).
-    *   Parameterized `NUMERIC(P, S)` Arrow serialization is unverified against live `jobs.query` (`schema.py` hardcodes `(38, 9)`).
-    *   `REPEATED` drops type parameters during recursion; `INTERVAL` maps to `Duration("us")`; `RANGE<T>` raises `TypeError`; unnamed `STRUCT` subfields produce duplicate empty `Field("", ...)`; picosecond `TIMESTAMP` is unhandled.
-*   **Speculative dry-run fallback, column-name heuristics, or SQL parsing**: No rewritten-first dry-run probe, no second dry-run RPC on error paths, no `f[0-9]+_` / `casefold()` exclusion logic in `core/compiler`, and no custom GoogleSQL parser.
+*   **Connector-side workarounds for upstream Polars `pl.scan_arrow_c_stream` pushdown bugs**: Rather than overriding Polars' `QueryOptFlags` locally in `scan_query` or `scan_table`, this design relies on Polars' default `collect_batches()` optimizations and tracks both upstream `polars/io/arrow_c_stream.py` bugs as accepted risks until fixed in Polars (see [Risks & Mitigations](#risks--mitigations)).
+*   **Fixing shared `core/schema.py` type mappings and schema-unaware compiler gaps**: Pre-existing issues shared with `scan_table` are tracked separately—`BIGNUMERIC` (`Decimal(76, 38)` raising `InvalidOperationError` in `register_io_source`), `JSON`/`GEOGRAPHY` string-predicate errors, `IS_NAN`/`IS_INF` on non-`FLOAT64` and `BOOL.fill_null` type errors, `TIMESTAMP` `"utc"` vs. `"UTC"` Python equality, unverified parameterized `NUMERIC(P, S)` Arrow serialization, `REPEATED` parameter drops, `INTERVAL`→`Duration("us")`, `RANGE<T>`, unnamed `STRUCT` subfields, and picosecond `TIMESTAMP`.
+*   **Speculative dry-run fallback, column-name heuristics, or custom SQL parsing**: No rewritten-first dry-run probe, no second dry-run RPC on error paths, no `f[0-9]+_` / `casefold()` exclusion heuristics in `core/compiler`, and no custom GoogleSQL parser.
 *   **Client-side result caching or multi-collect deduplication**: `is_pure` stays `False`; self-joins (`lf.join(lf, ...)`) and repeated `.collect()` calls execute BigQuery per scan. *(Server-side `use_query_cache` pass-through is in scope.)*
 *   **Cost guardrails**: No `maximum_bytes_billed` parameter or dry-run byte threshold enforcement.
-*   **Results exceeding ~10 GB compressed**: Subject to BigQuery's anonymous destination table limit; larger results require an explicit destination table as documented in [docs/source/guides/large-query-results.md](../source/guides/large-query-results.md).
+*   **Results exceeding ~10 GB compressed**: Subject to BigQuery's anonymous destination table limit; larger results require an explicit destination table as documented in [Scanning Large Query Results](../source/guides/large-query-results.md).
 *   **Multi-statement scripts, DDL, and DML**: Rejected during dry run (`statementType != "SELECT"`).
-*   **Rust `arrow-bigquery` changes**: `jobs.cancel` on drop/abort, `py.check_signals()` polling during the 200-second `jobs.query` wait, `BigQueryJobService` retry/backoff/throttler attachment, Rust `tracing` spans, and narrow-row inline first-page multi-stream cutover are deferred to Future Improvements.
-*   **Additional `jobs.query` parameters and `scan_table` parity**: `location`, `default_dataset`, `query_parameters`, `maximum_bytes_billed`, `timeout_ms`, `labels`, `destination_table` (requires `jobs.insert`), `arrow_buffer_compression` on `scan_table`/`read_table`, `maintain_order` on `scan_table`, and early-stop `n_rows` in `scan_table` are deferred to Future Improvements.
+*   **Rust `arrow-bigquery` changes**: `jobs.cancel` on drop/abort, `py.check_signals()` polling during the 200-second `jobs.query` wait, `BigQueryJobService` retry/backoff/throttler attachment, Rust `tracing` spans, and narrow-row inline first-page multi-stream cutover are deferred to [Future Improvements](#future-improvements).
+*   **Additional `jobs.query` parameters and `scan_table` option parity**: `location`, `default_dataset`, `query_parameters`, `maximum_bytes_billed`, `timeout_ms`, `labels`, `destination_table` (requires `jobs.insert`), `arrow_buffer_compression` on `scan_table`/`read_table`, `maintain_order` on `scan_table`, and early-stop `n_rows` in `scan_table` are deferred to [Future Improvements](#future-improvements).
 
 ## Open Questions
 
-None. GoogleSQL pipe syntax (`|>`), the shared `PlanNode` tree (`Slice(offset, length)`, `Filter`, `Project`) with separate `QueryExecutor` and `ReadApiExecutor` backends, Polars default `collect_batches()` optimizations with documented upstream known issues, and Polars `>= 2.0.0` workspace alignment are resolved.
+None. GoogleSQL pipe syntax compatibility (`WITH`, `WITH RECURSIVE`, unparenthesized `UNION ALL` / `INTERSECT DISTINCT` / `EXCEPT DISTINCT` precedence, `CREATE TEMP FUNCTION ...; SELECT ...`, trailing `ORDER BY ... LIMIT ...`, user pipe queries, struct value tables, `|> LIMIT ... OFFSET ...`, anonymous `f0_` columns, and case-colliding columns) and byte-for-byte `totalBytesProcessed` column/partition/zero-column pruning parity with `FROM (...)` subqueries have been verified directly against live BigQuery (summarized in [GoogleSQL Pipe Pushdown Rules](#googlesql-pipe-pushdown-rules)). Shared logical-plan architecture, reliance on Polars default `collect_batches()` optimizations, retention of `is_exact` post-filter `Slice` gating alongside ongoing compiler semantic-parity fixes, and Polars `>= 2.0.0` alignment are resolved.
 
 ## Critical User Journeys (CUJs)
 
@@ -74,19 +62,19 @@ None. GoogleSQL pipe syntax (`|>`), the shared `PlanNode` tree (`Slice(offset, l
 *   **Given**: A GoogleSQL query with `ORDER BY` whose output exceeds RAM but fits within BigQuery's ~10 GB compressed anonymous table cap (for example, 4 GB compressed), and a caller holding `roles/bigquery.readSessionUser` and `roles/bigquery.jobUser`.
 *   **When**: The caller runs `lf = client.scan_query(sql)` (`maintain_order=True`, `schema=None`), optionally appends `.filter(...)` or `.select(...)`, inspects `lf.explain()`, and streams via `lf.sink_parquet("out.parquet")` or `lf.collect_batches()`.
 *   **Then**:
-    *   `scan_query()` runs one verbatim dry run (`dry_run=True`) on `raw_query`, checks `statementType == "SELECT"` and unique column names, extracts `polars_schema`, and returns a `pl.LazyFrame`.
+    *   `scan_query()` runs one verbatim dry run (`dry_run=True`) on `raw_query`, checks `statementType == "SELECT"` and non-empty unique column names, extracts the Polars schema, and returns a `pl.LazyFrame`.
     *   `lf.explain()` displays `PYTHON[BIGQUERY_QUERY] SCAN` with single-line metadata containing `maintain_order=True, pushdown=disabled` and no raw SQL.
-    *   Execution sends `raw_query` verbatim and downloads results sequentially over a single stream, preserving `ORDER BY` order and matching BigQuery's exact-string query cache key (`use_query_cache` default). Filters and projections execute locally as batches stream to disk. *(Known upstream issue [pola-rs/polars#30916](https://github.com/pola-rs/polars/issues/30916) affects ordered `lf.limit(n).filter(p)` until fixed in Polars.)*
+    *   Execution sends `raw_query` verbatim and downloads results sequentially over a single stream, preserving `ORDER BY` order and matching BigQuery's exact-string query cache key (`use_query_cache` default). Filters and projections execute locally as batches stream to disk. *(See [Risks & Mitigations](#risks--mitigations) for upstream Polars `#30916` on ordered `lf.limit(n).filter(p)`.)*
 
 ### CUJ 2: Unordered Dynamic Pushdown (`maintain_order=False`)
 
-*   **Given**: A base `SELECT` query (including `WITH` / `WITH RECURSIVE` CTEs, `UNION ALL`, or pipe syntax) where row order does not matter and downstream Polars code supplies filters and column lists at runtime.
+*   **Given**: A base `SELECT` query (including `WITH` / `WITH RECURSIVE` CTEs, `UNION ALL`, `CREATE TEMP FUNCTION`, or pipe syntax) where row order does not matter and downstream Polars code supplies filters and column lists at runtime.
 *   **When**: The caller runs `lf = client.scan_query(sql, maintain_order=False)`, collects `lf.filter(pl.col("state") == "WA").select(["name", "year"]).collect()`, and later collects with `.select(["year", "name"])` and the same filter.
 *   **Then**:
-    *   `scan_query()` runs one verbatim dry run to extract `polars_schema`.
+    *   `scan_query()` runs one verbatim dry run to discover the schema.
     *   `lf.explain()` displays `PYTHON[BIGQUERY_QUERY] SCAN` with `maintain_order=False, pushdown=enabled` and no raw SQL literals.
-    *   `source_generator` appends pipe operators ``{inner_query}\n|> WHERE (`state` = 'WA')\n|> SELECT `name`, `year`, `state` `` using `polars_schema` column order, so both column orders emit the same SQL string and hit the same BigQuery query cache entry, and user SQL stays on line 1.
-    *   `arrow-bigquery` runs with `maintain_order=False`, allowing parallel multi-stream reads when result size crosses its internal cutover thresholds. Polars re-applies `.filter(predicate)` and `.select(output_columns)` locally.
+    *   Execution appends pipe operators ``{inner_query}\n|> WHERE (`state` = 'WA')\n|> SELECT `name`, `year`, `state` `` in schema declaration order, so both column orders emit the same SQL string and hit the same BigQuery query cache entry while preserving user `[line:col]` positions.
+    *   `arrow-bigquery` runs with `maintain_order=False`, enabling adaptive parallel multi-stream reads when result size crosses its internal cutover thresholds. Polars re-applies `.filter(predicate)` and `.select(output_columns)` locally.
     *   If all columns are needed and no filter or limit is pushed, `raw_query` runs verbatim. If all columns are needed and a filter is pushed, `|> SELECT` is omitted so anonymous computed columns (`f0_`) flow through without being referenced by name.
 
 ### CUJ 3: Skipping Dry Run With Explicit `schema`
@@ -94,88 +82,110 @@ None. GoogleSQL pipe syntax (`|>`), the shared `PlanNode` tree (`Slice(offset, l
 *   **Given**: A caller that already knows the full result schema of a valid `SELECT` query and wants to avoid the construction-time dry-run RPC.
 *   **When**: The caller runs `lf = client.scan_query(sql, schema={"name": pl.String, "year": pl.Int64}, maintain_order=False)` and collects `lf.select("name").collect()`.
 *   **Then**:
-    *   `scan_query()` issues no network requests at construction time, validates non-empty `query`, non-empty `schema`, and valid `arrow_buffer_compression`, and leaves `validate_schema=False`.
+    *   `scan_query()` issues zero network requests at construction time, validates non-empty `query`, non-empty `schema`, and valid `arrow_buffer_compression`, and leaves `validate_schema=False`.
     *   `lf.explain()` includes `schema=explicit`.
     *   Projection, predicate, and `LIMIT` pipe pushdown operate on `.collect()`. Non-`SELECT` statements are not blocked eagerly, duplicate-column validation is skipped, and SQL syntax errors raise `pl.exceptions.ComputeError` at `.collect()` with unshifted user `[line:col]` positions.
 
 ### CUJ 4: `LIMIT` Pushdown and `limit().filter()` Under `maintain_order=False`
 
 *   **Given**: A query scanned with `maintain_order=False` using `lf.limit(n)`, `lf.limit(n).filter(p)`, or `lf.filter(p).limit(n)`.
-*   **When**: Each plan is collected against a real Arrow C stream.
+*   **When**: Each plan is collected.
 *   **Then**:
     *   `lf.limit(10).collect()` emits `{inner_query}\n|> LIMIT 10` (reducing bytes transferred and output table size; BigQuery on-demand scan billing is unchanged).
-    *   `lf.limit(3).filter(pl.col("a") > 2).collect()` emits ``{inner_query}\n|> WHERE (`a` > 2)\n|> LIMIT 3`` (valid because row order is undefined under `maintain_order=False`) and re-applies exact filtering locally.
-    *   `lf.filter(pl.col("a") > 2).limit(3).collect()` receives `n_rows=None` from Polars; BigQuery receives ``{inner_query}\n|> WHERE (`a` > 2)`` with no SQL `LIMIT`, and Polars stops pulling batches once 3 matching rows arrive.
+    *   `lf.limit(3).filter(pl.col("a") > 2).collect()` emits ``{inner_query}\n|> WHERE (`a` > 2)\n|> LIMIT 3`` (sound because row order is undefined under `maintain_order=False`) and re-applies exact filtering locally.
+    *   `lf.filter(pl.col("a") > 2).limit(3).collect()` receives `n_rows=None` under Polars' current `register_io_source` contract: BigQuery executes ``{inner_query}\n|> WHERE (`a` > 2)`` with **no SQL `LIMIT`** (meaning BigQuery materializes the full filtered result up to the ~10 GB anonymous table cap, bills the full filtered query, and waits up to 200 seconds for completion before Polars stops pulling batches once 3 matching rows arrive).
 
-### CUJ 5: Zero-Column Projection and Oversized Predicate (> 1 MB SQL Guard)
+### CUJ 5: Zero-Column Projection (`lf.drop(pl.all())`)
 
-*   **Given**: A zero-column scan (`with_columns=[]`) or an `is_in()` predicate whose rewritten SQL exceeds 1,000,000 UTF-8 bytes.
-*   **When**: `source_generator` builds the query plan under `maintain_order=False`.
+*   **Given**: A caller scanning a wide table query under `maintain_order=False` and dropping all columns (`lf.drop(pl.all())`, or `lf.filter(p).drop(pl.all())`).
+*   **When**: The plan executes against BigQuery.
 *   **Then**:
-    *   For `with_columns=[]` and `predicate=None`, `scan_query` emits ``{inner_query}\n|> SELECT 1 AS `_polars_bigquery_empty` `` so BigQuery prunes all base-table columns, and chains `.drop(pl.all())` locally. *(End-to-end `(N, 0)` height preservation on `pl.scan_arrow_c_stream` awaits the upstream Polars 0-column `projection_pushdown` fix.)*
-    *   For rewritten SQL exceeding 1,000,000 UTF-8 bytes, `scan_query` drops `|> WHERE` first while keeping `|> SELECT` and `|> LIMIT` pushdown and logs a `WARNING`. If projection/limit pipe clauses alone still exceed 1,000,000 UTF-8 bytes, it sends `raw_query` verbatim and logs a `WARNING`.
+    *   For `lf.drop(pl.all())` with no predicate, `scan_query` emits ``{inner_query}\n|> SELECT 1 AS `_polars_bigquery_empty` `` (with a collision-safe alias), pruning all base-table column bytes in BigQuery (`0` bytes processed on live public tables), and drops the dummy column locally via `.drop(pl.all())`. With a predicate `p`, it projects only `p`'s referenced columns and drops them after local filtering.
+    *   *(Note: `lf.select(pl.len()).collect()` requests one column from Polars rather than zero columns and already returns the exact row count; end-to-end `(N, 0)` height preservation for `lf.drop(pl.all()).collect()` awaits the upstream Polars 0-column `projection_pushdown` fix documented in [Risks & Mitigations](#risks--mitigations).)*
 
-### CUJ 6: Error Handling and Diagnostics
+### CUJ 6: Oversized Predicate (> 1 MB SQL Guard)
 
-*   **Given**: Invalid parameters, invalid SQL, a non-`SELECT` statement, duplicate column names, an explicit reference to an anonymous `f0_` column under `maintain_order=False`, or output exceeding ~10 GB compressed.
+*   **Given**: A caller attaching a large `.filter(pl.col("id").is_in(...))` expression under `maintain_order=False` whose rewritten SQL exceeds 1,000,000 UTF-8 bytes.
+*   **When**: The caller collects the `LazyFrame`.
+*   **Then**:
+    *   Instead of failing with BigQuery's unresolved query length error, `scan_query` drops `|> WHERE` (and any post-filter slices) first while retaining `|> SELECT` and pre-filter `|> LIMIT` pushdown, evaluates the filter locally in Polars, and emits a single `WARNING` log without raw SQL literals.
+    *   If remaining `|> SELECT` / `|> LIMIT` clauses alone still exceed 1,000,000 UTF-8 bytes (for example, a user query near 1 MB), `scan_query` falls back to verbatim `raw_query`, evaluates all operations locally, and emits a single `WARNING` log.
+
+### CUJ 7: Error Handling and Diagnostics
+
+*   **Given**: Invalid parameters, invalid SQL, a non-`SELECT` statement, duplicate column names, an explicit reference to an anonymous `f0_` column or ambiguous case-colliding column under `maintain_order=False`, or query output exceeding ~10 GB compressed.
 *   **When**: The caller constructs or collects the `LazyFrame`.
 *   **Then**:
-    *   Invalid `arrow_buffer_compression`, empty `query`, empty `schema={}`, non-`SELECT` `statementType`, and exact duplicate column names raise `ValueError` during `scan_query()`.
-    *   Invalid SQL during dry run raises `BigQueryError` with unshifted `[line:col]` positions. Malformed or missing `bigquerySchema` JSON raises `BigQueryError`.
-    *   Failures inside `.collect()` (including BigQuery `Unrecognized name: f0_`, ambiguous case-insensitive columns `a`/`A`, disallowed column identifier `ValueError`, or ~10 GB `responseTooLarge`) raise `pl.exceptions.ComputeError`, with user SQL line numbers unshifted (pipe operators appear after the user's SQL). Python `DEBUG`/`WARNING` logs under `polars_bigquery` (`_read_bigquery` and `core.executors.query`) record pushdown state without including raw SQL literals in `INFO`/`WARNING` output or `lf.explain()`.
+    *   Invalid `arrow_buffer_compression`, empty `query`, empty `schema={}`, non-`SELECT` `statementType`, and exact duplicate column names raise `ValueError` eagerly during `scan_query()`.
+    *   Invalid SQL during dry run raises `BigQueryError` with unshifted `[line:col]` positions. Missing, empty, or malformed `bigquerySchema` JSON raises `BigQueryError`.
+    *   Failures during `.collect()` or `.sink_*()` (including BigQuery `Unrecognized name: f0_`, ambiguous case-insensitive columns `a`/`A`, disallowed column identifier `ValueError`, or ~10 GB `responseTooLarge`) raise `pl.exceptions.ComputeError`, with user SQL line and column coordinates unshifted. Python `DEBUG` and `WARNING` logs under the `polars_bigquery` logger hierarchy record pushdown state without exposing raw SQL literals in `INFO`/`WARNING` logs or `lf.explain()`.
 
 ## Technical Plan (Architecture)
 
 ### High-Level Data Flow
 
-`Client.scan_query()` separates construction-time validation and dry-run schema discovery from collection-time planning and execution. Both `scan_query` and `scan_table` translate Polars' `register_io_source` callback arguments into a shared immutable logical plan tree (`PlanNode` in `polars_bigquery/core/plan.py`) composed of leaf scans (`QueryScan`, `TableScan`) and relational operators (`Filter`, `Slice`, `Project`) in explicit application order. Separate backend executors under `polars_bigquery/core/executors/` (`QueryExecutor` for GoogleSQL pipe syntax via `arrow_bigquery.Client.read_query`, and `ReadApiExecutor` for Storage Read API `selected_fields`/`row_restriction` via `arrow_bigquery.Client.read_table`) compile each `PlanNode` tree into a backend-specific server request plus a residual local `PlanNode` tree, then run one shared local evaluator (`apply_local_plan`) over `pl.scan_arrow_c_stream(...)`. Separating logical plan construction from backend executors prepares `polars-bigquery` for newer Polars I/O plugin APIs (such as `FileReader` and `LazyFrameResolver` in [pola-rs/polars#30583](https://github.com/pola-rs/polars/pull/30583)) where `Slice(offset, length)` and `Filter` can arrive in arbitrary order.
+`Client.scan_query()` separates construction-time validation and dry-run schema discovery from collection-time planning and execution. Both `scan_query` and `scan_table` translate Polars' `register_io_source` callback arguments into a shared immutable logical plan tree composed of leaf scans (`QueryScan`, `TableScan`) and relational operators (`Filter`, `Slice`, `Project`) in explicit application order. Separate query and Storage Read API backend executors compile each logical plan into a backend-specific BigQuery request plus a residual local plan, then run one shared local residual evaluator over `pl.scan_arrow_c_stream(...)`.
+
+The diagram below illustrates the end-to-end `Client.scan_query()` flow (`Client.scan_table()` follows the same logical-plan and local-evaluation stages through its Storage Read API backend):
 
 ```mermaid
 flowchart TD
-    A["Client.scan_query(query, schema, arrow_buffer_compression, maintain_order, use_query_cache)"] --> B["Eager validation (compression Literal, non-empty query, non-empty schema)"]
-    B --> C{"schema is None?"}
-    C -- "Yes" --> D["_dry_run_query(raw_query) [1 verbatim RPC, no fallback]"]
-    D --> E["Validate statementType == SELECT & JSON schema via extract_polars_schema_from_fields()"]
-    E --> F["Capture dry-run fields (location, totalBytesProcessed, cacheHit) for DEBUG log & explain_detail"]
-    C -- "No" --> G["_normalize_schema(schema) [no dry-run RPC]"]
-    F --> H["register_io_source(io_source=source_generator, schema=polars_schema, validate_schema=False, is_pure=False, explain_name='BIGQUERY_QUERY', explain_detail=...)"]
-    G --> H
+    subgraph Construction["Construction Time (Client.scan_query)"]
+        A["Client.scan_query(query, schema,\ncompression, maintain_order, use_query_cache)"]
+        B["Eager validation\n(compression, non-empty query, non-empty schema)"]
+        C{"schema is None?"}
+        D["Single verbatim dry run\n(jobs.query dryRun=true)"]
+        E["Validate statementType == SELECT\nand non-empty unique JSON schema"]
+        F["Normalize explicit schema\n(0 network RPCs)"]
+        G["Register Polars I/O source\n(explain_name=BIGQUERY_QUERY, metadata-only explain_detail)"]
+    end
 
-    H -. Deferred until collect or sink .-> I["source_generator(with_columns, predicate, n_rows, batch_size)"]
-    I --> J["build_io_source_plan(QueryScan, with_columns, predicate, n_rows) -> PlanNode tree"]
-    J --> K["QueryExecutor.execute(plan, batch_size) -> compile_query_plan(plan)"]
-    K --> L{"1 MB UTF-8 guard (<= 1,000,000 bytes)"}
-    L -- "Fits" --> M["Use compiled pipe SQL + residual_plan"]
-    L -- "Oversized + WHERE" --> N["Drop |> WHERE (and post-filter slices), update residual_plan, log WARNING"]
-    N -- "Still oversized" --> O["Fallback to verbatim raw_query + full residual_plan, log WARNING"]
-    N -- "Fits" --> M
-    L -- "Oversized (no WHERE)" --> O
-    M --> P["self._arrow_client.read_query(compiled.sql, ...)"]
-    O --> P
-    P --> Q["pl.scan_arrow_c_stream(arrow_stream_exporter)"]
-    Q --> R["apply_local_plan(lazyframe, compiled.residual_plan)"]
-    R --> S["return .collect_batches(chunk_size=batch_size, maintain_order=source.maintain_order)"]
+    subgraph Execution["Deferred Collection Time (.collect / .sink / .collect_batches)"]
+        H["Build logical plan tree\n(QueryScan -> Slice -> Filter -> Project)"]
+        I{"maintain_order == True?"}
+        J["Bypass pushdown\n(verbatim raw_query, full residual plan)"]
+        K["Compile GoogleSQL pipe plan\n(|> WHERE, |> SELECT, |> LIMIT [OFFSET])"]
+        L{"Rewritten SQL\n<= 1,000,000 UTF-8 bytes?"}
+        M["Drop |> WHERE and post-filter slices;\nrecheck <= 1,000,000 UTF-8 bytes"]
+        N["Fallback to verbatim raw_query\nand full residual plan"]
+        O["Emit DEBUG summary\n(+ single WARNING if degraded; no raw SQL)"]
+        P["arrow_client.read_query(compiled_sql)\n-> Arrow C stream"]
+        Q["Apply residual local plan\n(.slice / .filter / .select or .drop(pl.all()))"]
+        R["Stream batches via collect_batches\n(chunk_size, maintain_order)"]
+    end
+
+    A --> B --> C
+    C -->|"Yes"| D --> E --> G
+    C -->|"No"| F --> G
+    G -.->|"Deferred until collect or sink"| H
+    H --> I
+    I -->|"Yes"| J --> O
+    I -->|"No"| K --> L
+    L -->|"Yes"| O
+    L -->|"No (has WHERE)"| M
+    L -->|"No (no WHERE)"| N --> O
+    M -->|"Fits (pipe ops remain)"| O
+    M -->|"Still oversized or\nno pipe ops remain"| N
+    O --> P --> Q --> R
 ```
 
-### Component Architecture & Module Boundaries
+### Component Responsibilities
 
-| Component | Status | Responsibility |
+| Component | Package Location | Responsibility |
 | :--- | :--- | :--- |
-| `polars_bigquery/core/plan.py` | **Create** | Immutable logical plan IR (`PlanNode` ABC, `QueryScan`, `TableScan`, `Filter`, `Slice(offset, length)`, `Project`) mirroring `core/compiler/ir/base.py`, plus `build_io_source_plan(...)` translating current `register_io_source` callback arguments into a `PlanNode` tree. |
-| `polars_bigquery/core/executors/__init__.py` | **Create** | Package exports exposing `PlanExecutor`, `apply_local_plan`, `QueryExecutor`, `CompiledQueryPlan`, `compile_query_plan`, `ReadApiExecutor`, `CompiledReadApiPlan`, and `compile_read_api_plan`. |
-| `polars_bigquery/core/executors/base.py` | **Create** | `PlanExecutor` ABC (`execute(plan, *, batch_size=None) -> Iterator[pl.DataFrame]`) and shared `apply_local_plan(lazyframe, plan) -> pl.LazyFrame` walking any `PlanNode` tree bottom-up onto `pl.scan_arrow_c_stream(...)`. |
-| `polars_bigquery/core/executors/query.py` | **Create** | Stateless GoogleSQL pipe compiler (`compile_query_plan`, `CompiledQueryPlan`, `MAX_UNRESOLVED_SQL_BYTES = 1_000_000`, `MAX_BIGQUERY_LIMIT = (1 << 63) - 1`, collision-safe dummy alias generator) plus `QueryExecutor(arrow_client)` executing `arrow_client.read_query(...)`, structured `DEBUG`/`WARNING` logging, and `apply_local_plan(...)`. |
-| `polars_bigquery/core/executors/read_api.py` | **Create** | Stateless Storage Read API compiler (`compile_read_api_plan`, `CompiledReadApiPlan`) enforcing `Slice` pushdown barriers and computing `selected_fields` + `row_restriction`, plus `ReadApiExecutor(arrow_client)` executing `arrow_client.read_table(...)` and shared `apply_local_plan(...)`. |
-| `polars_bigquery/core/compiler/__init__.py`, `polars_bigquery/core/compiler/sql/__init__.py` | **Modify** | Expose existing `_compile_ir_to_sql`'s `(sql, is_exact)` pair via `CompiledPredicate` / `compile_predicate(predicate)` and `compile_ir_to_sql(root)`. `predicate_to_row_restriction()` delegates to `compile_predicate().sql`; all expression IR, parser, rewriter, and SQL formatting logic stays unchanged. |
-| `polars_bigquery/core/schema.py` | **Modify** | Extract `extract_polars_schema_from_fields(fields: list[dict]) -> pl.Schema` (including exact duplicate column check) so `scan_query` does not synthesize a `{"schema": ...}` table dict; `extract_polars_schema(table_metadata)` delegates to it and appends ingestion-time `_PARTITIONDATE` / `_PARTITIONTIME` pseudo-columns. |
-| `polars_bigquery/_read_bigquery.py` | **Modify** | Add `Client.scan_query()`, `_normalize_schema`, `_validate_compression`, `Client._dry_run_query()`, `logging.getLogger(__name__)`, and `explain_name`/`explain_detail` registration on both `scan_query` and `scan_table`. Construct `QueryScan` / `TableScan` plans via `build_io_source_plan(...)` and delegate execution to `QueryExecutor` (`scan_query`) and `ReadApiExecutor` (`scan_table`). Group `Client` methods in mode order (`read_table`, `read_query`, `scan_table`, `scan_query`) for `mkdocstrings` (`members_order: source`). |
-| `py-polars-bigquery/pyproject.toml`, `py-polars-expressions-testing/pyproject.toml`, `uv.lock` | **Modify** | Synchronize Polars floor to `polars >= 2.0.0, < 3.0.0`, update `uv.lock` from `2.0.0rc1` to `2.1.0`, and pin `arrow-bigquery >= 0.3.2` in `py-polars-bigquery/pyproject.toml`. |
-| `docs/source/` | **Modify** | Update `index.md` (add `roles/bigquery.jobUser`, runnable quickstart table, `scan_query` references), `api/index.md`, `api/predicate-pushdown.md`, and `guides/large-query-results.md` (keep filename unchanged, rename `def scan_query` helper). |
+| Client API & Dry-Run Entry Point | `py-polars-bigquery/polars_bigquery/_read_bigquery.py` | Exposes `Client.scan_query()` alongside `read_table`, `read_query`, and `scan_table`; performs eager validation, isolated dry-run schema discovery, PII-safe `explain_name`/`explain_detail` registration, and executor dispatch. |
+| Logical Plan Model | `py-polars-bigquery/polars_bigquery/core/plan.py` | Defines the immutable logical scan plan tree (`QueryScan`, `TableScan`, `Filter`, `Slice(offset, length)`, `Project`) and adapts Polars' `register_io_source` callback arguments into a plan tree. |
+| Expression Compiler Interface | `py-polars-bigquery/polars_bigquery/core/compiler/` | Compiles Polars filter expressions into BigQuery SQL plus a structural exactness flag (`is_exact`) while keeping existing `predicate_to_row_restriction()` behavior unchanged. |
+| Query Executor (GoogleSQL Pipe) | `py-polars-bigquery/polars_bigquery/core/executors/query.py` | Compiles `QueryScan` plans into GoogleSQL pipe queries (`|> WHERE`, `|> SELECT`, `|> LIMIT [OFFSET]`) with the 1,000,000-byte UTF-8 tiered guard, emits structured `DEBUG`/`WARNING` logs, invokes `arrow_client.read_query(...)`, and runs local residual evaluation. |
+| Storage Read API Executor | `py-polars-bigquery/polars_bigquery/core/executors/read_api.py` | Compiles `TableScan` plans into Storage Read API `selected_fields` (with single-column fallback for 0-column scans) and `row_restriction` (with `Slice` pushdown barriers), invokes `arrow_client.read_table(...)`, and runs local residual evaluation. |
+| Shared Local Residual Evaluator | `py-polars-bigquery/polars_bigquery/core/executors/base.py` | Defines the backend executor interface and walks any residual logical plan tree bottom-up over `pl.scan_arrow_c_stream(...)`. |
+| Schema Field Extractor | `py-polars-bigquery/polars_bigquery/core/schema.py` | Converts BigQuery `TableSchema` field lists into `pl.Schema` with exact duplicate column detection, shared by `scan_query` dry-run JSON and `scan_table` REST metadata (which additionally appends ingestion-time `_PARTITIONDATE` / `_PARTITIONTIME` pseudo-columns). |
 
 ### Public API Signature & Eager Validation
 
 ```python
 ArrowBufferCompression = Literal["lz4frame", "zstd", "unspecified"]
+
 
 class Client:
     def scan_query(
@@ -189,21 +199,21 @@ class Client:
     ) -> pl.LazyFrame: ...
 ```
 
-**Eager validation executed synchronously inside `scan_query()`:**
+**Eager validation executed synchronously inside `scan_query()`**:
 
-| Check | Order | Failure Condition | Exception Raised |
-| :--- | :--- | :--- | :--- |
-| `arrow_buffer_compression` | 1 | Not in `{"lz4frame", "zstd", "unspecified"}` | `ValueError` |
-| `query` non-empty | 2 | `not raw_query.strip().removesuffix(";").strip()` (rejects `""`, `"   "`, `" ; "`) | `ValueError` |
-| Explicit `schema` | 3 (if provided) | Empty mapping/schema (`len(polars_schema) == 0`) or invalid Polars dtype spec | `ValueError` / `TypeError` (from `pl.Schema`) |
-| Dry run RPC (`schema=None`) | 4 (if `schema is None`) | Network, auth, quota, or SQL syntax error in BigQuery | `BigQueryError` (unshifted `[line:col]` on `raw_query`) |
-| Dry run row / `statementType` | 5 | Empty metadata frame (`height == 0`) or `statementType not in (None, "SELECT")` | `BigQueryError` (empty frame) / `ValueError` (non-`SELECT`) |
-| `bigquerySchema` presence & JSON | 6 | `schema_json is None`, invalid JSON (`JSONDecodeError`), non-`dict` root, or non-`list` `"fields"` | `BigQueryError` |
-| Schema fields extraction | 7 | Exact duplicate column names (`SELECT 1 AS a, 2 AS a`) or unknown BigQuery type | `ValueError` (duplicates) / `TypeError` (unknown type) |
+| Order | Check | Scope | Failure Condition | Exception Raised |
+| :---: | :--- | :--- | :--- | :--- |
+| 1 | `arrow_buffer_compression` | Always | Not in `{"lz4frame", "zstd", "unspecified"}` | `ValueError` |
+| 2 | `query` non-empty | Always | Right-trimmed query without single trailing `;` is empty (`""`, `"   "`, `" ; "`) | `ValueError` |
+| 3 | Explicit `schema` | `schema is not None` | Empty mapping/schema (`len == 0`) or invalid Polars dtype spec | `ValueError` / `TypeError` |
+| 4 | Dry-run RPC | Dry run (`schema is None`) | Network, auth, quota, or SQL syntax error in BigQuery | `BigQueryError` (unshifted `[line:col]` on `raw_query`) |
+| 5 | Dry-run row & `statementType` | Dry run (`schema is None`) | Empty metadata frame (`height == 0`) or `statementType not in (None, "SELECT")` | `BigQueryError` (empty frame) / `ValueError` (non-`SELECT`) |
+| 6 | `bigquerySchema` JSON structure | Dry run (`schema is None`) | `bigquerySchema` missing/null, invalid JSON, non-`dict` root, missing/non-`list` `"fields"`, empty `"fields"`, non-`dict` field entry, or empty field `"name"` | `BigQueryError` |
+| 7 | Schema fields conversion | Dry run (`schema is None`) | Exact duplicate column names (`SELECT 1 AS a, 2 AS a`) or unknown BigQuery type | `ValueError` (duplicates) / `TypeError` (unknown type) |
 
-**Dry-run isolation (`_dry_run_query`):** Calls `self._arrow_client.read_query(raw_query, arrow_buffer_compression=arrow_buffer_compression, dry_run=True, maintain_order=True, use_query_cache=None)` directly instead of calling public `self.read_query()`, avoiding coupling to subclass overrides or mocks on `read_query()`. In Rust (`crates/arrow-bigquery/src/query.rs:330-340`), `dry_run()` sends `QueryRequest::new().set_dry_run(true)` without `use_query_cache` or compression options on the wire.
+**Dry-run isolation**: Construction-time dry runs invoke the underlying `arrow_bigquery.Client.read_query(..., dry_run=True, maintain_order=True, use_query_cache=None)` directly rather than calling public `Client.read_query()`, avoiding coupling to subclass overrides or test mocks on `read_query()`. In Rust ([`crates/arrow-bigquery/src/query.rs`](../../crates/arrow-bigquery/src/query.rs#L330-L340)), `dry_run()` sends `QueryRequest::new().set_dry_run(true)` without compression or cache options on the wire.
 
-**Behavioral delta between `schema=None` and explicit `schema={...}`** (the existing branch docstring calls `schema` `"purely an optimization"`, which omits the behavioral changes below):
+**Behavioral differences between `schema=None` and explicit `schema={...}`**: Providing an explicit `schema` changes construction-time and execution-time semantics rather than acting merely as a latency optimization:
 
 | Aspect | `schema=None` (Dry-Run Discovery) | `schema={...}` (Explicit Caller Schema) |
 | :--- | :--- | :--- |
@@ -212,118 +222,48 @@ class Client:
 | Exact duplicate column check | Blocked eagerly with `ValueError` | Skipped (relies on caller's unique mapping keys) |
 | Invalid SQL error timing & type | Construction time (`BigQueryError`, exact `[line:col]`) | Collection time (`pl.exceptions.ComputeError`, unshifted user `[line:col]`) |
 | Dtype validation at `.collect()` | `validate_schema=False` (Polars default) | `validate_schema=False` (caller must match full result schema) |
-| Partial schema risk | Not possible (BigQuery returns full schema) | Partial `schema` makes `set(needed) < all_columns` false, disabling `|> SELECT` projection pushdown |
+| Partial schema risk | Not possible (BigQuery returns full schema) | Partial `schema` makes `needed_set >= all_columns` true, silently disabling `|> SELECT` projection pushdown |
 | Dry-run metadata in `explain_detail` | Includes `schema=dry_run` and `location=<loc>` | `schema=explicit` (`location` omitted) |
 
-### Shared Logical Plan Tree (`core/plan.py`)
+### Shared Logical Plan & Backend Executors
 
-Both `scan_query` and `scan_table` represent the operations requested by Polars as an immutable tree of frozen dataclasses (`PlanNode`, mirroring `core/compiler/ir/base.py`):
+#### Logical Plan Model
 
-```python
-@dataclass(frozen=True, slots=True)
-class PlanNode(abc.ABC):
-    @abc.abstractmethod
-    def children(self) -> tuple[PlanNode, ...]: ...
+Both `scan_query` and `scan_table` model requested operations as an immutable linear tree of relational operators above a leaf scan:
 
-@dataclass(frozen=True, slots=True)
-class QueryScan(PlanNode):
-    raw_query: str
-    columns: tuple[str, ...]                          # polars_schema declaration order
-    maintain_order: bool = True
-    arrow_buffer_compression: ArrowBufferCompression = "lz4frame"
-    use_query_cache: bool | None = None
+*   **Leaf scans**: `QueryScan` (holding verbatim `raw_query`, non-empty schema `columns` in declaration order, `maintain_order`, `arrow_buffer_compression`, and `use_query_cache`) and `TableScan` (holding `table_ref`, non-empty schema `columns`, and `maintain_order`). Both require at least one column.
+*   **Unary operators**: `Filter(predicate)`, `Slice(offset, length)` (validating non-negative `int` bounds and rejecting `bool`), and `Project(columns)` (where an empty tuple represents a 0-column projection).
 
-    def children(self) -> tuple[PlanNode, ...]:
-        return ()
+Polars' current `register_io_source` callback (`with_columns`, `predicate`, `n_rows`) lowers into `Source -> [Slice(0, n_rows)] -> [Filter(predicate)] -> Project(output_columns)` (preserving `n_rows=0` and `with_columns=[]`). When future Polars I/O plugin APIs (such as `FileReader` / `LazyFrameResolver` in [pola-rs/polars#30583](https://github.com/pola-rs/polars/pull/30583)) expose arbitrary operator sequences such as `Filter -> Slice(offset, length)` or `Slice(offset, length) -> Filter`, callers construct the corresponding logical plan tree directly without changing either backend executor.
 
-@dataclass(frozen=True, slots=True)
-class TableScan(PlanNode):
-    table_ref: arrow_bigquery.BigQueryTableId
-    columns: tuple[str, ...]                          # polars_schema declaration order
-    maintain_order: bool = False
+#### GoogleSQL Pipe Pushdown Rules
 
-    def children(self) -> tuple[PlanNode, ...]:
-        return ()
+Given a `QueryScan` logical plan, the query compiler produces a compiled SQL string, a residual local logical plan, pushdown metadata, and an optional length-guard degradation reason:
 
-@dataclass(frozen=True, slots=True)
-class Filter(PlanNode):
-    input: PlanNode
-    predicate: pl.Expr
+1.  **Ordered bypass (`maintain_order=True`)**: Return `raw_query` verbatim with pushdown disabled and the full input plan as the residual local plan. Leaving `raw_query` completely unmodified preserves `ORDER BY` and BigQuery's exact-string query cache key.
+2.  **Right-trimmed inner query (`maintain_order=False`)**: When appending pipe operators, compute `inner_query` by stripping only trailing whitespace and at most one trailing semicolon (`.rstrip().removesuffix(";").rstrip()`) while leaving leading whitespace and newlines intact. Preserving leading newlines and indentation keeps BigQuery `[line:col]` error coordinates identical to `raw_query` on multi-line triple-quoted SQL; stripping at most one `;` ensures invalid double-semicolon queries (`"SELECT 1;;"`) still fail in BigQuery; and starting appended clauses on `\n|>` terminates trailing `--` / `#` line comments on the last line.
+3.  **Canonical `|> SELECT` projection (mutually exclusive 3-way partition)**: Compute `needed_set` as the union of the topmost `Project` columns (or all scan columns if no `Project` is present) and all `Filter` root column names, ordered in schema declaration order (so `lf.select(["a", "b"])` and `lf.select(["b", "a"])` emit identical SQL and share BigQuery's query cache; any unmatched names are appended deterministically):
+    *   **0-column constant mode** (`needed_columns` is empty): Emit ``|> SELECT 1 AS `<dummy>` `` using a collision-safe alias (`_polars_bigquery_empty`, suffixed `_1`, `_2`, ... until absent case-insensitively from the scan schema).
+    *   **All-column mode** (`needed_set >= set(scan_columns)`): Omit `|> SELECT` so anonymous computed columns (`f0_`, `f1_`) flow through `|> WHERE` and `|> LIMIT` without being referenced by name.
+    *   **Column-pruning mode** (all remaining cases): Validate and backtick-quote each column identifier fail-closed (`ValueError` on disallowed characters such as `` ` ``, `\`, `.`, `$`, `!`) and emit `|> SELECT ...`.
+4.  **Ordered `Filter` and `Slice` lowering**: Walk operators bottom-to-top, compiling each `Filter` via the expression compiler into `(sql, is_exact)` and normalizing trivial `"TRUE"` to `""` (while preserving `is_exact=True`):
+    *   **Unordered `Slice(0, n)` before `Filter(p)` (`register_io_source` pattern)**: Under `maintain_order=False`, commute subsequent `Filter` clauses ahead of a pending `Slice(0, n)` so `|> WHERE ...` emits before `|> LIMIT n`. Because row order is undefined and `p => p_sql`, every row set produced by `|> WHERE p_sql |> LIMIT n` followed by local exact `.filter(p)` is achievable by slicing `n` rows from some permutation and then filtering by `p`. If a following `Filter` is unpushable or partial, the pending pre-filter `Slice(0, n)` still flushes `|> LIMIT n`.
+    *   **`Filter(p)` before `Slice(offset, length)` (general plan pattern)**: Emit `|> WHERE {sql}` when non-empty. Push a subsequent `Slice(offset, length)` as `|> LIMIT {length}` (or `|> LIMIT {length} OFFSET {offset}` when `offset > 0`) only when every preceding `Filter` compiled with `is_exact=True`. If any preceding `Filter` has `is_exact=False`, activate a partial-filter barrier that withholds all subsequent `Slice` stages (and any operators above an unpushed `Slice`, while still allowing adjacent `Filter` stages with no intervening `Slice` to emit `|> WHERE`).
+    *   **`Slice(offset > 0, length)` before `Filter(p)`**: Emit `|> LIMIT {length} OFFSET {offset}` in tree order before subsequent `|> WHERE` clauses.
+    *   **Signed 64-bit SQL bounds & residual `offset` clearing**: Only push a `Slice(offset, length)` into SQL when both `offset` and `length` fit signed `INT64` (`<= (1 << 63) - 1`); if either exceeds BigQuery's signed `INT64` bound (for example, `u64::MAX` sentinel slices), withhold that slice and operators above it from SQL rather than raising an error, leaving them in the residual local plan. Whenever a `Slice(offset > 0, length)` is pushed into SQL and survives the length guard, clear its `offset` to `0` in the residual local plan so local Polars never double-skips rows.
+5.  **Unrewritten bypass & pipe assembly**: If no `|> WHERE`, `|> LIMIT`, or `|> SELECT` clause is emitted, return `raw_query` verbatim with the full input plan as the residual plan. Otherwise assemble `[inner_query]` followed by ordered `|> WHERE` / `|> LIMIT [OFFSET]` clauses, inserting `|> SELECT` (when present) immediately after the last `|> WHERE` clause if any exist, or immediately after `inner_query` if no `|> WHERE` clauses exist, joined with `"\n"`.
+6.  **Tiered 1,000,000-byte UTF-8 length guard**: Enforce `len(sql.encode("utf-8")) <= 1_000_000` (staying safely below BigQuery's 1,024,000-character / 1,048,576-byte unresolved query limit):
+    *   **Tier 1**: Full piped SQL fits → execute as compiled with no warning.
+    *   **Tier 2**: Oversized and at least one `|> WHERE` clause exists → drop all `|> WHERE` clauses and any `Slice` stages logically positioned after a dropped `Filter` (restoring original `offset` in the residual plan for any dropped `offset > 0` slice), keeping `|> SELECT` and pre-filter `Slice` stages. If at least one pipe clause remains and fits, execute it; if no pipe clauses remain, revert to verbatim `raw_query` with full residual plan. Emit one `WARNING`.
+    *   **Tier 3**: Remaining `|> SELECT` / `|> LIMIT` clauses still exceed 1,000,000 UTF-8 bytes → revert to verbatim `raw_query` with full residual plan (no projected columns, `WHERE` clauses, or slices pushed) and emit one `WARNING`.
 
-    def children(self) -> tuple[PlanNode, ...]:
-        return (self.input,)
+**Live BigQuery verification summary**: Direct testing against BigQuery confirmed GoogleSQL pipe compatibility for `WITH` and `WITH RECURSIVE` CTEs, unparenthesized `UNION ALL` / `INTERSECT DISTINCT` / `EXCEPT DISTINCT` (pipe operators bind looser than set operations and filter the full result), `CREATE TEMP FUNCTION ...; SELECT ...`, trailing `ORDER BY ... LIMIT ...`, user pipe queries (`FROM ... |> WHERE ...`), struct value tables (`SELECT AS STRUCT`, `SELECT AS VALUE STRUCT(...)`), `|> LIMIT ... OFFSET ...` (including followed by `|> WHERE`), all-column `f0_` preservation, and unshifted `[line:col]` coordinates under `.rstrip()` (`[3:5]` verbatim vs. `[3:5]` right-trimmed, vs. `[2:5]` if left-trimmed). Dry-run `totalBytesProcessed` checks confirmed exact byte-for-byte pruning parity with `FROM (...)` subqueries on `bigquery-public-data.usa_names.usa_1910_2013` (full `171,432,506` B → single-column `22,209,808` B = `|> SELECT` `22,209,808` B; `|> SELECT 1 AS _polars_bigquery_empty` = `0` B) and partitioned `bigquery-public-data.pypi.file_downloads` (full `263,712,429,047,128` B → 1-day partition filter + projection `13,450,936,282` B = pipe `13,450,936,282` B; 0-column dummy = `0` B). Live tests also confirmed that case-colliding columns (`SELECT 1 AS a, 2 AS A`) deduplicate to `a` and `A_1` in BigQuery's result schema (allowing `|> LIMIT`, while `|> WHERE (\`a\` = 1)` fails with `Column name a is ambiguous`), and that trailing `; -- comment` fails with `Statement not supported: SubpipelineStatement` (see [Risks & Mitigations](#risks--mitigations)).
 
-@dataclass(frozen=True, slots=True)
-class Slice(PlanNode):
-    input: PlanNode
-    offset: int                                       # >= 0 (validated in __post_init__)
-    length: int                                       # >= 0 (validated in __post_init__)
+#### SQL Emission Matrix (`register_io_source` Path, `maintain_order=False`, Within 1 MB Budget)
 
-    def children(self) -> tuple[PlanNode, ...]:
-        return (self.input,)
+*(When `maintain_order=True`, all operations bypass pushdown and execute `raw_query` verbatim with the full local residual pipeline.)*
 
-@dataclass(frozen=True, slots=True)
-class Project(PlanNode):
-    input: PlanNode
-    columns: tuple[str, ...]                          # () represents 0-column projection
-
-    def children(self) -> tuple[PlanNode, ...]:
-        return (self.input,)
-```
-
-`build_io_source_plan(source, *, with_columns, predicate, n_rows) -> PlanNode` adapts Polars' current `register_io_source` callback arguments into a `PlanNode` tree: `source` -> `Slice(0, n_rows)` (when `n_rows is not None`, never `if n_rows:`) -> `Filter(predicate)` (when `predicate is not None`) -> `Project(output_columns)`. When future Polars I/O plugin APIs pass arbitrary operator sequences (such as `Filter -> Slice(offset, length)` or `Slice(offset, length) -> Filter`), callers construct the corresponding `PlanNode` tree directly without changing either executor.
-
-### GoogleSQL Pipe Query Executor (`core/executors/query.py`)
-
-```python
-MAX_UNRESOLVED_SQL_BYTES = 1_000_000   # Below BigQuery's 1,024,000-char / 1,048,576-byte limit
-MAX_BIGQUERY_LIMIT = (1 << 63) - 1     # Signed INT64 upper bound for SQL LIMIT / OFFSET
-
-@dataclass(frozen=True, slots=True)
-class CompiledQueryPlan:
-    sql: str                                   # Final SQL string passed to arrow_client.read_query
-    rewritten: bool                            # True if GoogleSQL pipe operators were appended
-    residual_plan: PlanNode                    # Local PlanNode tree applied to pl.scan_arrow_c_stream
-    projected_columns: tuple[str, ...] | None  # None = no |> SELECT (all cols/verbatim); () = dummy 0-col constant
-    where_clauses: tuple[str, ...]             # Effective |> WHERE clauses pushed
-    pushed_slices: tuple[tuple[int, int], ...] # Effective (offset, length) slices pushed
-    dummy_column: str | None                   # Collision-safe alias when |> SELECT 1 AS ... is used
-    degraded_reason: Literal["sql_length_dropped_where", "sql_length_skipped_pushdown"] | None
-```
-
-#### Compilation Algorithm (`compile_query_plan`)
-
-Inputs: `plan: PlanNode` (rooted above a `QueryScan` leaf), `max_sql_bytes: int = MAX_UNRESOLVED_SQL_BYTES`.
-
-1.  **Decompose tree & validate bounds:** Walk `plan` to its `QueryScan` leaf (`TypeError` if leaf is not `QueryScan`), collecting `ops` bottom-to-top (`Filter | Slice | Project`). For every `Slice(offset, length)`, validate `0 <= offset <= MAX_BIGQUERY_LIMIT` and `0 <= length <= MAX_BIGQUERY_LIMIT` (`ValueError` otherwise).
-2.  **Ordered bypass (`source.maintain_order=True`):** Return `CompiledQueryPlan(sql=source.raw_query, rewritten=False, residual_plan=plan, projected_columns=None, where_clauses=(), pushed_slices=(), dummy_column=None, degraded_reason=None)`. Leaving `raw_query` untouched preserves `ORDER BY` and BigQuery's exact-string query cache key.
-3.  **Compute `inner_query`:** `source.raw_query.strip().removesuffix(";").strip()`, used only when appending pipe operators (`raw_query` stays verbatim when `rewritten=False`). Stripping at most one trailing `;` ensures `"SELECT 1;;"` still fails in BigQuery with a syntax error instead of silently executing, and the leading `\n` before `|>` terminates trailing `--` / `#` line comments on the last line of `inner_query`.
-4.  **Live-column analysis & canonical `|> SELECT`:** Compute `final_output_cols` (columns of the topmost `Project`, or `source.columns` if no `Project` is present) and `all_filter_cols` (union of `op.predicate.meta.root_names()` across all `Filter` ops). Let `needed_set = set(final_output_cols) | all_filter_cols`, ordered in `source.columns` declaration order (`[c for c in source.columns if c in needed_set]`, appending any unmatched names deterministically).
-    *   *Why:* `lf.select(["a", "b"])` and `lf.select(["b", "a"])` emit the same SQL (``|> SELECT `a`, `b` ``) and hit the same BigQuery query cache entry; retaining all `Filter` columns keeps local residual `.filter(...)` valid.
-    *   **0-column constant mode** (`needed_columns == []`): pick `dummy_col` via `_choose_dummy_column_name(source.columns)` (`"_polars_bigquery_empty"`, suffixed `_1`, `_2`, ... until `dummy_col.casefold()` is absent from `{c.casefold() for c in source.columns}`). Set ``select_op = f"|> SELECT 1 AS `{dummy_col}`"``.
-    *   **Column-pruning mode** (`0 < len(needed_columns) < len(source.columns)`): quote each name via `compiler.sql.column_to_sql_identifier(col)` (`ValueError` on disallowed characters such as `` ` ``, `\`, `.`, `$`, `!`). Set `select_op = "|> SELECT " + ", ".join(quoted_cols)`.
-    *   **All-column mode** (`needed_set >= set(source.columns)`): set `select_op = ""` (omit `|> SELECT`). Anonymous computed columns (`f0_`, `f1_`) flow through `|> WHERE` and `|> LIMIT` without being referenced by name.
-5.  **Lower ordered `Filter` and `Slice` stages:** Walk `ops` bottom-to-top using `compiler.compile_predicate(op.predicate) -> CompiledPredicate(sql, is_exact)` (normalizing `"TRUE"` to `""`):
-    *   **Unordered `Slice(0, n)` before `Filter(p)` (`register_io_source` pattern):** Under `maintain_order=False`, when a `Slice(0, n)` precedes one or more `Filter` ops (with no earlier partial filter), emit those `|> WHERE` clauses *before* `|> LIMIT {n}`. Because row order is undefined and `p => p_sql`, any output of `|> WHERE p_sql` + `|> LIMIT n` followed by local exact `filter(p)` is achievable by slicing `n` rows from some permutation and then filtering by `p`.
-    *   **`Filter(p)` before `Slice(offset, length)` (general tree pattern):** Emit `|> WHERE {sql}` when `sql != ""`. If `is_exact` is `False` (partial or unpushable filter), set a `partial_filter_barrier` and stop pushing any subsequent `Slice` (and ops above it) onto SQL so BigQuery cannot truncate rows before local Polars evaluates the unpushed filter portion. When all filters below `Slice` are exact (`is_exact=True`), push `|> LIMIT {length}` (when `offset == 0`) or `|> LIMIT {length} OFFSET {offset}` (when `offset > 0`).
-    *   **`Slice(offset > 0, length)` before `Filter(p)`:** Emit `|> LIMIT {length} OFFSET {offset}` in tree order before subsequent `|> WHERE {sql}` clauses.
-    *   **Residual `offset > 0` clearing:** Whenever a `Slice(offset > 0, length)` is pushed into SQL (and survives the 1 MB guard), replace it with `Slice(0, length)` in `residual_plan` so local Polars does not skip `offset` rows a second time. `Slice(0, length)` stays in `residual_plan` as an idempotent bound.
-6.  **Unrewritten bypass (`maintain_order=False`):** If no `|> WHERE` stage, no `|> LIMIT` stage, and `select_op == ""`, return verbatim `source.raw_query` (`rewritten=False`, `residual_plan=plan`).
-7.  **Assemble GoogleSQL pipe query:** Start with `[inner_query]`, append ordered `|> WHERE` / `|> LIMIT [OFFSET]` stages, inserting `select_op` (when non-empty) immediately after the last `|> WHERE` stage (before any trailing `|> LIMIT` when no `|> WHERE` follows it, matching the SQL Emission Matrix and ensuring all `|> WHERE` clauses see every inner column), and join with `"\n"`.
-    *   *Why pipe syntax (`|>`):* User SQL starts on line 1 (unshifted error `[line:col]` coordinates), no wrapper parentheses (no unbalanced-parentheses breakout), no subquery range-variable alias collisions, top-level constructs like `WITH RECURSIVE` remain valid, and all-column filter/slice scans require no `SELECT *` wrapper.
-8.  **Tiered 1 MB UTF-8 length guard (`len(sql.encode("utf-8")) <= max_sql_bytes`):**
-    *   Enforcing `<= 1_000_000` UTF-8 bytes leaves 24,000 characters below BigQuery's 1,024,000-character limit and 48,576 bytes below 1,048,576 bytes.
-    *   **Tier 1:** If full piped SQL fits, return it with `degraded_reason=None` and the computed `residual_plan`.
-    *   **Tier 2:** If oversized and at least one `|> WHERE` stage exists: drop all `|> WHERE` stages *and* any `Slice` stages positioned after a dropped `Filter` in `ops` (dropping a filter turns it unpushed, so post-filter SQL slices would truncate unfiltered rows), retaining `select_op` and any `Slice` stages logically before dropped filters, and keeping the original `offset` in `residual_plan` for any dropped `offset > 0` slice:
-        *   If at least one pipe op remains and fits `<= max_sql_bytes`, return it with `degraded_reason="sql_length_dropped_where"`.
-        *   If no pipe ops remain, return `source.raw_query` verbatim (`rewritten=False`, `residual_plan=plan`, `degraded_reason="sql_length_dropped_where"`).
-    *   **Tier 3:** If the remaining `|> SELECT` / `|> LIMIT` SQL still exceeds `max_sql_bytes` (for example, `raw_query` itself is near 1 MB), return `source.raw_query` verbatim (`rewritten=False`, `residual_plan=plan`, `dummy_column=None`, `pushed_slices=()`, `degraded_reason="sql_length_skipped_pushdown"`).
-
-`QueryExecutor(arrow_client).execute(plan, *, batch_size=None)` calls `compile_query_plan(plan)`, emits `WARNING` if `compiled.degraded_reason is not None` and `DEBUG` summary (without raw SQL literals), invokes `arrow_client.read_query(compiled.sql, arrow_buffer_compression=source.arrow_buffer_compression, dry_run=False, maintain_order=source.maintain_order, use_query_cache=source.use_query_cache)`, runs `apply_local_plan(pl.scan_arrow_c_stream(exporter), compiled.residual_plan)`, and returns `.collect_batches(chunk_size=batch_size, maintain_order=source.maintain_order)`.
-
-#### SQL Emission Matrix (`register_io_source` Path, `maintain_order=False`, within 1 MB budget)
-
-| User Operation | `with_columns` | `predicate` | `n_rows` | Emitted SQL | Residual Local Pipeline |
+| Polars Operation | `with_columns` | `predicate` | `n_rows` | Emitted SQL | Residual Local Pipeline |
 | :--- | :--- | :--- | :--- | :--- | :--- |
 | `lf.collect()` | `None` | `None` | `None` | `raw_query` (verbatim) | `.select(all_columns)` |
 | `lf.select(["b", "a"])` (all cols) | `["b", "a"]` | `None` | `None` | `raw_query` (verbatim) | `.select(["b", "a"])` |
@@ -337,98 +277,72 @@ Inputs: `plan: PlanNode` (rooted above a `QueryScan` leaf), `max_sql_bytes: int 
 | `lf.limit(10).filter(p)` (pushable) | `None` | `p` | `10` | `{inner}\n\|> WHERE {sql(p)}\n\|> LIMIT 10` | `.slice(0, 10).filter(p).select(all_columns)` |
 | `lf.limit(10).filter(p).select(["a"])` | `["a"]` | `p` (uses `b`) | `10` | ``{inner}\n\|> WHERE {sql(p)}\n\|> SELECT `a`, `b`\n\|> LIMIT 10`` | `.slice(0, 10).filter(p).select(["a"])` |
 | `lf.limit(10).filter(p)` (unpushable) | `None` | `p` | `10` | `{inner}\n\|> LIMIT 10` | `.slice(0, 10).filter(p).select(all_columns)` |
-| Direct call `with_columns=[]`, no `p` | `[]` | `None` | `None` or `10` | ``{inner}\n\|> SELECT 1 AS `_polars_bigquery_empty` [\n\|> LIMIT 10]`` | `[.slice(0, 10)].drop(pl.all())` |
-| Direct call `with_columns=[]`, with `p` | `[]` | `p` (uses `b`) | `None` | ``{inner}\n\|> WHERE {sql(p)}\n\|> SELECT `b` `` | `.filter(p).drop(pl.all())` |
-| Any query with `maintain_order=True` | any | any | any | `raw_query` (verbatim) | `[.slice(0, n)][.filter(p)].select(...) / .drop(pl.all())` |
+| `lf.drop(pl.all())` | `[]` | `None` | `None` | ``{inner}\n\|> SELECT 1 AS `_polars_bigquery_empty` `` | `.drop(pl.all())` |
+| `lf.limit(10).drop(pl.all())` | `[]` | `None` | `10` | ``{inner}\n\|> SELECT 1 AS `_polars_bigquery_empty`\n\|> LIMIT 10`` | `.slice(0, 10).drop(pl.all())` |
+| `lf.filter(p).drop(pl.all())` | `[]` | `p` (uses `b`) | `None` | ``{inner}\n\|> WHERE {sql(p)}\n\|> SELECT `b` `` | `.filter(p).drop(pl.all())` |
 
-#### General `PlanNode` Tree Orderings (`maintain_order=False`, future I/O plugin APIs)
+#### General Logical Plan Orderings (`maintain_order=False`, Future I/O Plugin APIs)
 
-| Logical `PlanNode` Tree (bottom-to-top) | Emitted SQL | Residual Local Pipeline |
+| Logical Plan Tree (bottom-to-top) | Emitted SQL | Residual Local Pipeline |
 | :--- | :--- | :--- |
-| `QueryScan -> Filter(p, exact) -> Slice(0, 10) -> Project(["a"])` | ``{inner}\n\|> WHERE {sql(p)}\n\|> SELECT `a`\n\|> LIMIT 10`` | `.filter(p).slice(0, 10).select(["a"])` |
-| `QueryScan -> Filter(p, partial) -> Slice(0, 10) -> Project(["a"])` | ``{inner}\n\|> WHERE {sql(p)}\n\|> SELECT `a`, ...`` *(no SQL `LIMIT`)* | `.filter(p).slice(0, 10).select(["a"])` |
-| `QueryScan -> Filter(p, exact) -> Slice(5, 10) -> Project(["a"])` | ``{inner}\n\|> WHERE {sql(p)}\n\|> SELECT `a`\n\|> LIMIT 10 OFFSET 5`` | `.filter(p).slice(0, 10).select(["a"])` *(offset cleared)* |
-| `QueryScan -> Slice(5, 10) -> Filter(p) -> Project(["a"])` | ``{inner}\n\|> LIMIT 10 OFFSET 5\n\|> WHERE {sql(p)}\n\|> SELECT `a`, ...`` | `.slice(0, 10).filter(p).select(["a"])` *(offset cleared)* |
+| `QueryScan -> Filter(p [uses b], exact) -> Slice(0, 10) -> Project(["a"])` | ``{inner}\n\|> WHERE {sql(p)}\n\|> SELECT `a`, `b`\n\|> LIMIT 10`` | `.filter(p).slice(0, 10).select(["a"])` |
+| `QueryScan -> Filter(p [uses b], partial) -> Slice(0, 10) -> Project(["a"])` | ``{inner}\n\|> WHERE {sql(p)}\n\|> SELECT `a`, `b` `` *(no SQL `LIMIT`)* | `.filter(p).slice(0, 10).select(["a"])` |
+| `QueryScan -> Filter(p [uses b], exact) -> Slice(5, 10) -> Project(["a"])` | ``{inner}\n\|> WHERE {sql(p)}\n\|> SELECT `a`, `b`\n\|> LIMIT 10 OFFSET 5`` | `.filter(p).slice(0, 10).select(["a"])` *(offset cleared)* |
+| `QueryScan -> Slice(5, 10) -> Filter(p [uses b]) -> Project(["a"])` | ``{inner}\n\|> LIMIT 10 OFFSET 5\n\|> WHERE {sql(p)}\n\|> SELECT `a`, `b` `` | `.slice(0, 10).filter(p).select(["a"])` *(offset cleared)* |
 
-### Storage Read API Executor (`core/executors/read_api.py`)
+#### Storage Read API Pushdown Rules (`scan_table` Alignment)
 
-```python
-@dataclass(frozen=True, slots=True)
-class CompiledReadApiPlan:
-    selected_fields: tuple[str, ...]  # Deduplicated union of final Project columns + all Filter root columns
-    row_restriction: str              # Compiled Storage Read API row_restriction SQL ("" if none)
-    residual_plan: PlanNode           # Always the full input PlanNode tree (Read API applies no Slice)
-```
+For `TableScan` plans, the Storage Read API backend compiles `selected_fields` and `row_restriction` while keeping the entire input plan as the residual local plan (because Storage Read API sessions never perform server-side slicing):
 
-`compile_read_api_plan(plan: PlanNode) -> CompiledReadApiPlan` walks `plan` bottom-to-top to its `TableScan` leaf (`TypeError` if leaf is not `TableScan`):
-*   Computes `selected_fields = tuple(dict.fromkeys([*final_output_cols, *all_filter_cols]))`.
-*   Collects compiled `Filter` predicates bottom-to-top into `restrictions`, ignoring `""` and `"TRUE"`:
-    *   Stops collecting further `Filter` ops across a `Slice` barrier when `source.maintain_order=True` or when `Slice.offset > 0` (preventing filters from being pushed below an ordered or non-zero-offset slice).
-    *   Allows collecting filters across `Slice(0, n)` when `source.maintain_order=False` (unordered multiset, preserving `scan_table`'s existing behavior for `lf.limit(n).filter(p)`).
-    *   Joins multiple collected restrictions with `" AND "` (wrapping each clause in `(...)` when `len(restrictions) > 1`).
-*   Sets `residual_plan = plan` because Storage Read API sessions never perform server-side slicing.
+*   **Column selection & 0-column billing guard**: Compute `selected_fields` as the deduplicated union of final `Project` columns and all `Filter` root columns. If that union is empty (for example, `lf.drop(pl.all())` with no predicate), select the single first schema column (`(scan_columns[0],)`) rather than passing an empty `selected_fields` list—which [`crates/arrow-bigquery/src/lib.rs`](../../crates/arrow-bigquery/src/lib.rs#L148-L152) forwards to BigQuery Storage Read API as "read all columns of the table"—and drop it locally via `.drop(pl.all())`.
+*   **Filter pushdown & `Slice` barriers**: Collect compiled `Filter` clauses bottom-to-top, ignoring `""` and `"TRUE"`, and join multiple clauses with `" AND "` (parenthesizing each clause when more than one is present). Stop collecting filters across a `Slice` barrier when `maintain_order=True` or `Slice.offset > 0`, while allowing filter pushdown across unordered `Slice(0, n)` (preserving `scan_table`'s existing behavior).
+*   **Behavioral alignment**: Routing `Client.scan_table()` through the shared logical plan aligns its local `Slice`-before-`Filter` order and `.drop(pl.all())` handling with `Client.scan_query()` while preserving existing `selected_fields` and `row_restriction` behavior on single-filter and unfiltered scans.
 
-`ReadApiExecutor(arrow_client).execute(plan, *, batch_size=None)` calls `compile_read_api_plan(plan)`, invokes `arrow_client.read_table(source.table_ref, maintain_order=source.maintain_order, selected_fields=list(compiled.selected_fields), row_restriction=compiled.row_restriction)`, runs `apply_local_plan(pl.scan_arrow_c_stream(exporter), compiled.residual_plan)`, and returns `.collect_batches(chunk_size=batch_size, maintain_order=source.maintain_order)`.
+#### Shared Local Residual Evaluation
 
-*Behavioral alignment on `Client.scan_table`:* Existing `selected_fields`, `row_restriction`, and single-filter / unfiltered scans are unchanged. Building `TableScan` plans via `build_io_source_plan(...)` aligns `scan_table`'s local `Slice`/`Filter` order (`Slice` before `Filter`) and 0-column `.drop(pl.all())` with `scan_query` and Polars' `register_io_source` contract, so upstream fixes for [pola-rs/polars#30916](https://github.com/pola-rs/polars/issues/30916) and 0-column `projection_pushdown` apply automatically to both `scan_table` and `scan_query`.
+Both backend executors run one shared local residual evaluator over `pl.scan_arrow_c_stream(arrow_stream_exporter)`:
 
-### Shared Local Residual Evaluator (`core/executors/base.py`)
-
-Both `QueryExecutor` and `ReadApiExecutor` share one local evaluator over `pl.scan_arrow_c_stream(arrow_stream_exporter)`:
-
-```python
-def apply_local_plan(lazyframe: pl.LazyFrame, plan: PlanNode) -> pl.LazyFrame:
-    # Iterative bottom-up walk from leaf scan (QueryScan / TableScan) to root:
-    #   Slice(offset, length) -> lazyframe.slice(offset, length)
-    #   Filter(predicate)     -> lazyframe.filter(predicate)
-    #   Project(columns)      -> lazyframe.select(list(columns)) if columns else lazyframe.drop(pl.all())
-```
-
-Design notes:
-1.  **Exact tree-order local execution:** Walks `residual_plan` bottom-up so arbitrary sequences of `Slice`, `Filter`, and `Project` evaluate in their logical tree order, and uses `.drop(pl.all())` instead of `.select([])` for `Project(())`.
-2.  **Polars default optimizations (known upstream issues):** `collect_batches(...)` uses Polars' default `QueryOptFlags` rather than overriding `predicate_pushdown` or `projection_pushdown`. On `polars 2.1.0`, two upstream bugs inside `polars/io/arrow_c_stream.py` remain documented as known issues until fixed upstream:
-    *   [pola-rs/polars#30916](https://github.com/pola-rs/polars/issues/30916): `pl.scan_arrow_c_stream` applies `filter` before `limit`/`slice`, affecting ordered `maintain_order=True` scans with `lf.limit(n).filter(p)`.
-    *   Zero-column `projection_pushdown`: `pl.scan_arrow_c_stream(...).drop(pl.all()).collect_batches()` pushes `with_columns=[]` into `arrow_c_stream.py`, which runs `df.select([])` and returns `[]` instead of `[(N, 0)]` (file a companion upstream Polars issue).
-3.  **Direct `return` instead of `yield from`:** Returns `_CollectBatches` directly without retaining a suspended Python generator frame holding a reference to `arrow_stream_exporter` until GC/close.
-4.  **`maintain_order=source.maintain_order`:** Propagates the ordering flag to `collect_batches(...)` instead of defaulting to `maintain_order=True` inside Polars' inner streaming engine when `maintain_order=False`.
+1.  **Exact tree-order execution**: Walks the residual logical plan bottom-up, applying `.slice(offset, length)` for `Slice`, `.filter(predicate)` for `Filter`, and `.select(columns)` for non-empty `Project` or `.drop(pl.all())` for empty `Project(())`.
+2.  **Streaming batch collection with Polars defaults**: Calls `.collect_batches(chunk_size=batch_size, maintain_order=source.maintain_order)` using Polars' default `QueryOptFlags` (avoiding connector-side optimizer overrides; see [Risks & Mitigations](#risks--mitigations) for the two upstream `polars 2.0.0–2.1.0` `arrow_c_stream.py` issues) and returns the batch iterator directly.
 
 ### Observability, Logging & Error Contracts
 
-#### `lf.explain()` Format
-`register_io_source` displays `explain_name` as `PYTHON[<explain_name>] SCAN ...` and `explain_detail` as a static, single-line string captured at construction time. Raw SQL text and predicate literals are omitted from `explain_detail` to avoid leaking PII/secrets into logged plans and to obey the single-line format:
+#### `LazyFrame.explain()` Format
 
-*   **`scan_query`:**
+`register_io_source` renders `explain_name` as `PYTHON[<explain_name>] SCAN ...` and `explain_detail` as a static, single-line string captured at construction time. Raw SQL text and predicate literals are never placed in `explain_detail` to avoid leaking PII/secrets into logged plans and to preserve single-line formatting:
+
+*   **`scan_query`**:
     *   `explain_name = "BIGQUERY_QUERY"`
     *   `explain_detail` (comma-separated key-value pairs):
         *   Ordered, dry-run: `maintain_order=True, pushdown=disabled, schema=dry_run, location=US` (omit `location` if null/absent)
         *   Unordered, dry-run: `maintain_order=False, pushdown=enabled, schema=dry_run, location=US`
         *   Explicit schema: `maintain_order=False, pushdown=enabled, schema=explicit`
-*   **`scan_table`:**
+*   **`scan_table`**:
     *   `explain_name = "BIGQUERY_TABLE"`
     *   `explain_detail = f"table={table_ref}, schema={'metadata' if schema is None else 'explicit'}"`
 
-Because `explain_detail` is fixed at construction time, it cannot display dynamically generated `|> WHERE` clauses. Docs note that Polars prints `SELECTION:` and `PROJECT:` under the scan node even when `maintain_order=True` disables server-side pushdown.
+Because `explain_detail` is fixed at construction time, it cannot display dynamically generated `|> WHERE` clauses. Documentation notes that Polars prints `SELECTION:` and `PROJECT:` under the scan node even when `maintain_order=True` disables server-side pushdown.
 
-#### Python Logging (`logging.getLogger(__name__)`)
-*   **`DEBUG` on dry run (`polars_bigquery._read_bigquery`, `schema=None`):** Logs `statement_type`, `location`, `total_bytes_processed`, `cache_hit`, and column count (`len(polars_schema)`). No raw SQL.
-*   **`DEBUG` on execution (`polars_bigquery.core.executors.query`):** Logs `maintain_order`, `rewritten`, `projected_cols` (`len/total`, or `0-col dummy`), `where_clauses` count and total byte length, `pushed_slices`, `sql_bytes`, and `degraded_reason`. Raw SQL strings are not emitted at `INFO` or `WARNING`.
-*   **`WARNING` on 1 MB step-down guard (`polars_bigquery.core.executors.query`):** Emitted when `compiled.degraded_reason is not None` (`sql_length_dropped_where` or `sql_length_skipped_pushdown`), recording `sql_bytes` and `MAX_UNRESOLVED_SQL_BYTES` without raw SQL literals.
+#### Structured Python Logging
+
+*   **`DEBUG` on dry run (`schema=None`)**: Records `statement_type`, `location`, `total_bytes_processed`, `cache_hit`, and column count. No raw SQL.
+*   **`DEBUG` on query execution**: Records `maintain_order`, `rewritten`, projected column count (`projected/total` or `0-col dummy`), `where_clauses` count and total byte length, `pushed_slices`, `sql_bytes`, and `degraded_reason`. Raw SQL strings and predicate literals are never emitted at `INFO` or `WARNING`.
+*   **`WARNING` on 1 MB step-down guard**: Emitted once per degraded execution when the 1,000,000-byte UTF-8 ceiling triggers Tier 2 or Tier 3 fallback, recording `degraded_reason`, `sql_bytes`, and the 1,000,000-byte ceiling without raw SQL literals.
 
 #### Exception Contract Matrix
 
 | Phase | Trigger | Exception Type | Notes |
 | :--- | :--- | :--- | :--- |
 | Construction (`scan_query`) | Invalid `arrow_buffer_compression`, empty `query`, empty `schema={}`, non-`SELECT` `statementType`, exact duplicate column names | `ValueError` | Raised eagerly |
-| Construction (`scan_query`) | Invalid SQL, auth/quota/network failure, missing/malformed `bigquerySchema` JSON, empty dry-run result | `polars_bigquery.exceptions.BigQueryError` | Unshifted `[line:col]` on `raw_query` |
+| Construction (`scan_query`) | Invalid SQL, auth/quota/network failure, missing/empty/malformed `bigquerySchema` JSON or field entries, empty dry-run result | `polars_bigquery.exceptions.BigQueryError` | Unshifted `[line:col]` on `raw_query` |
 | Construction (`scan_query`) | Unknown BigQuery field type in dry-run schema, unspecified `pl.Schema` dtype class (e.g. `pl.Datetime`) | `TypeError` | Raised eagerly |
-| Execution (`.collect()` / `.sink_*()`) | Any failure inside `source_generator` or mid-stream Rust reader (BigQuery `Unrecognized name: f0_`, ambiguous `a`/`A`, ~10 GB `responseTooLarge`, disallowed column identifier `ValueError`, invalid `Slice` / `n_rows` range `ValueError`, network/auth error) | `pl.exceptions.ComputeError` | Polars wraps generator/stream exceptions into `ComputeError`. User SQL stays on line 1 (appended `|>` clauses follow the user's SQL). |
+| Execution (`.collect()` / `.sink_*()`) | Any failure inside execution or mid-stream Rust reader (BigQuery `Unrecognized name: f0_`, ambiguous `a`/`A`, ~10 GB `responseTooLarge`, disallowed column identifier `ValueError`, trailing `; -- comment` syntax error, network/auth error) | `pl.exceptions.ComputeError` | Polars wraps generator/stream exceptions into `ComputeError`. Leading whitespace preservation keeps user SQL `[line:col]` coordinates unshifted. |
 
 ### Underlying `arrow-bigquery` Streaming & `Client` Lifecycle
 
-*   **Sequential vs. parallel streaming:** Under `maintain_order=True`, `arrow-bigquery` downloads results sequentially over a single stream. Under `maintain_order=False`, `arrow-bigquery` may switch to parallel multi-stream reads when result size crosses its internal cutover thresholds (narrow-row inline-first-page queries stay on the single default stream while decoding batches in parallel). Docs describe `maintain_order=False` as enabling adaptive parallel reads rather than unconditional multi-stream sessions.
-*   **Query cache and re-execution:** Under `maintain_order=False`, distinct filter/projection/limit combinations emit distinct top-level SQL strings and miss BigQuery's 24-hour query cache (under `maintain_order=True`, repeated `.collect()` hits the cached query). With `is_pure=False`, self-joins (`lf.join(lf, ...)`) and multi-branch plans execute and bill BigQuery once per scan branch.
-*   **`Client` context-manager lifetime:** `source_generator` closes over `self`, retaining `Client`, its HTTP session, and its Rust gRPC channel. `Client.close()` currently closes only `_rest_client`, not `_arrow_client`, so collecting a `LazyFrame` outside a `with Client(...) as client:` block works today; docstrings will advise collecting inside the `with` block in case `_arrow_client` adds explicit shutdown later.
-*   **Dependency floors:** Raise both `py-polars-bigquery/pyproject.toml` and `py-polars-expressions-testing/pyproject.toml` to `polars >= 2.0.0, < 3.0.0` (updating `uv.lock` from `2.0.0rc1` to `2.1.0`), ensuring `explain_name` and `explain_detail` exist without signature-detection shims, and pin `arrow-bigquery >= 0.3.2` in `py-polars-bigquery/pyproject.toml`.
+*   **Sequential vs. adaptive parallel streaming**: Under `maintain_order=True`, `arrow-bigquery` downloads results sequentially over a single stream. Under `maintain_order=False`, `arrow-bigquery` may switch to parallel multi-stream reads when result size crosses its internal cutover thresholds (narrow-row inline-first-page queries stay on the single default stream while decoding batches in parallel). Documentation describes `maintain_order=False` as enabling adaptive parallel reads rather than unconditional multi-stream sessions.
+*   **Query cache and re-execution**: Under `maintain_order=True`, repeated `.collect()` calls emit identical verbatim SQL and hit BigQuery's 24-hour query cache. Under `maintain_order=False`, distinct filter/projection/limit combinations emit distinct top-level SQL strings and miss BigQuery's cache; with `is_pure=False`, self-joins (`lf.join(lf, ...)`) and multi-branch plans execute and bill BigQuery once per scan branch.
+*   **`Client` context-manager lifetime**: The registered I/O source closure captures only the backend executor (which holds `_arrow_client`), not `self`, avoiding unnecessary retention of `Client` and its REST HTTP session pool (`_rest_client`) for the lifetime of the `LazyFrame`. `Client.close()` currently closes only `_rest_client`, not `_arrow_client`, so collecting outside a `with Client(...) as client:` block works today; docstrings advise collecting inside the `with` block in case `_arrow_client` adds explicit shutdown later.
 
 ## Alternatives Considered
 
@@ -440,135 +354,135 @@ Because `explain_detail` is fixed at construction time, it cannot display dynami
 
 ### Alternative B: Lazy Streaming `scan_query` Without SQL Pushdown (No-Rewrite v1)
 
-*   **Pros**: Small implementation (~30 lines wrapping `arrow_client.read_query()`), preserves 100% of BigQuery query cache keys and exact error line numbers, and avoids all SQL rewrite edge cases.
+*   **Pros**: Small implementation wrapping `arrow_client.read_query()`, preserves 100% of BigQuery query cache keys and exact error line numbers, and avoids all SQL rewrite edge cases.
 *   **Cons**: Transfers every column and row produced by the base query across the network and evaluates all Polars `.select()`, `.filter()`, and `.limit()` operations locally.
-*   **Reason for Rejection**: Dynamic Polars-driven projection and filter pushdown to reduce network transfer size is a core requirement of the feature.
+*   **Reason for Rejection**: Dynamic Polars-driven projection and filter pushdown to reduce bytes scanned and transferred is a core requirement of the feature.
 
 ### Alternative C: Decouple `maintain_order` From SQL Pushdown, or Default `maintain_order=False`
 
 *   **Pros**:
-    *   *Decoupled `pushdown` flag*: Would allow `(maintain_order=False, pushdown=False)` for two edge cases: (1) reusing BigQuery's 24-hour query cache across multiple local `.filter()` calls while still allowing parallel multi-stream reads on a large result, and (2) running parallel multi-stream reads when explicitly selecting or filtering anonymous `f0_` columns.
-    *   *Default `maintain_order=False`*: Matches `scan_table` and enables pushdown by default without an extra argument.
+    *   *Decoupled `pushdown` flag*: Enables `(maintain_order=False, pushdown=False)` so callers can reuse BigQuery's 24-hour query cache across local filters—or select/filter anonymous `f0_` columns—while still allowing adaptive parallel multi-stream reads.
+    *   *Default `maintain_order=False`*: Matches `scan_table` and enables pushdown by default without an extra keyword argument.
 *   **Cons**:
-    *   *Decoupled `pushdown` flag*: Creates an invalid flag combination (`maintain_order=True, pushdown=True`), because `|> WHERE` does not guarantee preservation of an inner `ORDER BY`. The remaining non-redundant combination (`maintain_order=False, pushdown=False`) adds API surface and divergence from `read_query()` for narrow edge cases.
+    *   *Decoupled `pushdown` flag*: Introduces an invalid flag combination (`maintain_order=True, pushdown=True`), because `|> WHERE` does not guarantee preservation of an inner `ORDER BY`, adding API surface and divergence from `read_query()` for narrow edge cases.
     *   *Default `maintain_order=False`*: Silently breaks `ORDER BY` queries by default and diverges from `Client.read_query(maintain_order=True)`.
-*   **Reason for Rejection**: Because `maintain_order=True` + pushdown is invalid, coupling pushdown to `maintain_order` keeps a single flag matching `read_query()` without invalid states. Defaulting to `maintain_order=True` prevents silent `ORDER BY` regressions; callers opt into `maintain_order=False` when order does not matter.
+*   **Reason for Rejection**: Coupling pushdown to `maintain_order` avoids invalid states while matching `read_query()`, and defaulting to `maintain_order=True` prevents silent `ORDER BY` regressions; callers opt into `maintain_order=False` when row order does not matter.
 
 ### Alternative D: Rewritten-First Dry-Run Probe With Verbatim Fallback
 
-*   **Pros**: Detects SQL constructs incompatible with pushdown rewriting during construction with one RPC on the normal path and disables pushdown instead of failing at `.collect()`.
-*   **Cons**:
-    *   Breaks parity between `schema=None` and explicit `schema={...}`: incompatible queries succeed via fallback when `schema=None`, but fail at `.collect()` when explicit `schema` skips the dry-run probe.
-    *   Because `arrow_bigquery.exceptions.BigQueryError` exposes no structured status code or reason (and `BigQueryJobService` has no retry throttler), catching `BigQueryError` fires two dry-run RPCs on every `401`, `403`, `404`, `429`, `5xx`, timeout, or syntax error, and can silently disable pushdown if a transient `503` hits only the first call.
-    *   Chains synthetic rewrite tracebacks unless suppressed.
+*   **Pros**: Detects SQL constructs incompatible with pushdown rewriting during construction with one RPC on the happy path and disables pushdown instead of failing at `.collect()`.
+*   **Cons**: Breaks parity between `schema=None` and explicit `schema={...}` (incompatible queries fall back under `schema=None` but fail under explicit `schema`). Because `BigQueryError` exposes no structured HTTP status code and `BigQueryJobService` has no retry throttler, catching `BigQueryError` fires two dry-run RPCs on every `401`, `403`, `404`, `429`, `5xx`, timeout, or syntax error, and can silently disable pushdown on a transient `503`.
 *   **Reason for Rejection**: A single verbatim dry run on `raw_query` avoids duplicate error-path RPCs, preserves exact `[line:col]` errors, and keeps behavior consistent with explicit `schema`.
 
-### Alternative E: Client-Side Column Heuristics (`f[0-9]+_` and `casefold()`) via `compiler` `excluded_columns`
+### Alternative E: Client-Side Column Heuristics (`f[0-9]+_` and `casefold()`) in `core/compiler`
 
-*   **Pros**: Avoids runtime `Unrecognized name` and `Ambiguous column` BigQuery errors when a caller explicitly projects or filters on unaliased (`f0_`) or case-insensitively colliding (`a`, `A`) columns under `maintain_order=False`.
+*   **Pros**: Avoids runtime `Unrecognized name` and `Ambiguous column` BigQuery errors when a caller explicitly projects or filters on unaliased (`f0_`) or case-colliding (`a`, `A`) columns under `maintain_order=False`.
 *   **Cons**: False-positives on legitimate explicitly named columns matching `f[0-9]+_`, silently disabling pushdown; leaks query-pushdown heuristics into the shared `core/compiler` module used by `scan_table`.
 *   **Reason for Rejection**: Omitting `|> SELECT` for all-column filtered/limited scans covers common unaliased queries without heuristics; explicit references to anonymous or case-colliding columns are left to BigQuery's server-side errors and documented with `AS` aliasing guidance.
 
 ### Alternative F: Standard SQL Subquery Wrapping (`SELECT ... FROM (\n{inner_query}\n)`) Instead of GoogleSQL Pipe Syntax (`|>`)
 
 *   **Pros**: Uses SQL-92 subquery syntax understood by generic SQL proxies or third-party emulators, with familiar scoping rules across `UNION ALL` and `ORDER BY`.
-*   **Cons**:
-    *   Fails on top-level-only GoogleSQL constructs (`WITH RECURSIVE`, `CREATE TEMP FUNCTION ...; SELECT ...`).
-    *   Prepends `SELECT ... FROM (\n` before user SQL, shifting all BigQuery runtime error `[line:col]` positions by `+1`.
-    *   Allows unbalanced-parentheses breakout when explicit `schema` skips dry run (`SELECT 1 AS a) AS x UNION ALL SELECT 2 AS a FROM (SELECT 3` becomes syntactically valid inside `FROM (...)`).
-    *   Requires `SELECT *` wrapping on filter-only and limit-only scans (and risks range-variable shadowing if an `AS` alias is attached).
-*   **Reason for Rejection**: BigQuery has no official local emulator requiring SQL-92-only syntax, and GoogleSQL pipe syntax (`|>`) keeps user SQL on line 1 (exact error coordinates), supports `WITH RECURSIVE` and user pipe queries, eliminates wrapper parentheses and aliases, and omits `SELECT *` on filter/limit-only scans. Live BigQuery system tests will verify `UNION ALL` precedence, `CREATE TEMP FUNCTION`, trailing `LIMIT`, value tables, and pruning parity.
+*   **Cons**: Fails on top-level-only GoogleSQL constructs (`WITH RECURSIVE`, `CREATE TEMP FUNCTION ...; SELECT ...`), prepends `SELECT ... FROM (\n` before user SQL (shifting every BigQuery runtime error line by `+1`), allows unbalanced-parentheses breakout when explicit `schema` skips dry run, and requires `SELECT *` wrapping on filter-only and limit-only scans (risking range-variable alias collisions).
+*   **Reason for Rejection**: Live BigQuery verification confirmed that GoogleSQL pipe syntax (`|>`) preserves exact `[line:col]` coordinates under right-trimming, supports `WITH RECURSIVE`, `CREATE TEMP FUNCTION ...; SELECT ...`, unparenthesized `UNION ALL` / `INTERSECT DISTINCT` / `EXCEPT DISTINCT`, trailing `ORDER BY ... LIMIT ...`, user pipe queries, and struct value tables, and achieves byte-for-byte identical `totalBytesProcessed` pruning parity with `FROM (...)` subqueries without wrapper parentheses or `SELECT *`.
 
 ### Alternative G: Always Materialize to a Destination Table and Push Down via Storage Read API
 
 *   **Pros**: Pushes `selected_fields` and `row_restriction` without rewriting user SQL, works with anonymous `f0_` columns, and supports > ~10 GB results if an explicit destination table is created.
 *   **Cons**: Disables `JOB_CREATION_OPTIONAL` inline Arrow responses (adding job creation and `CreateReadSession` startup latency), cannot prune base-table storage bytes during query execution, and cannot shrink results below the ~10 GB anonymous table cap.
-*   **Reason for Rejection**: Preserving `jobs.query` inline execution and allowing BigQuery's optimizer to push filters/projections into base-table scans is preferred for `<= ~10 GB` queries; destination-table scanning remains documented in [docs/source/guides/large-query-results.md](../source/guides/large-query-results.md).
+*   **Reason for Rejection**: Preserving `jobs.query` inline execution and allowing BigQuery's optimizer to prune base-table partitions and columns is preferred for `<= ~10 GB` queries; destination-table scanning remains documented in [Scanning Large Query Results](../source/guides/large-query-results.md).
 
-### Alternative H: Different `LIMIT` Pushdown Strategies (No SQL `LIMIT`, Drop `WHERE` When `n_rows` Set, or Double-Wrap)
+### Alternative H: Different `LIMIT` Pushdown Strategies (No SQL `LIMIT`, or Strict Slice-Before-Filter SQL)
 
 *   **Pros**:
-    *   *No SQL `LIMIT` pushdown*: Preserves query cache keys across `lf.head(5)` and `lf.collect()`, and relies on stream cancellation.
+    *   *No SQL `LIMIT` pushdown*: Preserves BigQuery query cache keys across `lf.head(5)` and `lf.collect()` and relies on client-side stream cancellation.
     *   *Omit SQL `WHERE` when `n_rows` is set (or double-wrap)*: Enforces strict slice-before-filter ordering in SQL even under `maintain_order=False`.
 *   **Cons**:
-    *   *No SQL `LIMIT`*: Transfers full query output until client-side stop and cannot keep large queries under the ~10 GB anonymous table cap via `.limit(n)`.
-    *   *Omit `WHERE` or double-wrap*: Unnecessary under `maintain_order=False`, because row order is explicitly undefined; for an unordered multiset, `|> WHERE p_sql` + `|> LIMIT n` followed by local exact `filter(p)` always produces a subset achievable by slicing `n` rows from some permutation and then filtering, while transferring fewer rows when `p` is selective.
+    *   *No SQL `LIMIT` pushdown*: Transfers full query output until client-side stop and cannot keep large queries under the ~10 GB anonymous table cap via `.limit(n)`.
+    *   *Omit SQL `WHERE` when `n_rows` is set (or double-wrap)*: Unnecessary under `maintain_order=False`, because row order is explicitly undefined; for an unordered multiset, `|> WHERE p_sql` + `|> LIMIT n` followed by local exact `.filter(p)` always produces a subset achievable by slicing `n` rows from some permutation and then filtering, while transferring fewer rows when `p` is selective.
 *   **Reason for Rejection**: Pushing both `|> WHERE` and `|> LIMIT` together under `maintain_order=False` reduces transfer size while remaining sound for unordered scans; ordered `maintain_order=True` executes verbatim.
 
 ### Alternative I: Local Workarounds for Upstream `pl.scan_arrow_c_stream` Bugs (`QueryOptFlags` or Direct Per-Batch Loop)
 
 *   **Pros**:
-    *   *`QueryOptFlags(predicate_pushdown=False, projection_pushdown=False)`*: Works around both [pola-rs/polars#30916](https://github.com/pola-rs/polars/issues/30916) and the 0-column `projection_pushdown` bug immediately on `polars 2.1.0` while keeping `slice_pushdown=True` and streaming batch coalescing.
+    *   *`QueryOptFlags(predicate_pushdown=False, projection_pushdown=False)`*: Works around both [pola-rs/polars#30916](https://github.com/pola-rs/polars/issues/30916) and the 0-column `projection_pushdown` bug immediately on `polars 2.0.0–2.1.0` while keeping `slice_pushdown=True` and streaming batch coalescing.
     *   *Direct per-batch Python loop*: Independent of `pl.scan_arrow_c_stream` optimizer flags across future Polars releases.
 *   **Cons**:
-    *   *`QueryOptFlags`*: Carries a Polars-internal optimizer workaround in `polars-bigquery` for bugs that belong upstream in `polars/io/arrow_c_stream.py`.
-    *   *Direct per-batch Python loop*: Drops Polars' streaming `chunk_size` coalescing after selective local filters unless manual buffering is added, reintroduces a suspended generator frame holding `arrow_stream_exporter` until GC/close, and requires rewriting `polars.scan_arrow_c_stream` unit test mocks.
-*   **Reason for Rejection**: Rely on Polars' default `collect_batches()` optimizations without connector-side workarounds, and document both upstream `arrow_c_stream.py` bugs as known issues so upstream fixes apply automatically.
+    *   *`QueryOptFlags(predicate_pushdown=False, projection_pushdown=False)`*: Introduces a connector-side Polars optimizer override for bugs that belong upstream in `polars/io/arrow_c_stream.py`.
+    *   *Direct per-batch Python loop*: Drops Polars' streaming `chunk_size` coalescing after selective local filters unless manual buffering is added, complicates stream resource lifetime, and diverges from `pl.scan_arrow_c_stream` test patterns.
+*   **Reason for Rejection**: Minimize connector-side workarounds for upstream Polars bugs during early connector maturity; rely on Polars' default `collect_batches()` optimizations and track both upstream fixes in [Risks & Mitigations](#risks--mitigations).
 
 ### Alternative J: Enable `validate_schema=True` or `is_pure=True` on `register_io_source`
 
 *   **Pros**:
-    *   `validate_schema=True`: Checks batch dtypes against declared `schema` in memory with no extra RPCs.
-    *   `is_pure=True`: Lets Polars common subplan elimination run BigQuery once for self-joins (`lf.join(lf, ...)`).
+    *   *`validate_schema=True`*: Checks batch dtypes against declared `schema` in memory with zero extra RPCs.
+    *   *`is_pure=True`*: Lets Polars common subplan elimination execute BigQuery once for self-joins (`lf.join(lf, ...)`).
 *   **Cons**:
-    *   `validate_schema=True`: Risks rejecting valid queries due to pre-existing `core/schema.py` mismatches (such as `INTERVAL` or unverified parameterized `NUMERIC(P, S)`), and adds per-batch checks contrary to trusting caller-supplied `schema`.
-    *   `is_pure=True`: Changes semantics for non-deterministic SQL (`RAND()`, `CURRENT_TIMESTAMP()`). BigQuery's `jobs.query(dryRun=True)` response (`QueryResponse` / `JobStatistics2`) does not expose a determinism or cacheability flag, so `is_pure` cannot be inferred from dry run and would require an explicit caller argument.
-*   **Reason for Rejection**: Keep Polars defaults (`validate_schema=False`, `is_pure=False`), matching `Client.scan_table`, and defer an opt-in `is_pure` parameter to Future Improvements.
+    *   *`validate_schema=True`*: Risks rejecting valid queries due to pre-existing `core/schema.py` mismatches (such as `INTERVAL` or unverified parameterized `NUMERIC(P, S)`), and adds per-batch checks contrary to trusting caller-supplied `schema`.
+    *   *`is_pure=True`*: Breaks semantics for non-deterministic SQL (`RAND()`, `CURRENT_TIMESTAMP()`), and BigQuery dry runs do not expose a determinism or cacheability flag to infer purity automatically.
+*   **Reason for Rejection**: Keep Polars defaults (`validate_schema=False`, `is_pure=False`), matching `Client.scan_table`, and defer an explicit opt-in `is_pure` parameter to [Future Improvements](#future-improvements).
 
-### Alternative K: Keep `polars >= 1.43.2` With an `inspect.signature` Shim
+### Alternative K: Keep `polars >= 1.43.0` With an `inspect.signature` Shim
 
-*   **Pros**: Avoids dropping `polars 1.x` environments.
+*   **Pros**: Preserves compatibility with `polars 1.x` environments without a breaking minimum-version bump.
 *   **Cons**: Leaves `polars 1.x` callers without `explain_name`/`explain_detail` output if unsupported on `1.43.x`, adds runtime signature-inspection boilerplate, and requires maintaining CI coverage across both Polars `1.x` and `2.x` expression JSON formats.
-*   **Reason for Rejection**: Polars `2.0.0` is GA (latest `2.1.0`); bumping both workspace packages (`py-polars-bigquery` and `py-polars-expressions-testing`) to `polars >= 2.0.0, < 3.0.0` keeps dependencies aligned without shims.
+*   **Reason for Rejection**: Polars `2.0.0` is GA (latest `2.1.0`); bumping workspace packages to `polars >= 2.0.0, < 3.0.0` keeps dependencies clean and aligned without shims.
 
-### Alternative L: Flat Per-Backend Plans (or Inline Helpers), All-or-Nothing 1 MB Fallback, and `lazyframe.select([])`
+### Alternative L: Flat Per-Backend Pushdown Plans Instead of a Shared Logical Plan Tree
 
-*   **Pros**: Fewer dataclasses and no `core/plan.py` / `core/executors/` split; matches `register_io_source`'s fixed 4-argument signature directly.
-*   **Cons**:
-    *   Flat per-backend plans (`QueryPushdownPlan` / `ReadApiPushdownPlan`) cannot represent arbitrary orderings of `Filter` and `Slice(offset, length)` without redesign when adopting Polars' newer I/O plugin APIs (`FileReader` / `LazyFrameResolver` in [pola-rs/polars#30583](https://github.com/pola-rs/polars/pull/30583)), and keeping execution inline in `_read_bigquery.py` duplicates local `pl.scan_arrow_c_stream` post-processing across `scan_query` and `scan_table`.
-    *   Dropping all pushdown above 1 MB unnecessarily discards `|> SELECT` and pre-filter `|> LIMIT` when only an oversized `is_in` `|> WHERE` clause caused the overflow.
-    *   `lazyframe.select([])` produces `(0, 0)` (dropping row height), whereas `|> SELECT 1 AS <dummy>` + `.drop(pl.all())` expresses column dropping without discarding row count once upstream Polars fixes 0-column `projection_pushdown`.
-*   **Reason for Rejection**: A shared `PlanNode` tree (`QueryScan`, `TableScan`, `Filter`, `Slice(offset, length)`, `Project`) with separate `QueryExecutor` and `ReadApiExecutor` backends separates logical operator order from backend pushdown capabilities, shares one local residual evaluator, and pairs with tiered 1 MB step-down and `.drop(pl.all())`.
+*   **Pros**: Fewer abstractions and a direct 1:1 mapping to `register_io_source`'s fixed four-argument callback signature without introducing `core/plan.py` or a separate `core/executors/` package.
+*   **Cons**: Cannot represent arbitrary orderings of `Filter` and `Slice(offset, length)` without redesign when migrating to newer Polars I/O plugin APIs (`FileReader` / `LazyFrameResolver` in [pola-rs/polars#30583](https://github.com/pola-rs/polars/pull/30583)), and duplicates local `pl.scan_arrow_c_stream` residual execution across `scan_query` and `scan_table`.
+*   **Reason for Rejection**: A shared immutable logical plan tree with separate query and Storage Read API executors decouples logical operator order from backend pushdown capabilities and shares one local residual evaluator across both scan APIs.
+
+### Alternative M: All-or-Nothing 1 MB Fallback Instead of Tiered Degradation
+
+*   **Pros**: Simpler length-guard branch with only two states (full rewrite vs. verbatim `raw_query`) and no post-filter slice rollback logic.
+*   **Cons**: Unnecessarily discards `|> SELECT` column pruning and pre-filter `|> LIMIT` pushdown whenever an oversized `is_in()` predicate pushes `|> WHERE` past 1,000,000 bytes, forcing BigQuery to scan and transfer every column of the query.
+*   **Reason for Rejection**: Dropping `|> WHERE` (and post-filter slices) first preserves column pruning and pre-filter limits on large `is_in()` queries while still guaranteeing fallback to verbatim `raw_query` if remaining pipe clauses exceed the ceiling.
+
+## Risks & Mitigations
+
+*   **Upstream Polars `pl.scan_arrow_c_stream` Pushdown Bugs on `polars 2.0.0–2.1.0` (Accepted Risk)**: Under Polars' default `QueryOptFlags`, two upstream bugs in `polars/io/arrow_c_stream.py` affect both `scan_query` and `scan_table`: (1) [pola-rs/polars#30916](https://github.com/pola-rs/polars/issues/30916) evaluates `filter` before `limit`/`slice`, producing wrong rows on ordered `maintain_order=True` queries using `lf.limit(n).filter(p)` (e.g., `[3, 4, 5]` instead of `[3]` on `[1..6].limit(3).filter(a > 2)`), and (2) zero-column `projection_pushdown` collapses `lf.drop(pl.all()).collect()` (`with_columns=[]`) to `(0, 0)` instead of `(N, 0)` (note that `lf.select(pl.len()).collect()` is unaffected because Polars requests one column). **Mitigation**: Intentionally avoid connector-side `QueryOptFlags` workarounds during early connector maturity so upstream Polars fixes apply automatically once released; document both known upstream issues clearly in `Client.scan_query()` docstrings and track a companion Polars issue for 0-column `projection_pushdown`.
+*   **Structural vs. Semantic `is_exact` Parity for Future Post-Filter `Slice` Pushdown (Accepted Risk)**: In [`core/compiler/sql/__init__.py`](../../py-polars-bigquery/polars_bigquery/core/compiler/sql/__init__.py#L34-L65), `is_exact=True` currently indicates that no `Unsupported` IR node was dropped inside `AND`, rather than proving full BigQuery-vs-Polars row-set equivalence on edge cases (`FLOAT64` `NaN != NaN` evaluating `TRUE` in BigQuery vs. `FALSE` in Polars, `RE2` ASCII `\d`/`\w`/`\s` vs. Rust `regex` Unicode classes, and `DropNulls` inside `OR`). If BigQuery returns false positives before a pushed `|> LIMIT`/`OFFSET`, local Polars filtering could drop them after truncation. **Mitigation**: Polars' current `register_io_source` callback never emits `Filter -> Slice` (`n_rows` is always applied before `Filter`); ongoing semantic-parity fixes in `core/compiler/` are closing these edge cases before newer Polars I/O plugin APIs expose post-filter `Slice` pushdown.
+*   **Missing Retry/Backoff/Throttler on Rust `BigQueryJobService`**: [`crates/arrow-bigquery/src/client_builder.rs`](../../crates/arrow-bigquery/src/client_builder.rs#L71-L76) constructs `BigQueryJobService` without retry/backoff policies or `AdaptiveThrottler` (unlike `Read::builder()` and `scan_table`'s `BigQueryRestClient`), so transient `429`/`503` responses during `scan_query` dry runs or execution fail immediately. **Mitigation**: Tracked for Rust client parity in [Future Improvements](#future-improvements); callers on latency- or retry-sensitive paths can supply explicit `schema` to avoid construction-time dry-run RPCs.
+*   **`lf.filter(p).limit(n)` Full-Execution, ~10 GB Cap, and 200-Second Wait**: Under `register_io_source`, Polars retains `SLICE` above the scan node (`n_rows=None`), so BigQuery executes `{inner_query}\n|> WHERE ...` without SQL `LIMIT`—billing the full filtered scan, blocking uninterruptibly up to 200 seconds (no `py.check_signals()` or `jobs.cancel` yet), and failing with `responseTooLarge` if filtered output exceeds ~10 GB even when `.limit(3)` is requested. **Mitigation**: Document this distinction explicitly in user docs and docstrings; callers needing a server-side cap can place `LIMIT` in SQL or use `lf.limit(n)` until newer Polars I/O plugin APIs support post-filter `Slice` pushdown.
+*   **Interactive Billing Amplification (`maintain_order=False` Cache Misses & `is_pure=False`)**: Under `maintain_order=False`, distinct filter/projection/limit plans emit distinct top-level SQL strings that miss BigQuery's 24-hour query cache, and `is_pure=False` executes BigQuery once per branch in self-joins (`lf.join(lf, ...)`). **Mitigation**: Default to `maintain_order=True` (verbatim cache hits), canonicalize `|> SELECT` columns in schema declaration order so equivalent projections share cache entries, and direct repeated-scan workloads to destination-table materialization in [Scanning Large Query Results](../source/guides/large-query-results.md).
+*   **Trailing Semicolon Followed by Comment (`; -- comment`) and Anonymous/Ambiguous Columns**: Live BigQuery testing confirmed that comments placed *after* a trailing semicolon (e.g., `SELECT 1 AS a; -- note`) retain `;` under right-trimming and fail with `Statement not supported: SubpipelineStatement` when pipe operators are appended (comments without `;` succeed). Explicitly selecting or filtering anonymous `f0_` columns or case-colliding columns (`SELECT 1 AS a, 2 AS A`) raises BigQuery `Unrecognized name` or `Column name a is ambiguous` errors. **Mitigation**: Document omitting trailing `;` (or placing comments before `;`), aliasing computed/colliding columns with `AS`, or using `maintain_order=True` rather than introducing a custom SQL lexer.
+*   **Explicit `schema` Bypassing Dry-Run Safety Checks**: Passing `schema` skips dry-run `statementType == "SELECT"` and duplicate-column checks, so DDL/DML statements execute on `.collect()` and partial schemas silently disable `|> SELECT` projection pushdown. **Mitigation**: Document both behavioral trade-offs prominently in `Client.scan_query()` docstrings.
+*   **Pre-Existing `core/schema.py` and Schema-Unaware Compiler Gaps**: Shared with `scan_table` (for example, `BIGNUMERIC` raising `InvalidOperationError`, or string predicates pushed onto `JSON`/`GEOGRAPHY`). **Mitigation**: Tracked separately in [Future Improvements](#future-improvements); callers can keep `maintain_order=True` or cast affected columns in SQL.
+*   **Breaking Minimum Polars Version Bump**: Raising the floor from `polars >= 1.43.0` to `polars >= 2.0.0, < 3.0.0` drops `polars 1.x` environments. **Mitigation**: Call out clearly in release notes; Polars `2.0.0` is GA and rollback is Python-only.
 
 --------------------------------------------------------------------------------
 
 ## Non-Functional Requirements
 
-*   **Security & Privacy**:
-    *   `explain_detail` and `INFO`/`WARNING` logs must never emit raw user SQL text or inline predicate literals (which frequently contain PII, email addresses, customer IDs, or tokens).
-    *   Column identifiers in `|> SELECT` clauses continue to pass through `compiler.sql.column_to_sql_identifier()`, which raises `ValueError` on disallowed characters (`` ` ``, `\`, `.`, `$`, `!`, control characters).
-    *   Documentation explicitly warns that supplying `schema` skips the dry-run `statementType == "SELECT"` check, so DDL/DML statements passed alongside explicit `schema` execute on `.collect()`.
-    *   Getting-started IAM docs list both `roles/bigquery.readSessionUser` and `roles/bigquery.jobUser` (`bigquery.jobs.create`).
-*   **Performance & Latency**:
-    *   `schema=None` performs one synchronous dry-run RPC at `scan_query()` construction time; `schema={...}` performs zero RPCs at construction time.
-    *   Verbatim `raw_query` preservation (`maintain_order=True`) and canonical `polars_schema` column ordering (`maintain_order=False`) avoid unnecessary BigQuery query cache misses.
-    *   Rewritten SQL varies per filter/projection/slice combination and misses BigQuery's cache across distinct plans; `is_pure=False` executes once per scan node in multi-branch plans; `|> LIMIT` reduces transfer and output table size without reducing BigQuery on-demand scan billing.
-*   **Rollout & Rollback**:
-    *   `Client.scan_query()` is additive in Python and uses the existing `arrow_bigquery.Client.read_query()` binding (no Rust ABI or wire-format change).
-    *   Routing `Client.scan_table()` through `TableScan` -> `ReadApiExecutor` preserves existing `selected_fields` and `row_restriction` pushdown while aligning local `Slice`/`Filter` order and 0-column `.drop(pl.all())` with `Client.scan_query()`.
-    *   Raising the Polars floor to `polars >= 2.0.0, < 3.0.0` is a breaking dependency requirement for `polars 1.x` callers and must be highlighted in release notes. Rollback requires reverting Python package changes only.
+*   **Streaming Memory Footprint**: Python memory usage during `.sink_parquet()` and `.collect_batches()` stays bounded at $O(\text{batch\_size})$ (independent of total query result size) across results up to BigQuery's ~10 GB compressed anonymous destination table limit.
+*   **Pruning Parity & Scan Efficiency**: GoogleSQL pipe pushdown achieves `totalBytesProcessed` less than or equal to equivalent `SELECT ... FROM (...) WHERE ...` subquery wrapping (verified live byte-for-byte on `bigquery-public-data.usa_names.usa_1910_2013` and partitioned `bigquery-public-data.pypi.file_downloads`, including `0` bytes scanned for 0-column `|> SELECT 1 AS <dummy>`). Zero-column `scan_table` scans request at most one column (`selected_fields` of length `1`) rather than all table columns.
+*   **Construction Latency & RPC Budget**: `schema=None` executes exactly `1` synchronous `jobs.query(dryRun=true)` RPC at construction time (zero speculative retries on error); explicit `schema` executes `0` construction-time RPCs.
+*   **Security & Privacy**: Zero raw user SQL text or inline predicate literals appear in `lf.explain()` (`explain_detail`) or `INFO`/`WARNING` logs. Every `|> SELECT` column identifier passes fail-closed character validation (`ValueError` on disallowed characters). Documentation lists both `roles/bigquery.readSessionUser` and `roles/bigquery.jobUser` (`bigquery.jobs.create`) as required IAM roles and warns that explicit `schema` skips the `SELECT`-only dry-run guard.
+*   **Compatibility, Dependencies & Rollback**: Requires `polars >= 2.0.0, < 3.0.0` (synchronized across workspace Python packages) and `arrow-bigquery >= 0.3.2`. `Client.scan_query()` is additive in Python using existing `arrow_bigquery.Client.read_query()` bindings (zero Rust ABI or wire-format changes). Routing `Client.scan_table()` through the shared logical plan preserves existing `selected_fields` and `row_restriction` pushdown while adding the 0-column single-column guard. Rollback requires reverting Python package changes only.
 
 --------------------------------------------------------------------------------
 
-### Additional Resources
+## Additional Resources
 
-*   [polars\_bigquery\_scan\_table\_row\_predicate\_pushdown.md](./polars_bigquery_scan_table_row_predicate_pushdown.md) — expression compiler IR and `row_restriction` design shared by `scan_table` and `scan_query`
-*   [arrow\_bigquery\_crate\_completed\_large\_results\_schema.md](./arrow_bigquery_crate_completed_large_results_schema.md) — underlying `arrow-bigquery` `jobs.query` and `LARGE_RESULTS` streaming behavior
-*   [docs/source/guides/large-query-results.md](../source/guides/large-query-results.md) — destination-table scanning guide for results > ~10 GB compressed
-*   [docs/source/api/predicate-pushdown.md](../source/api/predicate-pushdown.md) — supported Polars expressions and BigQuery SQL translations
-*   [pola-rs/polars#30916](https://github.com/pola-rs/polars/issues/30916) — upstream Polars bug report for `pl.scan_arrow_c_stream` applying `filter` before `limit`
-*   [pola-rs/polars#30583](https://github.com/pola-rs/polars/pull/30583) — upstream Polars unstable `FileReader` and `LazyFrameResolver` I/O plugin APIs
+*   [`Client.scan_table` Row Predicate Pushdown Design](./polars_bigquery_scan_table_row_predicate_pushdown.md) — Specifies the expression compiler IR, rewriter passes, and SQL formatting shared by `scan_table` and `scan_query`.
+*   [Handling Completed Large-Result Queries Without Inline Arrow Schemas](./arrow_bigquery_crate_completed_large_results_schema.md) — Documents underlying `arrow-bigquery` `jobs.query` and `LARGE_RESULTS` streaming and multi-stream cutover behavior.
+*   [Scanning Large Query Results Guide](../source/guides/large-query-results.md) — Documents explicit destination-table scanning for results exceeding ~10 GB compressed or materialized results scanned multiple times.
+*   [Row Predicate Pushdown Reference](../source/api/predicate-pushdown.md) — Lists supported Polars expressions, BigQuery SQL translations, and type mappings.
+*   [Polars Issue #30916](https://github.com/pola-rs/polars/issues/30916) — Upstream Polars bug report for `pl.scan_arrow_c_stream` applying `filter` before `limit`.
+*   [Polars PR #30583](https://github.com/pola-rs/polars/pull/30583) — Upstream Polars unstable `FileReader` and `LazyFrameResolver` I/O plugin APIs.
 
-### Future Improvements
+## Future Improvements
 
-*   **Migrate to Polars' `LazyFrameResolver` / `FileReader` I/O plugin APIs ([pola-rs/polars#30583](https://github.com/pola-rs/polars/pull/30583))**: Once Polars stabilizes these APIs and supports post-filter `Slice`/`limit` (paired with per-filter `applied_filters` / `applied_post_slice` confirmation) and optional `n_rows_in_file() -> int | None` (since BigQuery queries, views, external tables, streaming buffers, and RLS tables lack cheap exact metadata row counts), plug them directly into `core/plan.py` and `core/executors/` to push down `lf.filter(p).limit(n)` as `|> WHERE ... |> LIMIT n`, expose `explain_properties()`, handle 0-column projections without `scan_arrow_c_stream`, and trigger `on_drop()` cleanup.
+*   **Migrate to Polars' `LazyFrameResolver` / `FileReader` I/O plugin APIs ([pola-rs/polars#30583](https://github.com/pola-rs/polars/pull/30583))**: Once Polars stabilizes these APIs and supports post-filter `Slice`/`limit` (paired with per-filter `applied_filters` / `applied_post_slice` confirmation) and optional `n_rows_in_file() -> int | None` (since BigQuery queries, views, external tables, streaming buffers, and RLS tables lack cheap exact metadata row counts), plug them directly into the shared logical plan and executors to push down `lf.filter(p).limit(n)` as `|> WHERE ... |> LIMIT n`, expose `explain_properties()`, handle 0-column projections without `scan_arrow_c_stream`, and trigger `on_drop()` cleanup.
 *   **Query cancellation and signal handling (`crates/arrow-bigquery`, `py-arrow-bigquery`)**: Poll `py.check_signals()` during the 200-second `jobs.query` initial wait so `Ctrl+C` responds promptly, and issue best-effort `jobs.cancel` when an incomplete query stream is aborted or dropped early.
-*   **Query retries and throttling (`crates/arrow-bigquery`)**: Attach `retry_policy`, `backoff_policy`, and the shared `AdaptiveThrottler` to `BigQueryJobService::builder()` in `crates/arrow-bigquery/src/client_builder.rs` (matching `Read::builder()`).
+*   **Query retries and throttling (`crates/arrow-bigquery`)**: Attach `retry_policy`, `backoff_policy`, and the shared `AdaptiveThrottler` to `BigQueryJobService::builder()` in [`crates/arrow-bigquery/src/client_builder.rs`](../../crates/arrow-bigquery/src/client_builder.rs#L71-L76) (matching `Read::builder()`).
 *   **Rust `tracing` telemetry and cutover improvements (`crates/arrow-bigquery`)**: Emit `tracing` spans carrying `request_id`, `job_id`, and `location`; attach `request_id` to synchronous errors; enable mid-flight multi-stream cutover for narrow-row `LARGE_RESULTS` jobs that include an inline first page.
 *   **Additional `jobs.query` options (`py-polars-bigquery`, `py-arrow-bigquery`, `crates/arrow-bigquery`)**: Expose `location`, `default_dataset`, `query_parameters`, `maximum_bytes_billed`, `timeout_ms`, `labels`, and optionally an explicit `is_pure` opt-in parameter for deterministic queries (leaning toward flat keyword arguments matching existing `read_query` parameters).
 *   **Destination-table support for > ~10 GB results**: Add an explicit destination-table path backed by `jobs.insert` (because `jobs.query` does not accept `destinationTable`).
 *   **`scan_table` and `read_table` option parity**: Expose `arrow_buffer_compression` on `scan_table` and `read_table`, evaluate `maintain_order` on `scan_table`, and add early-stop `n_rows` stream cancellation in `scan_table`.
-*   **Shared `core/schema.py` and schema-aware compiler fixes**: Fix `BIGNUMERIC` (`Decimal(76, 38)` crash), block invalid SQL pushdown on `JSON`/`GEOGRAPHY`/`BOOL.fill_null`/`IS_NAN`, align `TIMESTAMP` `"utc"` vs. `"UTC"`, verify parameterized `NUMERIC(P, S)` live Arrow serialization, and add support for `INTERVAL`, `RANGE<T>`, unnamed `STRUCT` subfields, and picosecond `TIMESTAMP`.
+*   **Shared `core/schema.py` and schema-aware compiler fixes**: Complete compiler semantic-parity fixes (`FLOAT64` `NaN`, regex character classes, `DropNulls`), fix `BIGNUMERIC` (`Decimal(76, 38)` crash), block invalid SQL pushdown on `JSON`/`GEOGRAPHY`/`BOOL.fill_null`/`IS_NAN`, align `TIMESTAMP` `"utc"` vs. `"UTC"`, verify parameterized `NUMERIC(P, S)` live Arrow serialization, and add support for `INTERVAL`, `RANGE<T>`, unnamed `STRUCT` subfields, and picosecond `TIMESTAMP`.
 
 --------------------------------------------------------------------------------
 
