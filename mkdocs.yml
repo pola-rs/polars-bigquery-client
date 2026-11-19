@@ -84,8 +84,9 @@ plugins:
   - mkdocstrings:
       handlers:
         python:
-          paths: [py-polars-bigquery]
+          paths: [py-polars-bigquery, py-arrow-bigquery]
           options:
+            preload_modules: [arrow_bigquery]
             docstring_style: numpy
             merge_init_into_class: true
             show_root_heading: true
