@@ -9,6 +9,7 @@ from polars_bigquery import (
     __version__,
 )
 from polars_bigquery._read_bigquery import _get_user_agent
+from polars_bigquery.exceptions import BigQueryError
 
 
 @pytest.fixture
@@ -501,3 +502,54 @@ def test_client_read_query_dry_run_returns_polars_dataframe():
     assert df["totalBytesProcessed"].to_list() == [128]
     assert df["cacheHit"].to_list() == [True]
     assert df["statementType"].to_list() == ["SELECT"]
+
+
+@pytest.mark.parametrize("dry_run", [False, True])
+def test_client_read_query_invalid_sql_raises_polars_bigquery_error(dry_run):
+    import json
+    import threading
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self):
+            length = int(self.headers.get("Content-Length", "0"))
+            _ = self.rfile.read(length)
+            payload = json.dumps(
+                {
+                    "error": {
+                        "code": 400,
+                        "message": 'Syntax error: Unexpected identifier "BROKEN"',
+                        "status": "INVALID_ARGUMENT",
+                    }
+                }
+            ).encode("utf-8")
+            self.send_response(400)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+        def log_message(self, format, *args):
+            pass
+
+    server = HTTPServer(("127.0.0.1", 0), Handler)
+    port = server.server_port
+    server_thread = threading.Thread(target=server.handle_request)
+    server_thread.start()
+
+    try:
+
+        def creds():
+            return ({"bearer_token": "fake-tok"}, None)
+
+        with Client(quota_project_id="test-proj", credentials_provider=creds) as client:
+            client._arrow_client = arrow_bigquery.Client(
+                quota_project_id="test-proj",
+                credentials_provider=creds,
+                bq_endpoint=f"http://127.0.0.1:{port}",
+            )
+            with pytest.raises(BigQueryError, match="Syntax error"):
+                client.read_query("SELECT BROKEN", dry_run=dry_run)
+    finally:
+        server_thread.join()
+        server.server_close()
