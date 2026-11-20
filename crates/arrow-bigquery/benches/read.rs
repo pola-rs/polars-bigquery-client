@@ -47,11 +47,8 @@ async fn consume_receiver(mut receiver: BigQueryRecordBatchReceiver) {
 }
 
 async fn read_sec_quarterly_financials_table(client: &Arc<Client>, table_id: &str) {
-    let table = BigQueryTableId {
-        project_id: "bigquery-public-data".to_owned(),
-        dataset_id: "sec_quarterly_financials".to_owned(),
-        table_id: table_id.to_owned(),
-    };
+    let table = BigQueryTableId::new("bigquery-public-data", "sec_quarterly_financials", table_id)
+        .expect("valid benchmark table id");
     let (_, receiver) = client
         .read_table(
             &table,
@@ -67,11 +64,12 @@ async fn read_sec_quarterly_financials_table(client: &Arc<Client>, table_id: &st
 }
 
 async fn read_numbers_table(client: &Arc<Client>, proportion: f64) {
-    let table = BigQueryTableId {
-        project_id: "bigquery-public-data".to_owned(),
-        dataset_id: "sec_quarterly_financials".to_owned(),
-        table_id: "numbers".to_owned(),
-    };
+    let table = BigQueryTableId::new(
+        "bigquery-public-data",
+        "sec_quarterly_financials",
+        "numbers",
+    )
+    .expect("valid benchmark table id");
     let (_, receiver) = client
                         .read_table(
                             &table,

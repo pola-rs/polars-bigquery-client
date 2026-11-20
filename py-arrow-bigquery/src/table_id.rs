@@ -1,5 +1,25 @@
+use std::error::Error as StdError;
+
 use pyo3::exceptions::{PyAttributeError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
+use pyo3::types::PyString;
+
+fn format_invalid_table_id_err(err: &arrow_bigquery_lib::BigQueryError) -> String {
+    err.source()
+        .map(ToString::to_string)
+        .unwrap_or_else(|| format!("Invalid table ID: {err}"))
+}
+
+fn format_input_preview(s: &str) -> String {
+    const MAX_CHARS: usize = 128;
+    let mut chars = s.chars();
+    let preview: String = chars.by_ref().take(MAX_CHARS).collect();
+    if chars.next().is_some() {
+        format!("{preview:?}... (truncated)")
+    } else {
+        format!("{s:?}")
+    }
+}
 
 /// Helper that extracts an optional string attribute from a Python object:
 /// - Returns `Ok(None)` only when the attribute does not exist (`AttributeError`) or is `None`.
@@ -26,17 +46,21 @@ pub struct BigQueryTableId {
 impl BigQueryTableId {
     #[new]
     #[pyo3(signature = (project_id, dataset_id, table_id))]
-    pub fn new(project_id: String, dataset_id: String, table_id: String) -> Self {
-        Self {
-            inner: arrow_bigquery_lib::BigQueryTableId::new(project_id, dataset_id, table_id),
-        }
+    pub fn new(project_id: String, dataset_id: String, table_id: String) -> PyResult<Self> {
+        let inner = arrow_bigquery_lib::BigQueryTableId::new(project_id, dataset_id, table_id)
+            .map_err(|err| PyValueError::new_err(format_invalid_table_id_err(&err)))?;
+        Ok(Self { inner })
     }
 
     #[staticmethod]
     pub fn from_string(s: &str) -> PyResult<Self> {
-        let inner: arrow_bigquery_lib::BigQueryTableId = s
-            .parse()
-            .map_err(|_| PyValueError::new_err(format!("Invalid table ID: {s}")))?;
+        let inner: arrow_bigquery_lib::BigQueryTableId = s.parse().map_err(|err| {
+            PyValueError::new_err(format!(
+                "{} (got {})",
+                format_invalid_table_id_err(&err),
+                format_input_preview(s),
+            ))
+        })?;
         Ok(Self { inner })
     }
 
@@ -54,7 +78,8 @@ impl BigQueryTableId {
             return Ok(existing.get().clone());
         }
 
-        if let Ok(s) = table_id.extract::<&str>() {
+        if table_id.is_instance_of::<PyString>() {
+            let s = table_id.extract::<&str>()?;
             return Self::from_string(s);
         }
 
@@ -66,7 +91,7 @@ impl BigQueryTableId {
         let table = get_optional_string_attr(table_id, "table_id")?;
 
         if let (Some(project), Some(dataset), Some(table)) = (project, dataset, table) {
-            return Ok(Self::new(project, dataset, table));
+            return Self::new(project, dataset, table);
         }
 
         Err(PyTypeError::new_err(format!(
@@ -77,36 +102,35 @@ impl BigQueryTableId {
 
     #[getter]
     pub fn project_id(&self) -> &str {
-        &self.inner.project_id
+        self.inner.project_id()
     }
 
     #[getter]
     pub fn dataset_id(&self) -> &str {
-        &self.inner.dataset_id
+        self.inner.dataset_id()
     }
 
     #[getter]
     pub fn table_id(&self) -> &str {
-        &self.inner.table_id
+        self.inner.table_id()
     }
 
     #[getter]
     pub fn project(&self) -> &str {
-        &self.inner.project_id
+        self.inner.project_id()
     }
 
     fn __repr__(&self) -> String {
         format!(
             "BigQueryTableId(project_id='{}', dataset_id='{}', table_id='{}')",
-            self.inner.project_id, self.inner.dataset_id, self.inner.table_id
+            self.inner.project_id(),
+            self.inner.dataset_id(),
+            self.inner.table_id(),
         )
     }
 
     fn __str__(&self) -> String {
-        format!(
-            "{}.{}.{}",
-            self.inner.project_id, self.inner.dataset_id, self.inner.table_id
-        )
+        self.inner.to_string()
     }
 }
 
@@ -165,6 +189,46 @@ obj = BrokenTable()
             let err = BigQueryTableId::parse(&obj).unwrap_err();
             assert!(err.is_instance_of::<PyRuntimeError>(py));
             assert!(err.to_string().contains("custom property failure"));
+        });
+    }
+
+    #[test]
+    fn test_bigquery_table_id_new_and_parse_reject_invalid_segments() {
+        Python::initialize();
+        Python::attach(|py| {
+            // Direct constructor validation
+            let err = BigQueryTableId::new(
+                "proj/../../evil".to_string(),
+                "ds".to_string(),
+                "tab?fields=all#".to_string(),
+            )
+            .unwrap_err();
+            assert!(err.is_instance_of::<PyValueError>(py));
+            assert!(err.to_string().contains("Invalid table ID"));
+
+            // String parsing validation (query/fragment metacharacters)
+            let err = BigQueryTableId::from_string("proj.ds.tab?fields=etag#frag").unwrap_err();
+            assert!(err.is_instance_of::<PyValueError>(py));
+            assert!(err.to_string().contains("Invalid table ID"));
+
+            // Duck-typed object validation in parse()
+            let locals = PyDict::new(py);
+            py.run(
+                c"
+class FakeTable:
+    project = 'proj/../../evil'
+    dataset_id = 'ds'
+    table_id = 'tab?fields=all#'
+obj = FakeTable()
+",
+                None,
+                Some(&locals),
+            )
+            .unwrap();
+            let obj = locals.get_item("obj").unwrap().unwrap();
+            let err = BigQueryTableId::parse(&obj).unwrap_err();
+            assert!(err.is_instance_of::<PyValueError>(py));
+            assert!(err.to_string().contains("Invalid table ID"));
         });
     }
 }

@@ -356,7 +356,8 @@ mod tests {
         Python::attach(|py| {
             let client =
                 Client::new(py, "test-project".to_string(), None, None, None, None).unwrap();
-            let table = BigQueryTableId::new("p".to_string(), "d".to_string(), "t".to_string());
+            let table =
+                BigQueryTableId::new("p".to_string(), "d".to_string(), "t".to_string()).unwrap();
             let err = match client.read_table(
                 py,
                 &table,
@@ -392,7 +393,8 @@ mod tests {
 
             let client =
                 Client::new(py, "test-project".to_string(), None, None, None, None).unwrap();
-            let table = BigQueryTableId::new("p".to_string(), "d".to_string(), "t".to_string());
+            let table =
+                BigQueryTableId::new("p".to_string(), "d".to_string(), "t".to_string()).unwrap();
             let err = match client.read_table(
                 py,
                 &table,
@@ -484,7 +486,8 @@ mod tests {
             let client = Client {
                 client: inner_client,
             };
-            let table = BigQueryTableId::new("p".to_string(), "d".to_string(), "t".to_string());
+            let table =
+                BigQueryTableId::new("p".to_string(), "d".to_string(), "t".to_string()).unwrap();
 
             let err = match client
                 .read_table(py, &table, "lz4frame", false, None, "", None, None, None)
