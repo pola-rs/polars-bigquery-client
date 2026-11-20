@@ -205,6 +205,17 @@ def test_client_read_bigquery_invalid_table_str(mock_rust_client):
     client = Client(quota_project_id="q")
     with pytest.raises(ValueError, match="Invalid table ID"):
         client.read_table(table="just_a_string")
+    with pytest.raises(ValueError, match="Invalid table ID"):
+        client.read_table(table="proj.ds.tab?fields=etag#frag")
+
+    class FakeTable:
+        project = "proj/../../evil"
+        dataset_id = "ds"
+        table_id = "tab?fields=all#"
+
+    with pytest.raises(ValueError, match="Invalid table ID"):
+        client.read_table(table=FakeTable())
+    mock_rust_client.read_table.assert_not_called()
 
 
 def test_client_read_bigquery_propagates_errors(mock_rust_client):

@@ -28,9 +28,153 @@ pub(crate) const DEFAULT_COMPRESSION: arrow_serialization_options::CompressionCo
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct BigQueryTableId {
-    pub project_id: String,
-    pub dataset_id: String,
-    pub table_id: String,
+    project_id: String,
+    dataset_id: String,
+    table_id: String,
+}
+
+fn is_valid_project_label(label: &str) -> bool {
+    !label.is_empty()
+        && label
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+}
+
+fn validate_project_id(project_id: &str) -> Result<(), InvalidTableId> {
+    if project_id.is_empty() {
+        return Err(InvalidTableId("project_id must not be empty".into()));
+    }
+
+    match project_id.split_once(':') {
+        Some((domain, project)) => {
+            if domain.is_empty() || !domain.split('.').all(is_valid_project_label) {
+                return Err(InvalidTableId(
+                    "project_id contains invalid domain prefix".into(),
+                ));
+            }
+            if !is_valid_project_label(project) {
+                return Err(InvalidTableId(
+                    "project_id contains invalid characters".into(),
+                ));
+            }
+        },
+        None => {
+            if !is_valid_project_label(project_id) {
+                return Err(InvalidTableId(
+                    "project_id contains invalid characters".into(),
+                ));
+            }
+        },
+    }
+
+    Ok(())
+}
+
+fn is_valid_dataset_char(c: char) -> bool {
+    if c.is_ascii() {
+        c.is_ascii_alphanumeric() || matches!(c, '_' | '-')
+    } else {
+        !c.is_control() && !c.is_whitespace()
+    }
+}
+
+fn validate_dataset_id(dataset_id: &str) -> Result<(), InvalidTableId> {
+    if dataset_id.is_empty() {
+        return Err(InvalidTableId("dataset_id must not be empty".into()));
+    }
+    if !dataset_id
+        .split('.')
+        .all(|part| !part.is_empty() && part.chars().all(is_valid_dataset_char))
+    {
+        return Err(InvalidTableId(
+            "dataset_id contains invalid segment or characters".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn is_unicode_space_separator(c: char) -> bool {
+    matches!(
+        c,
+        ' ' | '\u{00A0}' | '\u{1680}' | '\u{202F}' | '\u{205F}' | '\u{3000}'
+    ) || ('\u{2000}'..='\u{200A}').contains(&c)
+}
+
+fn is_valid_table_base_char(c: char) -> bool {
+    if c.is_ascii() {
+        // BigQuery table names allow Unicode categories L, M, N, Pc ('_'), Pd ('-'), and Zs (' ').
+        c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | ' ')
+    } else {
+        // Allow non-ASCII Unicode letters, marks, numbers, connectors, dashes, and Zs spaces,
+        // while rejecting C1 control chars and Unicode line/paragraph separators (Zl, Zp).
+        !c.is_control() && !matches!(c, '\u{2028}' | '\u{2029}')
+    }
+}
+
+fn is_valid_decorator_value(value: &str) -> bool {
+    !value.is_empty()
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+}
+
+fn validate_table_id(table_id: &str) -> Result<(), InvalidTableId> {
+    if table_id.is_empty() {
+        return Err(InvalidTableId("table_id must not be empty".into()));
+    }
+
+    let (base, suffix) = match table_id.find(['$', '@']) {
+        Some(idx) => (&table_id[..idx], Some(&table_id[idx..])),
+        None => (table_id, None),
+    };
+
+    if base.is_empty() || base.chars().all(is_unicode_space_separator) {
+        return Err(InvalidTableId(
+            "table_id must contain a non-empty table name".into(),
+        ));
+    }
+    if !base.chars().all(is_valid_table_base_char) {
+        return Err(InvalidTableId(
+            "table_id contains invalid characters".into(),
+        ));
+    }
+
+    if let Some(mut rest) = suffix {
+        let mut saw_dollar = false;
+        let mut saw_at = false;
+        while !rest.is_empty() {
+            match rest.as_bytes()[0] {
+                b'$' => {
+                    if saw_dollar {
+                        return Err(InvalidTableId(
+                            "table_id contains duplicate partition decorator".into(),
+                        ));
+                    }
+                    saw_dollar = true;
+                },
+                b'@' => {
+                    if saw_at {
+                        return Err(InvalidTableId(
+                            "table_id contains duplicate snapshot decorator".into(),
+                        ));
+                    }
+                    saw_at = true;
+                },
+                _ => unreachable!("suffix always begins at '$' or '@'"),
+            }
+            let after_sep = &rest[1..];
+            let next_sep = after_sep.find(['$', '@']).unwrap_or(after_sep.len());
+            let value = &after_sep[..next_sep];
+            if !is_valid_decorator_value(value) {
+                return Err(InvalidTableId(
+                    "table_id contains invalid decorator segment".into(),
+                ));
+            }
+            rest = &after_sep[next_sep..];
+        }
+    }
+
+    Ok(())
 }
 
 impl BigQueryTableId {
@@ -38,12 +182,32 @@ impl BigQueryTableId {
         project_id: impl Into<String>,
         dataset_id: impl Into<String>,
         table_id: impl Into<String>,
-    ) -> Self {
-        Self {
-            project_id: project_id.into(),
-            dataset_id: dataset_id.into(),
-            table_id: table_id.into(),
-        }
+    ) -> Result<Self, BigQueryError> {
+        let project_id = project_id.into();
+        let dataset_id = dataset_id.into();
+        let table_id = table_id.into();
+
+        validate_project_id(&project_id)?;
+        validate_dataset_id(&dataset_id)?;
+        validate_table_id(&table_id)?;
+
+        Ok(Self {
+            project_id,
+            dataset_id,
+            table_id,
+        })
+    }
+
+    pub fn project_id(&self) -> &str {
+        &self.project_id
+    }
+
+    pub fn dataset_id(&self) -> &str {
+        &self.dataset_id
+    }
+
+    pub fn table_id(&self) -> &str {
+        &self.table_id
     }
 
     pub fn to_table_path(&self) -> String {
@@ -64,7 +228,7 @@ impl std::fmt::Display for BigQueryTableId {
     }
 }
 
-fn parse_table_id<'s>(input: &mut &'s str) -> winnow::Result<BigQueryTableId> {
+fn parse_table_id_parts<'s>(input: &mut &'s str) -> winnow::Result<(String, String, String)> {
     // In the past, organizations could prefix their project IDs with a domain
     // name. Such projects still exist, especially at Google.
     let domain: Option<&'s str> =
@@ -94,23 +258,17 @@ fn parse_table_id<'s>(input: &mut &'s str) -> winnow::Result<BigQueryTableId> {
         None => project.to_string(),
     };
 
-    Ok(BigQueryTableId {
-        project_id,
-        dataset_id,
-        table_id,
-    })
+    Ok((project_id, dataset_id, table_id))
 }
 
 impl std::str::FromStr for BigQueryTableId {
     type Err = BigQueryError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        if s.contains('`') || s.contains('/') {
-            return Err(InvalidTableId.into());
-        }
-
         let mut input = s;
-        parse_table_id(&mut input).map_err(|_| InvalidTableId.into())
+        let (project_id, dataset_id, table_id) = parse_table_id_parts(&mut input)
+            .map_err(|_| InvalidTableId("expected format 'project.dataset.table'".into()))?;
+        Self::new(project_id, dataset_id, table_id)
     }
 }
 
@@ -252,12 +410,12 @@ impl Drop for BigQueryRecordBatchReceiver {
     }
 }
 
-#[derive(Debug, Clone)]
-struct InvalidTableId;
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct InvalidTableId(String);
 
 impl std::fmt::Display for InvalidTableId {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        write!(f, "invalid table id")
+        write!(f, "Invalid table ID: {}", self.0)
     }
 }
 
@@ -759,6 +917,256 @@ pub(crate) mod tests {
         assert!("google.com:proj:extra.ds.tab"
             .parse::<BigQueryTableId>()
             .is_err());
+        assert!("google..com:proj.ds.tab"
+            .parse::<BigQueryTableId>()
+            .is_err());
+        assert!(".google.com:proj.ds.tab"
+            .parse::<BigQueryTableId>()
+            .is_err());
+        assert!("google.com.:proj.ds.tab"
+            .parse::<BigQueryTableId>()
+            .is_err());
+        assert!("..:proj.ds.tab".parse::<BigQueryTableId>().is_err());
+        assert!("google.com:proj.ds:extra.tab"
+            .parse::<BigQueryTableId>()
+            .is_err());
+        assert!("google.com:proj.ds.tab:extra"
+            .parse::<BigQueryTableId>()
+            .is_err());
+    }
+
+    #[test]
+    fn test_table_id_new_and_getters_valid_cases() {
+        let valid_cases = [
+            ("proj", "ds", "tab"),
+            ("p", "d", "t"),
+            ("my-project-123", "my_dataset", "my_table"),
+            ("my_project", "_temp_dataset", "anon_table_123"),
+            ("123456789", "ds-obj", "tab-obj"),
+            ("google.com:my-project", "my_dataset", "my_table"),
+            ("sub.example.com:proj-1", "cat.ns1.ns2", "tab-1"),
+            ("proj", "region-us.INFORMATION_SCHEMA", "JOBS_BY_PROJECT"),
+            ("proj", "ds", "my_table$20200101"),
+            ("proj", "ds", "my_table$__NULL__"),
+            ("proj", "ds", "my_table@1700000000000"),
+            ("proj", "ds", "my_table@-3600000"),
+            ("proj", "ds", "my_table@-3600000-"),
+            ("proj", "ds", "my_table@1000-2000"),
+            ("proj", "ds", "table 01"),
+            ("proj", "ds", "my  table"),
+            ("proj", "ds", " table 01 "),
+            ("proj", "ds", "table\u{00A0}01"),
+            ("proj", "ds", "テーブル\u{3000}01"),
+            ("proj", "ds", "table–01"),
+            ("proj", "ds", "table＿01"),
+            ("proj", "ds", "table 01$20200101"),
+            ("proj", "ds", "table 01@1700000000000"),
+            ("proj", "ds", "my_table$20200101@1700000000000"),
+            ("google.com:my-project", "ds", "table 01"),
+            ("proj", "ds", "étudiant-01"),
+            ("proj", "ds", "00_お客様"),
+            ("proj", "ds", "ग्राहक"),
+            ("proj", "ds", "e\u{0301}tudiant"),
+            ("proj", "数据_集", "étudiant-01$20240101"),
+        ];
+
+        for (project, dataset, table) in valid_cases {
+            let id = BigQueryTableId::new(project, dataset, table)
+                .unwrap_or_else(|e| panic!("expected ({project}, {dataset}, {table}) valid: {e}"));
+            assert_eq!(id.project_id(), project);
+            assert_eq!(id.dataset_id(), dataset);
+            assert_eq!(id.table_id(), table);
+            assert_eq!(
+                id.to_table_path(),
+                format!("projects/{project}/datasets/{dataset}/tables/{table}")
+            );
+
+            // Round-trip through Display and FromStr
+            let formatted = id.to_string();
+            let parsed: BigQueryTableId = formatted
+                .parse()
+                .unwrap_or_else(|e| panic!("round-trip parse failed for {formatted:?}: {e}"));
+            assert_eq!(parsed, id);
+        }
+    }
+
+    #[test]
+    fn test_table_id_new_and_from_str_reject_invalid_segments() {
+        let invalid_projects = [
+            "",
+            ".",
+            "..",
+            "proj.extra",
+            ":proj",
+            "google.com:",
+            "google..com:proj",
+            ".google.com:proj",
+            "google.com.:proj",
+            "..:proj",
+            ".:proj",
+            "google.com:proj:extra",
+            "google.com:proj.extra",
+            "proj/../../evil",
+            "proj/evil",
+            "proj\\evil",
+            "proj?fields=all",
+            "proj#frag",
+            "proj%2f",
+            "proj%2e%2e",
+            "`proj`",
+            "proj ",
+            " proj",
+            "proj name",
+            "proj\t",
+            "proj\n",
+            "proj\r\n",
+            "proj\x00",
+            "proj\x1f",
+            "proj\x7f",
+            "proj\u{0085}",
+            "proj\u{00a0}",
+            "proj\u{3000}",
+            "proj;evil=1",
+            "proj&x=1",
+            "proj=1",
+            "proj$1",
+            "proj@1",
+            "café",
+        ];
+        for bad in invalid_projects {
+            assert!(
+                BigQueryTableId::new(bad, "ds", "tab").is_err(),
+                "expected project_id {bad:?} to be rejected by new()"
+            );
+            if !matches!(bad, "proj.extra" | "google.com:proj.extra") {
+                // Note: concatenating ".ds.tab" onto "proj.extra" or "google.com:proj.extra"
+                // produces a valid multi-part dataset string (dataset "extra.ds").
+                assert!(
+                    format!("{bad}.ds.tab").parse::<BigQueryTableId>().is_err(),
+                    "expected project_id {bad:?} to be rejected by from_str()"
+                );
+            }
+        }
+
+        let invalid_datasets = [
+            "",
+            ".",
+            "..",
+            ".ds",
+            "ds.",
+            "a..b",
+            "ds:extra",
+            "ds/../../evil",
+            "ds/evil",
+            "ds\\evil",
+            "ds?fields=all",
+            "ds#frag",
+            "ds%2f",
+            "`ds`",
+            "ds ",
+            " ds",
+            "ds name",
+            "ds\t",
+            "ds\n",
+            "ds\r\n",
+            "ds\x00",
+            "ds\x1f",
+            "ds\x7f",
+            "ds\u{0085}",
+            "ds\u{009f}",
+            "ds\u{00a0}",
+            "ds\u{2028}",
+            "ds\u{2029}",
+            "ds\u{3000}",
+            "ds;evil=1",
+            "ds&x=1",
+            "ds=1",
+            "ds$1",
+            "ds@1",
+            "ds'quote",
+            "ds\"quote",
+        ];
+        for bad in invalid_datasets {
+            assert!(
+                BigQueryTableId::new("proj", bad, "tab").is_err(),
+                "expected dataset_id {bad:?} to be rejected by new()"
+            );
+            assert!(
+                format!("proj.{bad}.tab")
+                    .parse::<BigQueryTableId>()
+                    .is_err(),
+                "expected dataset_id {bad:?} to be rejected by from_str()"
+            );
+        }
+
+        let invalid_tables = [
+            "",
+            " ",
+            "   ",
+            "\u{00a0}",
+            "\u{3000}",
+            "   $20200101",
+            ".",
+            "..",
+            "a.b",
+            "tab:delete",
+            "tab/../../evil",
+            "tab/evil",
+            "tab\\evil",
+            "tab?fields=all#",
+            "tab?fields=etag#frag",
+            "tab#frag",
+            "tab%2f",
+            "tab%2e%2e",
+            "`tab`",
+            "tab\t",
+            "tab\n",
+            "tab\r\n",
+            "tab\x0b",
+            "tab\x0c",
+            "tab\x00",
+            "tab\x1f",
+            "tab\x7f",
+            "tab\u{0085}",
+            "tab\u{009f}",
+            "tab\u{2028}",
+            "tab\u{2029}",
+            "tab HTTP/1.1",
+            "tab;evil=1",
+            "tab&fields=all",
+            "tab=1",
+            "tab'quote",
+            "tab\"quote",
+            "tab<script>",
+            "$",
+            "@",
+            "$20200101",
+            "@1700000000000",
+            "tab$",
+            "tab@",
+            "tab$$20200101",
+            "tab$2020$2021",
+            "tab@@1234",
+            "tab@1@2",
+            "tab$@1234",
+            "tab@$1234",
+            "tab$2020 01",
+            "tab@123 456",
+            "tab$2020?x=1",
+        ];
+        for bad in invalid_tables {
+            assert!(
+                BigQueryTableId::new("proj", "ds", bad).is_err(),
+                "expected table_id {bad:?} to be rejected by new()"
+            );
+            if bad != "a.b" {
+                // Note: "proj.ds.a.b" parses as multi-part dataset "ds.a" and table "b".
+                assert!(
+                    format!("proj.ds.{bad}").parse::<BigQueryTableId>().is_err(),
+                    "expected table_id {bad:?} to be rejected by from_str()"
+                );
+            }
+        }
     }
 
     #[test]
@@ -1174,7 +1582,7 @@ pub(crate) mod tests {
             shared_throttler,
         );
 
-        let table = BigQueryTableId::new("proj", "ds", "tbl");
+        let table = BigQueryTableId::new("proj", "ds", "tbl").unwrap();
         let (_, mut rx) = client
             .read_table(&table, ReadOptions::default())
             .await

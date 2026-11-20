@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import urllib.parse
 from typing import Any
 
 import arrow_bigquery.api.resources
@@ -56,12 +57,24 @@ def _raise_for_bigquery_error(response: requests.Response) -> None:
         raise polars_bigquery.exceptions.BigQueryError(message) from exc
 
 
+def _quote_path_segment(segment: str, *, name: str) -> str:
+    """Percent-encode a single BigQuery REST URL path segment."""
+    if not isinstance(segment, str):
+        raise TypeError(f"Expected {name} to be a str, got {type(segment).__name__}")
+    if segment in ("", ".", ".."):
+        raise ValueError(f"Invalid {name} for URL path segment: {segment!r}")
+    return urllib.parse.quote(segment, safe="")
+
+
 def _get_table_metadata_url(
     *, table_ref: arrow_bigquery.api.resources.BigQueryTableId
 ) -> str:
+    project_id = _quote_path_segment(table_ref.project_id, name="project_id")
+    dataset_id = _quote_path_segment(table_ref.dataset_id, name="dataset_id")
+    table_id = _quote_path_segment(table_ref.table_id, name="table_id")
     return (
-        f"{_BIGQUERY_ENDPOINT}/projects/{table_ref.project_id}"
-        f"/datasets/{table_ref.dataset_id}/tables/{table_ref.table_id}"
+        f"{_BIGQUERY_ENDPOINT}/projects/{project_id}"
+        f"/datasets/{dataset_id}/tables/{table_id}"
         "?fields=schema,timePartitioning"
     )
 
