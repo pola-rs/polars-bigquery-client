@@ -377,3 +377,11 @@ def test_polars_datetime_time_unit(dtype, expected):
 )
 def test_column_width_rank(dtype, expected_rank):
     assert column_width_rank(dtype) == expected_rank
+
+
+def test_column_width_rank_prefers_authoritative_bq_type():
+    # Under Mode B storage loading, dtype alone might be pl.String(), while
+    # authoritative BQType controls the true rank.
+    assert column_width_rank(pl.String(), bq_type=BQType.ARRAY) == 6
+    assert column_width_rank(pl.String(), bq_type=BQType.BOOL) == 1
+    assert column_width_rank(pl.Int64(), bq_type=BQType.STRUCT) == 6

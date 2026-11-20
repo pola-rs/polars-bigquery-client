@@ -86,6 +86,9 @@ def _build_extension_dtype_checked(
     return dtype
 
 
+_VALID_FIELD_MODES = frozenset({"", "nullable", "required", "repeated"})
+
+
 def _extract_data_type(
     field: Any,
     path: str,
@@ -113,6 +116,8 @@ def _extract_data_type(
         mode = ""
     elif isinstance(raw_mode, str):
         mode = raw_mode.casefold()
+        if mode not in _VALID_FIELD_MODES:
+            raise _UnsupportedBigQueryType(f"unsupported mode {raw_mode!r}", path)
     else:
         raise _UnsupportedBigQueryType(f"invalid mode {raw_mode!r}", path)
 
@@ -348,6 +353,9 @@ def extract_schema_metadata(
                 )
             )
             continue
+        # Record the name before validating its type so a skipped column cannot be
+        # shadowed by a later duplicate or overwritten by an ingestion-time pseudo-column.
+        seen_names.add(normalized_name)
         try:
             dtype, bq_type = _extract_data_type(
                 field,
@@ -359,7 +367,6 @@ def extract_schema_metadata(
                 SkippedColumn(name=name, reason=exc.reason, path=exc.path)
             )
             continue
-        seen_names.add(normalized_name)
         pl_schema[name] = dtype
         bq_types[name] = bq_type
 

@@ -60,7 +60,7 @@ OPAQUE_BQ_TYPES: frozenset[BQType] = frozenset(
     }
 )
 
-_INT_DTYPE_CLASSES: tuple[type[DataType], ...] = (
+INT_DTYPE_CLASSES: tuple[type[DataType], ...] = (
     pl.Int8,
     pl.Int16,
     pl.Int32,
@@ -72,7 +72,7 @@ _INT_DTYPE_CLASSES: tuple[type[DataType], ...] = (
     pl.UInt64,
 )
 
-_FLOAT_DTYPE_CLASSES: tuple[type[DataType], ...] = (
+FLOAT_DTYPE_CLASSES: tuple[type[DataType], ...] = (
     pl.Float32,
     pl.Float64,
 )
@@ -81,8 +81,8 @@ _SIMPLE_DTYPE_TO_BQ_TYPE: tuple[
     tuple[type[DataType] | tuple[type[DataType], ...], BQType], ...
 ] = (
     (pl.Boolean, BQType.BOOL),
-    (_INT_DTYPE_CLASSES, BQType.INT64),
-    (_FLOAT_DTYPE_CLASSES, BQType.FLOAT64),
+    (INT_DTYPE_CLASSES, BQType.INT64),
+    (FLOAT_DTYPE_CLASSES, BQType.FLOAT64),
     (pl.String, BQType.STRING),
     (pl.Binary, BQType.BYTES),
     (pl.Date, BQType.DATE),
@@ -224,18 +224,28 @@ def polars_decimal_supports_one(dtype: DataType | DataTypeClass) -> bool:
     return True
 
 
-def column_width_rank(dtype: DataType | DataTypeClass) -> int:
-    """Return a deterministic storage-width rank (1=narrowest, 6=widest/unknown)."""
-    bq_type = polars_dtype_to_bq_type(dtype)
-    return _BQ_TYPE_WIDTH_RANK.get(bq_type, 6)
+def column_width_rank(
+    dtype: DataType | DataTypeClass,
+    *,
+    bq_type: BQType | None = None,
+) -> int:
+    """Return a deterministic storage-width rank (1=narrowest, 6=widest/unknown).
+
+    When `bq_type` is supplied (e.g. from authoritative BigQuery REST metadata),
+    it takes precedence over inferring the BigQuery type from `dtype`.
+    """
+    resolved = bq_type if bq_type is not None else polars_dtype_to_bq_type(dtype)
+    return _BQ_TYPE_WIDTH_RANK.get(resolved, 6)
 
 
 __all__ = [
     "BQ_NUMERIC_MAX_INTEGER_DIGITS",
     "BQ_NUMERIC_MAX_PRECISION",
     "BQ_NUMERIC_MAX_SCALE",
+    "FLOAT_DTYPE_CLASSES",
     "GEOGRAPHY_EXTENSION_METADATA",
     "GEOGRAPHY_EXTENSION_NAME",
+    "INT_DTYPE_CLASSES",
     "JSON_EXTENSION_NAME",
     "OPAQUE_BQ_TYPES",
     "BQType",

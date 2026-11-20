@@ -1,9 +1,5 @@
 from __future__ import annotations
 
-import dataclasses
-import functools
-from typing import Any
-
 from polars_bigquery.core.compiler._traversal import flatten_expr_bfs
 from polars_bigquery.core.compiler.ir.base import (
     Expr,
@@ -14,8 +10,6 @@ from polars_bigquery.core.compiler.ir.boolean import (
     And,
     BoolLiteral,
     Coalesce,
-    DropNulls,
-    IsNotNull,
     Not,
     Or,
     Ternary,
@@ -25,10 +19,7 @@ from polars_bigquery.core.compiler.ir.list_ import ListLiteral
 from polars_bigquery.core.compiler.rewriter.base import replace_children, rewrite_tree
 
 _FALSY_LITERALS = (BoolLiteral(False), NullLiteral())
-MAX_BOOLEAN_WHEN_REWRITE_NODES = 100_000
-_CHILD_FIELD_NAMES = frozenset(
-    {"expr", "left", "right", "operands", "predicate", "truthy", "falsy"}
-)
+MAX_BOOLEAN_WHEN_REWRITE_NODES = 20_000
 
 
 def _node_self_weight(node: Expr) -> int:
@@ -302,7 +293,9 @@ def rewrite_boolean_when(root: Expr) -> Expr:
                             unconstrained[p_idx] and unconstrained[t_idx]
                         )
                     else:
-                        extra_cost = 3
+                        # Replacing `Ternary(p, falsy_lit, f)` (`2 + p + f` nodes) with
+                        # `And(Not(Coalesce(p, False)), f)` (`4 + p + f` nodes) adds 2 nodes.
+                        extra_cost = 2
                         if (
                             4 + pred_w + falsy_w > MAX_BOOLEAN_WHEN_REWRITE_NODES
                             or extra_cost > remaining_budget
@@ -438,64 +431,3 @@ def rewrite_de_morgan_node(node: Expr) -> Expr:
 def rewrite_de_morgan(root: Expr) -> Expr:
     """Apply De Morgan's law across an IR tree to turn negated `Or` nodes into `And` nodes."""
     return rewrite_tree(root, rewrite_de_morgan_node)
-
-
-def _strip_drop_nulls_node(node: Expr) -> Expr:
-    """Strip a `DropNulls` wrapper by returning its inner expression."""
-    return node.expr if isinstance(node, DropNulls) else node
-
-
-def _expr_structural_key(root: Expr) -> tuple[Any, ...]:
-    """Compute a hashable, non-recursive structural signature for `root` via BFS."""
-    nodes, children_map = flatten_expr_bfs(root)
-    sig: list[Any] = []
-    for idx, node in enumerate(nodes):
-        cls = type(node)
-        if dataclasses.is_dataclass(node):
-            extras = tuple(
-                (f.name, getattr(node, f.name))
-                for f in dataclasses.fields(node)
-                if f.name not in _CHILD_FIELD_NAMES
-            )
-            sig.append((cls, extras, children_map[idx]))
-        else:
-            sig.append((cls, node, children_map[idx]))
-    return tuple(sig)
-
-
-def rewrite_drop_nulls_node(node: Expr, *, not_null_exprs: list[Expr]) -> Expr:
-    """Unwrap a single `DropNulls` node and record its inner expression for `IS NOT NULL`."""
-    if not isinstance(node, DropNulls):
-        return node
-    if node.expr.has_descendant(Unsupported):
-        return Unsupported()
-    not_null_exprs.append(node.expr)
-    return node.expr
-
-
-def rewrite_drop_nulls(root: Expr) -> Expr:
-    """Rewrite `DropNulls(expr)` into `expr` and conjoin `IsNotNull(expr)` at the root.
-
-    Note: Excluded from the active `rewrite_ir` pushdown pipeline because Polars'
-    `drop_nulls()` changes Series length and broadcasts length-1 results back across
-    null rows, so hoisting `IS NOT NULL` can silently drop matching rows and suppress
-    Polars `ShapeError`. Retained only for internal structural-rewrite testing.
-
-    Uses a non-recursive BFS signature key when deduplicating `IsNotNull` nodes so
-    deeply nested expression trees never trigger Python `RecursionError`.
-    """
-    not_null_exprs: list[Expr] = []
-    node_rewriter = functools.partial(
-        rewrite_drop_nulls_node,
-        not_null_exprs=not_null_exprs,
-    )
-    result = rewrite_tree(root, node_rewriter)
-    seen: set[tuple[Any, ...]] = set()
-    for expr in not_null_exprs:
-        cleaned_expr = rewrite_tree(expr, _strip_drop_nulls_node)
-        sig = _expr_structural_key(cleaned_expr)
-        if sig in seen:
-            continue
-        seen.add(sig)
-        result = And(left=result, right=IsNotNull(expr=cleaned_expr))
-    return result

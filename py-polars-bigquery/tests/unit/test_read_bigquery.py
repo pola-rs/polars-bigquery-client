@@ -1153,7 +1153,7 @@ def test_scan_table_caps_stream_count_on_small_limit(mock_arrow_client):
     )
 
 
-def test_bigquery_rest_retry_has_jitter_and_handles_401_and_errors():
+def test_bigquery_rest_retry_has_jitter_and_handles_401_and_errors(monkeypatch):
     import requests
     from polars_bigquery.core import bigquery_rest
 
@@ -1161,14 +1161,46 @@ def test_bigquery_rest_retry_has_jitter_and_handles_401_and_errors():
     try:
         adapter = session.get_adapter("https://bigquery.googleapis.com")
         assert adapter.max_retries.backoff_jitter > 0
+        # Automatic retries are strictly limited to safe, idempotent GET requests.
+        assert adapter.max_retries.allowed_methods == frozenset(["GET"])
     finally:
         session.close()
 
-    table_id = arrow_bigquery.BigQueryTableId("p", "d", "t")
-    tokens = iter(["expired-tok", "fresh-tok"])
+    # Verify compatibility with urllib3 1.x where Retry does not accept `backoff_jitter`.
+    monkeypatch.setattr(bigquery_rest, "_RETRY_SUPPORTS_BACKOFF_JITTER", False)
+    seen_retry_kwargs: list[dict[str, object]] = []
+    orig_retry = bigquery_rest.Retry
 
-    def creds():
-        return ({"bearer_token": next(tokens)}, None)
+    def _recording_retry(**kwargs):
+        seen_retry_kwargs.append(kwargs)
+        return orig_retry(**kwargs)
+
+    monkeypatch.setattr(bigquery_rest, "Retry", _recording_retry)
+    fallback_session = bigquery_rest.create_resilient_session()
+    fallback_session.close()
+    assert len(seen_retry_kwargs) == 1
+    assert "backoff_jitter" not in seen_retry_kwargs[0]
+    monkeypatch.undo()
+
+    table_id = arrow_bigquery.BigQueryTableId("p", "d", "t")
+
+    # Simulate a Polars `CachingCredentialProvider` subclass (caches token until cleared
+    # explicitly via `clear_cached_credentials()`, matching real `CredentialProviderGCP`).
+    class _StubCachingCreds:
+        def __init__(self) -> None:
+            self._cached: str | None = "stale-tok"
+            self.clear_calls = 0
+
+        def __call__(self):
+            if self._cached is None:
+                self._cached = "fresh-tok"
+            return ({"bearer_token": self._cached}, 9_999_999_999)
+
+        def clear_cached_credentials(self) -> None:
+            self.clear_calls += 1
+            self._cached = None
+
+    creds = _StubCachingCreds()
 
     resp_401 = MagicMock()
     resp_401.status_code = 401
@@ -1187,16 +1219,35 @@ def test_bigquery_rest_retry_has_jitter_and_handles_401_and_errors():
         session=mock_session,
     )
     assert result == {"schema": {"fields": []}}
+    assert creds.clear_calls == 1
     assert mock_session.get.call_count == 2
     assert (
         mock_session.get.call_args_list[0].kwargs["headers"]["Authorization"]
-        == "Bearer expired-tok"
+        == "Bearer stale-tok"
     )
     assert (
         mock_session.get.call_args_list[1].kwargs["headers"]["Authorization"]
         == "Bearer fresh-tok"
     )
+    assert (
+        mock_session.get.call_args_list[0].kwargs["timeout"]
+        == bigquery_rest.METADATA_TIMEOUT
+    )
     resp_401.close.assert_called_once()
+    resp_200.close.assert_called_once()
+
+    # Credentials provider failures wrap as BigQueryError instead of leaking raw errors.
+    def _failing_creds():
+        raise RuntimeError("refresh failed")
+
+    with pytest.raises(BigQueryError, match="Failed to obtain credentials"):
+        bigquery_rest.get_table_metadata(
+            table_id,
+            quota_project_id="q",
+            credentials_provider=_failing_creds,
+            user_agent="test-ua",
+            session=mock_session,
+        )
 
     # Network exceptions wrap as BigQueryError
     mock_session.get.side_effect = requests.exceptions.Timeout("timed out")
@@ -1209,7 +1260,7 @@ def test_bigquery_rest_retry_has_jitter_and_handles_401_and_errors():
             session=mock_session,
         )
 
-    # Non-JSON 200 response (e.g. proxy HTML error page) wraps as BigQueryError
+    # Non-JSON 200 response (e.g. proxy HTML error page) wraps as BigQueryError and closes
     bad_json_resp = MagicMock()
     bad_json_resp.status_code = 200
     bad_json_resp.raise_for_status.return_value = None
@@ -1223,8 +1274,9 @@ def test_bigquery_rest_retry_has_jitter_and_handles_401_and_errors():
             user_agent="test-ua",
             session=mock_session,
         )
+    bad_json_resp.close.assert_called_once()
 
-    # Non-dict JSON payload wraps as BigQueryError
+    # Non-dict JSON payload wraps as BigQueryError and closes
     list_resp = MagicMock()
     list_resp.status_code = 200
     list_resp.raise_for_status.return_value = None
@@ -1238,23 +1290,102 @@ def test_bigquery_rest_retry_has_jitter_and_handles_401_and_errors():
             user_agent="test-ua",
             session=mock_session,
         )
+    list_resp.close.assert_called_once()
 
 
 def test_unsupported_type_error_export_and_arrow_client_decode_options():
+    import time
+
+    from arrow_bigquery import _native
     from arrow_bigquery.exceptions import UnsupportedTypeError as ArrowUnsupported
     from polars_bigquery.exceptions import UnsupportedTypeError
 
     assert UnsupportedTypeError is ArrowUnsupported
     assert issubclass(UnsupportedTypeError, BigQueryError)
 
-    # Verify arrow_bigquery.Client accepts lossless Rust decode option overrides.
+    # Verify arrow_bigquery.Client accepts `preserve_datetime_extension` and does NOT
+    # expose the Rust-only `validate_ffi_types` knob on the Python FFI surface.
     client = arrow_bigquery.Client(
         quota_project_id="test-proj",
         credentials_provider=lambda: ({"bearer_token": "tok"}, None),
         preserve_datetime_extension=True,
-        validate_ffi_types=False,
     )
     assert client.quota_project_id == "test-proj"
+    with pytest.raises(TypeError):
+        arrow_bigquery.Client(
+            quota_project_id="test-proj",
+            credentials_provider=lambda: ({"bearer_token": "tok"}, None),
+            validate_ffi_types=False,  # type: ignore[call-arg]
+        )
+
+    # Verify native `ArrowStreamExporter.close()` aborts background tasks immediately.
+    exporter, drop_flag = _native._test_create_exporter_with_drop_flag()
+    assert not drop_flag.is_set()
+    exporter.close()
+    deadline = time.monotonic() + 1.0
+    while not drop_flag.is_set() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert drop_flag.is_set()
+
+
+def test_client_closes_exporter_when_stream_consumption_fails(mock_arrow_client):
+    close_calls = 0
+
+    class _ExplodingExporter:
+        def __arrow_c_stream__(self, requested_schema=None):
+            raise RuntimeError("boom during stream import")
+
+        def close(self) -> None:
+            nonlocal close_calls
+            close_calls += 1
+
+    client = Client(quota_project_id="test-proj")
+
+    mock_arrow_client.read_table.return_value = _ExplodingExporter()
+    with pytest.raises(RuntimeError, match="boom during stream import"):
+        client.read_table("my-project.my_dataset.tbl")
+    assert close_calls == 1
+
+    mock_arrow_client.read_query.return_value = _ExplodingExporter()
+    with pytest.raises(RuntimeError, match="boom during stream import"):
+        client.read_query("SELECT 1")
+    assert close_calls == 2
+
+    mock_arrow_client.read_table.return_value = _ExplodingExporter()
+    lf = client.scan_table("my-project.my_dataset.tbl", schema={"id": pl.Int64()})
+    with pytest.raises(RuntimeError, match="boom during stream import"):
+        lf.collect()
+    assert close_calls == 3
+
+
+def test_scan_table_keeps_parallel_streams_when_predicate_and_n_rows_combined(
+    mock_arrow_client, monkeypatch
+):
+    """Do not force `max_stream_count=1` if a caller passes both predicate and small n_rows."""
+    captured_io_source = {}
+    orig_register = pl.io.plugins.register_io_source
+
+    def _capture(io_source, schema):
+        captured_io_source["fn"] = io_source
+        return orig_register(io_source=io_source, schema=schema)
+
+    monkeypatch.setattr(pl.io.plugins, "register_io_source", _capture)
+    df_source = pl.DataFrame({"id": [1, 2, 3]})
+    mock_arrow_client.read_table.return_value = _FakeArrowStreamExporter(df_source)
+
+    client = Client(quota_project_id="test-proj")
+    client.scan_table("my-project.my_dataset.tbl", schema={"id": pl.Int64()})
+
+    batches = list(
+        captured_io_source["fn"](
+            with_columns=["id"],
+            predicate=pl.col("id") > 1,
+            n_rows=5,
+            batch_size=None,
+        )
+    )
+    assert sum(b.height for b in batches) == 2
+    assert "max_stream_count" not in mock_arrow_client.read_table.call_args.kwargs
 
 
 def test_arrow_bigquery_dependency_pin_tracks_polars_bigquery_version():
@@ -1264,15 +1395,20 @@ def test_arrow_bigquery_dependency_pin_tracks_polars_bigquery_version():
 
     import tomllib
 
+    def _release_tuple(ver: str) -> tuple[int, ...]:
+        m = re.match(r"^([0-9]+(?:\.[0-9]+)*)", ver.strip())
+        assert m is not None, f"Unparseable PEP 440 version {ver!r}"
+        return tuple(int(p) for p in m.group(1).split("."))
+
     pyproject_path = Path(__file__).resolve().parents[2] / "pyproject.toml"
     data = tomllib.loads(pyproject_path.read_text(encoding="utf-8"))
-    pkg_version = tuple(int(p) for p in data["project"]["version"].split("."))
+    pkg_version = _release_tuple(data["project"]["version"])
     deps = data["project"]["dependencies"]
     arrow_deps = [d for d in deps if d.startswith("arrow-bigquery")]
     assert len(arrow_deps) == 1
-    match = re.search(r">=\s*([0-9]+(?:\.[0-9]+)+)", arrow_deps[0])
+    match = re.search(r">=\s*([0-9]+(?:\.[0-9]+)*(?:[a-zA-Z0-9._+-]*)?)", arrow_deps[0])
     assert match is not None, f"Missing '>=' lower pin on {arrow_deps[0]!r}"
-    min_version = tuple(int(p) for p in match.group(1).split("."))
+    min_version = _release_tuple(match.group(1))
     assert min_version >= pkg_version, (
         f"py-polars-bigquery {data['project']['version']} must pin "
         f"arrow-bigquery >= {data['project']['version']} (found {arrow_deps[0]!r})"

@@ -9,7 +9,6 @@ import polars as pl
 
 from polars_bigquery.core.compiler._traversal import flatten_expr_bfs
 from polars_bigquery.core.compiler.ir.base import Expr, NullLiteral, Unsupported
-from polars_bigquery.core.compiler.ir.list_ import ListLiteral
 from polars_bigquery.core.compiler.parser import MAX_AST_NODES
 from polars_bigquery.core.compiler.typing import (
     base,
@@ -40,22 +39,22 @@ def resolve_and_lower_types(
     """Resolve column/expression types and lower schema-dependent IR nodes iteratively.
 
     Performs a two-pass iterative traversal (zero Python recursion):
-    1. Pass 1 (Top-down BFS indexing): Flattens `root` into breadth-first order and
-       computes total input AST node weight (counting `ListLiteral` as `1 + len(values)`).
+    1. Pass 1 (Top-down BFS indexing): Flattens `root` into breadth-first order.
+       Scalar expansion budget tracks IR node count (`MAX_AST_NODES - len(nodes)`)
+       so a large static `is_in(...)` `ListLiteral` sibling never starves unrelated
+       scalar rewrites (each `ListLiteral` still carries `weight = 1 + len(values)`
+       so `MAX_DUPLICATED_OPERAND_NODES` prevents duplicating heavy lists).
     2. Pass 2 (Bottom-up reverse-BFS evaluation): Evaluates types, enforces operator
        compatibility, lowers `FillNullWithStrategy`, `INT64` float predicates, and
        `FLOAT64` `NaN` comparisons within `MAX_AST_NODES` (refunding wasted budget when
        a lowered subtree degrades to `Unsupported`), and validates the root type.
     """
     nodes, children_map = flatten_expr_bfs(root)
-    total_input_weight = sum(
-        1 + len(node.values) if isinstance(node, ListLiteral) else 1 for node in nodes
-    )
 
     ctx = _TypingContext(
         schema=schema,
         bq_types=bq_types,
-        remaining_budget=max(0, MAX_AST_NODES - total_input_weight),
+        remaining_budget=max(0, MAX_AST_NODES - len(nodes)),
     )
 
     typed_nodes: list[_TypedNode] = [_UNSUPPORTED_TYPED_NODE] * len(nodes)

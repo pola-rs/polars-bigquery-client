@@ -73,7 +73,6 @@ def test_client_init_passes_credentials_provider():
             bq_endpoint=None,
             bqstorage_endpoint=None,
             preserve_datetime_extension=False,
-            validate_ffi_types=True,
         )
 
 
@@ -84,7 +83,6 @@ def test_client_init_passes_endpoints():
             bq_endpoint="https://custom.bq.endpoint.com",
             bqstorage_endpoint="https://custom.bqstorage.endpoint.com",
             preserve_datetime_extension=True,
-            validate_ffi_types=False,
         )
         mock_native_cls.assert_called_once_with(
             quota_project_id="test-proj",
@@ -93,7 +91,6 @@ def test_client_init_passes_endpoints():
             bq_endpoint="https://custom.bq.endpoint.com",
             bqstorage_endpoint="https://custom.bqstorage.endpoint.com",
             preserve_datetime_extension=True,
-            validate_ffi_types=False,
         )
 
 
@@ -408,6 +405,20 @@ def test_exporter_drop_after_stream_created():
     assert run_exporter_drop_after_stream_created_test(), (
         "The background task was not aborted within 1s"
     )
+
+
+def test_exporter_close_aborts_background_task():
+    exporter, drop_flag = _native._test_create_exporter_with_drop_flag()
+    assert not drop_flag.is_set()
+    exporter.close()
+    deadline = time.monotonic() + 1.0
+    while not drop_flag.is_set() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert drop_flag.is_set(), "close() should abort the background stream task"
+    # Second close is a safe no-op.
+    exporter.close()
+    with pytest.raises(ValueError, match="Stream already consumed"):
+        nanoarrow.c_array_stream(exporter)
 
 
 def test_bigquery_error_hierarchy_and_empty_quota_project():

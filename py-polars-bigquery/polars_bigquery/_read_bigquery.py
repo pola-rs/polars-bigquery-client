@@ -60,6 +60,13 @@ def _drop_columns_iter(batches: Iterator[pl.DataFrame]) -> Iterator[pl.DataFrame
             close()
 
 
+def _close_exporter(exporter: Any) -> None:
+    """Close an `ArrowStreamExporter` immediately when supported to abort background streams."""
+    close = getattr(exporter, "close", None)
+    if callable(close):
+        close()
+
+
 def _get_user_agent(user_agent: str | None) -> str:
     ua = f"polars-bigquery/{polars_bigquery.core.version.__version__}"
 
@@ -132,7 +139,7 @@ class Client:
                 credentials_provider=credentials_provider,
                 user_agent=self._user_agent,
             )
-        except Exception:
+        except BaseException:
             self._rest_client.close()
             raise
 
@@ -196,9 +203,12 @@ class Client:
 
         Raises
         ------
+        polars_bigquery.exceptions.UnsupportedTypeError
+            If the table contains an Arrow data type that cannot be decoded or
+            exported over Arrow C Data Interface FFI (such as BigQuery
+            `INTERVAL` or `BIGNUMERIC`).
         polars_bigquery.exceptions.BigQueryError
-            If the Storage Read API call fails or the table contains an Arrow
-            type rejected prior to FFI export (such as BigQuery `INTERVAL`).
+            If the Storage Read API call fails.
 
         Examples
         --------
@@ -211,7 +221,11 @@ class Client:
             table_ref,
             maintain_order=maintain_order,
         )
-        return pl.DataFrame(arrow_stream_exporter)
+        try:
+            return pl.DataFrame(arrow_stream_exporter)
+        except BaseException:
+            _close_exporter(arrow_stream_exporter)
+            raise
 
     def read_query(
         self,
@@ -285,7 +299,11 @@ class Client:
             maintain_order=maintain_order,
             use_query_cache=use_query_cache,
         )
-        return pl.DataFrame(arrow_stream_exporter)
+        try:
+            return pl.DataFrame(arrow_stream_exporter)
+        except BaseException:
+            _close_exporter(arrow_stream_exporter)
+            raise
 
     def scan_table(
         self,
@@ -362,9 +380,9 @@ class Client:
         Raises
         ------
         polars_bigquery.exceptions.BigQueryError
-            If `schema` is `None` and fetching the table metadata from the
-            BigQuery REST API fails, or if reading from the Storage Read API
-            fails during collection.
+            If `schema` is `None` and fetching table metadata from the BigQuery
+            REST API fails or returns malformed schema/partition metadata, or if
+            reading from the Storage Read API fails during collection.
         ValueError
             If `schema` is `None` and a non-empty table has zero supported
             columns remaining after omitting unsupported columns.
@@ -464,7 +482,8 @@ class Client:
                 narrowest_col = min(
                     polars_schema.items(),
                     key=lambda item: polars_bigquery.core.types.column_width_rank(
-                        item[1]
+                        item[1],
+                        bq_type=bq_types.get(item[0]) if bq_types is not None else None,
                     ),
                 )[0]
                 selected_fields = [narrowest_col]
@@ -494,26 +513,34 @@ class Client:
                 "selected_fields": selected_fields,
                 "row_restriction": row_restriction,
             }
-            if n_rows is not None and n_rows <= _SINGLE_STREAM_ROW_LIMIT:
+            if (
+                predicate is None
+                and n_rows is not None
+                and n_rows <= _SINGLE_STREAM_ROW_LIMIT
+            ):
                 read_kwargs["max_stream_count"] = 1
             arrow_stream_exporter = self._arrow_client.read_table(
                 table_ref,
                 **read_kwargs,
             )
-            lazyframe = pl.scan_arrow_c_stream(arrow_stream_exporter)
+            try:
+                lazyframe = pl.scan_arrow_c_stream(arrow_stream_exporter)
 
-            if predicate is not None:
-                lazyframe = lazyframe.filter(predicate)
+                if predicate is not None:
+                    lazyframe = lazyframe.filter(predicate)
 
-            if n_rows is not None:
-                lazyframe = lazyframe.limit(n_rows)
+                if n_rows is not None:
+                    lazyframe = lazyframe.limit(n_rows)
 
-            if columns == []:
-                return _drop_columns_iter(
-                    lazyframe.collect_batches(chunk_size=batch_size)
-                )
+                if columns == []:
+                    return _drop_columns_iter(
+                        lazyframe.collect_batches(chunk_size=batch_size)
+                    )
 
-            return lazyframe.select(columns).collect_batches(chunk_size=batch_size)
+                return lazyframe.select(columns).collect_batches(chunk_size=batch_size)
+            except BaseException:
+                _close_exporter(arrow_stream_exporter)
+                raise
 
         return polars.io.plugins.register_io_source(
             io_source=source_generator,

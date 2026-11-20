@@ -74,10 +74,14 @@ impl ServiceConfigBuilder {
 
     /// Configures whether decoded Arrow schemas reject types unsupported by the
     /// `polars-arrow` C Data Interface FFI layer (`Interval(MonthDayNano)`,
-    /// `Interval(MonthDayMillis)`, `Unknown`).
+    /// mismatched `Time32`/`Time64` units, empty `Union`, and interior NUL bytes
+    /// in field names or timestamp timezones).
     ///
     /// Defaults to `true`. Pure-Rust consumers that decode `RecordBatch` values
     /// directly without exporting over the Arrow C Data Interface may disable this.
+    /// Note that types `polars-arrow`'s IPC decoder cannot read at all
+    /// (`Decimal256`, `Interval(DayTime)`, `Interval(MonthDayMillis)`, and
+    /// `Unknown`) are still rejected unconditionally.
     pub fn with_validate_ffi_types(mut self, validate: bool) -> Self {
         self.schema_decode_options.validate_ffi_types = validate;
         self

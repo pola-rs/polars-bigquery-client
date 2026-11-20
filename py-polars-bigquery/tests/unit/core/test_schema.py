@@ -628,3 +628,32 @@ def test_extract_schema_empty_partition_field_and_no_overwrite():
             "_PARTITIONTIME": pl.Datetime("us", "UTC"),
         }
     )
+
+
+def test_extract_schema_duplicate_after_skipped_and_unknown_mode():
+    metadata = {
+        "schema": {
+            "fields": [
+                {"name": "ok", "type": "INT64"},
+                # Unsupported first occurrence must still reserve the name against duplicates.
+                {"name": "dup", "type": "INTERVAL"},
+                {"name": "DUP", "type": "INT64"},
+                # Skipped column named _PARTITIONTIME must block pseudo-column shadowing.
+                {"name": "_PARTITIONTIME", "type": "INTERVAL"},
+                # Unrecognized mode fails closed as skipped instead of defaulting to scalar.
+                {"name": "bad_mode", "type": "STRING", "mode": "STREAMING"},
+            ]
+        },
+        "timePartitioning": {"type": "DAY"},
+    }
+    extracted = extract_schema_metadata(metadata)
+    assert extracted.polars_schema == pl.Schema(
+        {"ok": pl.Int64(), "_PARTITIONDATE": pl.Date()}
+    )
+    assert "_PARTITIONTIME" not in extracted.polars_schema
+    assert [(c.name, c.reason) for c in extracted.skipped_columns] == [
+        ("dup", "INTERVAL"),
+        ("DUP", "duplicate column"),
+        ("_PARTITIONTIME", "INTERVAL"),
+        ("bad_mode", "unsupported mode 'STREAMING'"),
+    ]

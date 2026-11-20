@@ -23,12 +23,18 @@ const MAX_SCHEMA_NESTING_DEPTH: usize = 64;
 /// schema metadata.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SchemaDecodeOptions {
-    /// Strip `google:sqlType:datetime` extension metadata so naive microsecond `DATETIME`
-    /// columns expose native Arrow `Timestamp(Microsecond, None)`.
+    /// Strip `google:sqlType:datetime` extension metadata on microsecond naive
+    /// `Timestamp(Microsecond, None)` and `ARRAY<DATETIME>` columns so they expose
+    /// native Arrow `Timestamp(Microsecond, None)`.
     pub strip_datetime_extension: bool,
-    /// Reject Arrow data types known to panic/abort during `polars-arrow` C Data
-    /// Interface FFI export (`Interval(MonthDayNano)`, `Interval(MonthDayMillis)`,
-    /// and `Unknown`).
+    /// Reject Arrow data types that can be decoded in pure-Rust IPC but panic or abort
+    /// during `polars-arrow` C Data Interface FFI export (`Interval(MonthDayNano)`,
+    /// mismatched `Time32`/`Time64` units, empty `Union`, and interior NUL bytes in
+    /// field names or timestamp timezones).
+    ///
+    /// Note: types that `polars-arrow`'s IPC decoder cannot read at all (`Decimal256`,
+    /// `Interval(DayTime)`, `Interval(MonthDayMillis)`, and `Unknown`) are rejected
+    /// unconditionally even when `validate_ffi_types` is `false`.
     pub validate_ffi_types: bool,
 }
 
@@ -50,45 +56,18 @@ fn check_nesting_depth(depth: usize, path: &str) -> Result<(), BigQueryError> {
     Ok(())
 }
 
-fn dtype_has_datetime_extension(
-    dtype: &ArrowDataType,
-    path: &str,
-    depth: usize,
-) -> Result<bool, BigQueryError> {
-    check_nesting_depth(depth, path)?;
+fn is_expected_datetime_storage(dtype: &ArrowDataType) -> bool {
     match dtype {
-        ArrowDataType::Extension(ext) => {
-            if ext.name.as_str() == BQ_DATETIME_EXTENSION_NAME {
-                return Ok(true);
-            }
-            dtype_has_datetime_extension(&ext.inner, path, depth + 1)
-        },
+        ArrowDataType::Timestamp(polars_arrow::datatypes::TimeUnit::Microsecond, None) => true,
         ArrowDataType::List(inner)
         | ArrowDataType::LargeList(inner)
-        | ArrowDataType::FixedSizeList(inner, _)
-        | ArrowDataType::Map(inner, _) => field_has_datetime_extension(inner, path, depth + 1),
-        ArrowDataType::Struct(fields) => {
-            for (idx, field) in fields.iter().enumerate() {
-                let child_path = child_field_path(path, field, idx);
-                if field_has_datetime_extension(field, &child_path, depth + 1)? {
-                    return Ok(true);
-                }
-            }
-            Ok(false)
+        | ArrowDataType::FixedSizeList(inner, _) => {
+            matches!(
+                inner.dtype(),
+                ArrowDataType::Timestamp(polars_arrow::datatypes::TimeUnit::Microsecond, None)
+            )
         },
-        ArrowDataType::Dictionary(_, values, _) => {
-            dtype_has_datetime_extension(values, path, depth + 1)
-        },
-        ArrowDataType::Union(union) => {
-            for (idx, field) in union.fields.iter().enumerate() {
-                let child_path = child_field_path(path, field, idx);
-                if field_has_datetime_extension(field, &child_path, depth + 1)? {
-                    return Ok(true);
-                }
-            }
-            Ok(false)
-        },
-        _ => Ok(false),
+        _ => false,
     }
 }
 
@@ -100,26 +79,10 @@ fn child_field_path(parent: &str, field: &Field, idx: usize) -> String {
     }
 }
 
-fn field_has_datetime_extension(
-    field: &Field,
-    path: &str,
-    depth: usize,
-) -> Result<bool, BigQueryError> {
-    if field.metadata.as_ref().is_some_and(|meta| {
+fn field_metadata_has_datetime_extension(field: &Field) -> bool {
+    field.metadata.as_ref().is_some_and(|meta| {
         meta.get("ARROW:extension:name").map(|v| v.as_str()) == Some(BQ_DATETIME_EXTENSION_NAME)
-    }) {
-        return Ok(true);
-    }
-    dtype_has_datetime_extension(field.dtype(), path, depth)
-}
-
-fn schema_has_datetime_extension(schema: &ArrowSchema) -> Result<bool, BigQueryError> {
-    for (_, field) in schema.iter() {
-        if field_has_datetime_extension(field, field.name.as_str(), 0)? {
-            return Ok(true);
-        }
-    }
-    Ok(false)
+    })
 }
 
 fn strip_datetime_extension_dtype(
@@ -131,7 +94,9 @@ fn strip_datetime_extension_dtype(
     match dtype {
         ArrowDataType::Extension(mut ext) => {
             let inner = strip_datetime_extension_dtype(ext.inner, path, depth + 1)?;
-            if ext.name.as_str() == BQ_DATETIME_EXTENSION_NAME {
+            if ext.name.as_str() == BQ_DATETIME_EXTENSION_NAME
+                && is_expected_datetime_storage(&inner)
+            {
                 Ok(inner)
             } else {
                 ext.inner = inner;
@@ -155,11 +120,7 @@ fn strip_datetime_extension_dtype(
         ArrowDataType::Struct(fields) => {
             let mut stripped = Vec::with_capacity(fields.len());
             for (idx, field) in fields.into_iter().enumerate() {
-                let child_path = if field.name.is_empty() {
-                    format!("{path}[{idx}]")
-                } else {
-                    format!("{path}.{}", field.name)
-                };
+                let child_path = child_field_path(path, &field, idx);
                 stripped.push(strip_datetime_extension_field(
                     field,
                     &child_path,
@@ -176,11 +137,7 @@ fn strip_datetime_extension_dtype(
         ArrowDataType::Union(mut union) => {
             let mut stripped = Vec::with_capacity(union.fields.len());
             for (idx, field) in union.fields.into_iter().enumerate() {
-                let child_path = if field.name.is_empty() {
-                    format!("{path}[{idx}]")
-                } else {
-                    format!("{path}.{}", field.name)
-                };
+                let child_path = child_field_path(path, &field, idx);
                 stripped.push(strip_datetime_extension_field(
                     field,
                     &child_path,
@@ -200,9 +157,8 @@ fn strip_datetime_extension_field(
     depth: usize,
 ) -> Result<Field, BigQueryError> {
     field.dtype = strip_datetime_extension_dtype(field.dtype, path, depth)?;
-    if let Some(meta) = field.metadata.as_ref() {
-        if meta.get("ARROW:extension:name").map(|v| v.as_str()) == Some(BQ_DATETIME_EXTENSION_NAME)
-        {
+    if field_metadata_has_datetime_extension(&field) && is_expected_datetime_storage(&field.dtype) {
+        if let Some(meta) = field.metadata.as_ref() {
             let mut updated = (**meta).clone();
             updated.remove("ARROW:extension:name");
             updated.remove("ARROW:extension:metadata");
@@ -217,15 +173,33 @@ fn strip_datetime_extension_field(
 }
 
 fn strip_datetime_extensions(schema: ArrowSchema) -> Result<ArrowSchema, BigQueryError> {
-    if !schema_has_datetime_extension(&schema)? {
-        return Ok(schema);
-    }
     let mut fields = Vec::with_capacity(schema.len());
     for (_, field) in schema.into_iter() {
         let name = field.name.to_string();
         fields.push(strip_datetime_extension_field(field, &name, 0)?);
     }
     Ok(ArrowSchema::from_iter(fields))
+}
+
+fn format_panic_payload(payload: Box<dyn std::any::Any + Send>) -> String {
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        (*s).to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "unknown panic payload".to_string()
+    }
+}
+
+fn format_sql_cast_hint(path: &str) -> String {
+    if path.contains('.') || path.contains('[') {
+        "Use a SQL query to select or CAST the nested field (e.g. `CAST(field AS STRING)` or `CAST(field AS FLOAT64)`).".to_string()
+    } else {
+        let escaped = path.replace('`', "\\`");
+        format!(
+            "Use a SQL query to CAST the column (e.g. `CAST(`{escaped}` AS STRING)` or `CAST(`{escaped}` AS FLOAT64)`)"
+        )
+    }
 }
 
 fn validate_field_name_for_ffi(name: &str, path: &str) -> Result<(), BigQueryError> {
@@ -242,11 +216,21 @@ fn validate_arrow_field(
     path: &str,
     depth: usize,
     validate_ffi_types: bool,
+    has_datetime_ext: &mut bool,
 ) -> Result<(), BigQueryError> {
     if validate_ffi_types {
         validate_field_name_for_ffi(field.name.as_str(), path)?;
     }
-    validate_supported_arrow_dtype(field.dtype(), path, depth, validate_ffi_types)
+    if field_metadata_has_datetime_extension(field) && is_expected_datetime_storage(field.dtype()) {
+        *has_datetime_ext = true;
+    }
+    validate_supported_arrow_dtype(
+        field.dtype(),
+        path,
+        depth,
+        validate_ffi_types,
+        has_datetime_ext,
+    )
 }
 
 fn validate_supported_arrow_dtype(
@@ -254,6 +238,7 @@ fn validate_supported_arrow_dtype(
     path: &str,
     depth: usize,
     validate_ffi_types: bool,
+    has_datetime_ext: &mut bool,
 ) -> Result<(), BigQueryError> {
     check_nesting_depth(depth, path)?;
     match dtype {
@@ -261,10 +246,10 @@ fn validate_supported_arrow_dtype(
         // without panicking inside `with_match_primitive_type_full!` / `to_physical_type()`.
         // Rejected unconditionally even when `validate_ffi_types == false`.
         ArrowDataType::Decimal256(precision, scale) => {
+            let hint = format_sql_cast_hint(path);
             Err(BigQueryError::UnsupportedType(format!(
                 "column `{path}` uses Arrow Decimal256({precision}, {scale}) (BigQuery BIGNUMERIC), \
-                 which cannot be decoded by polars-arrow. Use a SQL query to CAST the column \
-                 (e.g. `CAST({path} AS STRING)` or `CAST({path} AS FLOAT64)`)"
+                 which cannot be decoded by polars-arrow. {hint}"
             )))
         },
         ArrowDataType::Interval(IntervalUnit::DayTime) => {
@@ -325,18 +310,28 @@ fn validate_supported_arrow_dtype(
         | ArrowDataType::LargeList(inner)
         | ArrowDataType::FixedSizeList(inner, _)
         | ArrowDataType::Map(inner, _) => {
-            validate_arrow_field(inner, path, depth + 1, validate_ffi_types)
+            validate_arrow_field(inner, path, depth + 1, validate_ffi_types, has_datetime_ext)
         },
         ArrowDataType::Struct(fields) => {
             for (idx, field) in fields.iter().enumerate() {
                 let child_path = child_field_path(path, field, idx);
-                validate_arrow_field(field, &child_path, depth + 1, validate_ffi_types)?;
+                validate_arrow_field(
+                    field,
+                    &child_path,
+                    depth + 1,
+                    validate_ffi_types,
+                    has_datetime_ext,
+                )?;
             }
             Ok(())
         },
-        ArrowDataType::Dictionary(_, values, _) => {
-            validate_supported_arrow_dtype(values, path, depth + 1, validate_ffi_types)
-        },
+        ArrowDataType::Dictionary(_, values, _) => validate_supported_arrow_dtype(
+            values,
+            path,
+            depth + 1,
+            validate_ffi_types,
+            has_datetime_ext,
+        ),
         ArrowDataType::Union(union) => {
             if validate_ffi_types
                 && (union.fields.is_empty()
@@ -348,12 +343,29 @@ fn validate_supported_arrow_dtype(
             }
             for (idx, field) in union.fields.iter().enumerate() {
                 let child_path = child_field_path(path, field, idx);
-                validate_arrow_field(field, &child_path, depth + 1, validate_ffi_types)?;
+                validate_arrow_field(
+                    field,
+                    &child_path,
+                    depth + 1,
+                    validate_ffi_types,
+                    has_datetime_ext,
+                )?;
             }
             Ok(())
         },
         ArrowDataType::Extension(ext) => {
-            validate_supported_arrow_dtype(&ext.inner, path, depth + 1, validate_ffi_types)
+            if ext.name.as_str() == BQ_DATETIME_EXTENSION_NAME
+                && is_expected_datetime_storage(&ext.inner)
+            {
+                *has_datetime_ext = true;
+            }
+            validate_supported_arrow_dtype(
+                &ext.inner,
+                path,
+                depth + 1,
+                validate_ffi_types,
+                has_datetime_ext,
+            )
         },
         _ => Ok(()),
     }
@@ -362,8 +374,9 @@ fn validate_supported_arrow_dtype(
 /// Validates that an [`ArrowSchema`] does not contain any types known to panic or abort
 /// when decoded from Arrow IPC or exported over the `polars-arrow` Arrow C Data Interface FFI layer.
 pub fn validate_ffi_schema(schema: &ArrowSchema) -> Result<(), BigQueryError> {
+    let mut ignored = false;
     for (_, field) in schema.iter() {
-        validate_arrow_field(field, field.name.as_str(), 0, true)?;
+        validate_arrow_field(field, field.name.as_str(), 0, true, &mut ignored)?;
     }
     Ok(())
 }
@@ -373,12 +386,32 @@ pub(crate) fn parse_arrow_schema_with_options(
     schema_bytes: &[u8],
     options: SchemaDecodeOptions,
 ) -> Result<StreamMetadata, BigQueryError> {
-    let mut cursor = Cursor::new(schema_bytes);
-    let mut metadata = read_stream_metadata(&mut cursor)?;
+    // Defense in depth: `polars-arrow`'s IPC schema reader uses `todo!()` for some newer
+    // Arrow logical types (`RunEndEncoded`, `ListView`, `LargeListView`). Catch unwinds so
+    // an unexpected IPC payload never crashes the Tokio worker or Python process.
+    let mut metadata = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let mut cursor = Cursor::new(schema_bytes);
+        read_stream_metadata(&mut cursor)
+    })) {
+        Ok(res) => res?,
+        Err(payload) => {
+            let msg = format_panic_payload(payload);
+            return Err(BigQueryError::Protocol(format!(
+                "Arrow IPC schema decoder panicked: {msg}"
+            )));
+        },
+    };
+    let mut has_datetime_ext = false;
     for (_, field) in metadata.schema.iter() {
-        validate_arrow_field(field, field.name.as_str(), 0, options.validate_ffi_types)?;
+        validate_arrow_field(
+            field,
+            field.name.as_str(),
+            0,
+            options.validate_ffi_types,
+            &mut has_datetime_ext,
+        )?;
     }
-    if options.strip_datetime_extension {
+    if options.strip_datetime_extension && has_datetime_ext {
         metadata.schema = strip_datetime_extensions(metadata.schema)?;
     }
     Ok(metadata)
@@ -475,13 +508,7 @@ impl DecodeJob {
         })) {
             Ok(inner) => inner,
             Err(payload) => {
-                let msg = if let Some(s) = payload.downcast_ref::<&str>() {
-                    (*s).to_string()
-                } else if let Some(s) = payload.downcast_ref::<String>() {
-                    s.clone()
-                } else {
-                    "unknown panic payload".to_string()
-                };
+                let msg = format_panic_payload(payload);
                 Err(BigQueryError::Protocol(format!(
                     "Arrow IPC decoder panicked: {msg}"
                 )))
@@ -538,7 +565,7 @@ impl OrderedDecodeQueue {
 
     fn push(self: &Arc<Self>, job: DecodeJob) {
         let should_spawn = {
-            let mut state = self.state.lock().unwrap();
+            let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
             state.queue.push_back(job);
             if !state.running {
                 state.running = true;
@@ -556,6 +583,22 @@ impl OrderedDecodeQueue {
         }
     }
 
+    fn drain_on_abort(state: &mut OrderedQueueState) {
+        state.running = false;
+        let orphaned = std::mem::take(&mut state.queue);
+        let mut reported = false;
+        for job in orphaned {
+            let _ = job.cancel_tx.send_replace(true);
+            if !reported {
+                let _ = job.permit.send(Err(BigQueryError::Protocol(
+                    "Arrow IPC ordered decode worker panicked unexpectedly".into(),
+                )));
+                reported = true;
+            }
+            // Remaining permits drop here, releasing channel capacity so producers cannot deadlock.
+        }
+    }
+
     fn drain(&self) {
         struct ResetRunningOnPanic<'a> {
             state: &'a Mutex<OrderedQueueState>,
@@ -565,7 +608,7 @@ impl OrderedDecodeQueue {
             fn drop(&mut self) {
                 if !self.disarmed {
                     let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-                    state.running = false;
+                    OrderedDecodeQueue::drain_on_abort(&mut state);
                 }
             }
         }
@@ -1674,5 +1717,82 @@ mod tests {
             strip_datetime_extensions(deep_schema),
             Err(BigQueryError::Protocol(_))
         ));
+    }
+
+    #[test]
+    fn test_strip_datetime_preserves_unexpected_inner_dtype() {
+        use polars_arrow::datatypes::{ExtensionType, Metadata};
+
+        // An unexpected `google:sqlType:datetime` extension wrapping Utf8 (not microsecond
+        // Timestamp) must NOT be silently stripped to plain Utf8.
+        let string_dt_ext = ArrowDataType::Extension(Box::new(ExtensionType {
+            name: BQ_DATETIME_EXTENSION_NAME.into(),
+            inner: ArrowDataType::Utf8,
+            metadata: None,
+        }));
+        let mut meta = Metadata::default();
+        meta.insert(
+            "ARROW:extension:name".into(),
+            BQ_DATETIME_EXTENSION_NAME.into(),
+        );
+        let schema = ArrowSchema::from_iter(vec![Field::new(
+            "unexpected_dt".into(),
+            string_dt_ext.clone(),
+            true,
+        )
+        .with_metadata(meta)]);
+        let stripped = strip_datetime_extensions(schema).unwrap();
+        let f = stripped.get("unexpected_dt").unwrap();
+        assert_eq!(f.dtype(), &string_dt_ext);
+        assert_eq!(
+            f.metadata
+                .as_ref()
+                .and_then(|m| m.get("ARROW:extension:name"))
+                .map(|v| v.as_str()),
+            Some(BQ_DATETIME_EXTENSION_NAME)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_ordered_decode_queue_drain_on_abort_releases_permits_and_signals_error() {
+        let queue = OrderedDecodeQueue::new();
+        let (schema_bytes, valid_batch) = create_test_arrow_payload_with_range(0, 2);
+        let metadata = Arc::new(parse_arrow_schema(&schema_bytes).unwrap());
+
+        // Channel capacity = 2; fill all permits inside `queue` so producer would block
+        // if `drain_on_abort` failed to drop orphaned permits.
+        let (tx, mut rx) = tokio::sync::mpsc::channel(2);
+        let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+        let cancel_tx = Arc::new(cancel_tx);
+
+        let permit1 = tx.clone().reserve_owned().await.unwrap();
+        let permit2 = tx.clone().reserve_owned().await.unwrap();
+        {
+            let mut state = queue.state.lock().unwrap();
+            state.running = true;
+            for permit in [permit1, permit2] {
+                state.queue.push_back(DecodeJob {
+                    serialized_record_batch: bytes::Bytes::from(valid_batch.clone()),
+                    expected_row_count: 2,
+                    metadata: Arc::clone(&metadata),
+                    permit,
+                    cancel_tx: Arc::clone(&cancel_tx),
+                    cancel_rx: cancel_rx.clone(),
+                });
+            }
+            OrderedDecodeQueue::drain_on_abort(&mut state);
+            assert!(!state.running);
+            assert!(state.queue.is_empty());
+        }
+        drop(tx);
+
+        assert!(
+            *cancel_tx.borrow(),
+            "abort should signal cancellation to sibling readers"
+        );
+        let first = rx.recv().await.expect("expected fatal error");
+        assert!(matches!(first, Err(BigQueryError::Protocol(_))));
+        // Second orphaned permit was dropped cleanly; channel closes without hanging.
+        assert!(rx.recv().await.is_none());
     }
 }

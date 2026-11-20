@@ -346,7 +346,7 @@ def test_json_literal_to_sql_all_scalar_types_and_immutability() -> None:
     assert _json_literal_to_sql({"Boolean": False}) == "FALSE"
     assert _json_literal_to_sql({"Null": None}) == "NULL"
 
-    # DateTime units: Microseconds, Milliseconds, Nanoseconds (exact and inexact)
+    # DateTime units: Microseconds and Milliseconds only (Nanoseconds unsupported)
     assert (
         _json_literal_to_sql({"DateTime": [1000, "Microseconds"]})
         == "TIMESTAMP_MICROS(1000)"
@@ -355,10 +355,7 @@ def test_json_literal_to_sql_all_scalar_types_and_immutability() -> None:
         _json_literal_to_sql({"DateTime": [2000, "Milliseconds"]})
         == "TIMESTAMP_MILLIS(2000)"
     )
-    assert (
-        _json_literal_to_sql({"DateTime": [5000, "Nanoseconds"]})
-        == "TIMESTAMP_MICROS(5)"
-    )
+    assert _json_literal_to_sql({"DateTime": [5000, "Nanoseconds"]}) is None
     assert _json_literal_to_sql({"DateTime": [5555, "Nanoseconds"]}) is None
     assert _json_literal_to_sql({"DateTime": [10, "Seconds"]}) is None
 
@@ -1077,9 +1074,7 @@ def test_parse_temporal_literals_enforce_bigquery_date_and_timestamp_bounds() ->
         compiler.parser.temporal.parse_ticks_and_unit(
             300_000_000_000_000, "Milliseconds"
         )
-    with pytest.raises(
-        ValueError, match="Timestamp nanoseconds out of BigQuery bounds"
-    ):
+    with pytest.raises(ValueError, match="Unsupported datetime unit or precision"):
         compiler.parser.temporal.parse_ticks_and_unit(
             300_000_000_000_000_000_000, "Nanoseconds"
         )
@@ -3729,77 +3724,6 @@ def test_parse_drop_nulls_and_null_checks_reject_invalid_inputs(
 
 
 @pytest.mark.parametrize(
-    ("root", "expected"),
-    [
-        pytest.param(
-            compiler.ir.Column("a"),
-            compiler.ir.Column("a"),
-            id="no_drop_nulls_returns_unchanged_root",
-        ),
-        pytest.param(
-            compiler.ir.Eq(
-                left=compiler.ir.DropNulls(expr=compiler.ir.Column("a")),
-                right=compiler.ir.IntLiteral(1),
-            ),
-            compiler.ir.And(
-                left=compiler.ir.Eq(
-                    left=compiler.ir.Column("a"),
-                    right=compiler.ir.IntLiteral(1),
-                ),
-                right=compiler.ir.IsNotNull(expr=compiler.ir.Column("a")),
-            ),
-            id="single_drop_nulls_conjoins_is_not_null_at_root",
-        ),
-        pytest.param(
-            compiler.ir.DropNulls(
-                expr=compiler.ir.And(
-                    left=compiler.ir.Column("a"),
-                    right=compiler.ir.Unsupported(),
-                )
-            ),
-            compiler.ir.Unsupported(),
-            id="drop_nulls_with_unsupported_descendant_rewrites_to_unsupported",
-        ),
-        pytest.param(
-            compiler.ir.And(
-                left=compiler.ir.Eq(
-                    left=compiler.ir.DropNulls(expr=compiler.ir.Column("a")),
-                    right=compiler.ir.IntLiteral(1),
-                ),
-                right=compiler.ir.Eq(
-                    left=compiler.ir.DropNulls(expr=compiler.ir.Column("a")),
-                    right=compiler.ir.IntLiteral(2),
-                ),
-            ),
-            compiler.ir.And(
-                left=compiler.ir.And(
-                    left=compiler.ir.Eq(
-                        left=compiler.ir.Column("a"),
-                        right=compiler.ir.IntLiteral(1),
-                    ),
-                    right=compiler.ir.Eq(
-                        left=compiler.ir.Column("a"),
-                        right=compiler.ir.IntLiteral(2),
-                    ),
-                ),
-                right=compiler.ir.IsNotNull(expr=compiler.ir.Column("a")),
-            ),
-            id="duplicate_drop_nulls_emits_single_is_not_null",
-        ),
-    ],
-)
-def test_rewrite_drop_nulls(
-    root: compiler.ir.Expr,
-    expected: compiler.ir.Expr,
-) -> None:
-    # Arrange & Act
-    actual = compiler.rewriter.boolean.rewrite_drop_nulls(root)
-
-    # Assert
-    assert actual == expected
-
-
-@pytest.mark.parametrize(
     ("expr", "node_type", "expected"),
     [
         pytest.param(
@@ -5270,21 +5194,86 @@ def test_rewrite_boolean_when_weights_list_literals_against_budget(monkeypatch) 
     assert boolean_rewriter.rewrite_boolean_when(nested) == compiler.ir.Unsupported()
 
 
-def test_rewrite_drop_nulls_handles_deep_nesting_without_recursion_error() -> None:
-    """Iterative structural dedup in `rewrite_drop_nulls` must avoid `RecursionError`."""
-    from polars_bigquery.core.compiler.rewriter import boolean as boolean_rewriter
+def test_nanosecond_datetime_literals_degrade_to_unsupported() -> None:
+    """Nanosecond Datetime literals must degrade to Unsupported (never widened to us)."""
+    import datetime as dt
 
-    deep: compiler.ir.Expr = compiler.ir.Column("a")
-    for _ in range(1_200):
-        deep = compiler.ir.And(left=deep, right=compiler.ir.BoolLiteral(True))
-
-    root = compiler.ir.And(
-        left=compiler.ir.DropNulls(expr=deep),
-        right=compiler.ir.DropNulls(expr=deep),
+    schema = pl.Schema(
+        {
+            "flag": pl.Boolean(),
+            "dt_us": pl.Datetime("us"),
+            "ts_us": pl.Datetime("us", "UTC"),
+        }
     )
-    out = boolean_rewriter.rewrite_drop_nulls(root)
-    assert isinstance(out, compiler.ir.And)
-    assert isinstance(out.right, compiler.ir.IsNotNull)
+    # Regression: previously an exact-microsecond `ns` literal lost its unit and
+    # caused `fill_null(strategy="one")` to emit `TIMESTAMP_MICROS(1)` instead of
+    # matching Polars' 1-nanosecond physical value (silent row drop).
+    when_ns_naive = (
+        pl.when(pl.col("flag"))
+        .then(pl.lit(dt.datetime(2024, 1, 1), dtype=pl.Datetime("ns")))  # noqa: DTZ001
+        .otherwise(None)
+        .fill_null(strategy="one")
+        < dt.datetime(1970, 1, 1, 0, 0, 0, 1)  # noqa: DTZ001
+    )
+    assert compiler.predicate_to_row_restriction(when_ns_naive, schema=schema) == ""
+
+    when_ns_utc = pl.when(pl.col("flag")).then(
+        pl.lit(
+            dt.datetime(2024, 1, 1, tzinfo=dt.timezone.utc),
+            dtype=pl.Datetime("ns", "UTC"),
+        )
+    ).otherwise(None).fill_null(strategy="one") < dt.datetime(
+        1970, 1, 1, 0, 0, 0, 1, tzinfo=dt.timezone.utc
+    )
+    assert compiler.predicate_to_row_restriction(when_ns_utc, schema=schema) == ""
+
+    # `is_in` with a Datetime("ns") Series also degrades safely.
+    ns_series = pl.Series(
+        [dt.datetime(2024, 1, 1)],  # noqa: DTZ001
+        dtype=pl.Datetime("ns"),
+    )
+    assert (
+        compiler.predicate_to_row_restriction(
+            pl.col("dt_us").is_in(ns_series), schema=schema
+        )
+        == ""
+    )
+
+    # Exact sibling conjunct survives partial pushdown.
+    partial = when_ns_naive & pl.col("flag")
+    assert compiler.predicate_to_row_restriction(partial, schema=schema) == "`flag`"
+
+
+def test_is_in_series_excludes_float16_and_uint128() -> None:
+    """`parser/list_.py` must reject `Float16` and `UInt128` Series like `core/types.py`."""
+    import warnings
+
+    schema = pl.Schema({"f": pl.Float64(), "i": pl.Int64()})
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", DeprecationWarning)
+        f16_expr = pl.col("f").is_in(pl.Series([0.1], dtype=pl.Float16))
+        u128_expr = pl.col("i").is_in(pl.Series([1, 2], dtype=pl.UInt128))
+    assert compiler.predicate_to_row_restriction(f16_expr, schema=schema) == ""
+    assert compiler.predicate_to_row_restriction(u128_expr, schema=schema) == ""
+
+
+def test_large_is_in_list_does_not_starve_sibling_scalar_rewrites() -> None:
+    """A large static `ListLiteral` sibling must not starve unrelated AST lowering."""
+    schema = pl.Schema({"id": pl.Int64(), "f": pl.Float64()})
+    big_list = compiler.ir.ListLiteral(
+        values=tuple(compiler.ir.IntLiteral(i) for i in range(9_995))
+    )
+    root = compiler.ir.And(
+        left=compiler.ir.IsIn(left=compiler.ir.Column("id"), right=big_list),
+        right=compiler.ir.Gt(
+            left=compiler.ir.Column("f"), right=compiler.ir.FloatLiteral(5.0)
+        ),
+    )
+    lowered = compiler.resolve_and_lower_types(root, schema)
+    assert isinstance(lowered, compiler.ir.And)
+    sql = compiler.ir_to_sql(lowered)
+    assert sql is not None
+    assert "((`f` > 5.0) OR IS_NAN(`f`))" in sql
 
 
 def test_ternary_nullable_predicate_keeps_non_null_branches_in_case_b() -> None:

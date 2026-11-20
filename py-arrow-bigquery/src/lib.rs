@@ -23,7 +23,7 @@ pub struct Client {
 #[pymethods]
 impl Client {
     #[new]
-    #[pyo3(signature = (*, quota_project_id, credentials_provider=None, user_agent=None, bq_endpoint=None, bqstorage_endpoint=None, preserve_datetime_extension=false, validate_ffi_types=true))]
+    #[pyo3(signature = (*, quota_project_id, credentials_provider=None, user_agent=None, bq_endpoint=None, bqstorage_endpoint=None, preserve_datetime_extension=false))]
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         py: Python<'_>,
@@ -33,7 +33,6 @@ impl Client {
         bq_endpoint: Option<String>,
         bqstorage_endpoint: Option<String>,
         preserve_datetime_extension: bool,
-        validate_ffi_types: bool,
     ) -> PyResult<Self> {
         let cred = match credentials_provider {
             Some(provider) if !provider.is_none(py) => {
@@ -49,8 +48,7 @@ impl Client {
                 let mut builder = arrow_bigquery_lib::Client::builder()
                     .with_user_agent(user_agent)
                     .with_quota_project_id(Some(quota_project_id))
-                    .with_preserve_datetime_extension(preserve_datetime_extension)
-                    .with_validate_ffi_types(validate_ffi_types);
+                    .with_preserve_datetime_extension(preserve_datetime_extension);
                 if let Some(cred) = cred {
                     builder = builder.with_cred(cred);
                 }
@@ -112,7 +110,7 @@ impl Client {
             py.detach(|| rt.block_on(async move { client.read_table(&table, read_options).await }));
 
         let (schema, receiver) = result.map_err(|err| error::to_py_err(py, err))?;
-        Ok(ArrowStreamExporter::new(schema, receiver))
+        Ok(ArrowStreamExporter::new_validated(schema, receiver))
     }
 
     /// Executes a BigQuery SQL query (or dry run) and returns an [`ArrowStreamExporter`]
@@ -165,7 +163,7 @@ impl Client {
                 })
             });
             let (schema, receiver) = result.map_err(|err| error::to_py_err(py, err))?;
-            Ok(ArrowStreamExporter::new(schema, receiver))
+            Ok(ArrowStreamExporter::new_validated(schema, receiver))
         }
     }
 }
@@ -371,7 +369,6 @@ mod tests {
                 None,
                 None,
                 false,
-                true,
             )
             .unwrap();
             let table =
@@ -417,7 +414,6 @@ mod tests {
                 None,
                 None,
                 false,
-                true,
             )
             .unwrap();
             let table =
@@ -462,7 +458,6 @@ mod tests {
                 Some("https://custom.bq.endpoint.com".to_string()),
                 Some("https://custom.bqstorage.endpoint.com".to_string()),
                 true,
-                false,
             );
             assert!(client.is_ok());
         });
@@ -552,7 +547,6 @@ mod tests {
                 None,
                 None,
                 false,
-                true,
             )
             .unwrap();
             let err = match client.read_query(py, "SELECT 1", "invalid_codec", false, false, None) {
