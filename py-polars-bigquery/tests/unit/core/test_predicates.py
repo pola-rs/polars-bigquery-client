@@ -2271,7 +2271,7 @@ def test_emit_coalesce_sql_rejects_invalid_inputs(
         ),
         pytest.param(
             pl.when(pl.col("a") == 1).then(True).otherwise(True),
-            "IF((`a` = 1), TRUE, TRUE)",
+            "TRUE",
             id="boolean_when_both_branches_true",
         ),
         pytest.param(
@@ -2368,7 +2368,7 @@ def test_emit_coalesce_sql_rejects_invalid_inputs(
             pl.when(pl.col("a") == 1)
             .then(pl.when(pl.col("b") == 2).then(True).otherwise(True))
             .otherwise(pl.col("c") == 3),
-            "IF((`a` = 1), IF((`b` = 2), TRUE, TRUE), (`c` = 3))",
+            "IF((`a` = 1), TRUE, (`c` = 3))",
             id="nested_truthy_when_in_truthy_branch",
         ),
         pytest.param(
@@ -5172,3 +5172,163 @@ def test_rewrite_boolean_when_expansion_cap_degrades_to_unsupported(
     )
     monkeypatch.setattr(boolean_rewriter, "MAX_BOOLEAN_WHEN_REWRITE_NODES", 5)
     assert boolean_rewriter.rewrite_boolean_when(nested) == compiler.ir.Unsupported()
+
+
+def test_float32_literal_widens_through_ieee754_binary32() -> None:
+    """Float32 literal 0.1 must match Polars' f32->f64 widened value, not f64 0.1."""
+    import struct
+
+    schema = pl.Schema({"f": pl.Float64()})
+    expected_val = struct.unpack("<f", struct.pack("<f", 0.1))[0]
+    assert expected_val != 0.1
+
+    sql = compiler.predicate_to_row_restriction(
+        pl.col("f") == pl.lit(0.1, dtype=pl.Float32),
+        schema=schema,
+    )
+    assert sql == f"(`f` = {expected_val!r})"
+
+    # Out-of-range float32 value overflows binary32 -> falls back to Unsupported ("")
+    assert (
+        compiler._json_expr_to_row_restriction(
+            {
+                "BinaryExpr": {
+                    "left": {"Column": "f"},
+                    "op": "Eq",
+                    "right": {"Literal": {"Scalar": {"Float32": 1e50}}},
+                }
+            },
+            schema,
+        )
+        is None
+    )
+
+
+def test_rewrite_boolean_when_suppresses_tautology_and_scales_linearly() -> None:
+    """Boolean `when` chains with only trivial branches omit tautological SQL and stay O(N)."""
+    import time
+
+    from polars_bigquery.core.compiler.rewriter import boolean as boolean_rewriter
+
+    schema = pl.Schema({"good": pl.Int64(), "i": pl.Int64()})
+    # Two-branch chain where the fallback branch becomes Unsupported must NOT emit
+    # `((`good` = 1) OR (NOT COALESCE((`good` = 1), FALSE)))`.
+    taut_chain = (
+        pl.when(pl.col("good") == 1)
+        .then(True)
+        .when(pl.col("i") * 2 == 4)
+        .then(True)
+        .otherwise(False)
+    )
+    assert compiler.predicate_to_row_restriction(taut_chain, schema=schema) == ""
+
+    # Both branches Unsupported (e.g. non-boolean expressions) degrades immediately.
+    unsup_both = (
+        pl.when(pl.col("good") == 1).then(pl.col("i") * 2).otherwise(pl.col("i") * 3)
+    )
+    assert compiler.predicate_to_row_restriction(unsup_both, schema=schema) == ""
+
+    # `rewrite_boolean_when_node` and `rewrite_boolean_when` share the same tautology rule.
+    ir_taut = compiler.ir.Ternary(
+        predicate=compiler.ir.Eq(compiler.ir.Column("good"), compiler.ir.IntLiteral(1)),
+        truthy=compiler.ir.BoolLiteral(True),
+        falsy=compiler.ir.Unsupported(),
+    )
+    assert (
+        boolean_rewriter.rewrite_boolean_when_node(ir_taut) == compiler.ir.Unsupported()
+    )
+    assert boolean_rewriter.rewrite_boolean_when(ir_taut) == compiler.ir.Unsupported()
+
+    # Verify linear O(N) runtime on a 1,600-deep chained Ternary (was ~1.45s quadratic).
+    deep_chain: compiler.ir.Expr = compiler.ir.Column("z")
+    for _ in range(1_600):
+        deep_chain = compiler.ir.Ternary(
+            predicate=compiler.ir.Column("p"),
+            truthy=compiler.ir.Column("t"),
+            falsy=deep_chain,
+        )
+    t0 = time.perf_counter()
+    rewritten = boolean_rewriter.rewrite_boolean_when(deep_chain)
+    elapsed = time.perf_counter() - t0
+    assert isinstance(rewritten, compiler.ir.Ternary)
+    assert elapsed < 0.5, f"expected linear rewrite, took {elapsed:.3f}s"
+
+
+def test_rewrite_boolean_when_weights_list_literals_against_budget(monkeypatch) -> None:
+    """Large `ListLiteral` predicates must count toward the expansion budget."""
+    from polars_bigquery.core.compiler.rewriter import boolean as boolean_rewriter
+
+    big_list = compiler.ir.ListLiteral(
+        values=tuple(compiler.ir.IntLiteral(i) for i in range(50))
+    )
+    nested = compiler.ir.Ternary(
+        predicate=compiler.ir.IsIn(compiler.ir.Column("a"), big_list),
+        truthy=compiler.ir.Eq(compiler.ir.Column("b"), compiler.ir.IntLiteral(2)),
+        falsy=compiler.ir.And(compiler.ir.Column("c"), compiler.ir.Unsupported()),
+    )
+    monkeypatch.setattr(boolean_rewriter, "MAX_BOOLEAN_WHEN_REWRITE_NODES", 80)
+    assert boolean_rewriter.rewrite_boolean_when(nested) == compiler.ir.Unsupported()
+
+
+def test_rewrite_drop_nulls_handles_deep_nesting_without_recursion_error() -> None:
+    """Iterative structural dedup in `rewrite_drop_nulls` must avoid `RecursionError`."""
+    from polars_bigquery.core.compiler.rewriter import boolean as boolean_rewriter
+
+    deep: compiler.ir.Expr = compiler.ir.Column("a")
+    for _ in range(1_200):
+        deep = compiler.ir.And(left=deep, right=compiler.ir.BoolLiteral(True))
+
+    root = compiler.ir.And(
+        left=compiler.ir.DropNulls(expr=deep),
+        right=compiler.ir.DropNulls(expr=deep),
+    )
+    out = boolean_rewriter.rewrite_drop_nulls(root)
+    assert isinstance(out, compiler.ir.And)
+    assert isinstance(out.right, compiler.ir.IsNotNull)
+
+
+def test_ternary_nullable_predicate_keeps_non_null_branches_in_case_b() -> None:
+    """`IF(nullable_bool, 1, 2)` is non-null, avoiding redundant `IS NOT NULL` duplication."""
+    schema = pl.Schema({"f": pl.Float64(), "b": pl.Boolean()})
+    expr = pl.col("f") > pl.when(pl.col("b")).then(1).otherwise(2)
+    sql = compiler.predicate_to_row_restriction(expr, schema=schema)
+    assert sql == "((`f` > IF(`b`, 1, 2)) OR IS_NAN(`f`))"
+
+
+def test_column_identifier_rejects_control_whitespace_and_separators() -> None:
+    """Only Unicode Zs space separators (not tabs/vertical tabs/line separators) are allowed."""
+    assert compiler.sql.column_to_sql_identifier("first name") == "`first name`"
+    assert compiler.sql.column_to_sql_identifier("a\u00a0b") == "`a\u00a0b`"
+    for bad in ("a\tb", "a\x0bb", "a\x0cb", "a\x85b", "a\u2028b", "a\u2029b"):
+        with pytest.raises(ValueError, match="unsupported character"):
+            compiler.sql.column_to_sql_identifier(bad)
+
+
+def test_typing_registry_covers_every_concrete_ir_expr_subclass() -> None:
+    """Every concrete IR `Expr` subclass must have an explicit `_type_node` handler."""
+    import inspect
+
+    from polars_bigquery.core.compiler.ir.base import Expr
+    from polars_bigquery.core.compiler.typing.base import _type_node
+
+    def _iter_subclasses(cls: type[Expr]) -> set[type[Expr]]:
+        found: set[type[Expr]] = set()
+        for sub in cls.__subclasses__():
+            found.add(sub)
+            found.update(_iter_subclasses(sub))
+        return found
+
+    abstract_bases = {
+        compiler.ir.base.UnaryExpr,
+        compiler.ir.base.BinaryExpr,
+        compiler.ir.base.TernaryExpr,
+        compiler.ir.base.VariadicExpr,
+        compiler.ir.base.Literal,
+    }
+    concrete_nodes = {
+        cls
+        for cls in _iter_subclasses(Expr)
+        if not inspect.isabstract(cls) and cls not in abstract_bases
+    }
+    missing = {cls for cls in concrete_nodes if cls not in _type_node.registry}
+    assert missing == set(), f"Unregistered IR nodes in typing dispatch: {missing}"

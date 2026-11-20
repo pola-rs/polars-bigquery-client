@@ -138,6 +138,8 @@ mod tests {
         assert!(builder.bqstorage_endpoint.is_none());
         assert!(builder.user_agent.is_none());
         assert!(builder.quota_project_id.is_none());
+        assert!(builder.schema_decode_options.strip_datetime_extension);
+        assert!(builder.schema_decode_options.validate_ffi_types);
     }
 
     #[test]
@@ -148,7 +150,9 @@ mod tests {
             .with_bq_endpoint("https://custom.bq.endpoint.com")
             .with_bqstorage_endpoint("https://custom.bqstorage.endpoint.com")
             .with_user_agent(Some("custom-agent/1.0".to_string()))
-            .with_quota_project_id(Some("custom-project".to_string()));
+            .with_quota_project_id(Some("custom-project".to_string()))
+            .with_preserve_datetime_extension(true)
+            .with_validate_ffi_types(false);
 
         assert!(builder.cred.is_some());
         assert_eq!(
@@ -161,6 +165,29 @@ mod tests {
         );
         assert_eq!(builder.user_agent.as_deref(), Some("custom-agent/1.0"));
         assert_eq!(builder.quota_project_id.as_deref(), Some("custom-project"));
+        assert!(!builder.schema_decode_options.strip_datetime_extension);
+        assert!(!builder.schema_decode_options.validate_ffi_types);
+    }
+
+    #[tokio::test]
+    async fn test_service_config_builder_build_preserves_decode_options() {
+        let cred = google_cloud_auth::credentials::anonymous::Builder::new().build();
+        let client = ServiceConfigBuilder::new()
+            .with_cred(cred)
+            .with_quota_project_id(Some("custom-project".to_string()))
+            .with_preserve_datetime_extension(true)
+            .with_validate_ffi_types(false)
+            .build()
+            .await
+            .expect("should build client");
+
+        assert_eq!(
+            client.schema_decode_options(),
+            SchemaDecodeOptions {
+                strip_datetime_extension: false,
+                validate_ffi_types: false,
+            }
+        );
     }
 
     #[tokio::test]

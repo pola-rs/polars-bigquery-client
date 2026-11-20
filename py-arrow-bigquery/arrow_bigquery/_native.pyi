@@ -4,6 +4,9 @@ from typing import Any
 class BigQueryError(RuntimeError):
     """Error raised when a BigQuery API request, stream, or query job fails or times out."""
 
+class UnsupportedTypeError(BigQueryError):
+    """Error raised when a BigQuery schema contains a data type that cannot be decoded or exported over FFI."""
+
 class ArrowStreamExporter:
     """Bridge exporting BigQuery Arrow record batches via the Arrow C Stream interface."""
 
@@ -46,6 +49,8 @@ class Client:
         user_agent: str | None = None,
         bq_endpoint: str | None = None,
         bqstorage_endpoint: str | None = None,
+        preserve_datetime_extension: bool = False,
+        validate_ffi_types: bool = True,
     ) -> None: ...
     def read_table(
         self,

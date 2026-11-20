@@ -72,6 +72,8 @@ def test_client_init_passes_credentials_provider():
             user_agent=f"arrow-bigquery/{__version__}",
             bq_endpoint=None,
             bqstorage_endpoint=None,
+            preserve_datetime_extension=False,
+            validate_ffi_types=True,
         )
 
 
@@ -81,6 +83,8 @@ def test_client_init_passes_endpoints():
             quota_project_id="test-proj",
             bq_endpoint="https://custom.bq.endpoint.com",
             bqstorage_endpoint="https://custom.bqstorage.endpoint.com",
+            preserve_datetime_extension=True,
+            validate_ffi_types=False,
         )
         mock_native_cls.assert_called_once_with(
             quota_project_id="test-proj",
@@ -88,6 +92,8 @@ def test_client_init_passes_endpoints():
             user_agent=f"arrow-bigquery/{__version__}",
             bq_endpoint="https://custom.bq.endpoint.com",
             bqstorage_endpoint="https://custom.bqstorage.endpoint.com",
+            preserve_datetime_extension=True,
+            validate_ffi_types=False,
         )
 
 

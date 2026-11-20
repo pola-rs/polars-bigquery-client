@@ -581,6 +581,7 @@ impl Client {
                 maintain_order,
                 cancel_tx: Arc::clone(&cancel_tx),
                 cancel_rx,
+                schema_decode_options: self.schema_decode_options(),
             },
         ));
         BigQueryRecordBatchReceiver::new(rx, Some(cancel_tx), vec![handle])

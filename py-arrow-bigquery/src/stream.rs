@@ -108,13 +108,12 @@ impl Iterator for ReceiverIterator {
                 Ok(Some(Err(err))) => {
                     // Drop the receiver immediately so sibling background streams are aborted now.
                     self.rx = None;
+                    // polars-arrow's Arrow C Stream export callback converts errors with
+                    // `CString::new(...).unwrap()`, which panics across `extern "C"` on interior NUL bytes.
+                    let sanitized_err = err.format_causal_chain().replace('\0', "\\x00");
                     return Some(Err(
                         pyo3_polars::export::polars_error::PolarsError::ComputeError(
-                            format!(
-                                "BigQuery Storage API read error: {}",
-                                err.format_causal_chain()
-                            )
-                            .into(),
+                            format!("BigQuery Storage API read error: {sanitized_err}").into(),
                         ),
                     ));
                 },
@@ -141,8 +140,14 @@ impl ArrowStreamExporter {
         requested_schema: Option<Py<PyAny>>,
     ) -> PyResult<Py<PyAny>> {
         let _ = requested_schema;
-        arrow_bigquery_lib::validate_ffi_schema(&self.schema)
-            .map_err(|err| crate::error::to_py_err(py, err))?;
+        if let Err(err) = arrow_bigquery_lib::validate_ffi_schema(&self.schema) {
+            // Drain the receiver immediately so background Tokio/gRPC stream tasks abort
+            // instead of running until Python garbage-collects this exporter.
+            if let Ok(mut source_guard) = self.source.lock() {
+                let _ = source_guard.take();
+            }
+            return Err(crate::error::to_py_err(py, err));
+        }
         let mut source_guard = self.source.lock().map_err(|_| {
             pyo3::exceptions::PyRuntimeError::new_err("Stream receiver lock is poisoned")
         })?;

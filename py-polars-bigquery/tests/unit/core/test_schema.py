@@ -472,12 +472,26 @@ def test_extract_schema_all_unsupported_physical_with_ingestion_time_partitionin
 
 
 def test_extract_schema_hardens_malformed_deep_and_duplicate_metadata():
-    # Non-mapping root / schema / fields fail safely as empty schema
-    assert extract_schema_metadata("not-a-dict").polars_schema == pl.Schema({})  # type: ignore[arg-type]
-    assert extract_schema_metadata({"schema": "bad"}).polars_schema == pl.Schema({})
-    assert extract_schema_metadata(
-        {"schema": {"fields": "bad"}}
-    ).polars_schema == pl.Schema({})
+    # Malformed non-mapping / wrong-typed envelopes fail fast with ValueError so
+    # corrupted HTTP responses never silently turn into 0-row empty table scans.
+    with pytest.raises(TypeError, match="expected a mapping"):
+        extract_schema_metadata("not-a-dict")  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="expected 'schema' to be a mapping"):
+        extract_schema_metadata({"schema": "bad"})
+    with pytest.raises(ValueError, match="expected 'schema.fields' to be a list"):
+        extract_schema_metadata({"schema": {"fields": "bad"}})
+    with pytest.raises(ValueError, match="expected 'timePartitioning' to be a mapping"):
+        extract_schema_metadata({"timePartitioning": "bad"})
+    with pytest.raises(
+        ValueError, match=r"expected 'timePartitioning\.field' to be a string"
+    ):
+        extract_schema_metadata({"timePartitioning": {"field": 123}})
+    with pytest.raises(
+        ValueError, match=r"expected 'timePartitioning\.type' to be a string"
+    ):
+        extract_schema_metadata({"timePartitioning": {"type": 123}})
+    with pytest.raises(ValueError, match="unsupported 'timePartitioning.type'"):
+        extract_schema_metadata({"timePartitioning": {"type": "WEEK"}})
 
     # Deeply nested STRUCT beyond MAX_SCHEMA_NESTING_DEPTH skips without RecursionError
     from polars_bigquery.core.schema import MAX_SCHEMA_NESTING_DEPTH
@@ -491,12 +505,22 @@ def test_extract_schema_hardens_malformed_deep_and_duplicate_metadata():
             "fields": [
                 {"name": "ok", "type": "INT64"},
                 {"name": "ok", "type": "STRING"},
+                {"name": "OK", "type": "STRING"},
                 "not-a-mapping",
                 {"name": 123, "type": "STRING"},
                 {"name": "bad_mode", "type": "STRING", "mode": 42},
                 {"name": "bad_type", "type": 99},
+                {"name": "ts_float6", "type": "TIMESTAMP", "timestampPrecision": 6.0},
                 {"name": "bad_fields", "type": "STRUCT", "fields": "not-a-list"},
                 {"name": "bad_sub", "type": "STRUCT", "fields": ["not-a-dict"]},
+                {
+                    "name": "dup_case_sub",
+                    "type": "STRUCT",
+                    "fields": [
+                        {"name": "x", "type": "INT64"},
+                        {"name": "X", "type": "STRING"},
+                    ],
+                },
                 deep,
             ]
         }
@@ -505,11 +529,37 @@ def test_extract_schema_hardens_malformed_deep_and_duplicate_metadata():
     assert extracted.polars_schema == pl.Schema({"ok": pl.Int64()})
     reasons = {col.name: col.reason for col in extracted.skipped_columns}
     assert reasons["ok"] == "duplicate column"
+    assert reasons["OK"] == "duplicate column"
     assert reasons["bad_mode"] == "invalid mode 42"
     assert reasons["bad_type"] == "invalid type 99"
+    assert reasons["ts_float6"] == "TIMESTAMP(precision=6.0)"
     assert reasons["bad_fields"] == "malformed STRUCT fields"
     assert reasons["bad_sub"] == "malformed STRUCT subfield"
+    assert reasons["dup_case_sub"] == "duplicate STRUCT subfield"
     assert f"exceeds {MAX_SCHEMA_NESTING_DEPTH}" in reasons[deep["name"]]
+
+
+def test_extract_schema_extension_builder_non_datatype_and_lookup_error():
+    metadata = {"schema": {"fields": [{"name": "j", "type": "JSON"}]}}
+
+    extracted_none = extract_schema_metadata(
+        metadata,
+        extension_dtype_builder=lambda _n, _s, _m: None,  # type: ignore[return-value]
+    )
+    assert extracted_none.polars_schema == pl.Schema({})
+    assert len(extracted_none.skipped_columns) == 1
+    assert "non-DataType NoneType" in extracted_none.skipped_columns[0].reason
+
+    def _raise_key_error(_n, _s, _m):
+        raise KeyError("missing config")
+
+    extracted_err = extract_schema_metadata(
+        metadata,
+        extension_dtype_builder=_raise_key_error,
+    )
+    assert extracted_err.polars_schema == pl.Schema({})
+    assert len(extracted_err.skipped_columns) == 1
+    assert "rejected storage" in extracted_err.skipped_columns[0].reason
 
 
 def test_extract_schema_custom_extension_rejection_becomes_skipped_column():

@@ -13,7 +13,11 @@ import polars_bigquery
 import pytest
 from polars_bigquery.core import bigquery_rest, compiler
 from polars_bigquery.core.types import JSON_EXTENSION_NAME
-from polars_bigquery.exceptions import BigQueryError, UnsupportedTypeWarning
+from polars_bigquery.exceptions import (
+    BigQueryError,
+    UnsupportedTypeError,
+    UnsupportedTypeWarning,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -641,19 +645,22 @@ def test_scan_mixed_table_omits_unsupported_and_read_table_rejects_interval(
     df = lf.collect().sort("id")
     assert df.to_dict(as_series=False) == {"id": [1, 2], "name": ["alice", "bob"]}
 
-    # Calling read_table() on an INTERVAL-containing table raises BigQueryError
-    # from crates/arrow-bigquery referencing upstream Polars issues (no process abort).
-    with pytest.raises(BigQueryError) as exc_info:
+    # Calling read_table() on an INTERVAL/BIGNUMERIC-containing table raises
+    # UnsupportedTypeError (a BigQueryError subclass) from crates/arrow-bigquery
+    # rather than aborting or panicking the Python process.
+    with pytest.raises(UnsupportedTypeError):
         client.read_table(table_id)
-    err_msg = str(exc_info.value)
-    assert "30920" in err_msg
-    assert "30921" in err_msg
 
-    # Calling read_query() returning an INTERVAL also raises BigQueryError safely.
-    with pytest.raises(BigQueryError) as q_exc_info:
+    # Calling read_query() returning an INTERVAL raises UnsupportedTypeError safely.
+    with pytest.raises(UnsupportedTypeError) as q_exc_info:
         client.read_query("SELECT INTERVAL 1 DAY AS dur", use_query_cache=False)
     assert "30920" in str(q_exc_info.value)
     assert "30921" in str(q_exc_info.value)
+
+    # Calling read_query() returning an isolated BIGNUMERIC (Arrow Decimal256)
+    # also raises UnsupportedTypeError safely instead of panicking in Rayon IPC decoding.
+    with pytest.raises(UnsupportedTypeError, match="BIGNUMERIC"):
+        client.read_query("SELECT BIGNUMERIC '1.5' AS amount", use_query_cache=False)
 
 
 def test_scan_ingestion_time_partitioned_interval_only_tables(

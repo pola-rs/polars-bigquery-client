@@ -23,11 +23,12 @@ DEFAULT_TIMEOUT: tuple[float, float] = (_CONNECT_TIMEOUT, _READ_TIMEOUT)
 
 
 def create_resilient_session() -> requests.Session:
-    """Create a requests.Session with connection pooling and exponential backoff."""
+    """Create a requests.Session with connection pooling and jittered exponential backoff."""
     session = requests.Session()
     retry_strategy = Retry(
         total=5,
         backoff_factor=0.5,
+        backoff_jitter=0.5,
         status_forcelist=(429, 500, 502, 503, 504),
         allowed_methods=frozenset(["GET", "POST"]),
         respect_retry_after_header=True,
@@ -105,15 +106,43 @@ def get_table_metadata(
     timeout: tuple[float, float] = DEFAULT_TIMEOUT,
 ) -> dict:
     http = session if session is not None else requests
-    headers = _get_headers(
-        quota_project_id=quota_project_id,
-        credentials_provider=credentials_provider,
-        user_agent=user_agent,
-    )
     table_metadata_url = _get_table_metadata_url(table_ref=table_ref)
-    response = http.get(table_metadata_url, headers=headers, timeout=timeout)
+
+    def _send_get() -> requests.Response:
+        headers = _get_headers(
+            quota_project_id=quota_project_id,
+            credentials_provider=credentials_provider,
+            user_agent=user_agent,
+        )
+        try:
+            return http.get(table_metadata_url, headers=headers, timeout=timeout)
+        except requests.exceptions.RequestException as exc:
+            msg = (
+                f"Failed to fetch table metadata for '{table_ref}' from BigQuery "
+                f"REST API: {exc}"
+            )
+            raise polars_bigquery.exceptions.BigQueryError(msg) from exc
+
+    response = _send_get()
+    # Recover once from a stale/near-expiry bearer token (urllib3.Retry does not
+    # refresh the Authorization header on 401 Unauthorized).
+    if response.status_code == 401:
+        response.close()
+        response = _send_get()
+
     _raise_for_bigquery_error(response)
-    return response.json()
+    try:
+        payload = response.json()
+    except ValueError as exc:
+        msg = f"BigQuery REST API returned invalid JSON for table '{table_ref}': {exc}"
+        raise polars_bigquery.exceptions.BigQueryError(msg) from exc
+    if not isinstance(payload, dict):
+        msg = (
+            f"BigQuery REST API returned unexpected metadata payload type "
+            f"{type(payload).__name__} for table '{table_ref}'"
+        )
+        raise polars_bigquery.exceptions.BigQueryError(msg)
+    return payload
 
 
 class BigQueryRestClient:

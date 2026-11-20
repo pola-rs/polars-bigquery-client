@@ -72,12 +72,18 @@ def _build_extension_dtype_checked(
 ) -> DataType:
     """Invoke `builder` within an explicit error boundary for custom `BaseExtension` hooks."""
     try:
-        return builder(name, storage, metadata)
-    except (TypeError, ValueError, RuntimeError) as exc:
+        dtype = builder(name, storage, metadata)
+    except (TypeError, ValueError, RuntimeError, AttributeError, LookupError) as exc:
         raise _UnsupportedBigQueryType(
             f"extension {name} rejected storage {storage}: {exc}",
             path,
         ) from exc
+    if not isinstance(dtype, DataType):
+        raise _UnsupportedBigQueryType(
+            f"extension {name} returned non-DataType {type(dtype).__name__}",
+            path,
+        )
+    return dtype
 
 
 def _extract_data_type(
@@ -219,11 +225,12 @@ def _extract_data_type(
                 raise _UnsupportedBigQueryType(
                     "unnamed STRUCT subfield", f"{path}[{idx}]"
                 )
-            if sub_name in seen:
+            normalized_sub_name = sub_name.casefold()
+            if normalized_sub_name in seen:
                 raise _UnsupportedBigQueryType(
                     "duplicate STRUCT subfield", f"{path}.{sub_name}"
                 )
-            seen.add(sub_name)
+            seen.add(normalized_sub_name)
             sub_dtype, _ = _extract_data_type(
                 subfield,
                 f"{path}.{sub_name}",
@@ -238,13 +245,22 @@ def _extract_data_type(
         return Time(), BQType.TIME
     if type_ == "timestamp":
         precision = field.get("timestampPrecision")
-        if precision is None or (
-            not isinstance(precision, bool) and precision in (6, "6")
+        if (
+            precision is None
+            or (
+                isinstance(precision, int)
+                and not isinstance(precision, bool)
+                and precision == 6
+            )
+            or precision == "6"
         ):
             return Datetime(time_unit="us", time_zone="UTC"), BQType.TIMESTAMP
         raise _UnsupportedBigQueryType(f"TIMESTAMP(precision={precision})", path)
 
     raise _UnsupportedBigQueryType(f"unsupported type {type_ or '<missing>'}", path)
+
+
+_VALID_TIME_PARTITIONING_TYPES = frozenset({"day", "hour", "month", "year"})
 
 
 def extract_schema_metadata(
@@ -254,21 +270,51 @@ def extract_schema_metadata(
 ) -> ExtractedSchema:
     """Extract a Polars schema, authoritative BigQuery types, and skipped columns.
 
-    Pure metadata transformation with no warning or exception side effects.
+    Pure metadata transformation with no warning side effects. Raises
+    ``TypeError`` when the top-level ``table_metadata`` argument is not a
+    mapping, and ``ValueError`` when nested REST metadata fields are malformed
+    (e.g., non-mapping ``schema`` / ``timePartitioning``, non-list ``fields``,
+    or invalid ``timePartitioning.type``) so corrupted responses never silently
+    degrade into a 0-row empty table scan.
+
     Pass `extension_dtype_builder` to inject custom `JSON`/`GEOGRAPHY` dtype
     resolution independently of Polars' global extension registry or `os.environ`.
 
     See: https://docs.cloud.google.com/bigquery/docs/reference/rest/v2/tables#Table
     """
+    if not isinstance(table_metadata, Mapping):
+        msg = (
+            "Malformed BigQuery table metadata: expected a mapping, "
+            f"got {type(table_metadata).__name__}"
+        )
+        raise TypeError(msg)
+
+    raw_schema = table_metadata.get("schema")
+    if raw_schema is None:
+        fields: list[Any] | tuple[Any, ...] = []
+    elif not isinstance(raw_schema, Mapping):
+        msg = (
+            "Malformed BigQuery table metadata: expected 'schema' to be a mapping, "
+            f"got {type(raw_schema).__name__}"
+        )
+        raise ValueError(msg)
+    else:
+        raw_fields = raw_schema.get("fields")
+        if raw_fields is None:
+            fields = []
+        elif not isinstance(raw_fields, (list, tuple)):
+            msg = (
+                "Malformed BigQuery table metadata: expected 'schema.fields' to be a list, "
+                f"got {type(raw_fields).__name__}"
+            )
+            raise ValueError(msg)
+        else:
+            fields = raw_fields
+
     pl_schema: dict[str, DataType] = {}
+    seen_names: set[str] = set()
     bq_types: dict[str, BQType] = {}
     skipped_columns: list[SkippedColumn] = []
-
-    raw_schema = (
-        table_metadata.get("schema") if isinstance(table_metadata, Mapping) else None
-    )
-    raw_fields = raw_schema.get("fields") if isinstance(raw_schema, Mapping) else None
-    fields = raw_fields if isinstance(raw_fields, (list, tuple)) else []
 
     for idx, field in enumerate(fields):
         if not isinstance(field, Mapping):
@@ -292,7 +338,8 @@ def extract_schema_metadata(
                 )
             )
             continue
-        if name in pl_schema:
+        normalized_name = name.casefold()
+        if normalized_name in seen_names:
             skipped_columns.append(
                 SkippedColumn(
                     name=name,
@@ -312,6 +359,7 @@ def extract_schema_metadata(
                 SkippedColumn(name=name, reason=exc.reason, path=exc.path)
             )
             continue
+        seen_names.add(normalized_name)
         pl_schema[name] = dtype
         bq_types[name] = bq_type
 
@@ -320,24 +368,47 @@ def extract_schema_metadata(
     # whereas _PARTITIONTIME is exposed on all ingestion-time partitioned tables.
     # Treat both `None` and `""` as an absent partitioning field (protobuf-JSON safe).
     # See: https://cloud.google.com/bigquery/docs/partitioned-tables#ingestion_time
-    time_partitioning = (
-        table_metadata.get("timePartitioning")
-        if isinstance(table_metadata, Mapping)
-        else None
-    )
-    if isinstance(time_partitioning, Mapping) and not time_partitioning.get("field"):
-        raw_part_type = time_partitioning.get("type")
-        part_type = (
-            raw_part_type.casefold()
-            if isinstance(raw_part_type, str) and raw_part_type
-            else "day"
-        )
-        if part_type == "day" and "_PARTITIONDATE" not in pl_schema:
-            pl_schema["_PARTITIONDATE"] = Date()
-            bq_types["_PARTITIONDATE"] = BQType.DATE
-        if "_PARTITIONTIME" not in pl_schema:
-            pl_schema["_PARTITIONTIME"] = Datetime(time_unit="us", time_zone="UTC")
-            bq_types["_PARTITIONTIME"] = BQType.TIMESTAMP
+    time_partitioning = table_metadata.get("timePartitioning")
+    if time_partitioning is not None:
+        if not isinstance(time_partitioning, Mapping):
+            msg = (
+                "Malformed BigQuery table metadata: expected 'timePartitioning' "
+                f"to be a mapping, got {type(time_partitioning).__name__}"
+            )
+            raise ValueError(msg)
+        part_field = time_partitioning.get("field")
+        if part_field is not None and not isinstance(part_field, str):
+            msg = (
+                "Malformed BigQuery table metadata: expected 'timePartitioning.field' "
+                f"to be a string, got {type(part_field).__name__}"
+            )
+            raise ValueError(msg)
+        if not part_field:
+            raw_part_type = time_partitioning.get("type")
+            if raw_part_type is None or raw_part_type == "":
+                part_type = "day"
+            elif isinstance(raw_part_type, str):
+                part_type = raw_part_type.casefold()
+                if part_type not in _VALID_TIME_PARTITIONING_TYPES:
+                    msg = (
+                        "Malformed BigQuery table metadata: unsupported "
+                        f"'timePartitioning.type' value {raw_part_type!r}"
+                    )
+                    raise ValueError(msg)
+            else:
+                msg = (
+                    "Malformed BigQuery table metadata: expected "
+                    f"'timePartitioning.type' to be a string, got {type(raw_part_type).__name__}"
+                )
+                raise ValueError(msg)
+            if part_type == "day" and "_partitiondate" not in seen_names:
+                pl_schema["_PARTITIONDATE"] = Date()
+                bq_types["_PARTITIONDATE"] = BQType.DATE
+                seen_names.add("_partitiondate")
+            if "_partitiontime" not in seen_names:
+                pl_schema["_PARTITIONTIME"] = Datetime(time_unit="us", time_zone="UTC")
+                bq_types["_PARTITIONTIME"] = BQType.TIMESTAMP
+                seen_names.add("_partitiontime")
 
     return ExtractedSchema(
         polars_schema=pl.Schema(pl_schema),

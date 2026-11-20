@@ -34,6 +34,8 @@ class Client:
         user_agent: str | None = None,
         bq_endpoint: str | None = None,
         bqstorage_endpoint: str | None = None,
+        preserve_datetime_extension: bool = False,
+        validate_ffi_types: bool = True,
     ) -> None:
         self._quota_project_id = quota_project_id
         self._user_agent = user_agent
@@ -44,6 +46,8 @@ class Client:
             user_agent=full_user_agent,
             bq_endpoint=bq_endpoint,
             bqstorage_endpoint=bqstorage_endpoint,
+            preserve_datetime_extension=preserve_datetime_extension,
+            validate_ffi_types=validate_ffi_types,
         )
 
     @property

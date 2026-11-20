@@ -217,6 +217,7 @@ pub(crate) struct ReadQueryStreamOptions {
     pub(crate) maintain_order: bool,
     pub(crate) cancel_tx: Arc<tokio::sync::watch::Sender<bool>>,
     pub(crate) cancel_rx: tokio::sync::watch::Receiver<bool>,
+    pub(crate) schema_decode_options: SchemaDecodeOptions,
 }
 
 pub(crate) struct ReadStream {
@@ -602,6 +603,7 @@ pub(crate) async fn read_query_stream(options: ReadQueryStreamOptions) {
         maintain_order,
         cancel_tx,
         mut cancel_rx,
+        schema_decode_options,
     } = options;
     let decode_queue = DecodeQueue::new(maintain_order);
 
@@ -632,7 +634,7 @@ pub(crate) async fn read_query_stream(options: ReadQueryStreamOptions) {
                 maintain_order,
                 cancel_tx,
                 cancel_rx,
-                schema_decode_options: SchemaDecodeOptions::default(),
+                schema_decode_options,
             },
             decode_queue,
         );

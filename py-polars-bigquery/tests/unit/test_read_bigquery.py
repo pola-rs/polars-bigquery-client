@@ -1099,3 +1099,181 @@ def test_drop_columns_iter_closes_underlying_batch_iterator():
     assert not closed
     it.close()
     assert closed
+
+
+def test_client_init_closes_rest_session_when_arrow_client_fails():
+    mock_rest_instance = MagicMock()
+    with (
+        patch(
+            "polars_bigquery.core.bigquery_rest.BigQueryRestClient",
+            return_value=mock_rest_instance,
+        ),
+        patch(
+            "arrow_bigquery.Client",
+            side_effect=ValueError("quota_project_id is required"),
+        ),
+        pytest.raises(ValueError, match="quota_project_id"),
+    ):
+        Client(quota_project_id="")
+
+    mock_rest_instance.close.assert_called_once()
+
+
+def test_scan_table_wraps_malformed_metadata_as_bigquery_error(mock_arrow_client):
+    with patch(
+        "polars_bigquery.core.bigquery_rest.get_table_metadata",
+        return_value={"schema": "corrupted"},
+    ):
+        client = Client(quota_project_id="test-proj")
+        with pytest.raises(BigQueryError, match="Invalid BigQuery table metadata"):
+            client.scan_table("my-project.my_dataset.bad_table")
+
+
+def test_scan_table_caps_stream_count_on_small_limit(mock_arrow_client):
+    from polars_bigquery._read_bigquery import _SINGLE_STREAM_ROW_LIMIT
+
+    df_source = pl.DataFrame({"id": [1, 2, 3, 4, 5]})
+    mock_arrow_client.read_table.side_effect = [
+        _FakeArrowStreamExporter(df_source),
+        _FakeArrowStreamExporter(df_source),
+    ]
+    client = Client(quota_project_id="test-proj")
+    lf = client.scan_table("my-project.my_dataset.tbl", schema={"id": pl.Int64()})
+
+    small = lf.limit(3).collect()
+    assert small.height == 3
+    assert (
+        mock_arrow_client.read_table.call_args_list[0].kwargs["max_stream_count"] == 1
+    )
+
+    large = lf.limit(_SINGLE_STREAM_ROW_LIMIT + 1).collect()
+    assert large.height == 5
+    assert (
+        "max_stream_count" not in mock_arrow_client.read_table.call_args_list[1].kwargs
+    )
+
+
+def test_bigquery_rest_retry_has_jitter_and_handles_401_and_errors():
+    import requests
+    from polars_bigquery.core import bigquery_rest
+
+    session = bigquery_rest.create_resilient_session()
+    try:
+        adapter = session.get_adapter("https://bigquery.googleapis.com")
+        assert adapter.max_retries.backoff_jitter > 0
+    finally:
+        session.close()
+
+    table_id = arrow_bigquery.BigQueryTableId("p", "d", "t")
+    tokens = iter(["expired-tok", "fresh-tok"])
+
+    def creds():
+        return ({"bearer_token": next(tokens)}, None)
+
+    resp_401 = MagicMock()
+    resp_401.status_code = 401
+    resp_200 = MagicMock()
+    resp_200.status_code = 200
+    resp_200.raise_for_status.return_value = None
+    resp_200.json.return_value = {"schema": {"fields": []}}
+
+    mock_session = MagicMock()
+    mock_session.get.side_effect = [resp_401, resp_200]
+    result = bigquery_rest.get_table_metadata(
+        table_id,
+        quota_project_id="q",
+        credentials_provider=creds,
+        user_agent="test-ua",
+        session=mock_session,
+    )
+    assert result == {"schema": {"fields": []}}
+    assert mock_session.get.call_count == 2
+    assert (
+        mock_session.get.call_args_list[0].kwargs["headers"]["Authorization"]
+        == "Bearer expired-tok"
+    )
+    assert (
+        mock_session.get.call_args_list[1].kwargs["headers"]["Authorization"]
+        == "Bearer fresh-tok"
+    )
+    resp_401.close.assert_called_once()
+
+    # Network exceptions wrap as BigQueryError
+    mock_session.get.side_effect = requests.exceptions.Timeout("timed out")
+    with pytest.raises(BigQueryError, match="Failed to fetch table metadata"):
+        bigquery_rest.get_table_metadata(
+            table_id,
+            quota_project_id="q",
+            credentials_provider=lambda: ({"bearer_token": "tok"}, None),
+            user_agent="test-ua",
+            session=mock_session,
+        )
+
+    # Non-JSON 200 response (e.g. proxy HTML error page) wraps as BigQueryError
+    bad_json_resp = MagicMock()
+    bad_json_resp.status_code = 200
+    bad_json_resp.raise_for_status.return_value = None
+    bad_json_resp.json.side_effect = ValueError("Expecting value")
+    mock_session.get.side_effect = [bad_json_resp]
+    with pytest.raises(BigQueryError, match="invalid JSON"):
+        bigquery_rest.get_table_metadata(
+            table_id,
+            quota_project_id="q",
+            credentials_provider=lambda: ({"bearer_token": "tok"}, None),
+            user_agent="test-ua",
+            session=mock_session,
+        )
+
+    # Non-dict JSON payload wraps as BigQueryError
+    list_resp = MagicMock()
+    list_resp.status_code = 200
+    list_resp.raise_for_status.return_value = None
+    list_resp.json.return_value = ["unexpected"]
+    mock_session.get.side_effect = [list_resp]
+    with pytest.raises(BigQueryError, match="unexpected metadata payload type list"):
+        bigquery_rest.get_table_metadata(
+            table_id,
+            quota_project_id="q",
+            credentials_provider=lambda: ({"bearer_token": "tok"}, None),
+            user_agent="test-ua",
+            session=mock_session,
+        )
+
+
+def test_unsupported_type_error_export_and_arrow_client_decode_options():
+    from arrow_bigquery.exceptions import UnsupportedTypeError as ArrowUnsupported
+    from polars_bigquery.exceptions import UnsupportedTypeError
+
+    assert UnsupportedTypeError is ArrowUnsupported
+    assert issubclass(UnsupportedTypeError, BigQueryError)
+
+    # Verify arrow_bigquery.Client accepts lossless Rust decode option overrides.
+    client = arrow_bigquery.Client(
+        quota_project_id="test-proj",
+        credentials_provider=lambda: ({"bearer_token": "tok"}, None),
+        preserve_datetime_extension=True,
+        validate_ffi_types=False,
+    )
+    assert client.quota_project_id == "test-proj"
+
+
+def test_arrow_bigquery_dependency_pin_tracks_polars_bigquery_version():
+    """Guard against releasing polars-bigquery with a stale `arrow-bigquery` floor."""
+    import re
+    from pathlib import Path
+
+    import tomllib
+
+    pyproject_path = Path(__file__).resolve().parents[2] / "pyproject.toml"
+    data = tomllib.loads(pyproject_path.read_text(encoding="utf-8"))
+    pkg_version = tuple(int(p) for p in data["project"]["version"].split("."))
+    deps = data["project"]["dependencies"]
+    arrow_deps = [d for d in deps if d.startswith("arrow-bigquery")]
+    assert len(arrow_deps) == 1
+    match = re.search(r">=\s*([0-9]+(?:\.[0-9]+)+)", arrow_deps[0])
+    assert match is not None, f"Missing '>=' lower pin on {arrow_deps[0]!r}"
+    min_version = tuple(int(p) for p in match.group(1).split("."))
+    assert min_version >= pkg_version, (
+        f"py-polars-bigquery {data['project']['version']} must pin "
+        f"arrow-bigquery >= {data['project']['version']} (found {arrow_deps[0]!r})"
+    )

@@ -10,4 +10,6 @@ See [Data types](data-types.md) for the BigQuery-to-Polars schema mapping, exten
 
 ::: polars_bigquery.exceptions.BigQueryError
 
+::: polars_bigquery.exceptions.UnsupportedTypeError
+
 ::: polars_bigquery.exceptions.UnsupportedTypeWarning

@@ -50,44 +50,76 @@ fn check_nesting_depth(depth: usize, path: &str) -> Result<(), BigQueryError> {
     Ok(())
 }
 
-fn dtype_has_datetime_extension(dtype: &ArrowDataType, depth: usize) -> bool {
-    if depth > MAX_SCHEMA_NESTING_DEPTH {
-        return false;
-    }
+fn dtype_has_datetime_extension(
+    dtype: &ArrowDataType,
+    path: &str,
+    depth: usize,
+) -> Result<bool, BigQueryError> {
+    check_nesting_depth(depth, path)?;
     match dtype {
         ArrowDataType::Extension(ext) => {
-            ext.name.as_str() == BQ_DATETIME_EXTENSION_NAME
-                || dtype_has_datetime_extension(&ext.inner, depth + 1)
+            if ext.name.as_str() == BQ_DATETIME_EXTENSION_NAME {
+                return Ok(true);
+            }
+            dtype_has_datetime_extension(&ext.inner, path, depth + 1)
         },
         ArrowDataType::List(inner)
         | ArrowDataType::LargeList(inner)
         | ArrowDataType::FixedSizeList(inner, _)
-        | ArrowDataType::Map(inner, _) => field_has_datetime_extension(inner, depth + 1),
-        ArrowDataType::Struct(fields) => fields
-            .iter()
-            .any(|field| field_has_datetime_extension(field, depth + 1)),
-        ArrowDataType::Dictionary(_, values, _) => dtype_has_datetime_extension(values, depth + 1),
-        ArrowDataType::Union(union) => union
-            .fields
-            .iter()
-            .any(|field| field_has_datetime_extension(field, depth + 1)),
-        _ => false,
+        | ArrowDataType::Map(inner, _) => field_has_datetime_extension(inner, path, depth + 1),
+        ArrowDataType::Struct(fields) => {
+            for (idx, field) in fields.iter().enumerate() {
+                let child_path = child_field_path(path, field, idx);
+                if field_has_datetime_extension(field, &child_path, depth + 1)? {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        },
+        ArrowDataType::Dictionary(_, values, _) => {
+            dtype_has_datetime_extension(values, path, depth + 1)
+        },
+        ArrowDataType::Union(union) => {
+            for (idx, field) in union.fields.iter().enumerate() {
+                let child_path = child_field_path(path, field, idx);
+                if field_has_datetime_extension(field, &child_path, depth + 1)? {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        },
+        _ => Ok(false),
     }
 }
 
-fn field_has_datetime_extension(field: &Field, depth: usize) -> bool {
+fn child_field_path(parent: &str, field: &Field, idx: usize) -> String {
+    if field.name.is_empty() {
+        format!("{parent}[{idx}]")
+    } else {
+        format!("{parent}.{}", field.name)
+    }
+}
+
+fn field_has_datetime_extension(
+    field: &Field,
+    path: &str,
+    depth: usize,
+) -> Result<bool, BigQueryError> {
     if field.metadata.as_ref().is_some_and(|meta| {
         meta.get("ARROW:extension:name").map(|v| v.as_str()) == Some(BQ_DATETIME_EXTENSION_NAME)
     }) {
-        return true;
+        return Ok(true);
     }
-    dtype_has_datetime_extension(field.dtype(), depth)
+    dtype_has_datetime_extension(field.dtype(), path, depth)
 }
 
-fn schema_has_datetime_extension(schema: &ArrowSchema) -> bool {
-    schema
-        .iter()
-        .any(|(_, field)| field_has_datetime_extension(field, 0))
+fn schema_has_datetime_extension(schema: &ArrowSchema) -> Result<bool, BigQueryError> {
+    for (_, field) in schema.iter() {
+        if field_has_datetime_extension(field, field.name.as_str(), 0)? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn strip_datetime_extension_dtype(
@@ -185,7 +217,7 @@ fn strip_datetime_extension_field(
 }
 
 fn strip_datetime_extensions(schema: ArrowSchema) -> Result<ArrowSchema, BigQueryError> {
-    if !schema_has_datetime_extension(&schema) {
+    if !schema_has_datetime_extension(&schema)? {
         return Ok(schema);
     }
     let mut fields = Vec::with_capacity(schema.len());
@@ -196,14 +228,61 @@ fn strip_datetime_extensions(schema: ArrowSchema) -> Result<ArrowSchema, BigQuer
     Ok(ArrowSchema::from_iter(fields))
 }
 
+fn validate_field_name_for_ffi(name: &str, path: &str) -> Result<(), BigQueryError> {
+    if name.as_bytes().contains(&0) {
+        return Err(BigQueryError::Protocol(format!(
+            "column `{path}` contains an interior NUL byte in its field name, which cannot be exported over Arrow C Data Interface FFI"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_arrow_field(
+    field: &Field,
+    path: &str,
+    depth: usize,
+    validate_ffi_types: bool,
+) -> Result<(), BigQueryError> {
+    if validate_ffi_types {
+        validate_field_name_for_ffi(field.name.as_str(), path)?;
+    }
+    validate_supported_arrow_dtype(field.dtype(), path, depth, validate_ffi_types)
+}
+
 fn validate_supported_arrow_dtype(
     dtype: &ArrowDataType,
     path: &str,
     depth: usize,
+    validate_ffi_types: bool,
 ) -> Result<(), BigQueryError> {
     check_nesting_depth(depth, path)?;
     match dtype {
-        ArrowDataType::Interval(IntervalUnit::MonthDayNano) => {
+        // Types that `polars-arrow`'s IPC `StreamReader` (`deserialize::read`) cannot decode
+        // without panicking inside `with_match_primitive_type_full!` / `to_physical_type()`.
+        // Rejected unconditionally even when `validate_ffi_types == false`.
+        ArrowDataType::Decimal256(precision, scale) => {
+            Err(BigQueryError::UnsupportedType(format!(
+                "column `{path}` uses Arrow Decimal256({precision}, {scale}) (BigQuery BIGNUMERIC), \
+                 which cannot be decoded by polars-arrow. Use a SQL query to CAST the column \
+                 (e.g. `CAST({path} AS STRING)` or `CAST({path} AS FLOAT64)`)"
+            )))
+        },
+        ArrowDataType::Interval(IntervalUnit::DayTime) => {
+            Err(BigQueryError::UnsupportedType(format!(
+                "column `{path}` uses Arrow Interval(DayTime), which cannot be decoded by polars-arrow"
+            )))
+        },
+        ArrowDataType::Interval(IntervalUnit::MonthDayMillis) => {
+            Err(BigQueryError::UnsupportedType(format!(
+                "column `{path}` uses Arrow Interval(MonthDayMillis), which cannot be decoded or exported over Arrow C Data Interface FFI"
+            )))
+        },
+        ArrowDataType::Unknown => Err(BigQueryError::UnsupportedType(format!(
+            "column `{path}` uses ArrowDataType::Unknown, which is not supported by polars-arrow"
+        ))),
+        // Types decodable in pure-Rust IPC but known to panic/abort during Arrow C Data Interface
+        // FFI export (`polars-arrow::ffi::export_iterator`).
+        ArrowDataType::Interval(IntervalUnit::MonthDayNano) if validate_ffi_types => {
             Err(BigQueryError::UnsupportedType(format!(
                 "column `{path}` uses Arrow Interval(MonthDayNano) (BigQuery INTERVAL), \
                  which is not supported by Polars Arrow FFI \
@@ -211,57 +290,80 @@ fn validate_supported_arrow_dtype(
                  https://github.com/pola-rs/polars/issues/30921)"
             )))
         },
-        ArrowDataType::Interval(IntervalUnit::MonthDayMillis) => {
-            Err(BigQueryError::UnsupportedType(format!(
-                "column `{path}` uses Arrow Interval(MonthDayMillis), which is not supported by Arrow C Data Interface FFI export"
+        ArrowDataType::Time32(unit)
+            if validate_ffi_types
+                && !matches!(
+                    unit,
+                    polars_arrow::datatypes::TimeUnit::Second
+                        | polars_arrow::datatypes::TimeUnit::Millisecond
+                ) =>
+        {
+            Err(BigQueryError::Protocol(format!(
+                "column `{path}` uses invalid Arrow Time32({unit:?}) unit"
             )))
         },
-        ArrowDataType::Unknown => Err(BigQueryError::UnsupportedType(format!(
-            "column `{path}` uses ArrowDataType::Unknown, which is not supported by Arrow C Data Interface FFI export"
-        ))),
+        ArrowDataType::Time64(unit)
+            if validate_ffi_types
+                && !matches!(
+                    unit,
+                    polars_arrow::datatypes::TimeUnit::Microsecond
+                        | polars_arrow::datatypes::TimeUnit::Nanosecond
+                ) =>
+        {
+            Err(BigQueryError::Protocol(format!(
+                "column `{path}` uses invalid Arrow Time64({unit:?}) unit"
+            )))
+        },
+        ArrowDataType::Timestamp(_, Some(tz))
+            if validate_ffi_types && tz.as_bytes().contains(&0) =>
+        {
+            Err(BigQueryError::Protocol(format!(
+                "column `{path}` timestamp timezone contains an interior NUL byte, which cannot be exported over Arrow C Data Interface FFI"
+            )))
+        },
         ArrowDataType::List(inner)
         | ArrowDataType::LargeList(inner)
         | ArrowDataType::FixedSizeList(inner, _)
         | ArrowDataType::Map(inner, _) => {
-            validate_supported_arrow_dtype(inner.dtype(), path, depth + 1)
+            validate_arrow_field(inner, path, depth + 1, validate_ffi_types)
         },
         ArrowDataType::Struct(fields) => {
             for (idx, field) in fields.iter().enumerate() {
-                let child_path = if field.name.is_empty() {
-                    format!("{path}[{idx}]")
-                } else {
-                    format!("{path}.{}", field.name)
-                };
-                validate_supported_arrow_dtype(field.dtype(), &child_path, depth + 1)?;
+                let child_path = child_field_path(path, field, idx);
+                validate_arrow_field(field, &child_path, depth + 1, validate_ffi_types)?;
             }
             Ok(())
         },
         ArrowDataType::Dictionary(_, values, _) => {
-            validate_supported_arrow_dtype(values, path, depth + 1)
+            validate_supported_arrow_dtype(values, path, depth + 1, validate_ffi_types)
         },
         ArrowDataType::Union(union) => {
+            if validate_ffi_types
+                && (union.fields.is_empty()
+                    || union.ids.as_ref().is_some_and(|ids| ids.is_empty()))
+            {
+                return Err(BigQueryError::UnsupportedType(format!(
+                    "column `{path}` uses an empty Arrow Union, which is not supported by Arrow C Data Interface FFI export"
+                )));
+            }
             for (idx, field) in union.fields.iter().enumerate() {
-                let child_path = if field.name.is_empty() {
-                    format!("{path}[{idx}]")
-                } else {
-                    format!("{path}.{}", field.name)
-                };
-                validate_supported_arrow_dtype(field.dtype(), &child_path, depth + 1)?;
+                let child_path = child_field_path(path, field, idx);
+                validate_arrow_field(field, &child_path, depth + 1, validate_ffi_types)?;
             }
             Ok(())
         },
         ArrowDataType::Extension(ext) => {
-            validate_supported_arrow_dtype(&ext.inner, path, depth + 1)
+            validate_supported_arrow_dtype(&ext.inner, path, depth + 1, validate_ffi_types)
         },
         _ => Ok(()),
     }
 }
 
 /// Validates that an [`ArrowSchema`] does not contain any types known to panic or abort
-/// when exported over the `polars-arrow` Arrow C Data Interface FFI layer.
+/// when decoded from Arrow IPC or exported over the `polars-arrow` Arrow C Data Interface FFI layer.
 pub fn validate_ffi_schema(schema: &ArrowSchema) -> Result<(), BigQueryError> {
     for (_, field) in schema.iter() {
-        validate_supported_arrow_dtype(field.dtype(), field.name.as_str(), 0)?;
+        validate_arrow_field(field, field.name.as_str(), 0, true)?;
     }
     Ok(())
 }
@@ -273,8 +375,8 @@ pub(crate) fn parse_arrow_schema_with_options(
 ) -> Result<StreamMetadata, BigQueryError> {
     let mut cursor = Cursor::new(schema_bytes);
     let mut metadata = read_stream_metadata(&mut cursor)?;
-    if options.validate_ffi_types {
-        validate_ffi_schema(&metadata.schema)?;
+    for (_, field) in metadata.schema.iter() {
+        validate_arrow_field(field, field.name.as_str(), 0, options.validate_ffi_types)?;
     }
     if options.strip_datetime_extension {
         metadata.schema = strip_datetime_extensions(metadata.schema)?;
@@ -364,11 +466,27 @@ impl DecodeJob {
             return;
         }
 
-        let res = decode_arrow_record_batches(
-            serialized_record_batch,
-            expected_row_count,
-            Arc::unwrap_or_clone(metadata),
-        );
+        let res = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            decode_arrow_record_batches(
+                serialized_record_batch,
+                expected_row_count,
+                Arc::unwrap_or_clone(metadata),
+            )
+        })) {
+            Ok(inner) => inner,
+            Err(payload) => {
+                let msg = if let Some(s) = payload.downcast_ref::<&str>() {
+                    (*s).to_string()
+                } else if let Some(s) = payload.downcast_ref::<String>() {
+                    s.clone()
+                } else {
+                    "unknown panic payload".to_string()
+                };
+                Err(BigQueryError::Protocol(format!(
+                    "Arrow IPC decoder panicked: {msg}"
+                )))
+            },
+        };
 
         if *cancel_rx.borrow() {
             return;
@@ -439,13 +557,31 @@ impl OrderedDecodeQueue {
     }
 
     fn drain(&self) {
+        struct ResetRunningOnPanic<'a> {
+            state: &'a Mutex<OrderedQueueState>,
+            disarmed: bool,
+        }
+        impl Drop for ResetRunningOnPanic<'_> {
+            fn drop(&mut self) {
+                if !self.disarmed {
+                    let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+                    state.running = false;
+                }
+            }
+        }
+
+        let mut guard = ResetRunningOnPanic {
+            state: &self.state,
+            disarmed: false,
+        };
         loop {
             let next_job = {
-                let mut state = self.state.lock().unwrap();
+                let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
                 match state.queue.pop_front() {
                     Some(job) => job,
                     None => {
                         state.running = false;
+                        guard.disarmed = true;
                         return;
                     },
                 }
@@ -1412,5 +1548,131 @@ mod tests {
             parsed_unchecked.schema.get("dur").unwrap().dtype(),
             &ArrowDataType::Interval(IntervalUnit::MonthDayNano)
         );
+    }
+
+    #[test]
+    fn test_validate_rejects_bignumeric_decimal256_daytime_bad_time_empty_union_and_nul() {
+        use polars_arrow::datatypes::{TimeUnit, UnionMode, UnionType};
+
+        // Decimal256 (BigQuery BIGNUMERIC) must be rejected unconditionally even when
+        // `validate_ffi_types == false`, because `polars-arrow`'s IPC decoder panics on Int256.
+        let dec256_schema = ArrowSchema::from_iter(vec![Field::new(
+            "amount".into(),
+            ArrowDataType::Decimal256(76, 38),
+            true,
+        )]);
+        let dec256_bytes = serialize_arrow_schema(&dec256_schema);
+        let err = parse_arrow_schema_with_options(
+            &dec256_bytes,
+            SchemaDecodeOptions {
+                strip_datetime_extension: true,
+                validate_ffi_types: false,
+            },
+        )
+        .expect_err("Decimal256 should be rejected even with validate_ffi_types=false");
+        assert!(matches!(err, BigQueryError::UnsupportedType(_)));
+        assert!(err.to_string().contains("BIGNUMERIC"));
+        assert!(err.to_string().contains("amount"));
+
+        // Nested Decimal256 in Struct and List rejected via validate_ffi_schema
+        let nested_dec256 = ArrowSchema::from_iter(vec![Field::new(
+            "meta".into(),
+            ArrowDataType::Struct(vec![Field::new(
+                "vals".into(),
+                ArrowDataType::List(Box::new(Field::new(
+                    "item".into(),
+                    ArrowDataType::Decimal256(76, 38),
+                    true,
+                ))),
+                true,
+            )]),
+            true,
+        )]);
+        let err = validate_ffi_schema(&nested_dec256).unwrap_err();
+        assert!(matches!(err, BigQueryError::UnsupportedType(_)));
+        assert!(err.to_string().contains("meta.vals"));
+
+        // Interval(DayTime) rejected unconditionally even with validate_ffi_types=false
+        let daytime_schema = ArrowSchema::from_iter(vec![Field::new(
+            "dt_iv".into(),
+            ArrowDataType::Interval(IntervalUnit::DayTime),
+            true,
+        )]);
+        let daytime_err = parse_arrow_schema_with_options(
+            &serialize_arrow_schema(&daytime_schema),
+            SchemaDecodeOptions {
+                strip_datetime_extension: false,
+                validate_ffi_types: false,
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(daytime_err, BigQueryError::UnsupportedType(_)));
+
+        // Mismatched Time32/Time64 units rejected before FFI export (avoids unreachable!() panic)
+        let bad_time32 = ArrowSchema::from_iter(vec![Field::new(
+            "t32".into(),
+            ArrowDataType::Time32(TimeUnit::Microsecond),
+            true,
+        )]);
+        assert!(matches!(
+            validate_ffi_schema(&bad_time32),
+            Err(BigQueryError::Protocol(_))
+        ));
+        let bad_time64 = ArrowSchema::from_iter(vec![Field::new(
+            "t64".into(),
+            ArrowDataType::Time64(TimeUnit::Second),
+            true,
+        )]);
+        assert!(matches!(
+            validate_ffi_schema(&bad_time64),
+            Err(BigQueryError::Protocol(_))
+        ));
+
+        // Empty Union rejected before FFI export (avoids ids.len() - 1 underflow)
+        let empty_union = ArrowSchema::from_iter(vec![Field::new(
+            "empty_u".into(),
+            ArrowDataType::Union(Box::new(UnionType {
+                fields: vec![],
+                ids: None,
+                mode: UnionMode::Sparse,
+            })),
+            true,
+        )]);
+        assert!(matches!(
+            validate_ffi_schema(&empty_union),
+            Err(BigQueryError::UnsupportedType(_))
+        ));
+
+        // Interior NUL bytes in field name or Timestamp timezone rejected before CString::new().unwrap()
+        let nul_name = ArrowSchema::from_iter(vec![Field::new(
+            "bad\0col".into(),
+            ArrowDataType::Int64,
+            true,
+        )]);
+        assert!(matches!(
+            validate_ffi_schema(&nul_name),
+            Err(BigQueryError::Protocol(_))
+        ));
+        let nul_tz = ArrowSchema::from_iter(vec![Field::new(
+            "ts".into(),
+            ArrowDataType::Timestamp(TimeUnit::Microsecond, Some("UT\0C".into())),
+            true,
+        )]);
+        assert!(matches!(
+            validate_ffi_schema(&nul_tz),
+            Err(BigQueryError::Protocol(_))
+        ));
+
+        // `strip_datetime_extensions` must fail closed (Protocol error), NOT skip silently,
+        // when schema nesting depth exceeds MAX_SCHEMA_NESTING_DEPTH.
+        let mut deep_dtype = ArrowDataType::Int64;
+        for _ in 0..=MAX_SCHEMA_NESTING_DEPTH + 1 {
+            deep_dtype = ArrowDataType::List(Box::new(Field::new("item".into(), deep_dtype, true)));
+        }
+        let deep_schema = ArrowSchema::from_iter(vec![Field::new("deep".into(), deep_dtype, true)]);
+        assert!(matches!(
+            strip_datetime_extensions(deep_schema),
+            Err(BigQueryError::Protocol(_))
+        ));
     }
 }

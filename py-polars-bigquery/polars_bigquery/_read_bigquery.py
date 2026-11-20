@@ -20,6 +20,10 @@ from polars_bigquery.core import bigquery_rest, compiler
 logger = logging.getLogger(__name__)
 
 _MAX_SKIPPED_COLUMNS_DISPLAY = 5
+# Cap `read_table` fanout to a single stream when Polars pushes a small row
+# limit (`n_rows`), avoiding spinning up `available_parallelism()` parallel gRPC
+# streams and prefetch buffers only to discard nearly all rows.
+_SINGLE_STREAM_ROW_LIMIT = 10_000
 
 
 def _format_skipped_columns(
@@ -40,7 +44,13 @@ def _format_skipped_columns(
 
 
 def _drop_columns_iter(batches: Iterator[pl.DataFrame]) -> Iterator[pl.DataFrame]:
-    """Yield height-preserving zero-width frames and promptly close the stream on exit."""
+    """Yield height-preserving zero-width frames and close the iterator if supported.
+
+    Note: Polars 2.x's ``_CollectBatches`` iterator does not expose a ``.close()``
+    method; its underlying native stream is released when this generator finishes
+    or is garbage-collected. Calling ``.close()`` when present ensures prompt
+    cleanup for generator-backed or custom iterators.
+    """
     try:
         for batch in batches:
             yield batch.drop(batch.columns)
@@ -116,11 +126,15 @@ class Client:
             credentials_provider=credentials_provider,
             user_agent=self._user_agent,
         )
-        self._arrow_client = arrow_bigquery.Client(
-            quota_project_id=quota_project_id,
-            credentials_provider=credentials_provider,
-            user_agent=self._user_agent,
-        )
+        try:
+            self._arrow_client = arrow_bigquery.Client(
+                quota_project_id=quota_project_id,
+                credentials_provider=credentials_provider,
+                user_agent=self._user_agent,
+            )
+        except Exception:
+            self._rest_client.close()
+            raise
 
     def close(self) -> None:
         """Close underlying REST session resources."""
@@ -157,9 +171,10 @@ class Client:
         omits unsupported BigQuery columns with an
         [`UnsupportedTypeWarning`][polars_bigquery.exceptions.UnsupportedTypeWarning]),
         `read_table` streams all table columns directly from the Storage Read
-        API. Tables containing BigQuery `INTERVAL` columns fail immediately with
-        [`BigQueryError`][polars_bigquery.exceptions.BigQueryError] before Arrow
-        FFI export. See [Data types](data-types.md) for the complete mapping and
+        API. Tables containing BigQuery `INTERVAL` or `BIGNUMERIC` columns fail
+        immediately with [`UnsupportedTypeError`][polars_bigquery.exceptions.UnsupportedTypeError]
+        (a subclass of [`BigQueryError`][polars_bigquery.exceptions.BigQueryError])
+        before Arrow decoding / FFI export. See [Data types](data-types.md) for the complete mapping and
         [`Client.read_query`][polars_bigquery.Client.read_query] workarounds.
 
         Parameters
@@ -382,9 +397,13 @@ class Client:
         bq_types: Mapping[str, polars_bigquery.core.types.BQType] | None
         if schema is None:
             table_metadata = self._rest_client.get_table_metadata(table_ref)
-            extracted = polars_bigquery.core.schema.extract_schema_metadata(
-                table_metadata
-            )
+            try:
+                extracted = polars_bigquery.core.schema.extract_schema_metadata(
+                    table_metadata
+                )
+            except (TypeError, ValueError) as exc:
+                msg = f"Invalid BigQuery table metadata for '{table_ref}': {exc}"
+                raise polars_bigquery.exceptions.BigQueryError(msg) from exc
             polars_schema = extracted.polars_schema
             bq_types = extracted.bq_types
             if extracted.skipped_columns:
@@ -470,11 +489,16 @@ class Client:
             # Note: even when `row_restriction == "FALSE"` (e.g. `int_col.is_nan()`),
             # we intentionally open a Storage Read API session so server-side table
             # existence and IAM authorization errors surface consistently.
+            read_kwargs: dict[str, Any] = {
+                "maintain_order": False,
+                "selected_fields": selected_fields,
+                "row_restriction": row_restriction,
+            }
+            if n_rows is not None and n_rows <= _SINGLE_STREAM_ROW_LIMIT:
+                read_kwargs["max_stream_count"] = 1
             arrow_stream_exporter = self._arrow_client.read_table(
                 table_ref,
-                maintain_order=False,
-                selected_fields=selected_fields,
-                row_restriction=row_restriction,
+                **read_kwargs,
             )
             lazyframe = pl.scan_arrow_c_stream(arrow_stream_exporter)
 

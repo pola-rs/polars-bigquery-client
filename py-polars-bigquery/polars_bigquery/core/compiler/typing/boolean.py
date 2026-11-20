@@ -150,6 +150,16 @@ def _type_conditional(
             for branch in branches
             if not _is_null_branch(branch) and not isinstance(branch.node, Unsupported)
         ]
+        # If every single branch is Unsupported (no known BOOL branch and no NULL
+        # branch), the conditional would only produce a tautology (`p OR NOT
+        # COALESCE(p, FALSE)`) or mis-type non-boolean expressions (`when(p).then(x*2).otherwise(x*3)`).
+        has_null_branch = any(_is_null_branch(branch) for branch in branches)
+        if not known_branches and not has_null_branch:
+            logger.debug(
+                "Conditional %r has only Unsupported value branches; degrading to Unsupported",
+                type(node).__name__,
+            )
+            return _degrade(all_children, ctx)
         if all(branch.bq_type is BQType.BOOL for branch in known_branches):
             return _TypedNode(
                 node=reconstructed,
@@ -189,10 +199,10 @@ def _type_conditional(
     time_units = {branch.time_unit for branch in non_null_branches}
     time_unit = next(iter(time_units)) if len(time_units) == 1 else None
     is_known_non_nan = all(branch.is_known_non_nan for branch in non_null_branches)
-    is_known_non_null = (
-        not has_unsupported
-        and all(pred.is_known_non_null for pred in predicates)
-        and all(branch.is_known_non_null for branch in branches)
+    # Under IF / CASE WHEN, a NULL predicate falls through to the next WHEN / ELSE
+    # branch rather than yielding NULL, so non-nullness depends only on the value branches.
+    is_known_non_null = not has_unsupported and all(
+        branch.is_known_non_null for branch in branches
     )
     decimal_supports_one = all(
         branch.decimal_supports_one for branch in non_null_branches

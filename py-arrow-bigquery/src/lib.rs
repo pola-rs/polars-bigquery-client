@@ -23,7 +23,8 @@ pub struct Client {
 #[pymethods]
 impl Client {
     #[new]
-    #[pyo3(signature = (*, quota_project_id, credentials_provider=None, user_agent=None, bq_endpoint=None, bqstorage_endpoint=None))]
+    #[pyo3(signature = (*, quota_project_id, credentials_provider=None, user_agent=None, bq_endpoint=None, bqstorage_endpoint=None, preserve_datetime_extension=false, validate_ffi_types=true))]
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         py: Python<'_>,
         quota_project_id: String,
@@ -31,6 +32,8 @@ impl Client {
         user_agent: Option<String>,
         bq_endpoint: Option<String>,
         bqstorage_endpoint: Option<String>,
+        preserve_datetime_extension: bool,
+        validate_ffi_types: bool,
     ) -> PyResult<Self> {
         let cred = match credentials_provider {
             Some(provider) if !provider.is_none(py) => {
@@ -45,7 +48,9 @@ impl Client {
             rt.block_on(async {
                 let mut builder = arrow_bigquery_lib::Client::builder()
                     .with_user_agent(user_agent)
-                    .with_quota_project_id(Some(quota_project_id));
+                    .with_quota_project_id(Some(quota_project_id))
+                    .with_preserve_datetime_extension(preserve_datetime_extension)
+                    .with_validate_ffi_types(validate_ffi_types);
                 if let Some(cred) = cred {
                     builder = builder.with_cred(cred);
                 }
@@ -210,6 +215,10 @@ fn parse_read_options(
 #[pyo3(name = "_native")]
 fn polars_bigquery(m: &Bound<PyModule>) -> PyResult<()> {
     m.add("BigQueryError", m.py().get_type::<error::BigQueryError>())?;
+    m.add(
+        "UnsupportedTypeError",
+        m.py().get_type::<error::UnsupportedTypeError>(),
+    )?;
     m.add_class::<Client>()?;
     m.add_class::<BigQueryTableId>()?;
     #[cfg(feature = "testing")]
@@ -354,8 +363,17 @@ mod tests {
     fn test_client_read_table_invalid_compression() {
         Python::initialize();
         Python::attach(|py| {
-            let client =
-                Client::new(py, "test-project".to_string(), None, None, None, None).unwrap();
+            let client = Client::new(
+                py,
+                "test-project".to_string(),
+                None,
+                None,
+                None,
+                None,
+                false,
+                true,
+            )
+            .unwrap();
             let table =
                 BigQueryTableId::new("p".to_string(), "d".to_string(), "t".to_string()).unwrap();
             let err = match client.read_table(
@@ -391,8 +409,17 @@ mod tests {
                 .unwrap();
             let dt_py: Py<PyDateTime> = dt.extract().unwrap();
 
-            let client =
-                Client::new(py, "test-project".to_string(), None, None, None, None).unwrap();
+            let client = Client::new(
+                py,
+                "test-project".to_string(),
+                None,
+                None,
+                None,
+                None,
+                false,
+                true,
+            )
+            .unwrap();
             let table =
                 BigQueryTableId::new("p".to_string(), "d".to_string(), "t".to_string()).unwrap();
             let err = match client.read_table(
@@ -434,6 +461,8 @@ mod tests {
                 Some("test-agent/1.0".to_string()),
                 Some("https://custom.bq.endpoint.com".to_string()),
                 Some("https://custom.bqstorage.endpoint.com".to_string()),
+                true,
+                false,
             );
             assert!(client.is_ok());
         });
@@ -515,8 +544,17 @@ mod tests {
     fn test_client_read_query_invalid_compression() {
         Python::initialize();
         Python::attach(|py| {
-            let client =
-                Client::new(py, "test-project".to_string(), None, None, None, None).unwrap();
+            let client = Client::new(
+                py,
+                "test-project".to_string(),
+                None,
+                None,
+                None,
+                None,
+                false,
+                true,
+            )
+            .unwrap();
             let err = match client.read_query(py, "SELECT 1", "invalid_codec", false, false, None) {
                 Err(e) => e,
                 Ok(_) => panic!("expected Err for invalid compression codec"),

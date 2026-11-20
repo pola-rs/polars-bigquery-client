@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from arrow_bigquery.exceptions import BigQueryError
+from arrow_bigquery.exceptions import BigQueryError, UnsupportedTypeError
 
 
 class UnsupportedTypeWarning(UserWarning):
@@ -28,4 +28,4 @@ class UnsupportedTypeWarning(UserWarning):
     """
 
 
-__all__ = ["BigQueryError", "UnsupportedTypeWarning"]
+__all__ = ["BigQueryError", "UnsupportedTypeError", "UnsupportedTypeWarning"]
