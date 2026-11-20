@@ -12,9 +12,9 @@ classifiers = [
   "Programming Language :: Python :: Implementation :: PyPy",
 ]
 dependencies = [
-    "arrow-bigquery",
+    "arrow-bigquery >= 0.3.2",
     "google-auth >= 2.40.3",
-    "polars >= 1.43.0, < 3.0.0",
+    "polars >= 2.0.0, < 3.0.0",
     "requests >= 2.33.0, < 3.0.0",
 ]
 

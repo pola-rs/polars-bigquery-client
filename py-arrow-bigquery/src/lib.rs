@@ -13,6 +13,44 @@ use pyo3::types::PyDateTime;
 pub use stream::ArrowStreamExporter;
 pub use table_id::BigQueryTableId;
 
+/// Drives an async Rust future on the shared Tokio runtime while periodically
+/// polling `py.check_signals()` so `Ctrl+C` (`KeyboardInterrupt`) interrupts
+/// long-running waits (such as BigQuery `jobs.query` initial waits or
+/// `CreateReadSession` retries) promptly instead of blocking uninterruptibly.
+fn block_on_interruptible<F, T>(
+    py: Python<'_>,
+    fut: F,
+) -> PyResult<Result<T, arrow_bigquery_lib::BigQueryError>>
+where
+    F: std::future::Future<Output = Result<T, arrow_bigquery_lib::BigQueryError>> + Send + 'static,
+    T: Send + 'static,
+{
+    let rt = pyo3_async_runtimes::tokio::get_runtime();
+    let handle = rt.spawn(fut);
+    let abort_handle = handle.abort_handle();
+    let poll_interval = std::time::Duration::from_millis(100);
+    tokio::pin!(handle);
+
+    loop {
+        py.check_signals().inspect_err(|_| {
+            abort_handle.abort();
+        })?;
+
+        let step = py.detach(|| {
+            rt.block_on(async { tokio::time::timeout(poll_interval, &mut handle).await })
+        });
+        match step {
+            Ok(Ok(result)) => return Ok(result),
+            Ok(Err(join_err)) => {
+                return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+                    "BigQuery task failed unexpectedly: {join_err}"
+                )));
+            },
+            Err(_) => continue,
+        }
+    }
+}
+
 /// A Python-exposed client that keeps the BigQuery Storage Read API gRPC channel
 /// open across multiple table read operations, caching the OAuth2 token in Rust.
 #[pyclass(name = "Client")]
@@ -100,11 +138,13 @@ impl Client {
             selected_fields,
             snapshot_time,
         )?;
-        let rt = pyo3_async_runtimes::tokio::get_runtime();
         let client = self.client.clone();
         let table = table.inner.clone();
         let result =
-            py.detach(|| rt.block_on(async move { client.read_table(&table, read_options).await }));
+            block_on_interruptible(
+                py,
+                async move { client.read_table(&table, read_options).await },
+            )?;
 
         let (schema, receiver) = result.map_err(|err| error::to_py_err(py, err))?;
         Ok(ArrowStreamExporter::new(schema, receiver))
@@ -112,13 +152,15 @@ impl Client {
 
     /// Executes a BigQuery SQL query (or dry run) and returns an [`ArrowStreamExporter`]
     /// which can be consumed by Polars in Python.
+    #[allow(clippy::too_many_arguments)]
     #[pyo3(signature = (
         query,
         *,
         arrow_buffer_compression="lz4frame",
         dry_run=false,
         maintain_order=true,
-        use_query_cache=None
+        use_query_cache=None,
+        maximum_bytes_billed=None
     ))]
     pub fn read_query(
         &self,
@@ -128,37 +170,42 @@ impl Client {
         dry_run: bool,
         maintain_order: bool,
         use_query_cache: Option<bool>,
+        maximum_bytes_billed: Option<i64>,
     ) -> PyResult<ArrowStreamExporter> {
         let arrow_buffer_compression = parse_compression_codec(arrow_buffer_compression)?;
-        let rt = pyo3_async_runtimes::tokio::get_runtime();
+        if let Some(limit) = maximum_bytes_billed {
+            if limit < 0 {
+                return Err(PyValueError::new_err(format!(
+                    "maximum_bytes_billed must be non-negative, got {limit}"
+                )));
+            }
+        }
         let client = self.client.clone();
         let query = query.to_owned();
         if dry_run {
-            let result = py.detach(|| {
-                rt.block_on(async move {
-                    client
-                        .query(query)
-                        .with_arrow_buffer_compression(arrow_buffer_compression)
-                        .with_maintain_order(maintain_order)
-                        .with_use_query_cache(use_query_cache)
-                        .dry_run()
-                        .await
-                })
-            });
+            let result = block_on_interruptible(py, async move {
+                client
+                    .query(query)
+                    .with_arrow_buffer_compression(arrow_buffer_compression)
+                    .with_maintain_order(maintain_order)
+                    .with_use_query_cache(use_query_cache)
+                    .with_maximum_bytes_billed(maximum_bytes_billed)
+                    .dry_run()
+                    .await
+            })?;
             let batch = result.map_err(|err| error::to_py_err(py, err))?;
             Ok(ArrowStreamExporter::from_record_batch(batch))
         } else {
-            let result = py.detach(|| {
-                rt.block_on(async move {
-                    client
-                        .query(query)
-                        .with_arrow_buffer_compression(arrow_buffer_compression)
-                        .with_maintain_order(maintain_order)
-                        .with_use_query_cache(use_query_cache)
-                        .read()
-                        .await
-                })
-            });
+            let result = block_on_interruptible(py, async move {
+                client
+                    .query(query)
+                    .with_arrow_buffer_compression(arrow_buffer_compression)
+                    .with_maintain_order(maintain_order)
+                    .with_use_query_cache(use_query_cache)
+                    .with_maximum_bytes_billed(maximum_bytes_billed)
+                    .read()
+                    .await
+            })?;
             let (schema, receiver) = result.map_err(|err| error::to_py_err(py, err))?;
             Ok(ArrowStreamExporter::new(schema, receiver))
         }
@@ -517,7 +564,15 @@ mod tests {
         Python::attach(|py| {
             let client =
                 Client::new(py, "test-project".to_string(), None, None, None, None).unwrap();
-            let err = match client.read_query(py, "SELECT 1", "invalid_codec", false, false, None) {
+            let err = match client.read_query(
+                py,
+                "SELECT 1",
+                "invalid_codec",
+                false,
+                false,
+                None,
+                None,
+            ) {
                 Err(e) => e,
                 Ok(_) => panic!("expected Err for invalid compression codec"),
             };
@@ -525,6 +580,24 @@ mod tests {
             assert!(err
                 .to_string()
                 .contains("got unexpected compression codec invalid_codec"));
+        });
+    }
+
+    #[test]
+    fn test_client_read_query_negative_maximum_bytes_billed() {
+        Python::initialize();
+        Python::attach(|py| {
+            let client =
+                Client::new(py, "test-project".to_string(), None, None, None, None).unwrap();
+            let err =
+                match client.read_query(py, "SELECT 1", "lz4frame", false, true, None, Some(-5)) {
+                    Err(e) => e,
+                    Ok(_) => panic!("expected Err for negative maximum_bytes_billed"),
+                };
+            assert!(err.is_instance_of::<PyValueError>(py));
+            assert!(err
+                .to_string()
+                .contains("maximum_bytes_billed must be non-negative"));
         });
     }
 }

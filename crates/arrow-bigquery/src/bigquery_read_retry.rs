@@ -103,6 +103,15 @@ pub(crate) fn create_read_session_retry_policy() -> Arc<dyn RetryPolicy> {
     Arc::new(RetryableErrors.with_time_limit(CREATE_READ_SESSION_TIMEOUT))
 }
 
+/// Retry policy for BigQuery v2 `JobService` (`jobs.query`, `jobs.get`, `jobs.cancel`) requests.
+///
+/// Retries idempotent transient network/transport errors, HTTP 429/500/502/503/504,
+/// and transient RPC status codes (`ResourceExhausted`, `Unavailable`, `Internal`,
+/// `DeadlineExceeded`, `Aborted`) up to a 600s cumulative time budget.
+pub(crate) fn job_service_retry_policy() -> Arc<dyn RetryPolicy> {
+    Arc::new(RetryableErrors.with_time_limit(CREATE_READ_SESSION_TIMEOUT))
+}
+
 /// Retry policy for mid-stream `read_rows` reconnections.
 ///
 /// - `maximum_attempts` (10): Limits total consecutive failed reconnection attempts when no data progress is made.

@@ -413,3 +413,79 @@ def test_bigquery_error_hierarchy_and_empty_quota_project():
 
     with pytest.raises(ValueError, match="quota_project_id is required"):
         Client(quota_project_id="   ")
+
+
+def test_client_close_and_context_manager(mock_rust_client):
+    with Client(quota_project_id="q") as client:
+        assert client.quota_project_id == "q"
+
+    with pytest.raises(RuntimeError, match="closed"):
+        client.read_table("p.d.t")
+    with pytest.raises(RuntimeError, match="closed"):
+        client.read_query("SELECT 1")
+
+
+def test_client_read_query_maximum_bytes_billed(mock_rust_client):
+    client = Client(quota_project_id="q")
+    client.read_query("SELECT 1", maximum_bytes_billed=10_000)
+    mock_rust_client.read_query.assert_called_once_with(
+        "SELECT 1",
+        arrow_buffer_compression="lz4frame",
+        dry_run=False,
+        maintain_order=True,
+        use_query_cache=None,
+        maximum_bytes_billed=10_000,
+    )
+
+    with pytest.raises(TypeError, match="maximum_bytes_billed must be an int or None"):
+        client.read_query("SELECT 1", maximum_bytes_billed=True)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="maximum_bytes_billed must be non-negative"):
+        client.read_query("SELECT 1", maximum_bytes_billed=-1)
+
+
+def test_read_query_interruptible_during_wait():
+    import socket
+
+    # Hold a TCP connection open without responding so `jobs.query` blocks waiting.
+    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(1)
+    port = srv.getsockname()[1]
+    accepted: list[socket.socket] = []
+
+    def accept_and_hold():
+        try:
+            conn, _ = srv.accept()
+            accepted.append(conn)
+            time.sleep(2.0)
+        except OSError:
+            pass
+
+    server_thread = threading.Thread(target=accept_and_hold, daemon=True)
+    server_thread.start()
+
+    def send_interrupt():
+        time.sleep(0.25)
+        _thread.interrupt_main()
+
+    irq_thread = threading.Thread(target=send_interrupt, daemon=True)
+    client = Client(
+        quota_project_id="test-proj",
+        credentials_provider=lambda: ({"bearer_token": "tok"}, None),
+        bq_endpoint=f"http://127.0.0.1:{port}",
+    )
+    irq_thread.start()
+    t0 = time.monotonic()
+    try:
+        with pytest.raises(KeyboardInterrupt):
+            client.read_query("SELECT 1", dry_run=True)
+        elapsed = time.monotonic() - t0
+        assert elapsed < 1.5, (
+            f"read_query took too long to notice KeyboardInterrupt: {elapsed:.2f}s"
+        )
+    finally:
+        for conn in accepted:
+            conn.close()
+        srv.close()
+        irq_thread.join(timeout=1.0)
+        server_thread.join(timeout=0.1)

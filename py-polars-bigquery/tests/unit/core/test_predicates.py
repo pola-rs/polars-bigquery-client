@@ -76,7 +76,7 @@ def test_starts_with_combined_expression() -> None:
     )
     assert (
         compiler.predicate_to_row_restriction(expr)
-        == "((STARTS_WITH(`name`, 'T') AND (`number` > 10)) AND (`year` = 2000))"
+        == "(STARTS_WITH(`name`, 'T') AND (`number` > 10) AND (`year` = 2000))"
     )
 
 
@@ -496,7 +496,7 @@ def test_predicate_to_row_restriction_root_recursion_error_fallback(
     def raise_recursion(_expr_json):
         raise RecursionError("Maximum recursion depth exceeded")
 
-    monkeypatch.setattr(compiler, "_json_expr_to_row_restriction", raise_recursion)
+    monkeypatch.setattr(compiler, "_json_expr_to_compiled_predicate", raise_recursion)
     assert compiler.predicate_to_row_restriction(pl.col("a") == 1) == ""
 
 
@@ -655,8 +655,8 @@ def test_sec_quarterly_financials_submission_partition_pushdown() -> None:
     )
     assert (
         compiler.predicate_to_row_restriction(expr)
-        == "(((`_PARTITIONDATE` >= DATE(TIMESTAMP_SECONDS(18262 * 86400))) "
-        "AND (`_PARTITIONDATE` <= DATE(TIMESTAMP_SECONDS(18627 * 86400)))) "
+        == "((`_PARTITIONDATE` >= DATE(TIMESTAMP_SECONDS(18262 * 86400))) "
+        "AND (`_PARTITIONDATE` <= DATE(TIMESTAMP_SECONDS(18627 * 86400))) "
         "AND ((`central_index_key` IN (1652044, 1288776)) "
         "OR REGEXP_CONTAINS(UPPER(`company_name`), 'ALPHABET INC')))"
     )
@@ -682,11 +682,11 @@ def test_sec_quarterly_financials_numbers_partition_pushdown() -> None:
     )
     assert (
         compiler.predicate_to_row_restriction(expr)
-        == "((((`_PARTITIONDATE` >= DATE(TIMESTAMP_SECONDS(18262 * 86400))) "
-        "AND (`_PARTITIONDATE` <= DATE(TIMESTAMP_SECONDS(18627 * 86400)))) "
+        == "((`_PARTITIONDATE` >= DATE(TIMESTAMP_SECONDS(18262 * 86400))) "
+        "AND (`_PARTITIONDATE` <= DATE(TIMESTAMP_SECONDS(18627 * 86400))) "
         "AND (`measure_tag` IN ('Revenues', 'RevenueFromContractWithCustomerExcludingAssessedTax', "
         "'OperatingIncomeLoss', 'NetIncomeLoss', 'ResearchAndDevelopmentExpense', "
-        "'EarningsPerShareDiluted'))) "
+        "'EarningsPerShareDiluted')) "
         "AND (`units` IN ('USD', 'shares')))"
     )
 
@@ -3383,12 +3383,12 @@ def test_is_null_and_is_not_null_unsupported_and_degraded_cases(
         ),
         pytest.param(
             pl.col("a").drop_nulls().str.to_lowercase().drop_nulls() == "abc",
-            "(((LOWER(`a`) = 'abc') AND (LOWER(`a`) IS NOT NULL)) AND (`a` IS NOT NULL))",
+            "((LOWER(`a`) = 'abc') AND (LOWER(`a`) IS NOT NULL) AND (`a` IS NOT NULL))",
             id="nested_drop_nulls_chain",
         ),
         pytest.param(
             (pl.col("a").drop_nulls() == 1) & (pl.col("b").drop_nulls() == 2),
-            "((((`a` = 1) AND (`b` = 2)) AND (`a` IS NOT NULL)) AND (`b` IS NOT NULL))",
+            "((`a` = 1) AND (`b` = 2) AND (`a` IS NOT NULL) AND (`b` IS NOT NULL))",
             id="multiple_drop_nulls_in_conjunction",
         ),
         pytest.param(
@@ -3408,12 +3408,12 @@ def test_is_null_and_is_not_null_unsupported_and_degraded_cases(
         ),
         pytest.param(
             (~((pl.col("a") == 1) | (pl.col("b") == 2))).drop_nulls(),
-            "(((NOT (`a` = 1)) AND (NOT (`b` = 2))) AND (((NOT (`a` = 1)) AND (NOT (`b` = 2))) IS NOT NULL))",
+            "((NOT (`a` = 1)) AND (NOT (`b` = 2)) AND (((NOT (`a` = 1)) AND (NOT (`b` = 2))) IS NOT NULL))",
             id="de_morgan_rewrite_inside_drop_nulls",
         ),
         pytest.param(
             pl.when(pl.col("a") == 1).then(pl.col("b") == 2).drop_nulls(),
-            "(((`a` = 1) AND (`b` = 2)) AND (IF((`a` = 1), (`b` = 2), NULL) IS NOT NULL))",
+            "((`a` = 1) AND (`b` = 2) AND (IF((`a` = 1), (`b` = 2), NULL) IS NOT NULL))",
             id="when_without_otherwise_inside_drop_nulls",
         ),
     ],
@@ -3623,3 +3623,165 @@ def test_expr_has_descendant(
 
     # Assert
     assert actual is expected
+
+
+def test_format_conjuncts_sql() -> None:
+    assert compiler.format_conjuncts_sql(()) == ""
+    assert compiler.format_conjuncts_sql(["(`a` = 1)"]) == "(`a` = 1)"
+    assert (
+        compiler.format_conjuncts_sql(["(`a` = 1)", "(`b` = 2)"])
+        == "((`a` = 1) AND (`b` = 2))"
+    )
+    assert (
+        compiler.format_conjuncts_sql(["(`a` = 1)", "(`b` = 2)", "(`c` = 3)"])
+        == "((`a` = 1) AND (`b` = 2) AND (`c` = 3))"
+    )
+
+
+def test_compile_ir_to_sql_returns_exactness() -> None:
+    eq_node = compiler.ir.Eq(
+        left=compiler.ir.Column("a"),
+        right=compiler.ir.IntLiteral(1),
+    )
+    assert compiler.sql.compile_ir_to_sql(eq_node) == ("(`a` = 1)", True)
+
+    partial_and = compiler.ir.And(
+        left=eq_node,
+        right=compiler.ir.Unsupported(),
+    )
+    assert compiler.sql.compile_ir_to_sql(partial_and) == ("(`a` = 1)", False)
+
+
+def test_predicate_to_row_restriction_flat_and_true_omission() -> None:
+    right_assoc = (pl.col("a") == 1) & ((pl.col("b") == 2) & (pl.col("c") == 3))
+    assert (
+        compiler.predicate_to_row_restriction(right_assoc)
+        == "((`a` = 1) AND (`b` = 2) AND (`c` = 3))"
+    )
+    assert compiler.predicate_to_row_restriction(pl.lit(True)) == ""
+
+
+def test_compile_predicate_structured_conjuncts_and_exactness() -> None:
+    # Single exact comparison
+    res_single = compiler.compile_predicate(pl.col("a") == 1)
+    assert res_single == compiler.CompiledPredicate(
+        conjuncts=("(`a` = 1)",), is_exact=True
+    )
+    assert res_single.sql == "(`a` = 1)"
+
+    # Multi-conjunct flattening (including right-associative nesting)
+    expr = (pl.col("a") == 1) & ((pl.col("b") == 2) & (pl.col("c") == 3))
+    res_multi = compiler.compile_predicate(expr)
+    assert res_multi == compiler.CompiledPredicate(
+        conjuncts=("(`a` = 1)", "(`b` = 2)", "(`c` = 3)"),
+        is_exact=True,
+    )
+
+    # Conjuncts from pl.all_horizontal
+    res_all_h = compiler.compile_predicate(
+        pl.all_horizontal(pl.col("a") == 1, pl.col("b") == 2, pl.col("c") == 3)
+    )
+    assert res_all_h.conjuncts == ("(`a` = 1)", "(`b` = 2)", "(`c` = 3)")
+    assert res_all_h.is_exact is True
+
+    # Conjuncts introduced by rewrite_de_morgan: ~(a | b) -> (~a) & (~b)
+    res_dm = compiler.compile_predicate(~((pl.col("a") == 1) | (pl.col("b") == 2)))
+    assert res_dm.conjuncts == ("(NOT (`a` = 1))", "(NOT (`b` = 2))")
+    assert res_dm.is_exact is True
+
+    # Conjuncts introduced by rewrite_drop_nulls
+    res_dn = compiler.compile_predicate((pl.col("a") > 1).drop_nulls())
+    assert res_dn.is_exact is True
+    assert len(res_dn.conjuncts) == 2
+
+    # Trivial TRUE conjunct omitted while keeping is_exact=True
+    res_true = compiler.compile_predicate(pl.lit(True))
+    assert res_true == compiler.CompiledPredicate(conjuncts=(), is_exact=True)
+    assert res_true.sql == ""
+
+    res_and_true = compiler.compile_predicate((pl.col("a") == 1) & pl.lit(True))
+    assert res_and_true == compiler.CompiledPredicate(
+        conjuncts=("(`a` = 1)",), is_exact=True
+    )
+
+    # Partially pushable supported & unsupported
+    res_partial = compiler.compile_predicate(
+        (pl.col("a") == 1) & unsupported(pl.col("b"))
+    )
+    assert res_partial == compiler.CompiledPredicate(
+        conjuncts=("(`a` = 1)",), is_exact=False
+    )
+
+    # Partially pushable inside a single OR conjunct (sql_str non-None, is_exact=False)
+    or_ir = compiler.ir.Or(
+        left=compiler.ir.Eq(compiler.ir.Column("a"), compiler.ir.IntLiteral(1)),
+        right=compiler.ir.And(
+            left=compiler.ir.Eq(compiler.ir.Column("b"), compiler.ir.IntLiteral(2)),
+            right=compiler.ir.Unsupported(),
+        ),
+    )
+    assert compiler.sql.compile_ir_conjuncts_to_sql(or_ir) == (
+        ("((`a` = 1) OR (`b` = 2))",),
+        False,
+    )
+
+    # Completely unpushable
+    res_unpush = compiler.compile_predicate(unsupported(pl.col("a")))
+    assert res_unpush == compiler.CompiledPredicate(conjuncts=(), is_exact=False)
+    assert res_unpush.sql == ""
+
+    # Deep iterative stack for And chains (> Python default recursion limit)
+    deep_ir: compiler.ir.Expr = compiler.ir.Eq(
+        compiler.ir.Column("x"), compiler.ir.IntLiteral(0)
+    )
+    for i in range(1, 1500):
+        deep_ir = compiler.ir.And(
+            left=deep_ir,
+            right=compiler.ir.Eq(compiler.ir.Column("x"), compiler.ir.IntLiteral(i)),
+        )
+    conjuncts, is_exact = compiler.sql.compile_ir_conjuncts_to_sql(deep_ir)
+    assert is_exact is True
+    assert len(conjuncts) == 1500
+    assert conjuncts[0] == "(`x` = 0)"
+    assert conjuncts[-1] == "(`x` = 1499)"
+
+
+def test_formatted_conjuncts_byte_length_matches_utf8() -> None:
+    samples = [
+        [],
+        ["(`a` = 'é')"],
+        ["(`a` = 1)", "(`b` = '🦀')"],
+        ["(`a` = 1)", "(`b` = 2)", "(`c` = 'ééé')"],
+    ]
+    for conjuncts in samples:
+        expected = len(compiler.format_conjuncts_sql(conjuncts).encode("utf-8"))
+        lengths = [len(c.encode("utf-8")) for c in conjuncts]
+        assert compiler.formatted_conjuncts_byte_length(lengths) == expected
+
+
+def test_compile_predicate_handles_polars_serialization_error_on_udf() -> None:
+    from unittest.mock import patch
+
+    with patch.object(
+        pl.expr.expr.ExprMetaNameSpace,
+        "serialize",
+        side_effect=pl.exceptions.ComputeError("cannot serialize UDF"),
+    ):
+        result = compiler.compile_predicate(pl.col("a") == 1)
+    assert result == compiler.CompiledPredicate(conjuncts=(), is_exact=False)
+
+
+@pytest.mark.parametrize(
+    "bad_char",
+    ["\t", "\x0b", "\x0c", "\x85", "\u2028", "\u2029", "\n", "\r", "\0"],
+)
+def test_column_to_sql_identifier_rejects_control_and_line_break_whitespace(
+    bad_char: str,
+) -> None:
+    with pytest.raises(ValueError, match="unsupported character"):
+        compiler.sql.column_to_sql_identifier(f"col{bad_char}name")
+
+
+def test_column_to_sql_identifier_allows_unicode_space_separators() -> None:
+    assert compiler.sql.column_to_sql_identifier("first name") == "`first name`"
+    assert compiler.sql.column_to_sql_identifier("a\u3000b") == "`a\u3000b`"
