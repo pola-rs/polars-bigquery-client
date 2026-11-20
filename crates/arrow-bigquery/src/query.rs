@@ -152,6 +152,7 @@ pub struct Query<'a> {
     arrow_buffer_compression: Option<crate::CompressionCodec>,
     maintain_order: bool,
     use_query_cache: Option<bool>,
+    maximum_bytes_billed: Option<i64>,
     initial_wait_ms: u32,
 }
 
@@ -163,6 +164,7 @@ impl<'a> Query<'a> {
             arrow_buffer_compression: None,
             maintain_order: true,
             use_query_cache: None,
+            maximum_bytes_billed: None,
             initial_wait_ms: INITIAL_WAIT_MS_DEFAULT,
         }
     }
@@ -191,23 +193,51 @@ impl<'a> Query<'a> {
         self
     }
 
+    pub fn with_maximum_bytes_billed(
+        mut self,
+        maximum_bytes_billed: impl Into<Option<i64>>,
+    ) -> Self {
+        self.maximum_bytes_billed = maximum_bytes_billed.into();
+        self
+    }
+
     fn arrow_buffer_compression(&self) -> crate::CompressionCodec {
         self.arrow_buffer_compression
             .clone()
             .unwrap_or(crate::DEFAULT_COMPRESSION)
     }
 
-    fn build_read_request(&self) -> QueryRequest {
+    fn validate_maximum_bytes_billed(&self) -> Result<Option<i64>, BigQueryError> {
+        if let Some(limit) = self.maximum_bytes_billed {
+            if limit < 0 {
+                return Err(BigQueryError::InvalidConfig(format!(
+                    "maximum_bytes_billed must be non-negative, got {limit}"
+                )));
+            }
+        }
+        Ok(self.maximum_bytes_billed)
+    }
+
+    fn build_read_request(&self) -> Result<QueryRequest, BigQueryError> {
+        let maximum_bytes_billed = self.validate_maximum_bytes_billed()?;
         let arrow_options = ArrowSerializationOptions::new().set_buffer_compression(
             bq_to_gapic_compression_codec(self.arrow_buffer_compression()),
         );
-        QueryRequest::new()
+        Ok(QueryRequest::new()
             .set_request_id(generate_prefixed_id(QUERY_REQUEST_ID_PREFIX))
             .set_job_creation_mode(JobCreationMode::JobCreationOptional)
             .set_query_results_format(QueryResultsFormat::Arrow)
             .set_arrow_serialization_options(arrow_options)
             .set_or_clear_use_query_cache(self.use_query_cache)
-            .set_timeout_ms(self.initial_wait_ms)
+            .set_or_clear_maximum_bytes_billed(maximum_bytes_billed)
+            .set_timeout_ms(self.initial_wait_ms))
+    }
+
+    fn build_dry_run_request(&self) -> Result<QueryRequest, BigQueryError> {
+        let maximum_bytes_billed = self.validate_maximum_bytes_billed()?;
+        Ok(QueryRequest::new()
+            .set_dry_run(true)
+            .set_or_clear_maximum_bytes_billed(maximum_bytes_billed))
     }
 
     fn prepare_query(
@@ -295,7 +325,7 @@ impl<'a> Query<'a> {
         response: &QueryResponse,
         stream_name: String,
         serialized_schema: Option<bytes::Bytes>,
-    ) -> Result<(ArrowSchemaRef, BigQueryRecordBatchReceiver), BigQueryError> {
+    ) -> Result<(ArrowSchemaRef, BigQueryRecordBatchReceiver, bool), BigQueryError> {
         let first_page_check = if self.can_read_destination_table(response) {
             Some((
                 crate::bigquery_read_stream::FirstPageCheck {
@@ -321,15 +351,24 @@ impl<'a> Query<'a> {
             )
             .await;
         match res {
-            Ok((Some(schema_ref), receiver)) => Ok((schema_ref, receiver)),
-            Ok((None, _receiver)) => self.resolve_empty_job_stream(response).await,
+            Ok((Some(schema_ref), receiver)) => Ok((schema_ref, receiver, false)),
+            Ok((None, _receiver)) => {
+                let (schema_ref, receiver) = self.resolve_empty_job_stream(response).await?;
+                Ok((schema_ref, receiver, true))
+            },
             Err(err) => Err(self.resolve_job_error(response, err).await),
         }
     }
 
+    /// Performs a BigQuery dry-run (`dryRun = true`) returning a 1-row metadata
+    /// [`RecordBatch`] without executing or billing the query.
+    ///
+    /// Validates and forwards `maximum_bytes_billed` when set so callers get
+    /// consistent validation and can verify byte limits on dry runs.
     pub async fn dry_run(&self) -> Result<RecordBatch, BigQueryError> {
+        let request = self.build_dry_run_request()?;
         let response = self
-            .prepare_query(QueryRequest::new().set_dry_run(true))
+            .prepare_query(request)
             .with_idempotency(true)
             .send()
             .await
@@ -369,8 +408,9 @@ impl<'a> Query<'a> {
     pub async fn read(
         &self,
     ) -> Result<(ArrowSchemaRef, BigQueryRecordBatchReceiver), BigQueryError> {
+        let request = self.build_read_request()?;
         let mut response = self
-            .prepare_query(self.build_read_request())
+            .prepare_query(request)
             // We set the request ID, so all queries including DML are
             // idempotent, at least within the lifetime of the request ID.
             .with_idempotency(true)
@@ -379,10 +419,50 @@ impl<'a> Query<'a> {
             .map_err(map_query_error)?;
 
         if response.job_complete == Some(false) {
+            struct CancelOnDrop(Option<crate::JobCancelHandle>);
+            impl Drop for CancelOnDrop {
+                fn drop(&mut self) {
+                    if let Some(handle) = self.0.take() {
+                        handle.trigger();
+                    }
+                }
+            }
+
+            let (project_id, job_id, location) = extract_required_job_reference(&response)?;
+            let mut cancel_guard =
+                CancelOnDrop(tokio::runtime::Handle::try_current().ok().map(|runtime| {
+                    crate::JobCancelHandle {
+                        client: self.client.clone(),
+                        project_id: project_id.to_string(),
+                        job_id: job_id.to_string(),
+                        location: location.to_string(),
+                        runtime,
+                    }
+                }));
             let stream_name = default_job_stream_path(&response)?;
-            return self
+            let result = self
                 .read_job_stream_or_table(&response, stream_name, None)
                 .await;
+            let (schema, mut receiver, completed_empty) = match result {
+                Ok(resolved) => resolved,
+                Err(err) => {
+                    if matches!(err, BigQueryError::JobFailed(_)) {
+                        // The job has already terminated with an error on the server;
+                        // disarm the guard to avoid a redundant jobs.cancel request.
+                        cancel_guard.0 = None;
+                    }
+                    // For transport/gRPC or other errors, leave `cancel_guard` armed
+                    // so dropping it fires a best-effort jobs.cancel while the job
+                    // may still be running.
+                    return Err(err);
+                },
+            };
+            if let Some(handle) = cancel_guard.0.take() {
+                if !completed_empty {
+                    receiver.set_job_cancel(handle);
+                }
+            }
+            return Ok((schema, receiver));
         }
 
         let serialized_schema = match response.results_schema.take() {
@@ -456,8 +536,10 @@ impl<'a> Query<'a> {
                 }
             },
             (None, Some(stream_name)) => {
-                self.read_job_stream_or_table(&response, stream_name, serialized_schema)
-                    .await
+                let (schema, receiver, _completed_empty) = self
+                    .read_job_stream_or_table(&response, stream_name, serialized_schema)
+                    .await?;
+                Ok((schema, receiver))
             },
             (Some(first_page_bytes), stream_name) => {
                 let Some(serialized_schema) = serialized_schema else {
@@ -1372,7 +1454,7 @@ mod tests {
             "test-quota-proj".to_string(),
         );
 
-        let default_req = client.query("SELECT 1").build_read_request();
+        let default_req = client.query("SELECT 1").build_read_request().unwrap();
         assert_eq!(
             default_req.job_creation_mode,
             JobCreationMode::JobCreationOptional
@@ -1399,7 +1481,8 @@ mod tests {
             let req = client
                 .query("SELECT 1")
                 .with_arrow_buffer_compression(codec)
-                .build_read_request();
+                .build_read_request()
+                .unwrap();
             assert_eq!(
                 req.arrow_serialization_options()
                     .unwrap()
@@ -1411,7 +1494,8 @@ mod tests {
         let direct_v1_req = client
             .query("SELECT 1")
             .with_arrow_buffer_compression(V1Codec::Zstd)
-            .build_read_request();
+            .build_read_request()
+            .unwrap();
         assert_eq!(
             direct_v1_req
                 .arrow_serialization_options()
@@ -1420,18 +1504,54 @@ mod tests {
             V2Codec::Zstd
         );
         assert_eq!(default_req.use_query_cache, None);
+        assert_eq!(default_req.maximum_bytes_billed, None);
 
         let no_cache_req = client
             .query("SELECT 1")
             .with_use_query_cache(false)
-            .build_read_request();
+            .build_read_request()
+            .unwrap();
         assert_eq!(no_cache_req.use_query_cache, Some(false));
 
         let cache_req = client
             .query("SELECT 1")
             .with_use_query_cache(Some(true))
-            .build_read_request();
+            .build_read_request()
+            .unwrap();
         assert_eq!(cache_req.use_query_cache, Some(true));
+
+        let capped_req = client
+            .query("SELECT 1")
+            .with_maximum_bytes_billed(1_000_000)
+            .build_read_request()
+            .unwrap();
+        assert_eq!(capped_req.maximum_bytes_billed, Some(1_000_000));
+
+        let bad_err = client
+            .query("SELECT 1")
+            .with_maximum_bytes_billed(-1)
+            .build_read_request()
+            .unwrap_err();
+        assert!(matches!(bad_err, BigQueryError::InvalidConfig(_)));
+
+        let default_dry_run = client.query("SELECT 1").build_dry_run_request().unwrap();
+        assert!(default_dry_run.dry_run);
+        assert_eq!(default_dry_run.maximum_bytes_billed, None);
+
+        let capped_dry_run = client
+            .query("SELECT 1")
+            .with_maximum_bytes_billed(1_000_000)
+            .build_dry_run_request()
+            .unwrap();
+        assert!(capped_dry_run.dry_run);
+        assert_eq!(capped_dry_run.maximum_bytes_billed, Some(1_000_000));
+
+        let bad_dry_run_err = client
+            .query("SELECT 1")
+            .with_maximum_bytes_billed(-5)
+            .build_dry_run_request()
+            .unwrap_err();
+        assert!(matches!(bad_dry_run_err, BigQueryError::InvalidConfig(_)));
     }
 
     #[tokio::test]
@@ -3756,5 +3876,438 @@ mod tests {
             .expect_err("invalid destination_table should fail");
         assert!(matches!(err, BigQueryError::Protocol(_)));
         assert!(err.to_string().contains("destination_table is invalid"));
+    }
+
+    #[tokio::test]
+    async fn test_incomplete_job_cancel_on_early_drop_and_not_after_eof() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        use google_cloud_bigquery::client::Read;
+        use google_cloud_bigquery::model::{ArrowSchema as BqArrowSchema, ReadRowsResponse};
+        use google_cloud_bigquery_v2::model::{CancelJobRequest, JobCancelResponse, QueryResponse};
+        use google_cloud_gax::options::RequestOptions;
+        use google_cloud_gax::response::Response;
+
+        #[derive(Debug)]
+        struct CancelTrackingJobStub {
+            cancel_calls: Arc<AtomicUsize>,
+            cancel_notify: Arc<tokio::sync::Notify>,
+        }
+
+        impl google_cloud_bigquery_v2::stub::JobService for CancelTrackingJobStub {
+            async fn query(
+                &self,
+                _req: google_cloud_bigquery_v2::model::PostQueryRequest,
+                _options: RequestOptions,
+            ) -> google_cloud_bigquery_v2::Result<Response<QueryResponse>> {
+                Ok(Response::from(
+                    QueryResponse::new()
+                        .set_job_complete(false)
+                        .set_job_reference(
+                            JobReference::new()
+                                .set_project_id("proj")
+                                .set_job_id("job-123")
+                                .set_location("US"),
+                        ),
+                ))
+            }
+
+            async fn cancel_job(
+                &self,
+                req: CancelJobRequest,
+                options: RequestOptions,
+            ) -> google_cloud_bigquery_v2::Result<Response<JobCancelResponse>> {
+                assert_eq!(req.project_id, "proj");
+                assert_eq!(req.job_id, "job-123");
+                assert_eq!(req.location, "US");
+                assert_eq!(
+                    *options.attempt_timeout(),
+                    Some(std::time::Duration::from_secs(10))
+                );
+                self.cancel_calls.fetch_add(1, Ordering::SeqCst);
+                self.cancel_notify.notify_one();
+                Ok(Response::from(JobCancelResponse::new()))
+            }
+        }
+
+        // 1. Early drop before EOF triggers best-effort jobs.cancel.
+        let cancel_calls = Arc::new(AtomicUsize::new(0));
+        let cancel_notify = Arc::new(tokio::sync::Notify::new());
+        let (schema_bytes, resp1) = create_test_arrow_payload_with_range(0, 2);
+        let first_msg = ReadRowsResponse::new()
+            .set_arrow_schema(BqArrowSchema::new().set_serialized_schema(schema_bytes.clone()))
+            .set_arrow_record_batch(
+                google_cloud_bigquery::model::ArrowRecordBatch::new()
+                    .set_serialized_record_batch(resp1),
+            )
+            .set_row_count(2);
+        let (read_stub, _) = CannedReadRowsStub::new(vec![first_msg]);
+        let client = crate::Client::new_for_testing(
+            crate::BigQueryJobService::from_stub(CancelTrackingJobStub {
+                cancel_calls: Arc::clone(&cancel_calls),
+                cancel_notify: Arc::clone(&cancel_notify),
+            }),
+            Read::from_stub(read_stub),
+            "proj".to_string(),
+        );
+        let (_schema, receiver) = client.query("SELECT 1").read().await.unwrap();
+        drop(receiver);
+        tokio::time::timeout(std::time::Duration::from_secs(2), cancel_notify.notified())
+            .await
+            .expect("expected cancel_job to be called on early drop");
+        assert_eq!(cancel_calls.load(Ordering::SeqCst), 1);
+
+        // 2. Reading to clean EOF disarms cancel_job.
+        let eof_cancel_calls = Arc::new(AtomicUsize::new(0));
+        let eof_notify = Arc::new(tokio::sync::Notify::new());
+        let (_, batch_bytes) = create_test_arrow_payload_with_range(0, 1);
+        let msg = ReadRowsResponse::new()
+            .set_arrow_schema(BqArrowSchema::new().set_serialized_schema(schema_bytes))
+            .set_arrow_record_batch(
+                google_cloud_bigquery::model::ArrowRecordBatch::new()
+                    .set_serialized_record_batch(batch_bytes),
+            )
+            .set_row_count(1);
+        let (read_stub2, _) = CannedReadRowsStub::new(vec![msg]);
+        let client2 = crate::Client::new_for_testing(
+            crate::BigQueryJobService::from_stub(CancelTrackingJobStub {
+                cancel_calls: Arc::clone(&eof_cancel_calls),
+                cancel_notify: Arc::clone(&eof_notify),
+            }),
+            Read::from_stub(read_stub2),
+            "proj".to_string(),
+        );
+        let (_schema, mut receiver2) = client2.query("SELECT 1").read().await.unwrap();
+        assert!(receiver2.recv().await.is_some());
+        assert!(receiver2.recv().await.is_none());
+        drop(receiver2);
+        tokio::task::yield_now().await;
+        assert_eq!(eof_cancel_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn test_client_builder_retries_transient_job_service_errors() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let server_attempts = Arc::clone(&attempts);
+
+        let server = tokio::spawn(async move {
+            for idx in 0..3 {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut buf = [0u8; 4096];
+                let _ = stream.read(&mut buf).await;
+                server_attempts.fetch_add(1, Ordering::SeqCst);
+                let response = if idx == 0 {
+                    let body = r#"{"error":{"code":429,"message":"rate limit"}}"#;
+                    format!(
+                        "HTTP/1.1 429 Too Many Requests\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    )
+                } else if idx == 1 {
+                    let body = r#"{"error":{"code":503,"message":"unavailable"}}"#;
+                    format!(
+                        "HTTP/1.1 503 Service Unavailable\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    )
+                } else {
+                    let body = r#"{"jobReference":{"projectId":"p","location":"US"},"totalBytesProcessed":"16","statementType":"SELECT","schema":{"fields":[{"name":"x","type":"INT64"}]}}"#;
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    )
+                };
+                stream.write_all(response.as_bytes()).await.unwrap();
+                let _ = stream.shutdown().await;
+            }
+        });
+
+        let cred = google_cloud_auth::credentials::anonymous::Builder::new().build();
+        let client = crate::Client::builder()
+            .with_cred(cred)
+            .with_bq_endpoint(format!("http://127.0.0.1:{port}"))
+            .with_quota_project_id(Some("p".to_string()))
+            .build()
+            .await
+            .unwrap();
+
+        let batch = client.query("SELECT 1 AS x").dry_run().await.unwrap();
+        assert_eq!(batch.len(), 1);
+        assert_eq!(attempts.load(Ordering::SeqCst), 3);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_incomplete_job_cancel_on_grpc_error_and_not_on_job_failed_or_empty() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        use google_cloud_bigquery::client::Read;
+        use google_cloud_bigquery::model::{ReadRowsRequest, ReadRowsResponse};
+        use google_cloud_bigquery_v2::model::{
+            CancelJobRequest, ErrorProto, GetJobRequest, Job, JobCancelResponse, JobStatistics,
+            JobStatistics2, JobStatus, PostQueryRequest, QueryResponse,
+        };
+        use google_cloud_gax::error::rpc::{Code, Status};
+        use google_cloud_gax::error::Error as GaxError;
+        use google_cloud_gax::options::RequestOptions;
+        use google_cloud_gax::response::Response;
+        use google_cloud_gax::streaming::ResponseStream;
+
+        #[derive(Debug)]
+        struct MockJobStub {
+            get_job_response: std::sync::Mutex<Option<google_cloud_bigquery_v2::Result<Job>>>,
+            cancel_calls: Arc<AtomicUsize>,
+            cancel_notify: Arc<tokio::sync::Notify>,
+        }
+
+        impl google_cloud_bigquery_v2::stub::JobService for MockJobStub {
+            async fn query(
+                &self,
+                _req: PostQueryRequest,
+                _options: RequestOptions,
+            ) -> google_cloud_bigquery_v2::Result<Response<QueryResponse>> {
+                Ok(Response::from(
+                    QueryResponse::new()
+                        .set_job_complete(false)
+                        .set_job_reference(
+                            JobReference::new()
+                                .set_project_id("proj")
+                                .set_job_id("job-cancel-test")
+                                .set_location("US"),
+                        ),
+                ))
+            }
+
+            async fn get_job(
+                &self,
+                _req: GetJobRequest,
+                _options: RequestOptions,
+            ) -> google_cloud_bigquery_v2::Result<Response<Job>> {
+                self.get_job_response
+                    .lock()
+                    .unwrap()
+                    .take()
+                    .expect("expected single get_job call")
+                    .map(Response::from)
+            }
+
+            async fn cancel_job(
+                &self,
+                req: CancelJobRequest,
+                _options: RequestOptions,
+            ) -> google_cloud_bigquery_v2::Result<Response<JobCancelResponse>> {
+                assert_eq!(req.project_id, "proj");
+                assert_eq!(req.job_id, "job-cancel-test");
+                assert_eq!(req.location, "US");
+                self.cancel_calls.fetch_add(1, Ordering::SeqCst);
+                self.cancel_notify.notify_one();
+                Ok(Response::from(JobCancelResponse::new()))
+            }
+        }
+
+        #[derive(Debug)]
+        struct ErrorReadStub;
+
+        impl google_cloud_bigquery::stub::Read for ErrorReadStub {
+            async fn read_rows(
+                &self,
+                _req: ReadRowsRequest,
+                _options: RequestOptions,
+            ) -> google_cloud_bigquery::Result<ResponseStream<ReadRowsResponse>> {
+                let (tx, rx) = tokio::sync::mpsc::channel(1);
+                let status = Status::default()
+                    .set_code(Code::PermissionDenied)
+                    .set_message("denied");
+                let _ = tx.send(Err(GaxError::service(status))).await;
+                Ok(ResponseStream::from(rx))
+            }
+        }
+
+        #[derive(Debug)]
+        struct EmptyStreamReadStub;
+
+        impl google_cloud_bigquery::stub::Read for EmptyStreamReadStub {
+            async fn read_rows(
+                &self,
+                _req: ReadRowsRequest,
+                _options: RequestOptions,
+            ) -> google_cloud_bigquery::Result<ResponseStream<ReadRowsResponse>> {
+                let (tx, rx) = tokio::sync::mpsc::channel(1);
+                drop(tx);
+                Ok(ResponseStream::from(rx))
+            }
+        }
+
+        // 1. Non-JobFailed error (e.g. gRPC failure while job is still running) triggers jobs.cancel.
+        let grpc_cancel_calls = Arc::new(AtomicUsize::new(0));
+        let grpc_notify = Arc::new(tokio::sync::Notify::new());
+        let client_grpc = crate::Client::new_for_testing(
+            crate::BigQueryJobService::from_stub(MockJobStub {
+                get_job_response: std::sync::Mutex::new(Some(Ok(
+                    Job::new().set_status(JobStatus::new().set_state("RUNNING"))
+                ))),
+                cancel_calls: Arc::clone(&grpc_cancel_calls),
+                cancel_notify: Arc::clone(&grpc_notify),
+            }),
+            Read::from_stub(ErrorReadStub),
+            "proj".to_string(),
+        );
+        let err = match client_grpc.query("SELECT 1").read().await {
+            Err(e) => e,
+            Ok(_) => panic!("expected gRPC error"),
+        };
+        assert!(matches!(err, BigQueryError::Grpc(_)));
+        tokio::time::timeout(std::time::Duration::from_secs(2), grpc_notify.notified())
+            .await
+            .expect("expected cancel_job on non-JobFailed gRPC error");
+        assert_eq!(grpc_cancel_calls.load(Ordering::SeqCst), 1);
+
+        // 2. JobFailed error (job already failed server-side) does NOT trigger jobs.cancel.
+        let failed_cancel_calls = Arc::new(AtomicUsize::new(0));
+        let failed_notify = Arc::new(tokio::sync::Notify::new());
+        let failed_status = JobStatus::new().set_state("DONE").set_error_result(
+            ErrorProto::new()
+                .set_reason("invalidQuery")
+                .set_message("bad"),
+        );
+        let client_failed = crate::Client::new_for_testing(
+            crate::BigQueryJobService::from_stub(MockJobStub {
+                get_job_response: std::sync::Mutex::new(Some(Ok(
+                    Job::new().set_status(failed_status)
+                ))),
+                cancel_calls: Arc::clone(&failed_cancel_calls),
+                cancel_notify: Arc::clone(&failed_notify),
+            }),
+            Read::from_stub(ErrorReadStub),
+            "proj".to_string(),
+        );
+        let err = match client_failed.query("SELECT 1").read().await {
+            Err(e) => e,
+            Ok(_) => panic!("expected JobFailed error"),
+        };
+        assert!(matches!(err, BigQueryError::JobFailed(_)));
+        tokio::task::yield_now().await;
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        assert_eq!(failed_cancel_calls.load(Ordering::SeqCst), 0);
+
+        // 3. Empty completed job resolved via resolve_empty_job_stream does NOT cancel on early drop.
+        let empty_cancel_calls = Arc::new(AtomicUsize::new(0));
+        let empty_notify = Arc::new(tokio::sync::Notify::new());
+        let ddl_job = Job::new()
+            .set_status(JobStatus::new().set_state("DONE"))
+            .set_statistics(
+                JobStatistics::new().set_query(
+                    JobStatistics2::new()
+                        .set_statement_type("CREATE_TABLE")
+                        .set_ddl_operation_performed("CREATE"),
+                ),
+            );
+        let client_empty = crate::Client::new_for_testing(
+            crate::BigQueryJobService::from_stub(MockJobStub {
+                get_job_response: std::sync::Mutex::new(Some(Ok(ddl_job))),
+                cancel_calls: Arc::clone(&empty_cancel_calls),
+                cancel_notify: Arc::clone(&empty_notify),
+            }),
+            Read::from_stub(EmptyStreamReadStub),
+            "proj".to_string(),
+        );
+        let (_schema, receiver) = client_empty
+            .query("CREATE TABLE t AS SELECT 1")
+            .read()
+            .await
+            .unwrap();
+        // Drop WITHOUT reading to EOF.
+        drop(receiver);
+        tokio::task::yield_now().await;
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        assert_eq!(empty_cancel_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn test_cancel_job_does_not_retry_transient_http_errors() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let cancel_attempts = Arc::new(AtomicUsize::new(0));
+        let server_attempts = Arc::clone(&cancel_attempts);
+        let first_attempt_done = Arc::new(tokio::sync::Notify::new());
+        let server_notify = Arc::clone(&first_attempt_done);
+
+        let server = tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let mut buf = [0u8; 4096];
+                let _ = stream.read(&mut buf).await;
+                server_attempts.fetch_add(1, Ordering::SeqCst);
+                let body = r#"{"error":{"code":503,"message":"unavailable"}}"#;
+                let response = format!(
+                    "HTTP/1.1 503 Service Unavailable\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+                let _ = stream.shutdown().await;
+                server_notify.notify_one();
+            }
+        });
+
+        let cred = google_cloud_auth::credentials::anonymous::Builder::new().build();
+        let client = crate::Client::builder()
+            .with_cred(cred)
+            .with_bq_endpoint(format!("http://127.0.0.1:{port}"))
+            .with_quota_project_id(Some("p".to_string()))
+            .build()
+            .await
+            .unwrap();
+
+        let handle = crate::JobCancelHandle {
+            client,
+            project_id: "p".to_string(),
+            job_id: "job-503".to_string(),
+            location: "US".to_string(),
+            runtime: tokio::runtime::Handle::current(),
+        };
+        handle.trigger();
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            first_attempt_done.notified(),
+        )
+        .await
+        .expect("cancel_job request was not sent");
+        // Allow ample time beyond the 100ms initial backoff delay to confirm no retry occurs.
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        server.abort();
+        assert_eq!(cancel_attempts.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn test_dry_run_rejects_negative_maximum_bytes_billed() {
+        let cred = google_cloud_auth::credentials::anonymous::Builder::new().build();
+        let client = crate::Client::builder()
+            .with_cred(cred)
+            .with_bq_endpoint("http://127.0.0.1:1")
+            .with_quota_project_id(Some("p".to_string()))
+            .build()
+            .await
+            .unwrap();
+        let err = client
+            .query("SELECT 1")
+            .with_maximum_bytes_billed(-1)
+            .dry_run()
+            .await
+            .unwrap_err();
+        assert!(matches!(err, BigQueryError::InvalidConfig(_)));
     }
 }

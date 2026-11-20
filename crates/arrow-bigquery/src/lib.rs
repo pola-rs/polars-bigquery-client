@@ -344,6 +344,74 @@ pub struct StreamOptions {
     pub arrow_buffer_compression: Option<arrow_serialization_options::CompressionCodec>,
 }
 
+/// Best-effort server-side cancellation handle attached to a
+/// [`BigQueryRecordBatchReceiver`] for an incomplete `jobs.query` job.
+///
+/// Cleared when the stream finishes cleanly (EOF) or terminates with an error.
+/// If the receiver is aborted or dropped before completion (for example due to
+/// `Ctrl+C`, an exception, or early `limit()` stop), spawns a detached
+/// `jobs.cancel` call against BigQuery.
+pub(crate) struct JobCancelHandle {
+    pub(crate) client: Client,
+    pub(crate) project_id: String,
+    pub(crate) job_id: String,
+    pub(crate) location: String,
+    pub(crate) runtime: tokio::runtime::Handle,
+}
+
+/// Timeout applied to detached best-effort `jobs.cancel` requests.
+const JOB_CANCEL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+impl JobCancelHandle {
+    pub(crate) fn trigger(self) {
+        let client = self.client;
+        let project_id = self.project_id;
+        let job_id = self.job_id;
+        let location = self.location;
+        self.runtime.spawn(async move {
+            // Detached cancellation is best-effort cleanup: apply a short timeout,
+            // disable retries, and isolate its throttler so it neither inherits
+            // `JobService`'s 600s retry budget nor penalizes shared throttling state.
+            let cancel_req = client
+                .apply_request_options(
+                    client
+                        .bq_client
+                        .cancel_job()
+                        .set_project_id(&project_id)
+                        .set_job_id(&job_id)
+                        .set_location(&location)
+                        .with_idempotency(true),
+                )
+                .with_attempt_timeout(JOB_CANCEL_TIMEOUT)
+                .with_retry_policy(google_cloud_gax::retry_policy::NeverRetry)
+                .with_retry_throttler(client_builder::default_retry_throttler());
+            match tokio::time::timeout(JOB_CANCEL_TIMEOUT, cancel_req.send()).await {
+                Ok(Ok(_)) => {},
+                Ok(Err(_err)) => {
+                    #[cfg(feature = "tracing")]
+                    tracing::warn!(
+                        project_id = %project_id,
+                        job_id = %job_id,
+                        location = %location,
+                        error = %_err,
+                        "best-effort BigQuery jobs.cancel failed"
+                    );
+                },
+                Err(_elapsed) => {
+                    #[cfg(feature = "tracing")]
+                    tracing::warn!(
+                        project_id = %project_id,
+                        job_id = %job_id,
+                        location = %location,
+                        timeout_secs = JOB_CANCEL_TIMEOUT.as_secs(),
+                        "best-effort BigQuery jobs.cancel timed out"
+                    );
+                },
+            }
+        });
+    }
+}
+
 /// A receiver that yields [`RecordBatch`]es read from BigQuery.
 ///
 /// It manages the background tasks reading from the BigQuery Storage API streams
@@ -359,18 +427,25 @@ pub struct BigQueryRecordBatchReceiver {
     /// the receiver is dropped or encounters a fatal error, preventing resource leaks
     /// from orphan background tasks.
     handles: Vec<tokio::task::JoinHandle<()>>,
+    /// Optional best-effort `jobs.cancel` handle invoked if dropped/aborted before EOF.
+    job_cancel: Option<Box<JobCancelHandle>>,
 }
 
 impl BigQueryRecordBatchReceiver {
     pub async fn recv(&mut self) -> Option<Result<RecordBatch, BigQueryError>> {
         let item = self.rx.recv().await;
         if matches!(item, None | Some(Err(_))) {
+            // Stream reached EOF or terminated with an error; do not cancel the job.
+            self.job_cancel = None;
             self.abort();
         }
         item
     }
 
     /// Immediately cancels and aborts all background stream tasks owned by this receiver.
+    ///
+    /// If attached to an incomplete BigQuery query job that has not yet reached EOF,
+    /// spawns a best-effort detached `jobs.cancel` RPC to release server-side resources.
     pub fn abort(&mut self) {
         if let Some(cancel_tx) = self.cancel_tx.take() {
             let _ = cancel_tx.send_replace(true);
@@ -379,6 +454,13 @@ impl BigQueryRecordBatchReceiver {
         for handle in self.handles.drain(..) {
             handle.abort();
         }
+        if let Some(job_cancel) = self.job_cancel.take() {
+            job_cancel.trigger();
+        }
+    }
+
+    pub(crate) fn set_job_cancel(&mut self, handle: JobCancelHandle) {
+        self.job_cancel = Some(Box::new(handle));
     }
 
     pub(crate) fn new(
@@ -390,6 +472,7 @@ impl BigQueryRecordBatchReceiver {
             rx,
             cancel_tx,
             handles,
+            job_cancel: None,
         }
     }
 
