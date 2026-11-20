@@ -11,12 +11,16 @@ substitutions:
 steps:
   - id: build-ci-image
     name: gcr.io/cloud-builders/docker
+    env:
+      - CI_IMAGE=${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_CI_REPOSITORY_NAME}/${_CI_IMAGE_NAME}:latest
+      - BRANCH_NAME=${BRANCH_NAME}
+      - _PR_NUMBER=${_PR_NUMBER}
+      - _BASE_BRANCH=${_BASE_BRANCH}
     entrypoint: bash
     args:
       - -c
       - |
         set -euo pipefail
-        CI_IMAGE="${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_CI_REPOSITORY_NAME}/${_CI_IMAGE_NAME}:latest"
         docker pull "$${CI_IMAGE}" || true
         DOCKER_BUILDKIT=1 docker build \
           --build-arg BUILDKIT_INLINE_CACHE=1 \
@@ -24,7 +28,11 @@ steps:
           -t "$${CI_IMAGE}" \
           -f .cloudbuild/Dockerfile \
           .
-        docker push "$${CI_IMAGE}" || echo "Warning: could not push cache image to $${CI_IMAGE}"
+        if [ -z "$${_PR_NUMBER:-}" ] && [ -n "$${_BASE_BRANCH:-}" ] && [ "$${BRANCH_NAME:-}" = "$${_BASE_BRANCH}" ]; then
+          docker push "$${CI_IMAGE}" || echo "Warning: could not push cache image to $${CI_IMAGE}"
+        else
+          echo "Skipping push of $${CI_IMAGE} (PR or non-base branch build)"
+        fi
 
   - id: install-dependencies-and-build
     name: ${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_CI_REPOSITORY_NAME}/${_CI_IMAGE_NAME}:latest
@@ -64,8 +72,8 @@ steps:
         results_file="/tmp/pytest_benchmark_results.json"
 
         bencher_args=(
-          --project "${_BENCHER_PROJECT}"
-          --testbed "${_BENCHER_TESTBED}"
+          --project "$${_BENCHER_PROJECT}"
+          --testbed "$${_BENCHER_TESTBED}"
           --adapter python_pytest
           --file "$${results_file}"
           --error-on-alert
@@ -75,9 +83,9 @@ steps:
           bencher_args+=(--hash "$${COMMIT_SHA}")
         fi
 
-        if [ -z "$${_PR_NUMBER:-}" ] && [ "$${BRANCH_NAME:-main}" = "${_BASE_BRANCH}" ]; then
+        if [ -z "$${_PR_NUMBER:-}" ] && [ -n "$${_BASE_BRANCH:-}" ] && [ "$${BRANCH_NAME:-main}" = "$${_BASE_BRANCH}" ]; then
           bencher_args+=(
-            --branch "${_BASE_BRANCH}"
+            --branch "$${_BASE_BRANCH}"
             --threshold-measure latency
             --threshold-test t_test
             --threshold-max-sample-size 64
@@ -88,19 +96,19 @@ steps:
           target_branch="$${_HEAD_BRANCH:-$${BRANCH_NAME:-pr-$${_PR_NUMBER}}}"
           bencher_args+=(
             --branch "$${target_branch}"
-            --start-point "${_BASE_BRANCH}"
+            --start-point "$${_BASE_BRANCH}"
             --start-point-clone-thresholds
             --start-point-reset
           )
-          git fetch origin "${_BASE_BRANCH}" --depth=50 || true
-          start_point_hash="$$(git merge-base HEAD "origin/${_BASE_BRANCH}" 2>/dev/null || git rev-parse "origin/${_BASE_BRANCH}" 2>/dev/null || true)"
+          git fetch origin "$${_BASE_BRANCH}" --depth=50 || true
+          start_point_hash="$$(git merge-base HEAD "origin/$${_BASE_BRANCH}" 2>/dev/null || git rev-parse "origin/$${_BASE_BRANCH}" 2>/dev/null || true)"
           if [ -n "$${start_point_hash}" ]; then
             bencher_args+=(--start-point-hash "$${start_point_hash}")
           fi
         fi
 
         bencher run "$${bencher_args[@]}" \
-          "mask py-polars-bigquery test benchmark --output $${results_file}"
+          "env -u BENCHER_API_KEY mask py-polars-bigquery test benchmark --output $${results_file}"
 
 availableSecrets:
   secretManager:
@@ -110,4 +118,5 @@ availableSecrets:
 options:
   defaultLogsBucketBehavior: REGIONAL_USER_OWNED_BUCKET
   dynamicSubstitutions: true
+  substitutionOption: ALLOW_LOOSE
   machineType: E2_HIGHCPU_8
