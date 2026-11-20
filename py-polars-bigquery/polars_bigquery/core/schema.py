@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import dataclasses
+
 import polars as pl
 from polars.datatypes import (
     Binary,
@@ -8,7 +10,6 @@ from polars.datatypes import (
     Date,
     Datetime,
     Decimal,
-    Duration,
     Field,
     Float64,
     Int64,
@@ -18,9 +19,44 @@ from polars.datatypes import (
     Time,
 )
 
+from polars_bigquery.core.types import (
+    GEOGRAPHY_EXTENSION_METADATA,
+    GEOGRAPHY_EXTENSION_NAME,
+    JSON_EXTENSION_NAME,
+    BQType,
+    build_extension_dtype,
+)
 
-def _extract_data_type(field: dict) -> DataType:
-    """Convert a BigQuery type into a Polars type.
+
+@dataclasses.dataclass(frozen=True)
+class SkippedColumn:
+    """Metadata describing a top-level BigQuery column omitted during schema extraction."""
+
+    name: str
+    reason: str
+    path: str
+
+
+@dataclasses.dataclass(frozen=True)
+class ExtractedSchema:
+    """Structured result of extracting a Polars schema and BigQuery types from REST metadata."""
+
+    polars_schema: pl.Schema
+    bq_types: dict[str, BQType]
+    skipped_columns: tuple[SkippedColumn, ...]
+
+
+class _UnsupportedBigQueryType(Exception):
+    """Internal sentinel raised when a field or nested subfield cannot be represented."""
+
+    def __init__(self, reason: str, path: str) -> None:
+        super().__init__(reason)
+        self.reason = reason
+        self.path = path
+
+
+def _extract_data_type(field: dict, path: str) -> tuple[DataType, BQType]:
+    """Convert a BigQuery REST TableFieldSchema dict into `(Polars DataType, BQType)`.
 
     Note: the REST API uses the names from the Legacy SQL data types, but if
     user-entered it may include the newer aliases.
@@ -28,66 +64,153 @@ def _extract_data_type(field: dict) -> DataType:
 
     See: https://docs.cloud.google.com/bigquery/docs/reference/rest/v2/tables#TableFieldSchema
     """
-    # Check for BQ ARRAY (polars List) type first because it's not returned as
-    # a separate type in the BQ REST API. Instead, it uses the 'mode' field to
-    # indicate an ARRAY type.
-    if field.get("mode", "").casefold() == "repeated":
-        inner_type = _extract_data_type(
-            {
-                "name": field.get("name", ""),
-                "type": field.get("type", ""),
-                "fields": field.get("fields", []),
-                "mode": "NULLABLE",
-            }
-        )
-        return List(inner_type)
+    mode = (field.get("mode") or "").casefold()
+    type_ = (field.get("type") or "").casefold()
 
-    type_ = field.get("type", "").casefold()
+    # Check for BQ ARRAY (Polars List) first because the REST API encodes ARRAY
+    # via mode="REPEATED" rather than a separate type name.
+    if mode == "repeated":
+        # BigQuery attaches ARROW:extension:name to the outer List field for
+        # ARRAY<JSON> and ARRAY<GEOGRAPHY> rather than the inner String element.
+        if type_ == "json":
+            return (
+                build_extension_dtype(JSON_EXTENSION_NAME, List(String())),
+                BQType.ARRAY,
+            )
+        if type_ == "geography":
+            return (
+                build_extension_dtype(
+                    GEOGRAPHY_EXTENSION_NAME,
+                    List(String()),
+                    GEOGRAPHY_EXTENSION_METADATA,
+                ),
+                BQType.ARRAY,
+            )
+        inner_type, _ = _extract_data_type({**field, "mode": "NULLABLE"}, path)
+        return List(inner_type), BQType.ARRAY
 
     if type_ in ("bool", "boolean"):
-        return Boolean()
+        return Boolean(), BQType.BOOL
     if type_ == "bytes":
-        return Binary()
+        return Binary(), BQType.BYTES
     if type_ == "date":
-        return Date()
+        return Date(), BQType.DATE
     if type_ == "datetime":
         # In BigQuery DATETIME is naive (no associated timezone) and TIMESTAMP is UTC.
         # https://stackoverflow.com/a/47724366/101923
-        return Datetime(time_unit="us")
+        return Datetime(time_unit="us"), BQType.DATETIME
     if type_ == "geography":
-        # TODO(https://github.com/pola-rs/polars-bigquery-client/issues/40):
-        # Support GeoPolars data types, only if the package is installed.
-        return String()
+        return (
+            build_extension_dtype(
+                GEOGRAPHY_EXTENSION_NAME,
+                String(),
+                GEOGRAPHY_EXTENSION_METADATA,
+            ),
+            BQType.GEOGRAPHY,
+        )
     if type_ in ("float", "float64"):
-        return Float64()
+        return Float64(), BQType.FLOAT64
     if type_ in ("integer", "int64"):
-        return Int64()
+        return Int64(), BQType.INT64
     if type_ in ("numeric", "decimal"):
         # BigQuery NUMERIC type has precision 38 and scale 9.
         # https://cloud.google.com/bigquery/docs/reference/standard-sql/data-types#decimal_types
-        return Decimal(precision=38, scale=9)
+        return Decimal(precision=38, scale=9), BQType.NUMERIC
     if type_ in ("bignumeric", "bigdecimal"):
-        # BigQuery BIGNUMERIC type has precision 76 and scale 38.
-        return Decimal(precision=76, scale=38)
+        raise _UnsupportedBigQueryType("BIGNUMERIC", path)
     if type_ == "json":
-        return String()
+        return build_extension_dtype(JSON_EXTENSION_NAME, String()), BQType.JSON
     if type_ == "interval":
-        return Duration(time_unit="us")
+        raise _UnsupportedBigQueryType("INTERVAL", path)
+    if type_ == "range":
+        raise _UnsupportedBigQueryType("RANGE", path)
     if type_ in ("record", "struct"):
-        polars_fields = [
-            Field(subfield.get("name", ""), _extract_data_type(subfield))
-            for subfield in field.get("fields", [])
-        ]
-        return Struct(polars_fields)
+        subfields = field.get("fields") or []
+        if not subfields:
+            raise _UnsupportedBigQueryType("empty STRUCT", path)
+        seen: set[str] = set()
+        polars_fields: list[Field] = []
+        for idx, subfield in enumerate(subfields):
+            sub_name = subfield.get("name")
+            if not sub_name:
+                raise _UnsupportedBigQueryType(
+                    "unnamed STRUCT subfield", f"{path}[{idx}]"
+                )
+            if sub_name in seen:
+                raise _UnsupportedBigQueryType(
+                    "duplicate STRUCT subfield", f"{path}.{sub_name}"
+                )
+            seen.add(sub_name)
+            sub_dtype, _ = _extract_data_type(subfield, f"{path}.{sub_name}")
+            polars_fields.append(Field(sub_name, sub_dtype))
+        return Struct(polars_fields), BQType.STRUCT
     if type_ == "string":
-        return String()
+        return String(), BQType.STRING
     if type_ == "time":
-        return Time()
+        return Time(), BQType.TIME
     if type_ == "timestamp":
-        return Datetime(time_unit="us", time_zone="utc")
+        precision = field.get("timestampPrecision")
+        if precision is None or (
+            not isinstance(precision, bool) and precision in (6, "6")
+        ):
+            return Datetime(time_unit="us", time_zone="UTC"), BQType.TIMESTAMP
+        raise _UnsupportedBigQueryType(f"TIMESTAMP(precision={precision})", path)
 
-    message = f"got unexpected BigQuery type: {type_}"
-    raise TypeError(message)
+    raise _UnsupportedBigQueryType(f"unsupported type {type_ or '<missing>'}", path)
+
+
+def extract_schema_metadata(table_metadata: dict) -> ExtractedSchema:
+    """Extract a Polars schema, authoritative BigQuery types, and skipped columns.
+
+    Pure metadata transformation with no warning or exception side effects.
+
+    See: https://docs.cloud.google.com/bigquery/docs/reference/rest/v2/tables#Table
+    """
+    pl_schema: dict[str, DataType] = {}
+    bq_types: dict[str, BQType] = {}
+    skipped_columns: list[SkippedColumn] = []
+
+    fields = (table_metadata.get("schema") or {}).get("fields") or []
+    for idx, field in enumerate(fields):
+        name = field.get("name")
+        if not name:
+            placeholder = f"<unnamed[{idx}]>"
+            skipped_columns.append(
+                SkippedColumn(
+                    name=placeholder,
+                    reason="unnamed column",
+                    path=placeholder,
+                )
+            )
+            continue
+        try:
+            dtype, bq_type = _extract_data_type(field, name)
+        except _UnsupportedBigQueryType as exc:
+            skipped_columns.append(
+                SkippedColumn(name=name, reason=exc.reason, path=exc.path)
+            )
+            continue
+        pl_schema[name] = dtype
+        bq_types[name] = bq_type
+
+    # If table is ingestion-time partitioned, add pseudo-columns for partition
+    # filters. BigQuery exposes _PARTITIONDATE only on DAY-partitioned tables,
+    # whereas _PARTITIONTIME is exposed on all ingestion-time partitioned tables.
+    # See: https://cloud.google.com/bigquery/docs/partitioned-tables#ingestion_time
+    if (
+        time_partitioning := table_metadata.get("timePartitioning")
+    ) is not None and time_partitioning.get("field") is None:
+        if (time_partitioning.get("type") or "DAY").casefold() == "day":
+            pl_schema["_PARTITIONDATE"] = Date()
+            bq_types["_PARTITIONDATE"] = BQType.DATE
+        pl_schema["_PARTITIONTIME"] = Datetime(time_unit="us", time_zone="UTC")
+        bq_types["_PARTITIONTIME"] = BQType.TIMESTAMP
+
+    return ExtractedSchema(
+        polars_schema=pl.Schema(pl_schema),
+        bq_types=bq_types,
+        skipped_columns=tuple(skipped_columns),
+    )
 
 
 def extract_polars_schema(table_metadata: dict) -> pl.Schema:
@@ -95,17 +218,4 @@ def extract_polars_schema(table_metadata: dict) -> pl.Schema:
 
     See: https://docs.cloud.google.com/bigquery/docs/reference/rest/v2/tables#Table
     """
-    pl_schema = {}
-    for field in table_metadata.get("schema", {}).get("fields", []):
-        pl_schema[field.get("name", "")] = _extract_data_type(field)
-
-    # If table is ingestion time partitioned, add pseudocolumns for _PARTITIONDATE
-    # and _PARTITIONTIME to allow for partition filters. See:
-    # https://cloud.google.com/bigquery/docs/partitioned-tables#ingestion_time
-    if (
-        time_partitioning := table_metadata.get("timePartitioning")
-    ) is not None and time_partitioning.get("field") is None:
-        pl_schema["_PARTITIONDATE"] = Date()
-        pl_schema["_PARTITIONTIME"] = Datetime(time_unit="us", time_zone="utc")
-
-    return pl.Schema(pl_schema)
+    return extract_schema_metadata(table_metadata).polars_schema

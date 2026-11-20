@@ -15,6 +15,7 @@ nav:
     - Scanning large query results: guides/large-query-results.md
   - API reference:
     - api/index.md
+    - Data types: api/data-types.md
     - Row predicate pushdown: api/predicate-pushdown.md
   - Development:
     - Contributing:

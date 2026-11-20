@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import dataclasses
+from typing import Literal as TypingLiteral
 
 from polars_bigquery.core.compiler.ir.base import (
     BinaryExpr,
@@ -56,6 +57,13 @@ class Coalesce(VariadicExpr):
 @dataclasses.dataclass(frozen=True)
 class FillNull(BinaryExpr):
     """IR node representing an IFNULL expression."""
+
+
+@dataclasses.dataclass(frozen=True)
+class FillNullWithStrategy(UnaryExpr):
+    """IR node representing `Expr.fill_null(strategy="zero" | "one")`."""
+
+    strategy: TypingLiteral["Zero", "One"]
 
 
 @dataclasses.dataclass(frozen=True)

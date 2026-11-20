@@ -22,50 +22,76 @@ def _json_literal_to_sql(literal_json: dict[str, Any]) -> str | None:
 
 def test_is_null_expression() -> None:
     expr = pl.col("id").is_null()
-    assert compiler.predicate_to_row_restriction(expr) == "(`id` IS NULL)"
+    assert (
+        compiler.predicate_to_row_restriction(expr, schema={"id": pl.Int64})
+        == "(`id` IS NULL)"
+    )
 
 
 def test_is_not_null_expression() -> None:
     expr = pl.col("id").is_not_null()
-    assert compiler.predicate_to_row_restriction(expr) == "(`id` IS NOT NULL)"
+    assert (
+        compiler.predicate_to_row_restriction(expr, schema={"id": pl.Int64})
+        == "(`id` IS NOT NULL)"
+    )
 
 
 def test_parse_combined_expression() -> None:
     expr = (pl.col("str") == "2") & ((pl.col("id") > 10) | (pl.col("id") < 7.0))
     assert (
-        compiler.predicate_to_row_restriction(expr)
+        compiler.predicate_to_row_restriction(
+            expr, schema={"str": pl.String, "id": pl.Int64}
+        )
         == "((`str` = '2') AND ((`id` > 10) OR (`id` < 7.0)))"
     )
 
 
 def test_parse_gt() -> None:
     expr = pl.col("ts") > "2023-08-08"
-    assert compiler.predicate_to_row_restriction(expr) == "(`ts` > '2023-08-08')"
+    assert (
+        compiler.predicate_to_row_restriction(expr, schema={"ts": pl.String})
+        == "(`ts` > '2023-08-08')"
+    )
 
 
 def test_parse_gteq() -> None:
     expr = pl.col("ts") >= "2023-08-08"
-    assert compiler.predicate_to_row_restriction(expr) == "(`ts` >= '2023-08-08')"
+    assert (
+        compiler.predicate_to_row_restriction(expr, schema={"ts": pl.String})
+        == "(`ts` >= '2023-08-08')"
+    )
 
 
 def test_parse_eq() -> None:
     expr = pl.col("ts") == "2023-08-08"
-    assert compiler.predicate_to_row_restriction(expr) == "(`ts` = '2023-08-08')"
+    assert (
+        compiler.predicate_to_row_restriction(expr, schema={"ts": pl.String})
+        == "(`ts` = '2023-08-08')"
+    )
 
 
 def test_parse_lt() -> None:
     expr = pl.col("ts") < "2023-08-08"
-    assert compiler.predicate_to_row_restriction(expr) == "(`ts` < '2023-08-08')"
+    assert (
+        compiler.predicate_to_row_restriction(expr, schema={"ts": pl.String})
+        == "(`ts` < '2023-08-08')"
+    )
 
 
 def test_parse_lteq() -> None:
     expr = pl.col("ts") <= "2023-08-08"
-    assert compiler.predicate_to_row_restriction(expr) == "(`ts` <= '2023-08-08')"
+    assert (
+        compiler.predicate_to_row_restriction(expr, schema={"ts": pl.String})
+        == "(`ts` <= '2023-08-08')"
+    )
 
 
 def test_starts_with_expression() -> None:
     expr = pl.col("name").str.starts_with("T")
-    assert compiler.predicate_to_row_restriction(expr) == "STARTS_WITH(`name`, 'T')"
+    assert (
+        compiler.predicate_to_row_restriction(expr, schema={"name": pl.String})
+        == "STARTS_WITH(`name`, 'T')"
+    )
 
 
 def test_starts_with_combined_expression() -> None:
@@ -75,7 +101,10 @@ def test_starts_with_combined_expression() -> None:
         & (pl.col("year") == 2000)
     )
     assert (
-        compiler.predicate_to_row_restriction(expr)
+        compiler.predicate_to_row_restriction(
+            expr,
+            schema={"name": pl.String, "number": pl.Int64, "year": pl.Int64},
+        )
         == "((STARTS_WITH(`name`, 'T') AND (`number` > 10)) AND (`year` = 2000))"
     )
 
@@ -83,26 +112,35 @@ def test_starts_with_combined_expression() -> None:
 def test_starts_with_column_prefix() -> None:
     expr = pl.col("name").str.starts_with(pl.col("prefix"))
     assert (
-        compiler.predicate_to_row_restriction(expr) == "STARTS_WITH(`name`, `prefix`)"
+        compiler.predicate_to_row_restriction(
+            expr, schema={"name": pl.String, "prefix": pl.String}
+        )
+        == "STARTS_WITH(`name`, `prefix`)"
     )
 
 
 def test_ends_with_expression() -> None:
     expr = pl.col("name").str.ends_with("xyz")
-    assert compiler.predicate_to_row_restriction(expr) == "ENDS_WITH(`name`, 'xyz')"
+    assert (
+        compiler.predicate_to_row_restriction(expr, schema={"name": pl.String})
+        == "ENDS_WITH(`name`, 'xyz')"
+    )
 
 
 def test_not_starts_with_expression() -> None:
     expr = ~pl.col("name").str.starts_with("T")
     assert (
-        compiler.predicate_to_row_restriction(expr) == "(NOT STARTS_WITH(`name`, 'T'))"
+        compiler.predicate_to_row_restriction(expr, schema={"name": pl.String})
+        == "(NOT STARTS_WITH(`name`, 'T'))"
     )
 
 
 def test_not_eq_and_boolean_literal() -> None:
     expr = (pl.col("status") != "DELETED") & (pl.col("active") == True)
     assert (
-        compiler.predicate_to_row_restriction(expr)
+        compiler.predicate_to_row_restriction(
+            expr, schema={"status": pl.String, "active": pl.Boolean}
+        )
         == "((`status` != 'DELETED') AND (`active` = TRUE))"
     )
 
@@ -113,7 +151,7 @@ def test_flexible_column_names_and_string_escaping() -> None:
     # literals are single-quoted and escaped.
     expr = pl.col("user's-name 1") == "O'Reilly"
     assert (
-        compiler.predicate_to_row_restriction(expr)
+        compiler.predicate_to_row_restriction(expr, schema={"user's-name 1": pl.String})
         == "(`user's-name 1` = 'O\\'Reilly')"
     )
 
@@ -123,7 +161,9 @@ def test_japanese_and_multilingual_column_names() -> None:
     # are valid BigQuery flexible column names (\p{L}, \p{N}, \p{Pc}, \p{Pd}).
     expr = (pl.col("ユーザー名") == "田中") & (pl.col("価格_円") > 1000)
     assert (
-        compiler.predicate_to_row_restriction(expr)
+        compiler.predicate_to_row_restriction(
+            expr, schema={"ユーザー名": pl.String, "価格_円": pl.Int64}
+        )
         == "((`ユーザー名` = '田中') AND (`価格_円` > 1000))"
     )
 
@@ -156,7 +196,7 @@ def test_unsupported_column_names_raise_value_error() -> None:
     for invalid_col in ("bad`col", "bad\\col", "bad.col", "bad$col", ""):
         expr = pl.col(invalid_col) == 1
         with pytest.raises(ValueError, match="Invalid BigQuery column name"):
-            compiler.predicate_to_row_restriction(expr)
+            compiler.predicate_to_row_restriction(expr, schema={invalid_col: pl.Int64})
 
     # Length limit (>300 chars) is not enforced client-side so relaxed server limits work
     long_col = "a" * 301
@@ -164,16 +204,17 @@ def test_unsupported_column_names_raise_value_error() -> None:
 
 
 def test_nan_and_inf_floats_cast_to_float64() -> None:
+    val_schema = {"val": pl.Float64}
     # Polars expressions with float("nan") or float("inf") serialize with Float: null,
     # which cannot safely distinguish nan vs inf vs -inf. They safely fallback to in-memory filtering.
     expr_nan = pl.col("val") == float("nan")  # noqa: PLW0177
-    assert compiler.predicate_to_row_restriction(expr_nan) == ""
+    assert compiler.predicate_to_row_restriction(expr_nan, schema=val_schema) == ""
 
     expr_inf = pl.col("val") < float("inf")
-    assert compiler.predicate_to_row_restriction(expr_inf) == ""
+    assert compiler.predicate_to_row_restriction(expr_inf, schema=val_schema) == ""
 
     expr_neg_inf = pl.col("val") > float("-inf")
-    assert compiler.predicate_to_row_restriction(expr_neg_inf) == ""
+    assert compiler.predicate_to_row_restriction(expr_neg_inf, schema=val_schema) == ""
 
     # When JSON literals contain nan, inf, and -inf, they are correctly cast to FLOAT64
     assert _json_literal_to_sql({"Float64": "nan"}) == "CAST('nan' AS FLOAT64)"
@@ -184,18 +225,25 @@ def test_nan_and_inf_floats_cast_to_float64() -> None:
 
     # Boolean functions for NaN and Infinity
     assert (
-        compiler.predicate_to_row_restriction(pl.col("val").is_nan()) == "IS_NAN(`val`)"
+        compiler.predicate_to_row_restriction(pl.col("val").is_nan(), schema=val_schema)
+        == "IS_NAN(`val`)"
     )
     assert (
-        compiler.predicate_to_row_restriction(pl.col("val").is_not_nan())
+        compiler.predicate_to_row_restriction(
+            pl.col("val").is_not_nan(), schema=val_schema
+        )
         == "(NOT IS_NAN(`val`))"
     )
     assert (
-        compiler.predicate_to_row_restriction(pl.col("val").is_infinite())
+        compiler.predicate_to_row_restriction(
+            pl.col("val").is_infinite(), schema=val_schema
+        )
         == "IS_INF(`val`)"
     )
     assert (
-        compiler.predicate_to_row_restriction(pl.col("val").is_finite())
+        compiler.predicate_to_row_restriction(
+            pl.col("val").is_finite(), schema=val_schema
+        )
         == "(NOT IS_INF(`val`) AND NOT IS_NAN(`val`))"
     )
 
@@ -324,7 +372,12 @@ def test_json_literal_to_sql_all_scalar_types_and_immutability() -> None:
 
 def test_and_expression_preserves_valid_branch_with_unsupported_branch() -> None:
     expr = (pl.col("keep_col") == 1) & (unsupported(pl.col("other_col")) > 0.5)
-    assert compiler.predicate_to_row_restriction(expr) == "(`keep_col` = 1)"
+    assert (
+        compiler.predicate_to_row_restriction(
+            expr, schema={"keep_col": pl.Int64, "other_col": pl.Float64}
+        )
+        == "(`keep_col` = 1)"
+    )
     df = pl.DataFrame({"keep_col": [1, 1, 2], "other_col": [0.1, 0.8, 0.9]})
     assert df.filter(expr).to_dict(as_series=False) == {
         "keep_col": [1],
@@ -493,11 +546,14 @@ def test_ir_frozen_dataclasses_and_submodules() -> None:
 def test_predicate_to_row_restriction_root_recursion_error_fallback(
     monkeypatch,
 ) -> None:
-    def raise_recursion(_expr_json):
+    def raise_recursion(_expr_json, _schema, bq_types=None):
         raise RecursionError("Maximum recursion depth exceeded")
 
     monkeypatch.setattr(compiler, "_json_expr_to_row_restriction", raise_recursion)
-    assert compiler.predicate_to_row_restriction(pl.col("a") == 1) == ""
+    assert (
+        compiler.predicate_to_row_restriction(pl.col("a") == 1, schema={"a": pl.Int64})
+        == ""
+    )
 
 
 def test_escape_sql_string_tabs_and_null_bytes() -> None:
@@ -518,18 +574,19 @@ def test_json_to_ir_prunes_unsupported_subtrees() -> None:
 def test_predicate_to_row_restriction_pseudo_column_and_physical_column() -> None:
     from datetime import date
 
+    schema = {"_PARTITIONDATE": pl.Date, "val": pl.Float64}
     expr = (pl.col("_PARTITIONDATE") == date(2024, 1, 1)) & (
         unsupported(pl.col("val")) > 0.5
     )
     assert (
-        compiler.predicate_to_row_restriction(expr)
+        compiler.predicate_to_row_restriction(expr, schema=schema)
         == "(`_PARTITIONDATE` = DATE(TIMESTAMP_SECONDS(19723 * 86400)))"
     )
 
     expr_or = (pl.col("_PARTITIONDATE") == date(2024, 1, 1)) | (
         unsupported(pl.col("val")) > 0.5
     )
-    assert compiler.predicate_to_row_restriction(expr_or) == ""
+    assert compiler.predicate_to_row_restriction(expr_or, schema=schema) == ""
 
 
 def test_negation_over_partial_and_does_not_drop_data() -> None:
@@ -539,7 +596,9 @@ def test_negation_over_partial_and_does_not_drop_data() -> None:
     expr = ~((pl.col("a") == 1) & (unsupported(pl.col("b")) > 0.5))
 
     # Act
-    sql = compiler.predicate_to_row_restriction(expr)
+    sql = compiler.predicate_to_row_restriction(
+        expr, schema={"a": pl.Int64, "b": pl.Float64}
+    )
 
     # Assert
     assert sql == ""
@@ -550,7 +609,9 @@ def test_negation_over_exact_and_pushes_down() -> None:
     expr = ~((pl.col("a") == 1) & (pl.col("b") == 2))
 
     # Act
-    sql = compiler.predicate_to_row_restriction(expr)
+    sql = compiler.predicate_to_row_restriction(
+        expr, schema={"a": pl.Int64, "b": pl.Int64}
+    )
 
     # Assert
     assert sql == "(NOT ((`a` = 1) AND (`b` = 2)))"
@@ -561,7 +622,9 @@ def test_or_over_partial_and_relaxes_to_superset() -> None:
     expr = ((pl.col("a") == 1) & (unsupported(pl.col("b")) > 0.5)) | (pl.col("c") == 3)
 
     # Act
-    sql = compiler.predicate_to_row_restriction(expr)
+    sql = compiler.predicate_to_row_restriction(
+        expr, schema={"a": pl.Int64, "b": pl.Float64, "c": pl.Int64}
+    )
 
     # Assert
     assert sql == "((`a` = 1) OR (`c` = 3))"
@@ -597,7 +660,9 @@ def test_negation_over_or_with_partial_and_branch_pushes_down_exact_branch() -> 
     )
 
     # Act
-    sql = compiler.predicate_to_row_restriction(expr)
+    sql = compiler.predicate_to_row_restriction(
+        expr, schema={"a": pl.Int64, "b": pl.Float64, "c": pl.Int64}
+    )
 
     # Assert
     assert sql == "(NOT (`c` = 3))"
@@ -611,7 +676,10 @@ def test_negation_over_or_with_both_partial_and_branches_does_not_drop_data() ->
     )
 
     # Act
-    sql = compiler.predicate_to_row_restriction(expr)
+    sql = compiler.predicate_to_row_restriction(
+        expr,
+        schema={"a": pl.Int64, "b": pl.Float64, "c": pl.Int64, "d": pl.Float64},
+    )
 
     # Assert
     assert sql == ""
@@ -619,7 +687,7 @@ def test_negation_over_or_with_both_partial_and_branches_does_not_drop_data() ->
 
 def test_bare_null_literal_comparison_not_pushed_down() -> None:
     expr = pl.col("a") == pl.lit(None)
-    assert compiler.predicate_to_row_restriction(expr) == ""
+    assert compiler.predicate_to_row_restriction(expr, schema={"a": pl.Int64}) == ""
 
 
 def test_datetime_naive_vs_timezone_aware_pushdown() -> None:
@@ -630,14 +698,18 @@ def test_datetime_naive_vs_timezone_aware_pushdown() -> None:
         2024, 1, 1, 12, 0, tzinfo=timezone.utc
     )
     assert (
-        compiler.predicate_to_row_restriction(ts_expr)
+        compiler.predicate_to_row_restriction(
+            ts_expr, schema={"_PARTITIONTIME": pl.Datetime("us", "UTC")}
+        )
         == "(`_PARTITIONTIME` = TIMESTAMP_MICROS(1704110400000000))"
     )
 
     # Timezone-naive datetime -> BigQuery DATETIME
     dt_expr = pl.col("created_dt") == datetime(2024, 1, 1, 12, 0)  # noqa: DTZ001
     assert (
-        compiler.predicate_to_row_restriction(dt_expr)
+        compiler.predicate_to_row_restriction(
+            dt_expr, schema={"created_dt": pl.Datetime("us")}
+        )
         == "(`created_dt` = DATETIME(TIMESTAMP_MICROS(1704110400000000)))"
     )
 
@@ -654,7 +726,14 @@ def test_sec_quarterly_financials_submission_partition_pushdown() -> None:
         )
     )
     assert (
-        compiler.predicate_to_row_restriction(expr)
+        compiler.predicate_to_row_restriction(
+            expr,
+            schema={
+                "_PARTITIONDATE": pl.Date,
+                "central_index_key": pl.Int64,
+                "company_name": pl.String,
+            },
+        )
         == "(((`_PARTITIONDATE` >= DATE(TIMESTAMP_SECONDS(18262 * 86400))) "
         "AND (`_PARTITIONDATE` <= DATE(TIMESTAMP_SECONDS(18627 * 86400)))) "
         "AND ((`central_index_key` IN (1652044, 1288776)) "
@@ -681,7 +760,14 @@ def test_sec_quarterly_financials_numbers_partition_pushdown() -> None:
         & pl.col("units").is_in(["USD", "shares"])
     )
     assert (
-        compiler.predicate_to_row_restriction(expr)
+        compiler.predicate_to_row_restriction(
+            expr,
+            schema={
+                "_PARTITIONDATE": pl.Date,
+                "measure_tag": pl.String,
+                "units": pl.String,
+            },
+        )
         == "((((`_PARTITIONDATE` >= DATE(TIMESTAMP_SECONDS(18262 * 86400))) "
         "AND (`_PARTITIONDATE` <= DATE(TIMESTAMP_SECONDS(18627 * 86400)))) "
         "AND (`measure_tag` IN ('Revenues', 'RevenueFromContractWithCustomerExcludingAssessedTax', "
@@ -697,7 +783,8 @@ def test_is_in_and_string_contains_case_expressions() -> None:
     # Literal vs regex contains and lowercase
     assert (
         compiler.predicate_to_row_restriction(
-            pl.col("name").str.to_lowercase().str.contains("alphabet", literal=True)
+            pl.col("name").str.to_lowercase().str.contains("alphabet", literal=True),
+            schema={"name": pl.String},
         )
         == "(STRPOS(LOWER(`name`), 'alphabet') > 0)"
     )
@@ -705,44 +792,68 @@ def test_is_in_and_string_contains_case_expressions() -> None:
     # Series, Float, Boolean, Date, and Datetime lists in is_in
     assert (
         compiler.predicate_to_row_restriction(
-            pl.col("tag").is_in(pl.Series(["a", "b"]))
+            pl.col("tag").is_in(pl.Series(["a", "b"])),
+            schema={"tag": pl.String},
         )
         == "(`tag` IN ('a', 'b'))"
     )
     assert (
-        compiler.predicate_to_row_restriction(pl.col("score").is_in([1.5, 2.5]))
+        compiler.predicate_to_row_restriction(
+            pl.col("score").is_in([1.5, 2.5]),
+            schema={"score": pl.Float64},
+        )
         == "(`score` IN (1.5, 2.5))"
     )
     assert (
-        compiler.predicate_to_row_restriction(pl.col("flag").is_in([True, False]))
+        compiler.predicate_to_row_restriction(
+            pl.col("flag").is_in([True, False]),
+            schema={"flag": pl.Boolean},
+        )
         == "(`flag` IN (TRUE, FALSE))"
     )
     assert (
         compiler.predicate_to_row_restriction(
-            pl.col("dt").is_in([date(2020, 1, 1), date(2020, 12, 31)])
+            pl.col("dt").is_in([date(2020, 1, 1), date(2020, 12, 31)]),
+            schema={"dt": pl.Date},
         )
         == "(`dt` IN (DATE(TIMESTAMP_SECONDS(18262 * 86400)), DATE(TIMESTAMP_SECONDS(18627 * 86400))))"
     )
     assert (
         compiler.predicate_to_row_restriction(
-            pl.col("ts").is_in([datetime(2024, 1, 1, 12, 0, tzinfo=timezone.utc)])
+            pl.col("ts").is_in([datetime(2024, 1, 1, 12, 0, tzinfo=timezone.utc)]),
+            schema={"ts": pl.Datetime("us", "UTC")},
         )
         == "(`ts` IN (TIMESTAMP_MICROS(1704110400000000)))"
     )
 
     # Edge cases that must not push down (empty list, nulls_equal=True, NaN in float list, column rhs)
-    assert compiler.predicate_to_row_restriction(pl.col("a").is_in([])) == ""
     assert (
         compiler.predicate_to_row_restriction(
-            pl.col("a").is_in([1, 2], nulls_equal=True)
+            pl.col("a").is_in([]), schema={"a": pl.Int64}
         )
         == ""
     )
     assert (
-        compiler.predicate_to_row_restriction(pl.col("a").is_in([1.0, float("nan")]))
+        compiler.predicate_to_row_restriction(
+            pl.col("a").is_in([1, 2], nulls_equal=True),
+            schema={"a": pl.Int64},
+        )
         == ""
     )
-    assert compiler.predicate_to_row_restriction(pl.col("a").is_in(pl.col("b"))) == ""
+    assert (
+        compiler.predicate_to_row_restriction(
+            pl.col("a").is_in([1.0, float("nan")]),
+            schema={"a": pl.Float64},
+        )
+        == ""
+    )
+    assert (
+        compiler.predicate_to_row_restriction(
+            pl.col("a").is_in(pl.col("b")),
+            schema={"a": pl.Int64, "b": pl.List(pl.Int64)},
+        )
+        == ""
+    )
 
 
 def test_json_path_parser_registration_and_dispatch() -> None:
@@ -926,7 +1037,9 @@ def test_parse_int_literal_enforces_bigquery_int64_bounds() -> None:
     valid_max_ir = compiler.parser.numeric.parse_int_literal(max_int64)
     overflow_ir = compiler.parser.numeric.parse_int_literal(overflow_uint64)
     underflow_ir = compiler.parser.numeric.parse_int_literal(underflow_int128)
-    series_sql = compiler.predicate_to_row_restriction(overflow_series_expr)
+    series_sql = compiler.predicate_to_row_restriction(
+        overflow_series_expr, schema={"id": pl.Int64}
+    )
 
     # Assert
     assert valid_max_ir == compiler.ir.IntLiteral(max_int64)
@@ -1222,7 +1335,9 @@ def test_contains_strict_false_and_direct_unit_parser_reject_parameterized_specs
     non_strict_regex_expr = pl.col("name").str.contains("[invalid", strict=False)
 
     # Act
-    non_strict_sql = compiler.predicate_to_row_restriction(non_strict_regex_expr)
+    non_strict_sql = compiler.predicate_to_row_restriction(
+        non_strict_regex_expr, schema={"name": pl.String}
+    )
     direct_not_record = compiler.parser.boolean.parse_not(
         {"unexpected": True}, [{"Column": "a"}]
     )
@@ -1581,7 +1696,9 @@ def test_de_morgan_rewriter_preserves_pushdown_for_supported_branches(
     expected_sql: str,
 ) -> None:
     # Arrange & Act
-    actual_sql = compiler.predicate_to_row_restriction(expr)
+    actual_sql = compiler.predicate_to_row_restriction(
+        expr, schema={"a": pl.Int64, "b": pl.Float64, "c": pl.Int64}
+    )
 
     # Assert
     assert actual_sql == expected_sql
@@ -1773,30 +1890,35 @@ def test_rewriter_replace_children_rejects_invalid_arity(
 
 
 @pytest.mark.parametrize(
-    ("expr", "expected_sql"),
+    ("expr", "schema", "expected_sql"),
     [
         pytest.param(
             pl.coalesce("a", "b") == 1,
+            {"a": pl.Int64, "b": pl.Int64},
             "(COALESCE(`a`, `b`) = 1)",
             id="two_column_names",
         ),
         pytest.param(
             pl.coalesce(["a", "b"]) == 1,
+            {"a": pl.Int64, "b": pl.Int64},
             "(COALESCE(`a`, `b`) = 1)",
             id="column_name_list",
         ),
         pytest.param(
             pl.coalesce(pl.col("a"), pl.col("b"), 0) > 10,
+            {"a": pl.Int64, "b": pl.Int64},
             "(COALESCE(`a`, `b`, 0) > 10)",
             id="columns_with_integer_default",
         ),
         pytest.param(
             pl.coalesce("a") == 1,
+            {"a": pl.Int64},
             "(COALESCE(`a`) = 1)",
             id="single_column",
         ),
         pytest.param(
             pl.coalesce(pl.col("flag1"), pl.col("flag2"), False),
+            {"flag1": pl.Boolean, "flag2": pl.Boolean},
             "COALESCE(`flag1`, `flag2`, FALSE)",
             id="top_level_boolean_coalesce",
         ),
@@ -1807,21 +1929,25 @@ def test_rewriter_replace_children_rejects_invalid_arity(
                 pl.lit("fallback"),
             )
             == "abc",
+            {"a": pl.String, "b": pl.String},
             "(COALESCE(LOWER(`a`), UPPER(`b`), 'fallback') = 'abc')",
             id="nested_string_functions_in_coalesce",
         ),
         pytest.param(
             pl.coalesce(pl.coalesce("a", "b"), "c", 0) == 5,
+            {"a": pl.Int64, "b": pl.Int64, "c": pl.Int64},
             "(COALESCE(COALESCE(`a`, `b`), `c`, 0) = 5)",
             id="nested_coalesce",
         ),
         pytest.param(
             (pl.coalesce("a", "b", 0) > 5) & (unsupported(pl.col("c")) == 1),
+            {"a": pl.Int64, "b": pl.Int64, "c": pl.Int64},
             "(COALESCE(`a`, `b`, 0) > 5)",
             id="coalesce_in_conjunction_with_unsupported_sibling",
         ),
         pytest.param(
             pl.coalesce(~((pl.col("a") == 1) | (pl.col("b") == 2)), pl.col("c")),
+            {"a": pl.Int64, "b": pl.Int64, "c": pl.Boolean},
             "COALESCE(((NOT (`a` = 1)) AND (NOT (`b` = 2))), `c`)",
             id="de_morgan_rewrite_inside_coalesce_operand",
         ),
@@ -1833,6 +1959,7 @@ def test_rewriter_replace_children_rejects_invalid_arity(
                     eager=True,
                 )
             ),
+            {"x": pl.Int64},
             "(`x` IN (1, 2, 3))",
             id="eager_coalesce_series_in_is_in",
         ),
@@ -1840,10 +1967,11 @@ def test_rewriter_replace_children_rejects_invalid_arity(
 )
 def test_coalesce_expression_pushdown(
     expr: pl.Expr,
+    schema: dict[str, Any],
     expected_sql: str,
 ) -> None:
     # Arrange & Act
-    actual_sql = compiler.predicate_to_row_restriction(expr)
+    actual_sql = compiler.predicate_to_row_restriction(expr, schema=schema)
 
     # Assert
     assert actual_sql == expected_sql
@@ -1912,7 +2040,10 @@ def test_coalesce_unsupported_and_degraded_cases(
     expected_sql: str,
 ) -> None:
     # Arrange & Act
-    actual_sql = compiler.predicate_to_row_restriction(expr)
+    actual_sql = compiler.predicate_to_row_restriction(
+        expr,
+        schema={"a": pl.Int64, "b": pl.Int64, "c": pl.Int64, "d": pl.Int64},
+    )
 
     # Assert
     assert actual_sql == expected_sql
@@ -2272,7 +2403,16 @@ def test_emit_coalesce_sql_rejects_invalid_inputs(
 )
 def test_when_then_otherwise_pushdown(expr: pl.Expr, expected_sql: str) -> None:
     # Arrange & Act
-    actual_sql = compiler.predicate_to_row_restriction(expr)
+    actual_sql = compiler.predicate_to_row_restriction(
+        expr,
+        schema={
+            "a": pl.Int64,
+            "b": pl.Int64,
+            "c": pl.Int64,
+            "keep": pl.Int64,
+            "x": pl.Int64,
+        },
+    )
 
     # Assert
     assert actual_sql == expected_sql
@@ -2347,7 +2487,10 @@ def test_when_then_otherwise_pushdown(expr: pl.Expr, expected_sql: str) -> None:
 )
 def test_when_rejects_any_unsupported_or_inexact_descendant(expr: pl.Expr) -> None:
     # Arrange & Act
-    actual_sql = compiler.predicate_to_row_restriction(expr)
+    actual_sql = compiler.predicate_to_row_restriction(
+        expr,
+        schema={"a": pl.Int64, "b": pl.Int64, "c": pl.Int64},
+    )
 
     # Assert
     assert actual_sql == ""
@@ -2979,56 +3122,66 @@ def test_emit_ternary_and_when_sql_rejects_invalid_inputs(
 
 
 @pytest.mark.parametrize(
-    ("expr", "expected_sql"),
+    ("expr", "schema", "expected_sql"),
     [
         pytest.param(
             pl.col("a").fill_null(0) == 1,
+            {"a": pl.Int64},
             "(IFNULL(`a`, 0) = 1)",
             id="fill_with_int_literal",
         ),
         pytest.param(
             pl.col("a").fill_null("default") == "x",
+            {"a": pl.String},
             "(IFNULL(`a`, 'default') = 'x')",
             id="fill_with_string_literal",
         ),
         pytest.param(
             pl.col("a").fill_null(pl.col("b")) > 10,
+            {"a": pl.Int64, "b": pl.Int64},
             "(IFNULL(`a`, `b`) > 10)",
             id="fill_with_column_expr",
         ),
         pytest.param(
             pl.col("flag").fill_null(False),
+            {"flag": pl.Boolean},
             "IFNULL(`flag`, FALSE)",
             id="top_level_boolean_fill_null",
         ),
         pytest.param(
             pl.col("a").fill_null(strategy="zero") == 0,
+            {"a": pl.Int64},
             "(IFNULL(`a`, 0) = 0)",
             id="strategy_zero",
         ),
         pytest.param(
             pl.col("a").fill_null(strategy="one") == 1,
+            {"a": pl.Int64},
             "(IFNULL(`a`, 1) = 1)",
             id="strategy_one",
         ),
         pytest.param(
             pl.col("a").str.to_lowercase().fill_null(pl.col("b").str.to_uppercase())
             == "abc",
+            {"a": pl.String, "b": pl.String},
             "(IFNULL(LOWER(`a`), UPPER(`b`)) = 'abc')",
             id="nested_string_functions_in_fill_null",
         ),
         pytest.param(
             pl.col("a").fill_null(pl.col("b")).fill_null(0) == 5,
+            {"a": pl.Int64, "b": pl.Int64},
             "(IFNULL(IFNULL(`a`, `b`), 0) = 5)",
             id="chained_fill_null",
         ),
         pytest.param(
             (pl.col("a").fill_null(0) > 5) & (unsupported(pl.col("c")) == 1),
+            {"a": pl.Int64, "c": pl.Int64},
             "(IFNULL(`a`, 0) > 5)",
             id="fill_null_in_conjunction_with_unsupported_sibling",
         ),
         pytest.param(
             (~((pl.col("a") == 1) | (pl.col("b") == 2))).fill_null(pl.col("c")),
+            {"a": pl.Int64, "b": pl.Int64, "c": pl.Boolean},
             "IFNULL(((NOT (`a` = 1)) AND (NOT (`b` = 2))), `c`)",
             id="de_morgan_rewrite_inside_fill_null_operand",
         ),
@@ -3036,10 +3189,11 @@ def test_emit_ternary_and_when_sql_rejects_invalid_inputs(
 )
 def test_fill_null_expression_pushdown(
     expr: pl.Expr,
+    schema: dict[str, Any],
     expected_sql: str,
 ) -> None:
     # Arrange & Act
-    actual_sql = compiler.predicate_to_row_restriction(expr)
+    actual_sql = compiler.predicate_to_row_restriction(expr, schema=schema)
 
     # Assert
     assert actual_sql == expected_sql
@@ -3150,7 +3304,16 @@ def test_fill_null_unsupported_and_degraded_cases(
     expected_sql: str,
 ) -> None:
     # Arrange & Act
-    actual_sql = compiler.predicate_to_row_restriction(expr)
+    actual_sql = compiler.predicate_to_row_restriction(
+        expr,
+        schema={
+            "a": pl.Int64,
+            "b": pl.Int64,
+            "c": pl.Int64,
+            "d": pl.Int64,
+            "flag": pl.Boolean,
+        },
+    )
 
     # Assert
     assert actual_sql == expected_sql
@@ -3284,7 +3447,16 @@ def test_is_null_and_is_not_null_expression_pushdown(
     expected_sql: str,
 ) -> None:
     # Arrange & Act
-    actual_sql = compiler.predicate_to_row_restriction(expr)
+    actual_sql = compiler.predicate_to_row_restriction(
+        expr,
+        schema={
+            "id": pl.Int64,
+            "name": pl.String,
+            "a": pl.Int64,
+            "b": pl.Int64,
+            "flag": pl.Boolean,
+        },
+    )
 
     # Assert
     assert actual_sql == expected_sql
@@ -3352,67 +3524,80 @@ def test_is_null_and_is_not_null_unsupported_and_degraded_cases(
     expected_sql: str,
 ) -> None:
     # Arrange & Act
-    actual_sql = compiler.predicate_to_row_restriction(expr)
+    actual_sql = compiler.predicate_to_row_restriction(
+        expr, schema={"a": pl.Int64, "b": pl.Int64, "c": pl.Int64}
+    )
 
     # Assert
     assert actual_sql == expected_sql
 
 
 @pytest.mark.parametrize(
-    ("expr", "expected_sql"),
+    ("expr", "schema", "expected_sql"),
     [
         pytest.param(
             pl.col("flag").drop_nulls(),
+            {"flag": pl.Boolean},
             "(`flag` AND (`flag` IS NOT NULL))",
             id="top_level_boolean_drop_nulls",
         ),
         pytest.param(
             pl.col("a").drop_nulls() == 1,
+            {"a": pl.Int64},
             "((`a` = 1) AND (`a` IS NOT NULL))",
             id="drop_nulls_in_equality_comparison",
         ),
         pytest.param(
             pl.col("a").str.to_lowercase().drop_nulls() == "abc",
+            {"a": pl.String},
             "((LOWER(`a`) = 'abc') AND (LOWER(`a`) IS NOT NULL))",
             id="drop_nulls_on_string_function",
         ),
         pytest.param(
             pl.col("a").drop_nulls().str.to_lowercase() == "abc",
+            {"a": pl.String},
             "((LOWER(`a`) = 'abc') AND (`a` IS NOT NULL))",
             id="string_function_on_drop_nulls",
         ),
         pytest.param(
             pl.col("a").drop_nulls().str.to_lowercase().drop_nulls() == "abc",
+            {"a": pl.String},
             "(((LOWER(`a`) = 'abc') AND (LOWER(`a`) IS NOT NULL)) AND (`a` IS NOT NULL))",
             id="nested_drop_nulls_chain",
         ),
         pytest.param(
             (pl.col("a").drop_nulls() == 1) & (pl.col("b").drop_nulls() == 2),
+            {"a": pl.Int64, "b": pl.Int64},
             "((((`a` = 1) AND (`b` = 2)) AND (`a` IS NOT NULL)) AND (`b` IS NOT NULL))",
             id="multiple_drop_nulls_in_conjunction",
         ),
         pytest.param(
             (pl.col("a").drop_nulls() > 5) & (unsupported(pl.col("c")) == 1),
+            {"a": pl.Int64, "c": pl.Int64},
             "((`a` > 5) AND (`a` IS NOT NULL))",
             id="drop_nulls_in_conjunction_with_unsupported_sibling",
         ),
         pytest.param(
             pl.col("a").drop_nulls() == unsupported(pl.col("b")),
+            {"a": pl.Int64, "b": pl.Int64},
             "(`a` IS NOT NULL)",
             id="drop_nulls_with_unsupported_comparison_sibling_pushes_down_is_not_null",
         ),
         pytest.param(
             ~((pl.col("a").drop_nulls() == 1) | (unsupported(pl.col("b")) == 2)),
+            {"a": pl.Int64, "b": pl.Int64},
             "((NOT (`a` = 1)) AND (`a` IS NOT NULL))",
             id="drop_nulls_in_de_morgan_with_unsupported_sibling",
         ),
         pytest.param(
             (~((pl.col("a") == 1) | (pl.col("b") == 2))).drop_nulls(),
+            {"a": pl.Int64, "b": pl.Int64},
             "(((NOT (`a` = 1)) AND (NOT (`b` = 2))) AND (((NOT (`a` = 1)) AND (NOT (`b` = 2))) IS NOT NULL))",
             id="de_morgan_rewrite_inside_drop_nulls",
         ),
         pytest.param(
             pl.when(pl.col("a") == 1).then(pl.col("b") == 2).drop_nulls(),
+            {"a": pl.Int64, "b": pl.Int64},
             "(((`a` = 1) AND (`b` = 2)) AND (IF((`a` = 1), (`b` = 2), NULL) IS NOT NULL))",
             id="when_without_otherwise_inside_drop_nulls",
         ),
@@ -3420,10 +3605,11 @@ def test_is_null_and_is_not_null_unsupported_and_degraded_cases(
 )
 def test_drop_nulls_expression_pushdown(
     expr: pl.Expr,
+    schema: dict[str, Any],
     expected_sql: str,
 ) -> None:
     # Arrange & Act
-    actual_sql = compiler.predicate_to_row_restriction(expr)
+    actual_sql = compiler.predicate_to_row_restriction(expr, schema=schema)
 
     # Assert
     assert actual_sql == expected_sql
@@ -3477,7 +3663,9 @@ def test_drop_nulls_unsupported_and_degraded_cases(
     expected_sql: str,
 ) -> None:
     # Arrange & Act
-    actual_sql = compiler.predicate_to_row_restriction(expr)
+    actual_sql = compiler.predicate_to_row_restriction(
+        expr, schema={"a": pl.Int64, "b": pl.Int64, "c": pl.Int64}
+    )
 
     # Assert
     assert actual_sql == expected_sql
@@ -3623,3 +3811,1169 @@ def test_expr_has_descendant(
 
     # Assert
     assert actual is expected
+
+
+# ---------------------------------------------------------------------------
+# Phase 4: Schema-aware typing, lowering, literal formatters, and bounds tests
+# ---------------------------------------------------------------------------
+
+
+def test_internal_literal_sql_formatters_and_validation() -> None:
+    # BytesLiteral
+    assert compiler.ir_to_sql(compiler.ir.BytesLiteral(b"")) == "b''"
+    assert (
+        compiler.ir_to_sql(compiler.ir.BytesLiteral(b"\x00A\xff"))
+        == "b'\\x00\\x41\\xff'"
+    )
+
+    # TimeLiteral
+    assert compiler.ir_to_sql(compiler.ir.TimeLiteral(0)) == "TIME '00:00:00'"
+    assert (
+        compiler.ir_to_sql(compiler.ir.TimeLiteral(3_723_000_004))
+        == "TIME '01:02:03.000004'"
+    )
+    assert (
+        compiler.ir_to_sql(compiler.ir.TimeLiteral(86_399_999_999))
+        == "TIME '23:59:59.999999'"
+    )
+    for bad_micros in (-1, 86_400_000_000, True, False, 1.5, "0"):
+        with pytest.raises(ValueError, match="Invalid TimeLiteral micros"):
+            compiler.sql.literal_ir_to_sql(
+                compiler.ir.TimeLiteral(bad_micros)  # type: ignore[arg-type]
+            )
+
+    # DecimalLiteral
+    assert compiler.ir_to_sql(compiler.ir.DecimalLiteral("0")) == "NUMERIC '0'"
+    assert compiler.ir_to_sql(compiler.ir.DecimalLiteral("+1")) == "NUMERIC '+1'"
+    assert (
+        compiler.ir_to_sql(compiler.ir.DecimalLiteral("-123.45")) == "NUMERIC '-123.45'"
+    )
+    for bad_dec in ("NaN", "Inf", "1e5", " 0", "0 ", "0\n", ".5", "5.", "", 123):
+        with pytest.raises(ValueError, match="Invalid DecimalLiteral value"):
+            compiler.sql.literal_ir_to_sql(
+                compiler.ir.DecimalLiteral(bad_dec)  # type: ignore[arg-type]
+            )
+
+
+@pytest.mark.parametrize(
+    ("col_dtype", "strategy", "expected_rhs"),
+    [
+        (pl.Boolean(), "zero", "FALSE"),
+        (pl.Boolean(), "one", "TRUE"),
+        (pl.Int64(), "zero", "0"),
+        (pl.Int64(), "one", "1"),
+        (pl.Float64(), "zero", "0.0"),
+        (pl.Float64(), "one", "1.0"),
+        (pl.Decimal(38, 9), "zero", "NUMERIC '0'"),
+        (pl.Decimal(38, 9), "one", "NUMERIC '1'"),
+        (pl.String(), "zero", "''"),
+        (pl.String(), "one", None),
+        (pl.Binary(), "zero", "b''"),
+        (pl.Binary(), "one", None),
+        (pl.Date(), "zero", "DATE(TIMESTAMP_SECONDS(0 * 86400))"),
+        (pl.Date(), "one", "DATE(TIMESTAMP_SECONDS(1 * 86400))"),
+        (pl.Datetime("us"), "zero", "DATETIME(TIMESTAMP_MICROS(0))"),
+        (pl.Datetime("us"), "one", "DATETIME(TIMESTAMP_MICROS(1))"),
+        (pl.Datetime("ms"), "zero", "DATETIME(TIMESTAMP_MICROS(0))"),
+        (pl.Datetime("ms"), "one", "DATETIME(TIMESTAMP_MILLIS(1))"),
+        (pl.Datetime("ns"), "zero", "DATETIME(TIMESTAMP_MICROS(0))"),
+        (pl.Datetime("ns"), "one", None),
+        (pl.Datetime("us", "UTC"), "zero", "TIMESTAMP_MICROS(0)"),
+        (pl.Datetime("us", "UTC"), "one", "TIMESTAMP_MICROS(1)"),
+        (pl.Datetime("ms", "UTC"), "zero", "TIMESTAMP_MICROS(0)"),
+        (pl.Datetime("ms", "UTC"), "one", "TIMESTAMP_MILLIS(1)"),
+        (pl.Datetime("ns", "UTC"), "zero", "TIMESTAMP_MICROS(0)"),
+        (pl.Datetime("ns", "UTC"), "one", None),
+        (pl.Time(), "zero", "TIME '00:00:00'"),
+        (pl.Time(), "one", None),
+        (pl.Extension("google:sqlType:json", pl.String()), "zero", None),
+        (pl.Extension("google:sqlType:json", pl.String()), "one", None),
+        (
+            pl.Extension(
+                "google:sqlType:geography", pl.String(), '{"encoding": "WKT"}'
+            ),
+            "zero",
+            None,
+        ),
+        (
+            pl.Extension(
+                "google:sqlType:geography", pl.String(), '{"encoding": "WKT"}'
+            ),
+            "one",
+            None,
+        ),
+        (pl.List(pl.Int64()), "zero", None),
+        (pl.List(pl.Int64()), "one", None),
+        (pl.Struct({"k": pl.Int64()}), "zero", None),
+        (pl.Struct({"k": pl.Int64()}), "one", None),
+    ],
+)
+def test_fill_null_with_strategy_all_14_bq_types(
+    col_dtype: pl.DataType,
+    strategy: str,
+    expected_rhs: str | None,
+) -> None:
+    # Check inside is_not_null() so every scalar type yields a valid BOOL root.
+    expr = pl.col("c").fill_null(strategy=strategy).is_not_null()  # type: ignore[arg-type]
+    actual = compiler.predicate_to_row_restriction(expr, schema={"c": col_dtype})
+    if expected_rhs is None:
+        assert actual == ""
+    else:
+        assert actual == f"(IFNULL(`c`, {expected_rhs}) IS NOT NULL)"
+
+
+def test_fill_null_with_strategy_time_unit_propagation_and_invalid_strategy() -> None:
+    schema = pl.Schema(
+        {
+            "dt_ms1": pl.Datetime("ms"),
+            "dt_ms2": pl.Datetime("ms"),
+            "dt_us": pl.Datetime("us"),
+            "flag": pl.Boolean(),
+            "a": pl.Int64(),
+        }
+    )
+
+    # Matching ms time units preserve ms -> TIMESTAMP_MILLIS(1)
+    assert (
+        compiler.predicate_to_row_restriction(
+            pl.coalesce("dt_ms1", "dt_ms2").fill_null(strategy="one").is_not_null(),
+            schema=schema,
+        )
+        == "(IFNULL(COALESCE(`dt_ms1`, `dt_ms2`), DATETIME(TIMESTAMP_MILLIS(1))) IS NOT NULL)"
+    )
+    assert (
+        compiler.predicate_to_row_restriction(
+            pl.col("dt_ms1")
+            .fill_null(pl.col("dt_ms2"))
+            .fill_null(strategy="one")
+            .is_not_null(),
+            schema=schema,
+        )
+        == "(IFNULL(IFNULL(`dt_ms1`, `dt_ms2`), DATETIME(TIMESTAMP_MILLIS(1))) IS NOT NULL)"
+    )
+    assert (
+        compiler.predicate_to_row_restriction(
+            pl.when(pl.col("flag"))
+            .then(pl.col("dt_ms1"))
+            .otherwise(pl.col("dt_ms2"))
+            .fill_null(strategy="one")
+            .is_not_null(),
+            schema=schema,
+        )
+        == "(IFNULL(IF(`flag`, `dt_ms1`, `dt_ms2`), DATETIME(TIMESTAMP_MILLIS(1))) IS NOT NULL)"
+    )
+
+    # Mismatched time units drop time_unit to None -> strategy="one" degrades to ""
+    assert (
+        compiler.predicate_to_row_restriction(
+            pl.coalesce("dt_ms1", "dt_us").fill_null(strategy="one").is_not_null(),
+            schema=schema,
+        )
+        == ""
+    )
+    assert (
+        compiler.predicate_to_row_restriction(
+            pl.col("dt_ms1")
+            .fill_null(pl.col("dt_us"))
+            .fill_null(strategy="one")
+            .is_not_null(),
+            schema=schema,
+        )
+        == ""
+    )
+    assert (
+        compiler.predicate_to_row_restriction(
+            pl.when(pl.col("flag"))
+            .then(pl.col("dt_ms1"))
+            .otherwise(pl.col("dt_us"))
+            .fill_null(strategy="one")
+            .is_not_null(),
+            schema=schema,
+        )
+        == ""
+    )
+
+    # Direct IR with invalid strategy degrades cleanly
+    bad_ir = compiler.ir.IsNotNull(
+        expr=compiler.ir.FillNullWithStrategy(
+            expr=compiler.ir.Column("a"),
+            strategy="Invalid",  # type: ignore[arg-type]
+        )
+    )
+    assert isinstance(
+        compiler.resolve_and_lower_types(bad_ir, schema),
+        compiler.ir.Unsupported,
+    )
+
+
+def test_float_predicates_by_type() -> None:
+    schema = pl.Schema(
+        {
+            "f": pl.Float64(),
+            "i": pl.Int64(),
+            "n": pl.Decimal(38, 9),
+            "s": pl.String(),
+            "b": pl.Boolean(),
+            "j": pl.Extension("google:sqlType:json", pl.String()),
+        }
+    )
+
+    # FLOAT64: direct GoogleSQL predicates
+    assert (
+        compiler.predicate_to_row_restriction(pl.col("f").is_nan(), schema=schema)
+        == "IS_NAN(`f`)"
+    )
+    assert (
+        compiler.predicate_to_row_restriction(pl.col("f").is_not_nan(), schema=schema)
+        == "(NOT IS_NAN(`f`))"
+    )
+    assert (
+        compiler.predicate_to_row_restriction(pl.col("f").is_infinite(), schema=schema)
+        == "IS_INF(`f`)"
+    )
+    assert (
+        compiler.predicate_to_row_restriction(pl.col("f").is_finite(), schema=schema)
+        == "(NOT IS_INF(`f`) AND NOT IS_NAN(`f`))"
+    )
+
+    # INT64: null-safe 3-valued rewrites
+    assert (
+        compiler.predicate_to_row_restriction(pl.col("i").is_nan(), schema=schema)
+        == "FALSE"
+    )
+    assert (
+        compiler.predicate_to_row_restriction(pl.col("i").is_infinite(), schema=schema)
+        == "FALSE"
+    )
+    assert (
+        compiler.predicate_to_row_restriction(pl.col("i").is_not_nan(), schema=schema)
+        == "(`i` IS NOT NULL)"
+    )
+    assert (
+        compiler.predicate_to_row_restriction(pl.col("i").is_finite(), schema=schema)
+        == "(`i` IS NOT NULL)"
+    )
+    assert (
+        compiler.predicate_to_row_restriction(~pl.col("i").is_nan(), schema=schema)
+        == "(NOT IF((`i` IS NOT NULL), FALSE, NULL))"
+    )
+    assert (
+        compiler.predicate_to_row_restriction(
+            pl.col("i").is_nan().is_null(), schema=schema
+        )
+        == "(IF((`i` IS NOT NULL), FALSE, NULL) IS NULL)"
+    )
+    assert (
+        compiler.predicate_to_row_restriction(
+            pl.col("i").is_nan().fill_null(True), schema=schema
+        )
+        == "IFNULL(IF((`i` IS NOT NULL), FALSE, NULL), TRUE)"
+    )
+    assert (
+        compiler.predicate_to_row_restriction(
+            pl.col("i").is_finite() == True, schema=schema
+        )
+        == "(IF((`i` IS NOT NULL), TRUE, NULL) = TRUE)"
+    )
+
+    # NUMERIC, STRING, BOOL, JSON, Unsupported: degrade to ""
+    for col in ("n", "s", "b", "j"):
+        assert (
+            compiler.predicate_to_row_restriction(pl.col(col).is_nan(), schema=schema)
+            == ""
+        )
+        assert (
+            compiler.predicate_to_row_restriction(
+                pl.col(col).is_not_nan(), schema=schema
+            )
+            == ""
+        )
+        assert (
+            compiler.predicate_to_row_restriction(
+                pl.col(col).is_infinite(), schema=schema
+            )
+            == ""
+        )
+        assert (
+            compiler.predicate_to_row_restriction(
+                pl.col(col).is_finite(), schema=schema
+            )
+            == ""
+        )
+    assert (
+        compiler.predicate_to_row_restriction(
+            unsupported(pl.col("f")).is_nan(), schema=schema
+        )
+        == ""
+    )
+
+
+def test_integer_bitwise_non_bool_root_and_list_literal_isolation() -> None:
+    schema = pl.Schema(
+        {
+            "i": pl.Int64(),
+            "ok": pl.Int64(),
+            "flag": pl.Boolean(),
+            "s": pl.String(),
+            "j": pl.Extension("google:sqlType:json", pl.String()),
+        }
+    )
+
+    # Integer bitwise &, |, ~ are rejected; sibling & preserves partial pushdown
+    assert (
+        compiler.predicate_to_row_restriction((pl.col("i") & 4) == 4, schema=schema)
+        == ""
+    )
+    assert (
+        compiler.predicate_to_row_restriction((pl.col("i") | 4) == 4, schema=schema)
+        == ""
+    )
+    assert (
+        compiler.predicate_to_row_restriction((~pl.col("i")) == 0, schema=schema) == ""
+    )
+    assert (
+        compiler.predicate_to_row_restriction(
+            ((pl.col("i") & 4) == 4) & (pl.col("ok") == 1), schema=schema
+        )
+        == "(`ok` = 1)"
+    )
+
+    # Non-BOOL root expressions degrade to ""
+    assert compiler.predicate_to_row_restriction(pl.col("i"), schema=schema) == ""
+    assert compiler.predicate_to_row_restriction(pl.col("s"), schema=schema) == ""
+    assert compiler.predicate_to_row_restriction(pl.col("j"), schema=schema) == ""
+    assert compiler.predicate_to_row_restriction(pl.lit(1), schema=schema) == ""
+    assert (
+        compiler.predicate_to_row_restriction(pl.lit([True, False]), schema=schema)
+        == ""
+    )
+
+    # ListLiteral isolation across logical, null, comparison, ternary, root
+    bool_list = compiler.ir.ListLiteral((compiler.ir.BoolLiteral(True),))
+    int_list = compiler.ir.ListLiteral((compiler.ir.IntLiteral(1),))
+    for bad_ir in (
+        bool_list,
+        compiler.ir.And(bool_list, compiler.ir.BoolLiteral(True)),
+        compiler.ir.Or(compiler.ir.BoolLiteral(False), bool_list),
+        compiler.ir.Not(bool_list),
+        compiler.ir.IsNull(int_list),
+        compiler.ir.IsNotNull(int_list),
+        compiler.ir.DropNulls(int_list),
+        compiler.ir.Eq(int_list, int_list),
+        compiler.ir.FillNull(int_list, compiler.ir.IntLiteral(1)),
+        compiler.ir.Coalesce((int_list,)),
+        compiler.ir.Ternary(
+            bool_list, compiler.ir.BoolLiteral(True), compiler.ir.BoolLiteral(False)
+        ),
+        compiler.ir.Ternary(
+            compiler.ir.Column("flag"), bool_list, compiler.ir.BoolLiteral(False)
+        ),
+    ):
+        resolved = compiler.resolve_and_lower_types(bad_ir, schema)
+        assert isinstance(resolved, compiler.ir.Unsupported), (
+            f"Expected Unsupported for {bad_ir!r}"
+        )
+
+
+def test_opaque_types_allowlist_and_mode_b_bq_types_override() -> None:
+    from polars_bigquery.core.types import BQType
+
+    schema = pl.Schema(
+        {
+            "j": pl.Extension("google:sqlType:json", pl.String()),
+            "g": pl.Extension(
+                "google:sqlType:geography", pl.String(), '{"encoding": "WKT"}'
+            ),
+            "arr": pl.List(pl.Int64()),
+            "st": pl.Struct({"k": pl.Int64()}),
+            "j_storage": pl.String(),
+            "ok": pl.Int64(),
+        }
+    )
+
+    # All 4 OPAQUE types allow is_null, is_not_null, and drop_nulls
+    for col in ("j", "g", "arr", "st"):
+        assert (
+            compiler.predicate_to_row_restriction(pl.col(col).is_null(), schema=schema)
+            == f"(`{col}` IS NULL)"
+        )
+        assert (
+            compiler.predicate_to_row_restriction(
+                pl.col(col).is_not_null(), schema=schema
+            )
+            == f"(`{col}` IS NOT NULL)"
+        )
+        # Valid drop_nulls on an opaque column hoists IS NOT NULL even when outer op degrades
+        assert (
+            compiler.predicate_to_row_restriction(
+                pl.col(col).drop_nulls() == pl.col(col), schema=schema
+            )
+            == f"(`{col}` IS NOT NULL)"
+        )
+        # Disallowed ops degrade
+        assert (
+            compiler.predicate_to_row_restriction(
+                pl.col(col) == pl.col(col), schema=schema
+            )
+            == ""
+        )
+        assert (
+            compiler.predicate_to_row_restriction(
+                pl.coalesce(pl.col(col)).is_not_null(), schema=schema
+            )
+            == ""
+        )
+        assert (
+            compiler.predicate_to_row_restriction(
+                pl.col(col).fill_null(pl.col(col)).is_not_null(), schema=schema
+            )
+            == ""
+        )
+        assert (
+            compiler.predicate_to_row_restriction(
+                pl.when(pl.col("ok") == 1)
+                .then(pl.col(col))
+                .otherwise(pl.col(col))
+                .is_not_null(),
+                schema=schema,
+            )
+            == ""
+        )
+        assert (
+            compiler.predicate_to_row_restriction(
+                pl.col(col).is_in(["a"]), schema=schema
+            )
+            == ""
+        )
+
+    # Mode B override: j_storage is pl.String in schema, but BQType.JSON in bq_types
+    bq_types = {"j_storage": BQType.JSON}
+    assert (
+        compiler.predicate_to_row_restriction(
+            pl.col("j_storage").is_not_null(), schema=schema, bq_types=bq_types
+        )
+        == "(`j_storage` IS NOT NULL)"
+    )
+    assert (
+        compiler.predicate_to_row_restriction(
+            pl.col("j_storage") == "{}", schema=schema, bq_types=bq_types
+        )
+        == ""
+    )
+    assert (
+        compiler.predicate_to_row_restriction(
+            pl.col("j_storage").str.starts_with("{"), schema=schema, bq_types=bq_types
+        )
+        == ""
+    )
+    # Column present only in bq_types (not in schema) still resolves
+    assert (
+        compiler.predicate_to_row_restriction(
+            pl.col("extra_int") == 1,
+            schema={},
+            bq_types={"extra_int": BQType.INT64},
+        )
+        == "(`extra_int` = 1)"
+    )
+    # Missing column and unsupported Polars dtype degrade cleanly
+    assert (
+        compiler.predicate_to_row_restriction(
+            pl.col("missing") == 1, schema={"ok": pl.Int64}
+        )
+        == ""
+    )
+    assert (
+        compiler.predicate_to_row_restriction(
+            pl.col("dur").is_not_null(), schema={"dur": pl.Duration("us")}
+        )
+        == ""
+    )
+
+
+def test_strict_string_operators_and_cross_type_matrix() -> None:
+    from datetime import date, datetime, timezone
+
+    schema = pl.Schema(
+        {
+            "b": pl.Boolean(),
+            "i": pl.Int64(),
+            "f": pl.Float64(),
+            "n": pl.Decimal(38, 9),
+            "s": pl.String(),
+            "bin": pl.Binary(),
+            "d": pl.Date(),
+            "dt": pl.Datetime("us"),
+            "ts": pl.Datetime("us", "UTC"),
+            "t": pl.Time(),
+        }
+    )
+
+    # Strict STRING operators reject non-STRING operands
+    for col in ("i", "bin", "b"):
+        assert (
+            compiler.predicate_to_row_restriction(
+                pl.col(col).str.to_uppercase() == "A", schema=schema
+            )
+            == ""
+        )
+        assert (
+            compiler.predicate_to_row_restriction(
+                pl.col(col).str.to_lowercase() == "a", schema=schema
+            )
+            == ""
+        )
+        assert (
+            compiler.predicate_to_row_restriction(
+                pl.col(col).str.starts_with("a"), schema=schema
+            )
+            == ""
+        )
+        assert (
+            compiler.predicate_to_row_restriction(
+                pl.col(col).str.ends_with("a"), schema=schema
+            )
+            == ""
+        )
+        assert (
+            compiler.predicate_to_row_restriction(
+                pl.col(col).str.contains("a", literal=True), schema=schema
+            )
+            == ""
+        )
+    assert (
+        compiler.predicate_to_row_restriction(
+            pl.col("s").str.starts_with(pl.col("i")), schema=schema
+        )
+        == ""
+    )
+
+    # Allowed cross-type pairs: INT64 vs FLOAT64 (Case 0/C) and INT64 vs NUMERIC
+    assert (
+        compiler.predicate_to_row_restriction(pl.col("i") == 1.5, schema=schema)
+        == "(`i` = 1.5)"
+    )
+    assert (
+        compiler.predicate_to_row_restriction(pl.col("n") == 1, schema=schema)
+        == "(`n` = 1)"
+    )
+    assert (
+        compiler.predicate_to_row_restriction(pl.col("n") == pl.col("i"), schema=schema)
+        == "(`n` = `i`)"
+    )
+    assert (
+        compiler.predicate_to_row_restriction(
+            pl.col("n").fill_null(pl.col("i")) == 1, schema=schema
+        )
+        == "(IFNULL(`n`, `i`) = 1)"
+    )
+    assert (
+        compiler.predicate_to_row_restriction(pl.coalesce("i", "n") == 1, schema=schema)
+        == "(COALESCE(`i`, `n`) = 1)"
+    )
+
+    # Disallowed cross-type pairs: NUMERIC vs FLOAT64, cross-temporal, BYTES vs STRING, BOOL vs INT64
+    for expr in (
+        pl.col("n") == 1.5,
+        pl.col("n") == pl.col("f"),
+        pl.col("f") == pl.col("n"),
+        pl.col("n").fill_null(pl.col("f")) == 1,
+        pl.coalesce("i", "n", "f") == 1,
+        pl.when(pl.col("b")).then(pl.col("n")).otherwise(pl.col("f")) == 1,
+        pl.col("d") == datetime(2024, 1, 1, tzinfo=timezone.utc),
+        pl.col("d") == datetime(2024, 1, 1),  # noqa: DTZ001
+        pl.col("dt") == datetime(2024, 1, 1, tzinfo=timezone.utc),
+        pl.col("ts") == datetime(2024, 1, 1),  # noqa: DTZ001
+        pl.col("ts") == date(2024, 1, 1),
+        pl.col("t") == pl.col("ts"),
+        pl.col("bin") == "abc",
+        pl.col("b") == 1,
+        # Strict IsIn same-type match
+        pl.col("f").is_in([1, 2]),
+        pl.col("i").is_in(["a", "b"]),
+        pl.col("dt").is_in([datetime(2024, 1, 1, tzinfo=timezone.utc)]),
+        pl.col("ts").is_in([datetime(2024, 1, 1)]),  # noqa: DTZ001
+    ):
+        assert compiler.predicate_to_row_restriction(expr, schema=schema) == ""
+
+
+def test_direct_ir_typing_edge_cases_when_isin_drop_nulls_and_unknown_node() -> None:
+    import dataclasses
+
+    @dataclasses.dataclass(frozen=True)
+    class _UnknownExpr(compiler.ir.Expr):
+        child: compiler.ir.Expr
+
+        def children(self) -> tuple[compiler.ir.Expr, ...]:
+            return (self.child,)
+
+    schema = pl.Schema(
+        {
+            "a": pl.Int64(),
+            "b": pl.Int64(),
+            "s": pl.String(),
+            "flag": pl.Boolean(),
+            "n": pl.Decimal(38, 9),
+            "bin": pl.Binary(),
+            "t": pl.Time(),
+            "dt": pl.Datetime("us"),
+            "ts": pl.Datetime("us", "UTC"),
+        }
+    )
+
+    # Unknown IR node fails closed while preserving valid DropNulls descendant
+    unknown_plain = _UnknownExpr(child=compiler.ir.Column("a"))
+    assert (
+        compiler.resolve_and_lower_types(unknown_plain, schema)
+        == compiler.ir.Unsupported()
+    )
+    unknown_with_dn = _UnknownExpr(child=compiler.ir.DropNulls(compiler.ir.Column("a")))
+    assert compiler.resolve_and_lower_types(
+        unknown_with_dn, schema
+    ) == compiler.ir.Unsupported(
+        operands=(compiler.ir.DropNulls(compiler.ir.Column("a")),)
+    )
+
+    # Invalid DropNulls (e.g., DropNulls(Uppercase(int_col))) degrades to bare Unsupported()
+    bad_dn = compiler.ir.DropNulls(compiler.ir.Uppercase(compiler.ir.Column("a")))
+    assert compiler.resolve_and_lower_types(bad_dn, schema) == compiler.ir.Unsupported()
+
+    # Pre-existing parser Unsupported(operands=...) preserves only valid DropNulls children
+    pre_unsup = compiler.ir.Unsupported(
+        operands=(
+            compiler.ir.DropNulls(compiler.ir.Column("a")),
+            compiler.ir.Column("b"),
+        )
+    )
+    assert compiler.resolve_and_lower_types(
+        pre_unsup, schema
+    ) == compiler.ir.Unsupported(
+        operands=(compiler.ir.DropNulls(compiler.ir.Column("a")),)
+    )
+
+    # Direct scalar literals inside IsIn (Bytes, Time, Decimal, Date, Datetime, Timestamp)
+    for col, lit in (
+        ("n", compiler.ir.DecimalLiteral("1.5")),
+        ("bin", compiler.ir.BytesLiteral(b"hi")),
+        ("t", compiler.ir.TimeLiteral(0)),
+        (
+            "dt",
+            compiler.ir.TimestampLiteral(
+                0, compiler.ir.TimestampUnit.MICROSECONDS, tz=None
+            ),
+        ),
+        (
+            "ts",
+            compiler.ir.TimestampLiteral(
+                0, compiler.ir.TimestampUnit.MILLISECONDS, tz="UTC"
+            ),
+        ),
+    ):
+        isin = compiler.ir.IsIn(
+            left=compiler.ir.Column(col),
+            right=compiler.ir.ListLiteral((lit,)),
+        )
+        assert compiler.resolve_and_lower_types(isin, schema) == isin
+
+    # Direct ListLiteral validation in IsIn: empty, null element, heterogeneous, NaN, nested list
+    for bad_list in (
+        compiler.ir.ListLiteral(()),
+        compiler.ir.ListLiteral((compiler.ir.NullLiteral(),)),
+        compiler.ir.ListLiteral(
+            (compiler.ir.IntLiteral(1), compiler.ir.StringLiteral("x"))
+        ),
+        compiler.ir.ListLiteral((compiler.ir.FloatLiteral(float("nan")),)),
+        compiler.ir.ListLiteral(
+            (compiler.ir.ListLiteral((compiler.ir.IntLiteral(1),)),)
+        ),
+    ):
+        bad_isin = compiler.ir.IsIn(left=compiler.ir.Column("a"), right=bad_list)
+        assert isinstance(
+            compiler.resolve_and_lower_types(bad_isin, schema),
+            compiler.ir.Unsupported,
+        )
+
+    # Direct Coalesce with empty operands degrades
+    assert isinstance(
+        compiler.resolve_and_lower_types(compiler.ir.Coalesce(()), schema),
+        compiler.ir.Unsupported,
+    )
+
+    # Direct Ternary/When edge cases:
+    # 1. Valid multi-branch When
+    valid_when = compiler.ir.When(
+        operands=(
+            compiler.ir.Column("flag"),
+            compiler.ir.BoolLiteral(True),
+            compiler.ir.Not(compiler.ir.Column("flag")),
+            compiler.ir.BoolLiteral(False),
+            compiler.ir.NullLiteral(),
+        )
+    )
+    assert compiler.resolve_and_lower_types(valid_when, schema) == valid_when
+    # 2. Invalid When arity (even or < 3)
+    assert isinstance(
+        compiler.resolve_and_lower_types(
+            compiler.ir.When(
+                operands=(compiler.ir.Column("flag"), compiler.ir.BoolLiteral(True))
+            ),
+            schema,
+        ),
+        compiler.ir.Unsupported,
+    )
+    assert isinstance(
+        compiler.resolve_and_lower_types(
+            compiler.ir.When(
+                operands=(
+                    compiler.ir.Column("flag"),
+                    compiler.ir.BoolLiteral(True),
+                    compiler.ir.Column("flag"),
+                    compiler.ir.BoolLiteral(False),
+                )
+            ),
+            schema,
+        ),
+        compiler.ir.Unsupported,
+    )
+    # 3. Non-BOOL / NULL predicate on Ternary
+    for bad_pred in (compiler.ir.NullLiteral(), compiler.ir.Column("a")):
+        bad_t = compiler.ir.Ternary(
+            predicate=bad_pred,
+            truthy=compiler.ir.BoolLiteral(True),
+            falsy=compiler.ir.BoolLiteral(False),
+        )
+        assert isinstance(
+            compiler.resolve_and_lower_types(bad_t, schema),
+            compiler.ir.Unsupported,
+        )
+    # 4. Ternary with Unsupported value branch + BOOL/Null sibling preserved for partial pushdown
+    partial_bool_t = compiler.ir.Ternary(
+        predicate=compiler.ir.Column("flag"),
+        truthy=compiler.ir.Unsupported(),
+        falsy=compiler.ir.NullLiteral(),
+    )
+    assert compiler.resolve_and_lower_types(partial_bool_t, schema) == partial_bool_t
+    # 5. Ternary with Unsupported value branch + non-BOOL sibling degrades
+    partial_int_t = compiler.ir.Ternary(
+        predicate=compiler.ir.Column("flag"),
+        truthy=compiler.ir.Unsupported(),
+        falsy=compiler.ir.IntLiteral(1),
+    )
+    assert isinstance(
+        compiler.resolve_and_lower_types(partial_int_t, schema),
+        compiler.ir.Unsupported,
+    )
+    # 6. Chained Ternary with trailing None branch compiles cleanly
+    assert (
+        compiler.predicate_to_row_restriction(
+            pl.when(pl.col("a") == 1).then(10).when(pl.col("b") == 2).then(None) == 10,
+            schema=schema,
+        )
+        == "(CASE WHEN (`a` = 1) THEN 10 WHEN (`b` = 2) THEN NULL END = 10)"
+    )
+
+
+def test_float64_nan_comparison_cases_0_and_a_through_d() -> None:
+    schema = pl.Schema({"f1": pl.Float64(), "f2": pl.Float64(), "i": pl.Int64()})
+
+    # Case 0: both sides known non-NaN (INT64 vs finite FloatLiteral) -> unchanged
+    assert (
+        compiler.predicate_to_row_restriction(pl.col("i") > 5.0, schema=schema)
+        == "(`i` > 5.0)"
+    )
+
+    # Case A: FloatLiteral(NaN) on right and symmetric on left, across all 6 ops
+    # (constructed directly on IR because Polars JSON serializes NaN as Float: null)
+    nan_lit = compiler.ir.FloatLiteral(float("nan"))
+    f1 = compiler.ir.Column("f1")
+    i_col = compiler.ir.Column("i")
+
+    def compile_ir(ir_node: compiler.ir.Expr) -> str | None:
+        lowered = compiler.resolve_and_lower_types(ir_node, schema)
+        rewritten = compiler.rewrite_ir(lowered)
+        return compiler.ir_to_sql(rewritten)
+
+    # f1 op NaN (f1 can be NaN)
+    assert compile_ir(compiler.ir.Eq(f1, nan_lit)) == "IS_NAN(`f1`)"
+    assert compile_ir(compiler.ir.GtEq(f1, nan_lit)) == "IS_NAN(`f1`)"
+    assert compile_ir(compiler.ir.NotEq(f1, nan_lit)) == "(NOT IS_NAN(`f1`))"
+    assert compile_ir(compiler.ir.Lt(f1, nan_lit)) == "(NOT IS_NAN(`f1`))"
+    assert compile_ir(compiler.ir.LtEq(f1, nan_lit)) == "(`f1` IS NOT NULL)"
+    assert compile_ir(compiler.ir.Gt(f1, nan_lit)) == "FALSE"
+    # Negated LtEq / Gt verifies 3-valued Ternary preservation (NULL stays NULL)
+    assert (
+        compile_ir(compiler.ir.Not(compiler.ir.LtEq(f1, nan_lit)))
+        == "(NOT IF((`f1` IS NOT NULL), TRUE, NULL))"
+    )
+    assert (
+        compile_ir(compiler.ir.Not(compiler.ir.Gt(f1, nan_lit)))
+        == "(NOT IF((`f1` IS NOT NULL), FALSE, NULL))"
+    )
+
+    # Symmetric NaN op f1
+    assert compile_ir(compiler.ir.Eq(nan_lit, f1)) == "IS_NAN(`f1`)"
+    assert compile_ir(compiler.ir.LtEq(nan_lit, f1)) == "IS_NAN(`f1`)"
+    assert compile_ir(compiler.ir.NotEq(nan_lit, f1)) == "(NOT IS_NAN(`f1`))"
+    assert compile_ir(compiler.ir.Gt(nan_lit, f1)) == "(NOT IS_NAN(`f1`))"
+    assert compile_ir(compiler.ir.GtEq(nan_lit, f1)) == "(`f1` IS NOT NULL)"
+    assert compile_ir(compiler.ir.Lt(nan_lit, f1)) == "FALSE"
+
+    # i op NaN (i is known non-NaN INT64 -> never emits IS_NAN(i))
+    assert compile_ir(compiler.ir.Eq(i_col, nan_lit)) == "FALSE"
+    assert compile_ir(compiler.ir.GtEq(i_col, nan_lit)) == "FALSE"
+    assert compile_ir(compiler.ir.NotEq(i_col, nan_lit)) == "(`i` IS NOT NULL)"
+    assert compile_ir(compiler.ir.Lt(i_col, nan_lit)) == "(`i` IS NOT NULL)"
+    assert compile_ir(compiler.ir.LtEq(i_col, nan_lit)) == "(`i` IS NOT NULL)"
+    assert compile_ir(compiler.ir.Gt(i_col, nan_lit)) == "FALSE"
+    assert (
+        compile_ir(compiler.ir.Not(compiler.ir.Eq(i_col, nan_lit)))
+        == "(NOT IF((`i` IS NOT NULL), FALSE, NULL))"
+    )
+    assert (
+        compile_ir(compiler.ir.Not(compiler.ir.NotEq(i_col, nan_lit)))
+        == "(NOT IF((`i` IS NOT NULL), TRUE, NULL))"
+    )
+
+    # Case B: f1 op 5.0 and symmetric 5.0 op f1
+    assert (
+        compiler.predicate_to_row_restriction(pl.col("f1") == 5.0, schema=schema)
+        == "(`f1` = 5.0)"
+    )
+    assert (
+        compiler.predicate_to_row_restriction(pl.col("f1") != 5.0, schema=schema)
+        == "(`f1` != 5.0)"
+    )
+    assert (
+        compiler.predicate_to_row_restriction(pl.col("f1") < 5.0, schema=schema)
+        == "(`f1` < 5.0)"
+    )
+    assert (
+        compiler.predicate_to_row_restriction(pl.col("f1") <= 5.0, schema=schema)
+        == "(`f1` <= 5.0)"
+    )
+    assert (
+        compiler.predicate_to_row_restriction(pl.col("f1") > 5.0, schema=schema)
+        == "((`f1` > 5.0) OR IS_NAN(`f1`))"
+    )
+    assert (
+        compiler.predicate_to_row_restriction(pl.col("f1") >= 5.0, schema=schema)
+        == "((`f1` >= 5.0) OR IS_NAN(`f1`))"
+    )
+    # Symmetric 5.0 op f1
+    assert (
+        compiler.predicate_to_row_restriction(
+            pl.lit(5.0) == pl.col("f1"), schema=schema
+        )
+        == "(5.0 = `f1`)"
+    )
+    assert (
+        compiler.predicate_to_row_restriction(
+            pl.lit(5.0) != pl.col("f1"), schema=schema
+        )
+        == "(5.0 != `f1`)"
+    )
+    assert (
+        compiler.predicate_to_row_restriction(pl.lit(5.0) > pl.col("f1"), schema=schema)
+        == "(5.0 > `f1`)"
+    )
+    assert (
+        compiler.predicate_to_row_restriction(
+            pl.lit(5.0) >= pl.col("f1"), schema=schema
+        )
+        == "(5.0 >= `f1`)"
+    )
+    assert (
+        compiler.predicate_to_row_restriction(pl.lit(5.0) < pl.col("f1"), schema=schema)
+        == "((5.0 < `f1`) OR IS_NAN(`f1`))"
+    )
+    assert (
+        compiler.predicate_to_row_restriction(
+            pl.lit(5.0) <= pl.col("f1"), schema=schema
+        )
+        == "((5.0 <= `f1`) OR IS_NAN(`f1`))"
+    )
+    # Compound non-NaN non-null RHS (i.fill_null(0)) takes Case B rather than Case C
+    assert (
+        compiler.predicate_to_row_restriction(
+            pl.col("f1") > pl.col("i").fill_null(0), schema=schema
+        )
+        == "((`f1` > IFNULL(`i`, 0)) OR IS_NAN(`f1`))"
+    )
+
+    # Case C: f1 op i (nullable INT64) and symmetric i op f1
+    assert (
+        compiler.predicate_to_row_restriction(
+            pl.col("f1") == pl.col("i"), schema=schema
+        )
+        == "(`f1` = `i`)"
+    )
+    assert (
+        compiler.predicate_to_row_restriction(
+            pl.col("f1") != pl.col("i"), schema=schema
+        )
+        == "(`f1` != `i`)"
+    )
+    assert (
+        compiler.predicate_to_row_restriction(pl.col("f1") < pl.col("i"), schema=schema)
+        == "(`f1` < `i`)"
+    )
+    assert (
+        compiler.predicate_to_row_restriction(
+            pl.col("f1") <= pl.col("i"), schema=schema
+        )
+        == "(`f1` <= `i`)"
+    )
+    assert (
+        compiler.predicate_to_row_restriction(pl.col("f1") > pl.col("i"), schema=schema)
+        == "((`f1` > `i`) OR (IS_NAN(`f1`) AND (`i` IS NOT NULL)))"
+    )
+    assert (
+        compiler.predicate_to_row_restriction(
+            pl.col("f1") >= pl.col("i"), schema=schema
+        )
+        == "((`f1` >= `i`) OR (IS_NAN(`f1`) AND (`i` IS NOT NULL)))"
+    )
+    # Symmetric i op f1
+    assert (
+        compiler.predicate_to_row_restriction(pl.col("i") > pl.col("f1"), schema=schema)
+        == "(`i` > `f1`)"
+    )
+    assert (
+        compiler.predicate_to_row_restriction(
+            pl.col("i") >= pl.col("f1"), schema=schema
+        )
+        == "(`i` >= `f1`)"
+    )
+    assert (
+        compiler.predicate_to_row_restriction(pl.col("i") < pl.col("f1"), schema=schema)
+        == "((`i` < `f1`) OR ((`i` IS NOT NULL) AND IS_NAN(`f1`)))"
+    )
+    assert (
+        compiler.predicate_to_row_restriction(
+            pl.col("i") <= pl.col("f1"), schema=schema
+        )
+        == "((`i` <= `f1`) OR ((`i` IS NOT NULL) AND IS_NAN(`f1`)))"
+    )
+
+    # Case D: f1 op f2 (both can be NaN) across all 6 operators
+    assert (
+        compiler.predicate_to_row_restriction(
+            pl.col("f1") == pl.col("f2"), schema=schema
+        )
+        == "((`f1` = `f2`) OR (IS_NAN(`f1`) AND IS_NAN(`f2`)))"
+    )
+    assert (
+        compiler.predicate_to_row_restriction(
+            pl.col("f1") != pl.col("f2"), schema=schema
+        )
+        == "((`f1` != `f2`) AND (NOT (IS_NAN(`f1`) AND IS_NAN(`f2`))))"
+    )
+    assert (
+        compiler.predicate_to_row_restriction(
+            pl.col("f1") > pl.col("f2"), schema=schema
+        )
+        == "((`f1` > `f2`) OR (IS_NAN(`f1`) AND (NOT IS_NAN(`f2`))))"
+    )
+    assert (
+        compiler.predicate_to_row_restriction(
+            pl.col("f1") >= pl.col("f2"), schema=schema
+        )
+        == "((`f1` >= `f2`) OR (IS_NAN(`f1`) AND (`f2` IS NOT NULL)))"
+    )
+    assert (
+        compiler.predicate_to_row_restriction(
+            pl.col("f1") < pl.col("f2"), schema=schema
+        )
+        == "((`f1` < `f2`) OR ((NOT IS_NAN(`f1`)) AND IS_NAN(`f2`)))"
+    )
+    assert (
+        compiler.predicate_to_row_restriction(
+            pl.col("f1") <= pl.col("f2"), schema=schema
+        )
+        == "((`f1` <= `f2`) OR ((`f1` IS NOT NULL) AND IS_NAN(`f2`)))"
+    )
+
+
+def test_float64_case_d_truth_table_matches_polars_all_9_states() -> None:
+    """Verify Case D SQL 3-valued logic matches Polars across all 9 {finite, NaN, NULL} pairs."""
+    import math
+
+    def eval_sql_3vl(
+        ir_node: compiler.ir.Expr, env: dict[str, float | None]
+    ) -> bool | None:
+        if isinstance(ir_node, compiler.ir.Column):
+            return env[ir_node.name]  # type: ignore[return-value]
+        if isinstance(ir_node, compiler.ir.IsNan):
+            v = env[ir_node.expr.name]  # type: ignore[attr-defined]
+            return None if v is None else math.isnan(v)
+        if isinstance(ir_node, compiler.ir.IsNotNull):
+            v = env[ir_node.expr.name]  # type: ignore[attr-defined]
+            return v is not None
+        if isinstance(ir_node, compiler.ir.Not):
+            inner = eval_sql_3vl(ir_node.expr, env)
+            return None if inner is None else (not inner)
+        if isinstance(ir_node, compiler.ir.And):
+            l, r = eval_sql_3vl(ir_node.left, env), eval_sql_3vl(ir_node.right, env)
+            if l is False or r is False:
+                return False
+            if l is True and r is True:
+                return True
+            return None
+        if isinstance(ir_node, compiler.ir.Or):
+            l, r = eval_sql_3vl(ir_node.left, env), eval_sql_3vl(ir_node.right, env)
+            if l is True or r is True:
+                return True
+            if l is False and r is False:
+                return False
+            return None
+        # IEEE-754 + SQL 3VL comparison
+        lv = env[ir_node.left.name]  # type: ignore[attr-defined]
+        rv = env[ir_node.right.name]  # type: ignore[attr-defined]
+        if lv is None or rv is None:
+            return None
+        if isinstance(ir_node, compiler.ir.Eq):
+            return lv == rv
+        if isinstance(ir_node, compiler.ir.NotEq):
+            return lv != rv
+        if isinstance(ir_node, compiler.ir.Gt):
+            return lv > rv
+        if isinstance(ir_node, compiler.ir.GtEq):
+            return lv >= rv
+        if isinstance(ir_node, compiler.ir.Lt):
+            return lv < rv
+        if isinstance(ir_node, compiler.ir.LtEq):
+            return lv <= rv
+        raise AssertionError(f"Unexpected node: {ir_node!r}")
+
+    vals = [1.0, 2.0, float("nan"), None]
+    rows_a = [a for a in vals for _ in vals]
+    rows_b = [b for _ in vals for b in vals]
+    df = pl.DataFrame(
+        {
+            "a": pl.Series(rows_a, dtype=pl.Float64),
+            "b": pl.Series(rows_b, dtype=pl.Float64),
+        }
+    )
+    schema = df.schema
+
+    ops = [
+        (
+            pl.col("a") == pl.col("b"),
+            compiler.ir.Eq(compiler.ir.Column("a"), compiler.ir.Column("b")),
+        ),
+        (
+            pl.col("a") != pl.col("b"),
+            compiler.ir.NotEq(compiler.ir.Column("a"), compiler.ir.Column("b")),
+        ),
+        (
+            pl.col("a") > pl.col("b"),
+            compiler.ir.Gt(compiler.ir.Column("a"), compiler.ir.Column("b")),
+        ),
+        (
+            pl.col("a") >= pl.col("b"),
+            compiler.ir.GtEq(compiler.ir.Column("a"), compiler.ir.Column("b")),
+        ),
+        (
+            pl.col("a") < pl.col("b"),
+            compiler.ir.Lt(compiler.ir.Column("a"), compiler.ir.Column("b")),
+        ),
+        (
+            pl.col("a") <= pl.col("b"),
+            compiler.ir.LtEq(compiler.ir.Column("a"), compiler.ir.Column("b")),
+        ),
+    ]
+    for pl_expr, ir_cmp in ops:
+        lowered = compiler.resolve_and_lower_types(ir_cmp, schema)
+        expected = df.select(pl_expr.alias("res"))["res"].to_list()
+        actual = [
+            eval_sql_3vl(lowered, {"a": a, "b": b})
+            for a, b in zip(rows_a, rows_b, strict=True)
+        ]
+        assert actual == expected, f"Mismatch for {ir_cmp!r}: {actual} != {expected}"
+
+
+def test_duplication_list_fanout_budget_deep_ast_and_1mb_guard(monkeypatch) -> None:
+    schema = pl.Schema(
+        {"id": pl.Int64(), "f1": pl.Float64(), "f2": pl.Float64(), "s": pl.String()}
+    )
+
+    # 1. ListLiteral fanout weight (1 + 70 = 71 > MAX_DUPLICATED_OPERAND_NODES=64) blocks duplication
+    heavy_float_expr = (
+        pl.when(pl.col("id").is_in(list(range(70)))).then(pl.col("f1")).otherwise(0.0)
+    )
+    # Case B (> 5.0 duplicates heavy_float_expr -> degrades)
+    assert (
+        compiler.predicate_to_row_restriction(heavy_float_expr > 5.0, schema=schema)
+        == ""
+    )
+    # Case C (> id duplicates heavy_float_expr -> degrades)
+    assert (
+        compiler.predicate_to_row_restriction(
+            heavy_float_expr > pl.col("id"), schema=schema
+        )
+        == ""
+    )
+    # Case D (> f2 duplicates heavy_float_expr -> degrades)
+    assert (
+        compiler.predicate_to_row_restriction(
+            heavy_float_expr > pl.col("f2"), schema=schema
+        )
+        == ""
+    )
+
+    # 2. Remaining AST budget exhaustion blocks expanding rewrites cleanly
+    monkeypatch.setattr(compiler.typing, "MAX_AST_NODES", 2)
+    # INT64 is_nan needs extra_weight=3 -> degrades when budget=0
+    assert (
+        compiler.predicate_to_row_restriction(pl.col("id").is_nan(), schema=schema)
+        == ""
+    )
+    # FillNullWithStrategy needs extra_weight=1 -> degrades when budget=0
+    assert (
+        compiler.predicate_to_row_restriction(
+            pl.col("id").fill_null(strategy="zero") == 0, schema=schema
+        )
+        == ""
+    )
+    # Case A (Gt with NaN) needs extra_weight=2 -> degrades when budget=0
+    assert isinstance(
+        compiler.resolve_and_lower_types(
+            compiler.ir.Gt(
+                compiler.ir.Column("f1"), compiler.ir.FloatLiteral(float("nan"))
+            ),
+            schema,
+        ),
+        compiler.ir.Unsupported,
+    )
+    # Case D needs extra_weight=4+ -> degrades when budget=0
+    assert (
+        compiler.predicate_to_row_restriction(
+            pl.col("f1") == pl.col("f2"), schema=schema
+        )
+        == ""
+    )
+    monkeypatch.undo()
+
+    # 3. Deep iterative traversal in resolve_and_lower_types (depth=2500 > recursion limit)
+    deep_ir: compiler.ir.Expr = compiler.ir.Eq(
+        compiler.ir.Column("id"), compiler.ir.IntLiteral(0)
+    )
+    for i in range(1, 2500):
+        deep_ir = compiler.ir.And(
+            deep_ir,
+            compiler.ir.Eq(compiler.ir.Column("id"), compiler.ir.IntLiteral(i)),
+        )
+    resolved_deep = compiler.resolve_and_lower_types(deep_ir, schema)
+    assert isinstance(resolved_deep, compiler.ir.And)
+
+    # 4. MAX_ROW_RESTRICTION_BYTES 1 MB UTF-8 byte guard
+    monkeypatch.setattr(compiler, "MAX_ROW_RESTRICTION_BYTES", 20)
+    assert (
+        compiler.predicate_to_row_restriction(
+            pl.col("s") == "this string exceeds twenty utf-8 bytes", schema=schema
+        )
+        == ""
+    )
+    assert (
+        compiler.predicate_to_row_restriction(pl.col("id") == 1, schema=schema)
+        == "(`id` = 1)"
+    )

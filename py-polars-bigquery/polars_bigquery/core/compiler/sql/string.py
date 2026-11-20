@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from polars_bigquery.core.compiler.ir.string import (
+    BytesLiteral,
     Contains,
     EndsWith,
     Lowercase,
@@ -34,6 +35,13 @@ _escape_sql_string = escape_sql_string
 def format_string_literal(node: StringLiteral) -> str:
     """Format a StringLiteral IR node as a BigQuery SQL string literal."""
     return escape_sql_string(node.value)
+
+
+@literal_ir_to_sql.register
+def format_bytes_literal(node: BytesLiteral) -> str:
+    """Format a BytesLiteral IR node as a hex-escaped BigQuery SQL BYTES literal."""
+    escaped = "".join(f"\\x{byte:02x}" for byte in node.value)
+    return f"b'{escaped}'"
 
 
 @format_operator_sql.register

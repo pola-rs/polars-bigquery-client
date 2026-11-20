@@ -23,6 +23,13 @@ class FloatLiteral(Literal):
 
 
 @dataclasses.dataclass(frozen=True)
+class DecimalLiteral(Literal):
+    """Internal IR node representing a BigQuery NUMERIC decimal literal."""
+
+    value: str
+
+
+@dataclasses.dataclass(frozen=True)
 class IsNan(UnaryExpr):
     """IR node representing an IS_NAN check on a numeric expression."""
 

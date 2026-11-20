@@ -27,3 +27,10 @@ class TimestampLiteral(Literal):
     ticks: int
     unit: TimestampUnit
     tz: str | None = "UTC"
+
+
+@dataclasses.dataclass(frozen=True)
+class TimeLiteral(Literal):
+    """Internal IR node representing a BigQuery TIME literal (microseconds since midnight)."""
+
+    micros: int
