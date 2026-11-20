@@ -1,7 +1,7 @@
 use google_cloud_auth::credentials::Credentials;
 use google_cloud_bigquery::client::Read;
 use google_cloud_gax::retry_throttler::{
-    AdaptiveThrottler, RetryThrottlerArg, SharedRetryThrottler,
+    AdaptiveThrottler, CircuitBreaker, RetryThrottlerArg, SharedRetryThrottler,
 };
 
 use crate::{BigQueryError, BigQueryJobService, Client};
@@ -17,6 +17,17 @@ fn init_crypto() {
 
 pub(crate) fn default_retry_throttler() -> SharedRetryThrottler {
     RetryThrottlerArg::from(AdaptiveThrottler::default()).into()
+}
+
+/// Token-bucket circuit breaker for the low-QPS BigQuery v2 `JobService` REST client.
+///
+/// Unlike `AdaptiveThrottler::default()` (which starts at `0/0` with no time decay
+/// and rejects 50% of retries after a single failure on a cold client), a
+/// `CircuitBreaker` allows transient retries immediately on new clients and opens
+/// only under sustained error bursts (75+ consecutive transient failures without
+/// successes). When open, `JobServiceRetryableErrors::on_throttle` fails fast.
+pub(crate) fn job_service_retry_throttler() -> SharedRetryThrottler {
+    RetryThrottlerArg::from(CircuitBreaker::clamp(1000, 250, 10)).into()
 }
 
 #[derive(Default)]
@@ -68,12 +79,12 @@ impl ServiceConfigBuilder {
 
         // Decouple retry throttlers so REST 429 bursts on BigQueryJobService do
         // not throttle active gRPC ReadRows reconnects (and vice versa).
-        let bq_retry_throttler = default_retry_throttler();
+        let bq_retry_throttler = job_service_retry_throttler();
         let read_retry_throttler = default_retry_throttler();
 
         let mut bq_builder = BigQueryJobService::builder()
             .with_retry_policy(crate::bigquery_read_retry::job_service_retry_policy())
-            .with_backoff_policy(crate::bigquery_read_retry::default_backoff_policy())
+            .with_backoff_policy(crate::bigquery_read_retry::job_service_backoff_policy())
             .with_retry_throttler(bq_retry_throttler);
         let mut read_builder = Read::builder()
             .with_retry_policy(crate::bigquery_read_retry::create_read_session_retry_policy())

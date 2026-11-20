@@ -77,6 +77,23 @@ impl Iterator for ReceiverIterator {
             let rx = self.rx.as_mut()?;
 
             let step = Python::attach(|py| {
+                let is_main = match crate::cached_is_main_python_thread() {
+                    Some(v) => v,
+                    None => match crate::is_main_python_thread(py) {
+                        Ok(v) => v,
+                        Err(py_err) => {
+                            py_err.restore(py);
+                            return Err(());
+                        },
+                    },
+                };
+
+                if !is_main {
+                    // On non-main threads `py.check_signals()` is a no-op; detach the GIL
+                    // and await the next batch directly without 10 Hz GIL polling churn.
+                    return Ok(Ok(py.detach(|| rt.block_on(rx.recv()))));
+                }
+
                 // We need to be able to stop if the Python side decides to, so
                 // occasionally check to see if there were any interrupts.
                 if let Err(py_err) = py.check_signals() {

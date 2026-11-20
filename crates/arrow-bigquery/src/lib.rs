@@ -347,58 +347,104 @@ pub struct StreamOptions {
 /// Best-effort server-side cancellation handle attached to a
 /// [`BigQueryRecordBatchReceiver`] for an incomplete `jobs.query` job.
 ///
-/// Cleared when the stream finishes cleanly (EOF) or terminates with an error.
-/// If the receiver is aborted or dropped before completion (for example due to
-/// `Ctrl+C`, an exception, or early `limit()` stop), spawns a detached
-/// `jobs.cancel` call against BigQuery.
+/// Holds only the REST `JobService` transport pieces needed for `jobs.cancel`
+/// (never pinning the Storage Read API gRPC channel after a client closes).
+/// Cleared when the stream finishes cleanly (EOF), on a confirmed
+/// [`BigQueryError::JobFailed`], or when the backing job is confirmed `DONE`
+/// (e.g., via `jobs.get` during a multi-stream `ReadSession` cutover).
+/// If the receiver is aborted, dropped early, or hits a transport/decode error
+/// before the job completes, spawns a bounded detached `jobs.cancel` call
+/// against BigQuery.
 pub(crate) struct JobCancelHandle {
-    pub(crate) client: Client,
-    pub(crate) project_id: String,
-    pub(crate) job_id: String,
-    pub(crate) location: String,
-    pub(crate) runtime: tokio::runtime::Handle,
+    bq_client: BigQueryJobService,
+    quota_project_id: Arc<str>,
+    user_agent: Option<Arc<str>>,
+    project_id: String,
+    job_id: String,
+    location: String,
+    runtime: tokio::runtime::Handle,
+    cancel_limiter: Arc<tokio::sync::Semaphore>,
+    disarmed: Option<Arc<std::sync::atomic::AtomicBool>>,
 }
 
-/// Timeout applied to detached best-effort `jobs.cancel` requests.
-const JOB_CANCEL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+/// Overall timeout budget applied to detached best-effort `jobs.cancel` tasks
+/// (covers semaphore wait, token refresh, and up to `JOB_CANCEL_MAX_ATTEMPTS` tries).
+pub(crate) const JOB_CANCEL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Per-attempt HTTP timeout applied to each `jobs.cancel` try inside `JOB_CANCEL_TIMEOUT`.
+pub(crate) const JOB_CANCEL_ATTEMPT_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(5);
+
+/// Maximum number of concurrent detached `jobs.cancel` HTTP calls per [`Client`].
+const MAX_CONCURRENT_JOB_CANCELS: usize = 16;
+
+fn apply_request_options_parts<B: RequestOptionsBuilder>(
+    builder: B,
+    quota_project_id: &str,
+    user_agent: Option<&str>,
+) -> B {
+    let builder = builder.with_quota_project(quota_project_id);
+    match user_agent {
+        Some(user_agent) => builder.with_user_agent(user_agent),
+        None => builder,
+    }
+}
 
 impl JobCancelHandle {
     pub(crate) fn trigger(self) {
-        let client = self.client;
+        if self
+            .disarmed
+            .as_ref()
+            .is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Acquire))
+        {
+            return;
+        }
+        let bq_client = self.bq_client;
+        let quota_project_id = self.quota_project_id;
+        let user_agent = self.user_agent;
         let project_id = self.project_id;
         let job_id = self.job_id;
         let location = self.location;
+        let cancel_limiter = self.cancel_limiter;
         self.runtime.spawn(async move {
-            // Detached cancellation is best-effort cleanup: apply a short timeout,
-            // disable retries, and isolate its throttler so it neither inherits
-            // `JobService`'s 600s retry budget nor penalizes shared throttling state.
-            let cancel_req = client
-                .apply_request_options(
-                    client
-                        .bq_client
+            // Detached cancellation is best-effort cleanup: apply a bounded concurrency
+            // cap, allow up to 3 quick retries within `JOB_CANCEL_TIMEOUT` so a single
+            // stale TCP reset or transient 503 does not abandon a running query job,
+            // and isolate the retry throttler so failures do not affect normal queries.
+            let work = async {
+                let Ok(_permit) = cancel_limiter.acquire_owned().await else {
+                    return Ok(());
+                };
+                let cancel_req = apply_request_options_parts(
+                    bq_client
                         .cancel_job()
                         .set_project_id(&project_id)
                         .set_job_id(&job_id)
                         .set_location(&location)
                         .with_idempotency(true),
+                    &quota_project_id,
+                    user_agent.as_deref(),
                 )
-                .with_attempt_timeout(JOB_CANCEL_TIMEOUT)
-                .with_retry_policy(google_cloud_gax::retry_policy::NeverRetry)
-                .with_retry_throttler(client_builder::default_retry_throttler());
-            match tokio::time::timeout(JOB_CANCEL_TIMEOUT, cancel_req.send()).await {
-                Ok(Ok(_)) => {},
-                Ok(Err(_err)) => {
-                    #[cfg(feature = "tracing")]
+                .with_attempt_timeout(JOB_CANCEL_ATTEMPT_TIMEOUT)
+                .with_retry_policy(bigquery_read_retry::job_service_cancel_retry_policy(
+                    JOB_CANCEL_TIMEOUT,
+                ))
+                .with_backoff_policy(bigquery_read_retry::job_service_cancel_backoff_policy())
+                .with_retry_throttler(client_builder::job_service_retry_throttler());
+                cancel_req.send().await.map(|_| ())
+            };
+            match tokio::time::timeout(JOB_CANCEL_TIMEOUT, work).await {
+                Ok(Ok(())) => {},
+                Ok(Err(err)) => {
                     tracing::warn!(
                         project_id = %project_id,
                         job_id = %job_id,
                         location = %location,
-                        error = %_err,
+                        error = %err,
                         "best-effort BigQuery jobs.cancel failed"
                     );
                 },
                 Err(_elapsed) => {
-                    #[cfg(feature = "tracing")]
                     tracing::warn!(
                         project_id = %project_id,
                         job_id = %job_id,
@@ -434,10 +480,18 @@ pub struct BigQueryRecordBatchReceiver {
 impl BigQueryRecordBatchReceiver {
     pub async fn recv(&mut self) -> Option<Result<RecordBatch, BigQueryError>> {
         let item = self.rx.recv().await;
-        if matches!(item, None | Some(Err(_))) {
-            // Stream reached EOF or terminated with an error; do not cancel the job.
-            self.job_cancel = None;
-            self.abort();
+        match &item {
+            None | Some(Err(BigQueryError::JobFailed(_))) => {
+                // Clean EOF or confirmed server-side job failure: do not issue jobs.cancel.
+                self.job_cancel = None;
+                self.abort();
+            },
+            Some(Err(_)) => {
+                // Mid-stream transport, protocol, or decode error: keep `job_cancel` armed
+                // so `abort()` triggers best-effort `jobs.cancel` if the job is still running.
+                self.abort();
+            },
+            Some(Ok(_)) => {},
         }
         item
     }
@@ -524,6 +578,7 @@ pub struct Client {
     user_agent: Option<Arc<str>>,
     retry_throttler: SharedRetryThrottler,
     retry_config: bigquery_read_retry::StreamRetryConfig,
+    cancel_limiter: Arc<tokio::sync::Semaphore>,
 }
 
 fn channel_size() -> usize {
@@ -553,6 +608,7 @@ impl Client {
             user_agent: user_agent.map(Arc::from),
             retry_throttler,
             retry_config,
+            cancel_limiter: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_JOB_CANCELS)),
         }
     }
 
@@ -586,10 +642,27 @@ impl Client {
     }
 
     pub(crate) fn apply_request_options<B: RequestOptionsBuilder>(&self, builder: B) -> B {
-        let builder = builder.with_quota_project(&*self.quota_project_id);
-        match &self.user_agent {
-            Some(user_agent) => builder.with_user_agent(&**user_agent),
-            None => builder,
+        apply_request_options_parts(builder, &self.quota_project_id, self.user_agent.as_deref())
+    }
+
+    pub(crate) fn new_job_cancel_handle(
+        &self,
+        project_id: impl Into<String>,
+        job_id: impl Into<String>,
+        location: impl Into<String>,
+        runtime: tokio::runtime::Handle,
+        disarmed: Option<Arc<std::sync::atomic::AtomicBool>>,
+    ) -> JobCancelHandle {
+        JobCancelHandle {
+            bq_client: self.bq_client.clone(),
+            quota_project_id: Arc::clone(&self.quota_project_id),
+            user_agent: self.user_agent.clone(),
+            project_id: project_id.into(),
+            job_id: job_id.into(),
+            location: location.into(),
+            runtime,
+            cancel_limiter: Arc::clone(&self.cancel_limiter),
+            disarmed,
         }
     }
 

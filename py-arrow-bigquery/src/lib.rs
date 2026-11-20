@@ -5,37 +5,103 @@ mod table_id;
 #[cfg(feature = "testing")]
 mod testing;
 
+use std::cell::Cell;
+use std::sync::RwLock;
+
 use google_cloud_auth::credentials::Credentials;
 use google_cloud_bigquery::model::arrow_serialization_options::CompressionCodec;
-use pyo3::exceptions::PyValueError;
+use pyo3::exceptions::{
+    PyAttributeError, PyException, PyImportError, PyRuntimeError, PyTypeError, PyValueError,
+};
 use pyo3::prelude::*;
-use pyo3::types::PyDateTime;
+use pyo3::types::{PyBool, PyDateTime, PyInt};
 pub use stream::ArrowStreamExporter;
 pub use table_id::BigQueryTableId;
+
+thread_local! {
+    /// Per-OS-thread cache of `(pid, is_main_python_thread)`.
+    /// Keying by `std::process::id()` automatically invalidates entries after `os.fork()`.
+    static IS_MAIN_THREAD_CACHE: Cell<Option<(u32, bool)>> = const { Cell::new(None) };
+}
+
+/// Fast-path lookup of the cached main-thread status without acquiring the GIL.
+pub(crate) fn cached_is_main_python_thread() -> Option<bool> {
+    let pid = std::process::id();
+    IS_MAIN_THREAD_CACHE.with(|cache| match cache.get() {
+        Some((cached_pid, is_main)) if cached_pid == pid => Some(is_main),
+        _ => None,
+    })
+}
 
 /// Returns `true` when called from Python's main thread.
 ///
 /// Outside the main thread `py.check_signals()` is a no-op, so we avoid
 /// unnecessary 10 Hz GIL acquisitions during blocking waits on worker threads.
-/// Falls back to `true` if `threading` lookup fails (e.g. during shutdown).
-fn is_main_python_thread(py: Python<'_>) -> bool {
-    let Ok(threading) = py.import("threading") else {
-        return true;
-    };
-    let (Ok(current), Ok(main)) = (
-        threading.call_method0("current_thread"),
-        threading.call_method0("main_thread"),
-    ) else {
-        return true;
-    };
-    current.is(&main)
+/// Caches the result per OS thread keyed by PID (invalidating across `fork`).
+/// Propagates pending exceptions such as `KeyboardInterrupt` instead of silently
+/// swallowing them; falls back to `true` only if `threading` lookup fails with
+/// `ImportError`/`AttributeError` (e.g., during interpreter teardown).
+pub(crate) fn is_main_python_thread(py: Python<'_>) -> PyResult<bool> {
+    let pid = std::process::id();
+    if let Some(is_main) = cached_is_main_python_thread() {
+        return Ok(is_main);
+    }
+
+    let lookup = (|| -> PyResult<bool> {
+        let threading = py.import("threading")?;
+        let current = threading.call_method0("current_thread")?;
+        let main = threading.call_method0("main_thread")?;
+        Ok(current.is(&main))
+    })();
+
+    match lookup {
+        Ok(is_main) => {
+            IS_MAIN_THREAD_CACHE.with(|cache| cache.set(Some((pid, is_main))));
+            Ok(is_main)
+        },
+        Err(err)
+            if err.is_instance_of::<PyException>(py)
+                && (err.is_instance_of::<PyImportError>(py)
+                    || err.is_instance_of::<PyAttributeError>(py)) =>
+        {
+            Ok(true)
+        },
+        Err(err) => Err(err),
+    }
+}
+
+/// Bounded grace wait for an aborted Tokio task to execute its `Drop` hooks
+/// (e.g., `CancelOnDrop` firing best-effort `jobs.cancel`) before returning
+/// `KeyboardInterrupt` to Python.
+const ABORT_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// RAII guard that aborts the spawned Tokio task if dropped before completion
+/// (for example on panic or unexpected early return).
+struct AbortOnDrop(Option<tokio::task::AbortHandle>);
+
+impl AbortOnDrop {
+    fn disarm(&mut self) {
+        self.0 = None;
+    }
+
+    fn abort_now(&mut self) {
+        if let Some(handle) = self.0.take() {
+            handle.abort();
+        }
+    }
+}
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.abort_now();
+    }
 }
 
 /// Drives an async Rust future on the shared Tokio runtime while periodically
 /// polling `py.check_signals()` on the Python main thread so `Ctrl+C`
 /// (`KeyboardInterrupt`) interrupts long-running waits (such as BigQuery
-/// `jobs.query` initial waits or `CreateReadSession` retries) promptly instead
-/// of blocking uninterruptibly.
+/// `jobs.query` initial waits, `CreateReadSession` retries, or client setup)
+/// promptly instead of blocking uninterruptibly.
 ///
 /// On non-main Python threads (where `py.check_signals()` is a no-op), awaits
 /// the future directly without periodic GIL re-acquisition.
@@ -47,28 +113,42 @@ where
     F: std::future::Future<Output = Result<T, arrow_bigquery_lib::BigQueryError>> + Send + 'static,
     T: Send + 'static,
 {
+    // Fail fast on already-pending signals BEFORE spawning any network RPC.
+    py.check_signals()?;
+
     let rt = pyo3_async_runtimes::tokio::get_runtime();
-    if !is_main_python_thread(py) {
+    if !is_main_python_thread(py)? {
         return Ok(py.detach(|| rt.block_on(fut)));
     }
 
     let handle = rt.spawn(fut);
-    let abort_handle = handle.abort_handle();
+    let mut abort_guard = AbortOnDrop(Some(handle.abort_handle()));
     let poll_interval = std::time::Duration::from_millis(100);
     tokio::pin!(handle);
 
     loop {
-        py.check_signals().inspect_err(|_| {
-            abort_handle.abort();
-        })?;
+        if let Err(py_err) = py.check_signals() {
+            abort_guard.abort_now();
+            // Briefly yield for the cancelled task to unwind and execute `Drop`
+            // cleanup (e.g., spawning detached `jobs.cancel` from `CancelOnDrop`)
+            // before returning `KeyboardInterrupt` to Python.
+            let _ = py.detach(|| {
+                rt.block_on(async { tokio::time::timeout(ABORT_DRAIN_TIMEOUT, &mut handle).await })
+            });
+            return Err(py_err);
+        }
 
         let step = py.detach(|| {
             rt.block_on(async { tokio::time::timeout(poll_interval, &mut handle).await })
         });
         match step {
-            Ok(Ok(result)) => return Ok(result),
+            Ok(Ok(result)) => {
+                abort_guard.disarm();
+                return Ok(result);
+            },
             Ok(Err(join_err)) => {
-                return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+                abort_guard.disarm();
+                return Err(PyRuntimeError::new_err(format!(
                     "BigQuery task failed unexpectedly: {join_err}"
                 )));
             },
@@ -77,11 +157,50 @@ where
     }
 }
 
+fn extract_maximum_bytes_billed(value: Option<&Bound<'_, PyAny>>) -> PyResult<Option<i64>> {
+    let Some(obj) = value else {
+        return Ok(None);
+    };
+    if obj.is_none() {
+        return Ok(None);
+    }
+    if obj.is_instance_of::<PyBool>() || !obj.is_instance_of::<PyInt>() {
+        let type_name = obj.get_type().name()?;
+        return Err(PyTypeError::new_err(format!(
+            "maximum_bytes_billed must be an int or None, got {type_name}"
+        )));
+    }
+    if obj.lt(0)? {
+        return Err(PyValueError::new_err(format!(
+            "maximum_bytes_billed must be non-negative, got {obj}"
+        )));
+    }
+    if obj.gt(i64::MAX)? {
+        return Err(PyValueError::new_err(format!(
+            "maximum_bytes_billed must be <= {}, got {obj}",
+            i64::MAX
+        )));
+    }
+    Ok(Some(obj.extract::<i64>()?))
+}
+
 /// A Python-exposed client that keeps the BigQuery Storage Read API gRPC channel
 /// open across multiple table read operations, caching the OAuth2 token in Rust.
 #[pyclass(name = "Client")]
 pub struct Client {
-    client: arrow_bigquery_lib::Client,
+    client: RwLock<Option<arrow_bigquery_lib::Client>>,
+}
+
+impl Client {
+    fn clone_inner(&self) -> PyResult<arrow_bigquery_lib::Client> {
+        let guard = self
+            .client
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        guard.as_ref().cloned().ok_or_else(|| {
+            PyRuntimeError::new_err("Cannot use a closed arrow_bigquery.Client instance.")
+        })
+    }
 }
 
 #[pymethods]
@@ -104,28 +223,69 @@ impl Client {
             _ => None,
         };
 
-        let rt = pyo3_async_runtimes::tokio::get_runtime();
-        let result = py.detach(|| {
-            rt.block_on(async {
-                let mut builder = arrow_bigquery_lib::Client::builder()
-                    .with_user_agent(user_agent)
-                    .with_quota_project_id(Some(quota_project_id));
-                if let Some(cred) = cred {
-                    builder = builder.with_cred(cred);
-                }
-                if let Some(endpoint) = bq_endpoint {
-                    builder = builder.with_bq_endpoint(endpoint);
-                }
-                if let Some(endpoint) = bqstorage_endpoint {
-                    builder = builder.with_bqstorage_endpoint(endpoint);
-                }
+        let result = block_on_interruptible(py, async move {
+            let mut builder = arrow_bigquery_lib::Client::builder()
+                .with_user_agent(user_agent)
+                .with_quota_project_id(Some(quota_project_id));
+            if let Some(cred) = cred {
+                builder = builder.with_cred(cred);
+            }
+            if let Some(endpoint) = bq_endpoint {
+                builder = builder.with_bq_endpoint(endpoint);
+            }
+            if let Some(endpoint) = bqstorage_endpoint {
+                builder = builder.with_bqstorage_endpoint(endpoint);
+            }
 
-                arrow_bigquery_lib::Client::from_builder(builder).await
-            })
-        });
+            arrow_bigquery_lib::Client::from_builder(builder).await
+        })?;
 
         let client = result.map_err(|err| error::to_py_err(py, err))?;
-        Ok(Self { client })
+        Ok(Self {
+            client: RwLock::new(Some(client)),
+        })
+    }
+
+    /// Release the underlying native Rust client, cached connections, and Python
+    /// credentials provider reference. Idempotent.
+    pub fn close(&self, _py: Python<'_>) {
+        let dropped = {
+            let mut guard = self
+                .client
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            guard.take()
+        };
+        drop(dropped);
+    }
+
+    /// Whether this client has been closed via [`close()`](Client::close).
+    #[getter]
+    pub fn closed(&self) -> bool {
+        self.client
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_none()
+    }
+
+    fn __enter__(slf: PyRef<'_, Self>) -> PyResult<PyRef<'_, Self>> {
+        if slf.closed() {
+            return Err(PyRuntimeError::new_err(
+                "Cannot use a closed arrow_bigquery.Client instance.",
+            ));
+        }
+        Ok(slf)
+    }
+
+    #[pyo3(signature = (_exc_type=None, _exc_value=None, _traceback=None))]
+    fn __exit__(
+        &self,
+        py: Python<'_>,
+        _exc_type: Option<&Bound<'_, PyAny>>,
+        _exc_value: Option<&Bound<'_, PyAny>>,
+        _traceback: Option<&Bound<'_, PyAny>>,
+    ) {
+        self.close(py);
     }
 
     /// Reads a BigQuery table and returns an [`ArrowStreamExporter`] which can be
@@ -154,6 +314,7 @@ impl Client {
         selected_fields: Option<Vec<String>>,
         snapshot_time: Option<Py<PyDateTime>>,
     ) -> PyResult<ArrowStreamExporter> {
+        let client = self.clone_inner()?;
         let read_options = parse_read_options(
             py,
             arrow_buffer_compression,
@@ -164,7 +325,6 @@ impl Client {
             selected_fields,
             snapshot_time,
         )?;
-        let client = self.client.clone();
         let table = table.inner.clone();
         let result =
             block_on_interruptible(
@@ -196,17 +356,11 @@ impl Client {
         dry_run: bool,
         maintain_order: bool,
         use_query_cache: Option<bool>,
-        maximum_bytes_billed: Option<i64>,
+        maximum_bytes_billed: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<ArrowStreamExporter> {
+        let client = self.clone_inner()?;
         let arrow_buffer_compression = parse_compression_codec(arrow_buffer_compression)?;
-        if let Some(limit) = maximum_bytes_billed {
-            if limit < 0 {
-                return Err(PyValueError::new_err(format!(
-                    "maximum_bytes_billed must be non-negative, got {limit}"
-                )));
-            }
-        }
-        let client = self.client.clone();
+        let maximum_bytes_billed = extract_maximum_bytes_billed(maximum_bytes_billed)?;
         let query = query.to_owned();
         if dry_run {
             let result = block_on_interruptible(py, async move {
@@ -557,7 +711,7 @@ mod tests {
                 "test-project".to_string(),
             );
             let client = Client {
-                client: inner_client,
+                client: RwLock::new(Some(inner_client)),
             };
             let table =
                 BigQueryTableId::new("p".to_string(), "d".to_string(), "t".to_string()).unwrap();
@@ -610,20 +764,57 @@ mod tests {
     }
 
     #[test]
-    fn test_client_read_query_negative_maximum_bytes_billed() {
+    fn test_client_read_query_maximum_bytes_billed_validation() {
         Python::initialize();
         Python::attach(|py| {
             let client =
                 Client::new(py, "test-project".to_string(), None, None, None, None).unwrap();
-            let err =
-                match client.read_query(py, "SELECT 1", "lz4frame", false, true, None, Some(-5)) {
-                    Err(e) => e,
-                    Ok(_) => panic!("expected Err for negative maximum_bytes_billed"),
-                };
+
+            // Negative value raises ValueError.
+            let neg = (-5_i64).into_pyobject(py).unwrap().into_any();
+            let err = client
+                .read_query(py, "SELECT 1", "lz4frame", false, true, None, Some(&neg))
+                .err()
+                .expect("expected Err for negative maximum_bytes_billed");
             assert!(err.is_instance_of::<PyValueError>(py));
             assert!(err
                 .to_string()
                 .contains("maximum_bytes_billed must be non-negative"));
+
+            // Boolean value raises TypeError (must not coerce True -> 1).
+            let py_true = pyo3::types::PyBool::new(py, true).to_owned().into_any();
+            let err = client
+                .read_query(
+                    py,
+                    "SELECT 1",
+                    "lz4frame",
+                    false,
+                    true,
+                    None,
+                    Some(&py_true),
+                )
+                .err()
+                .expect("expected Err for bool maximum_bytes_billed");
+            assert!(err.is_instance_of::<PyTypeError>(py));
+
+            // Value above i64::MAX raises ValueError (not OverflowError).
+            let huge = (i64::MAX as i128 + 1).into_pyobject(py).unwrap().into_any();
+            let err = client
+                .read_query(py, "SELECT 1", "lz4frame", false, true, None, Some(&huge))
+                .err()
+                .expect("expected Err for overflowing maximum_bytes_billed");
+            assert!(err.is_instance_of::<PyValueError>(py));
+
+            // close() rejects subsequent reads with RuntimeError and is idempotent.
+            assert!(!client.closed());
+            client.close(py);
+            assert!(client.closed());
+            client.close(py);
+            let err = client
+                .read_query(py, "SELECT 1", "lz4frame", false, true, None, None)
+                .err()
+                .expect("expected RuntimeError on closed client");
+            assert!(err.is_instance_of::<PyRuntimeError>(py));
         });
     }
 }

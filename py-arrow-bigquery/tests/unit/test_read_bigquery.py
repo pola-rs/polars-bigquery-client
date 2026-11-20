@@ -249,6 +249,7 @@ def test_client_read_query_calls_rust(mock_rust_client):
         dry_run=False,
         maintain_order=True,
         use_query_cache=None,
+        maximum_bytes_billed=None,
     )
     assert result is placeholder
 
@@ -272,6 +273,7 @@ def test_client_read_query_passes_additional_parameters(mock_rust_client):
         dry_run=True,
         maintain_order=False,
         use_query_cache=False,
+        maximum_bytes_billed=None,
     )
     assert result is placeholder
 
@@ -416,16 +418,55 @@ def test_bigquery_error_hierarchy_and_empty_quota_project():
 
 
 def test_client_close_and_context_manager(mock_rust_client):
-    with Client(quota_project_id="q") as client:
+    client = Client(quota_project_id="q")
+    assert not client.closed
+    with client as ctx_client:
+        assert ctx_client is client
         assert client.quota_project_id == "q"
+        assert not client.closed
 
-    # Calling close() repeatedly is idempotent.
+    assert client.closed
+    mock_rust_client.close.assert_called_once_with()
+
+    # Calling close() repeatedly is idempotent and does not invoke native close() again.
     client.close()
+    assert client.closed
+    mock_rust_client.close.assert_called_once_with()
 
+    with pytest.raises(RuntimeError, match="closed"), client:
+        pass
     with pytest.raises(RuntimeError, match="closed"):
         client.read_table("p.d.t")
     with pytest.raises(RuntimeError, match="closed"):
         client.read_query("SELECT 1")
+
+
+def test_native_client_close_and_maximum_bytes_billed_validation():
+    native_client = _native.Client(
+        quota_project_id="test-proj",
+        credentials_provider=lambda: ({"bearer_token": "tok"}, None),
+    )
+    assert not native_client.closed
+    with pytest.raises(TypeError, match="maximum_bytes_billed must be an int or None"):
+        native_client.read_query("SELECT 1", maximum_bytes_billed=True)  # type: ignore[arg-type]
+    with pytest.raises(TypeError, match="maximum_bytes_billed must be an int or None"):
+        native_client.read_query("SELECT 1", maximum_bytes_billed=False)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="maximum_bytes_billed must be non-negative"):
+        native_client.read_query("SELECT 1", maximum_bytes_billed=-1)
+    max_i64 = (1 << 63) - 1
+    with pytest.raises(ValueError, match=f"maximum_bytes_billed must be <= {max_i64}"):
+        native_client.read_query("SELECT 1", maximum_bytes_billed=1 << 63)
+    with pytest.raises(ValueError, match=f"maximum_bytes_billed must be <= {max_i64}"):
+        native_client.read_query("SELECT 1", maximum_bytes_billed=1 << 200)
+
+    with native_client:
+        assert not native_client.closed
+    assert native_client.closed
+    native_client.close()
+    with pytest.raises(RuntimeError, match="closed"), native_client:
+        pass
+    with pytest.raises(RuntimeError, match="closed"):
+        native_client.read_query("SELECT 1")
 
 
 def test_client_read_query_maximum_bytes_billed(mock_rust_client):
@@ -528,12 +569,14 @@ def test_read_query_interruptible_during_wait():
     srv.listen(1)
     port = srv.getsockname()[1]
     accepted: list[socket.socket] = []
+    connected_event = threading.Event()
     stop_event = threading.Event()
 
     def accept_and_hold():
         try:
             conn, _ = srv.accept()
             accepted.append(conn)
+            connected_event.set()
             stop_event.wait(timeout=10.0)
         except OSError:
             pass
@@ -542,8 +585,11 @@ def test_read_query_interruptible_during_wait():
     server_thread.start()
 
     def send_interrupt():
-        time.sleep(0.25)
-        _thread.interrupt_main()
+        # Wait until the TCP connection from `jobs.query` is actually accepted so
+        # `_thread.interrupt_main()` is guaranteed to fire while inside
+        # `block_on_interruptible` instead of racing client setup on slow runners.
+        if connected_event.wait(timeout=5.0):
+            _thread.interrupt_main()
 
     irq_thread = threading.Thread(target=send_interrupt, daemon=True)
     client = Client(
@@ -552,11 +598,14 @@ def test_read_query_interruptible_during_wait():
         bq_endpoint=f"http://127.0.0.1:{port}",
     )
     irq_thread.start()
-    t0 = time.monotonic()
     try:
+        t0 = time.monotonic()
         with pytest.raises(KeyboardInterrupt):
             client.read_query("SELECT 1", dry_run=True)
         elapsed = time.monotonic() - t0
+        assert connected_event.is_set(), (
+            "interrupt fired before read_query connected to mock server"
+        )
         assert elapsed < 3.0, (
             f"read_query took too long to notice KeyboardInterrupt: {elapsed:.2f}s"
         )

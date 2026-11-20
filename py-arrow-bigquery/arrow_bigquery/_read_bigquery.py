@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import datetime
-from typing import Any
+from typing import Any, Self
 
 import arrow_bigquery._native
 import arrow_bigquery.core.version
@@ -55,11 +55,11 @@ class Client:
         )
 
     def close(self) -> None:
-        """Close the client and clear its reference to the underlying native client.
+        """Close the client and release the underlying native client reference.
 
-        Idempotent. Releasing the reference drops cached network channels and
-        OAuth2 tokens once any previously returned ``ArrowStreamExporter``
-        streams finish or are dropped.
+        Idempotent. Releasing the native client drops cached network channels
+        and clears the Rust-side credentials reference once any previously
+        returned ``ArrowStreamExporter`` streams finish or are dropped.
 
         Warning:
             Calling ``close()`` (or exiting a ``with Client(...) as client:``
@@ -70,24 +70,34 @@ class Client:
 
         Thread safety:
             :meth:`read_table` and :meth:`read_query` snapshot the underlying
-            native client reference before starting I/O, so a concurrent
+            native client reference once before starting I/O, so a concurrent
             ``close()`` will not interrupt an in-flight call or already-created
             ``ArrowStreamExporter``. Callers sharing a ``Client`` across threads
             should still finish dispatching reads before closing it.
         """
+        native_client = self._client
         self._client = None
+        if native_client is not None:
+            native_client.close()
 
-    def __enter__(self) -> Client:  # noqa: PYI034
+    @property
+    def closed(self) -> bool:
+        """Return ``True`` if :meth:`close` has been called on this client."""
+        return self._client is None
+
+    def __enter__(self) -> Self:
+        self._ensure_open()
         return self
 
     def __exit__(self, *exc_info: object) -> None:
         self.close()
 
     def _ensure_open(self) -> arrow_bigquery._native.Client:
-        if self._client is None:
+        native_client = self._client
+        if native_client is None:
             msg = "Cannot use a closed arrow_bigquery.Client instance."
             raise RuntimeError(msg)
-        return self._client
+        return native_client
 
     @property
     def quota_project_id(self) -> str:
@@ -142,6 +152,15 @@ class Client:
                 query (``0 <= maximum_bytes_billed <= (1 << 63) - 1``). When
                 set, also forwarded on dry runs for consistent limit checking.
 
+        Note:
+            Interrupting a query via ``Ctrl+C`` (``KeyboardInterrupt``) cancels
+            the BigQuery job server-side once a job ID has been returned
+            (``jobComplete=false``). Interrupting during the initial
+            ``jobs.query`` HTTP wait (default 200 s) closes only the client
+            socket because the server-generated job ID is not yet available.
+            On non-main Python threads, blocking waits cannot be interrupted by
+            ``Ctrl+C`` (CPython only delivers signals on the main thread).
+
         Raises:
             RuntimeError: If the client has already been closed via
                 :meth:`close` or exited a ``with`` block.
@@ -151,12 +170,6 @@ class Client:
                 signed 64-bit integer range (``(1 << 63) - 1``).
         """
         native_client = self._ensure_open()
-        kwargs: dict[str, Any] = {
-            "arrow_buffer_compression": arrow_buffer_compression,
-            "dry_run": dry_run,
-            "maintain_order": maintain_order,
-            "use_query_cache": use_query_cache,
-        }
         if maximum_bytes_billed is not None:
             if isinstance(maximum_bytes_billed, bool) or not isinstance(
                 maximum_bytes_billed, int
@@ -178,5 +191,11 @@ class Client:
                     f"got {maximum_bytes_billed}"
                 )
                 raise ValueError(msg)
-            kwargs["maximum_bytes_billed"] = maximum_bytes_billed
-        return native_client.read_query(query, **kwargs)
+        return native_client.read_query(
+            query,
+            arrow_buffer_compression=arrow_buffer_compression,
+            dry_run=dry_run,
+            maintain_order=maintain_order,
+            use_query_cache=use_query_cache,
+            maximum_bytes_billed=maximum_bytes_billed,
+        )
