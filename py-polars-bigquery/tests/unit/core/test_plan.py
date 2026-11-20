@@ -289,36 +289,6 @@ def test_plan_executor_is_abstract() -> None:
         PlanExecutor()  # type: ignore[abstract]
 
 
-def test_query_scan_maximum_bytes_billed_validation() -> None:
-    scan_ok = QueryScan(
-        raw_query="SELECT a FROM t",
-        columns=("a",),
-        maximum_bytes_billed=1_000_000,
-    )
-    assert scan_ok.maximum_bytes_billed == 1_000_000
-    assert (
-        QueryScan(
-            raw_query="SELECT a FROM t", columns=("a",), maximum_bytes_billed=0
-        ).maximum_bytes_billed
-        == 0
-    )
-
-    for bad in (True, False, 1.5, "100"):
-        with pytest.raises(TypeError, match="maximum_bytes_billed must be an int"):
-            QueryScan(
-                raw_query="SELECT a FROM t",
-                columns=("a",),
-                maximum_bytes_billed=bad,  # type: ignore[arg-type]
-            )
-
-    with pytest.raises(ValueError, match="maximum_bytes_billed must be non-negative"):
-        QueryScan(
-            raw_query="SELECT a FROM t",
-            columns=("a",),
-            maximum_bytes_billed=-1,
-        )
-
-
 def test_validate_and_normalize_rejects_unexpanded_selectors() -> None:
     import polars.selectors as cs
 

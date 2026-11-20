@@ -1485,14 +1485,6 @@ def test_client_input_type_and_wire_payload_validation(mock_arrow_client):
     with pytest.raises(TypeError, match="maintain_order must be a bool"):
         client.read_table("p.d.t", maintain_order="false")  # type: ignore[arg-type]
 
-    # maximum_bytes_billed validation
-    with pytest.raises(TypeError, match="maximum_bytes_billed must be an int or None"):
-        client.scan_query("SELECT 1", schema={"a": pl.Int64}, maximum_bytes_billed=True)  # type: ignore[arg-type]
-    with pytest.raises(ValueError, match="maximum_bytes_billed must be non-negative"):
-        client.scan_query("SELECT 1", schema={"a": pl.Int64}, maximum_bytes_billed=-1)
-    with pytest.raises(ValueError, match="maximum_bytes_billed must be non-negative"):
-        client.read_query("SELECT 1", maximum_bytes_billed=-10)
-
     # Semicolon-only / comment-only queries rejected eagerly without RPC
     for empty_sql in (";;", " ; ; ", "-- just a comment", "/* comment only */"):
         with pytest.raises(ValueError, match="non-empty SELECT statement"):
@@ -1552,39 +1544,6 @@ def test_client_scan_bignumeric_raises_clear_type_error(mock_arrow_client):
         pytest.raises(TypeError, match="BIGNUMERIC/BIGDECIMAL"),
     ):
         client.scan_table("p.d.t")
-
-
-def test_client_forwards_maximum_bytes_billed(mock_arrow_client):
-    client = Client(quota_project_id="q")
-    mock_arrow_client.read_query.return_value = MagicMock()
-    with patch("polars.DataFrame"):
-        client.read_query("SELECT 1", maximum_bytes_billed=1_000_000)
-    mock_arrow_client.read_query.assert_called_with(
-        "SELECT 1",
-        arrow_buffer_compression="lz4frame",
-        dry_run=False,
-        maintain_order=True,
-        use_query_cache=None,
-        maximum_bytes_billed=1_000_000,
-    )
-
-    mock_arrow_client.read_query.reset_mock()
-    with patch("polars.scan_arrow_c_stream", return_value=pl.LazyFrame({"a": [1]})):
-        lf = client.scan_query(
-            "SELECT a FROM t",
-            schema={"a": pl.Int64},
-            maintain_order=False,
-            maximum_bytes_billed=500_000,
-        )
-        assert lf.collect().to_dict(as_series=False) == {"a": [1]}
-    mock_arrow_client.read_query.assert_called_once_with(
-        "SELECT a FROM t\n|> SELECT `a`",
-        arrow_buffer_compression="lz4frame",
-        dry_run=False,
-        maintain_order=False,
-        use_query_cache=None,
-        maximum_bytes_billed=500_000,
-    )
 
 
 def test_client_scan_query_with_udf_filter_degrades_gracefully(mock_arrow_client):

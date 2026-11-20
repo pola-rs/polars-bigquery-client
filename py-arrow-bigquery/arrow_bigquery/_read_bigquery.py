@@ -38,31 +38,13 @@ class Client:
         self._quota_project_id = quota_project_id
         self._user_agent = user_agent
         full_user_agent = _get_user_agent(user_agent)
-        self._client: arrow_bigquery._native.Client | None = (
-            arrow_bigquery._native.Client(
-                quota_project_id=quota_project_id,
-                credentials_provider=credentials_provider,
-                user_agent=full_user_agent,
-                bq_endpoint=bq_endpoint,
-                bqstorage_endpoint=bqstorage_endpoint,
-            )
+        self._client = arrow_bigquery._native.Client(
+            quota_project_id=quota_project_id,
+            credentials_provider=credentials_provider,
+            user_agent=full_user_agent,
+            bq_endpoint=bq_endpoint,
+            bqstorage_endpoint=bqstorage_endpoint,
         )
-
-    def close(self) -> None:
-        """Release the underlying native client and cached network channels."""
-        self._client = None
-
-    def __enter__(self) -> Client:  # noqa: PYI034
-        return self
-
-    def __exit__(self, *exc_info: object) -> None:
-        self.close()
-
-    def _ensure_open(self) -> arrow_bigquery._native.Client:
-        if self._client is None:
-            msg = "Cannot use a closed arrow_bigquery.Client instance."
-            raise RuntimeError(msg)
-        return self._client
 
     @property
     def quota_project_id(self) -> str:
@@ -80,9 +62,8 @@ class Client:
         selected_fields: list[str] | None = None,
         snapshot_time: datetime.datetime | None = None,
     ) -> arrow_bigquery._native.ArrowStreamExporter:
-        native_client = self._ensure_open()
         table_id = _parse_table_id(table)
-        return native_client.read_table(
+        return self._client.read_table(
             table_id,
             arrow_buffer_compression=arrow_buffer_compression,
             maintain_order=maintain_order,
@@ -101,29 +82,11 @@ class Client:
         dry_run: bool = False,
         maintain_order: bool = True,
         use_query_cache: bool | None = None,
-        maximum_bytes_billed: int | None = None,
     ) -> arrow_bigquery._native.ArrowStreamExporter:
-        native_client = self._ensure_open()
-        kwargs: dict[str, Any] = {
-            "arrow_buffer_compression": arrow_buffer_compression,
-            "dry_run": dry_run,
-            "maintain_order": maintain_order,
-            "use_query_cache": use_query_cache,
-        }
-        if maximum_bytes_billed is not None:
-            if isinstance(maximum_bytes_billed, bool) or not isinstance(
-                maximum_bytes_billed, int
-            ):
-                msg = (
-                    "maximum_bytes_billed must be an int or None, "
-                    f"got {type(maximum_bytes_billed).__name__}"
-                )
-                raise TypeError(msg)
-            if maximum_bytes_billed < 0:
-                msg = (
-                    "maximum_bytes_billed must be non-negative, "
-                    f"got {maximum_bytes_billed}"
-                )
-                raise ValueError(msg)
-            kwargs["maximum_bytes_billed"] = maximum_bytes_billed
-        return native_client.read_query(query, **kwargs)
+        return self._client.read_query(
+            query,
+            arrow_buffer_compression=arrow_buffer_compression,
+            dry_run=dry_run,
+            maintain_order=maintain_order,
+            use_query_cache=use_query_cache,
+        )

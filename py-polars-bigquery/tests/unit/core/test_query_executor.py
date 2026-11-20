@@ -902,14 +902,13 @@ def test_compile_query_plan_inner_query_fast_path_and_large_conjunct_scaling() -
     assert elapsed < 2.0, f"Tier 2 pruning regressed to slow runtime: {elapsed:.2f}s"
 
 
-def test_query_executor_forwards_maximum_bytes_billed_and_handles_huge_slice() -> None:
+def test_query_executor_handles_huge_slice() -> None:
     mock_arrow_client = MagicMock()
     mock_arrow_client.read_query.return_value = MagicMock(name="exporter")
     scan = QueryScan(
         raw_query="SELECT a FROM t",
         columns=("a",),
         maintain_order=False,
-        maximum_bytes_billed=10_000_000,
     )
     plan = Slice(input=scan, offset=0, length=(1 << 64) - 1)
     executor = QueryExecutor(mock_arrow_client)
@@ -924,5 +923,4 @@ def test_query_executor_forwards_maximum_bytes_billed_and_handles_huge_slice() -
         dry_run=False,
         maintain_order=False,
         use_query_cache=None,
-        maximum_bytes_billed=10_000_000,
     )

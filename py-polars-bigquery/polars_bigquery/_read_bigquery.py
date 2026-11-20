@@ -72,18 +72,6 @@ def _validate_optional_bool(value: Any, name: str) -> bool | None:
     return value
 
 
-def _validate_maximum_bytes_billed(value: Any) -> int | None:
-    if value is None:
-        return None
-    if isinstance(value, bool) or not isinstance(value, int):
-        msg = f"maximum_bytes_billed must be an int or None, got {type(value).__name__}"
-        raise TypeError(msg)
-    if value < 0:
-        msg = f"maximum_bytes_billed must be non-negative, got {value}"
-        raise ValueError(msg)
-    return value
-
-
 def _normalize_schema(
     schema: pl.Schema | Mapping[str, DataType | DataTypeClass],
     *,
@@ -312,7 +300,6 @@ class Client:
         dry_run: bool = False,
         maintain_order: bool = True,
         use_query_cache: bool | None = None,
-        maximum_bytes_billed: int | None = None,
     ) -> pl.DataFrame:
         """Execute a GoogleSQL query and read the result into a Polars `DataFrame`.
 
@@ -347,10 +334,6 @@ class Client:
         use_query_cache
             Whether to look for the result in the query cache. If `None`, the
             BigQuery API default (`True`) is used.
-        maximum_bytes_billed
-            Optional non-negative ceiling on the bytes billed for the query.
-            Queries exceeding this limit are failed by BigQuery without
-            incurring a charge. Defaults to `None` (no client-side limit).
 
         Returns
         -------
@@ -383,16 +366,13 @@ class Client:
         _validate_bool(dry_run, "dry_run")
         _validate_bool(maintain_order, "maintain_order")
         _validate_optional_bool(use_query_cache, "use_query_cache")
-        _validate_maximum_bytes_billed(maximum_bytes_billed)
-        kwargs: dict[str, Any] = {
-            "arrow_buffer_compression": arrow_buffer_compression,
-            "dry_run": dry_run,
-            "maintain_order": maintain_order,
-            "use_query_cache": use_query_cache,
-        }
-        if maximum_bytes_billed is not None:
-            kwargs["maximum_bytes_billed"] = maximum_bytes_billed
-        arrow_stream_exporter = self._arrow_client.read_query(query, **kwargs)
+        arrow_stream_exporter = self._arrow_client.read_query(
+            query,
+            arrow_buffer_compression=arrow_buffer_compression,
+            dry_run=dry_run,
+            maintain_order=maintain_order,
+            use_query_cache=use_query_cache,
+        )
         return pl.DataFrame(arrow_stream_exporter)
 
     def scan_table(
@@ -547,7 +527,6 @@ class Client:
         arrow_buffer_compression: ArrowBufferCompression = "lz4frame",
         maintain_order: bool = True,
         use_query_cache: bool | None = None,
-        maximum_bytes_billed: int | None = None,
     ) -> pl.LazyFrame:
         """Lazily execute a GoogleSQL `SELECT` query into a Polars `LazyFrame`.
 
@@ -655,12 +634,6 @@ class Client:
         use_query_cache
             Whether BigQuery should use the query cache. If `None`, BigQuery's
             API default (`True`) is used.
-        maximum_bytes_billed
-            Optional non-negative ceiling on the bytes billed when the query
-            executes. Queries whose estimated billed bytes exceed this threshold
-            fail in BigQuery without incurring a charge. Useful as a guardrail
-            when `maintain_order=False` degrades oversized predicates locally.
-            Defaults to `None` (no client-side limit).
 
         Returns
         -------
@@ -672,20 +645,20 @@ class Client:
         ------
         ValueError
             If `arrow_buffer_compression` is invalid, `query` is empty (or contains
-            only comments/semicolons), `maximum_bytes_billed` is negative, an
-            explicit `schema` is empty, the dry run reports a non-`SELECT`
-            statement type, or the dry-run result schema contains exact
-            duplicate column names (or duplicate nested `STRUCT` subfield names).
+            only comments/semicolons), an explicit `schema` is empty, the dry run
+            reports a non-`SELECT` statement type, or the dry-run result schema
+            contains exact duplicate column names (or duplicate nested `STRUCT`
+            subfield names).
         polars_bigquery.exceptions.BigQueryError
             If the BigQuery dry run fails (for example, due to invalid SQL,
             unshifted `[line:col]` positions on `query`) or returns a missing,
             malformed, or empty schema response.
         TypeError
-            If `query`, `maintain_order`, `use_query_cache`, or
-            `maximum_bytes_billed` have invalid types, if the dry-run result
-            schema contains an unsupported BigQuery field type (including
-            `BIGNUMERIC` / `BIGDECIMAL`), or if an explicit `schema` contains an
-            unspecified Polars data type class (such as bare `pl.Datetime`).
+            If `query`, `maintain_order`, or `use_query_cache` have invalid
+            types, if the dry-run result schema contains an unsupported
+            BigQuery field type (including `BIGNUMERIC` / `BIGDECIMAL`), or if
+            an explicit `schema` contains an unspecified Polars data type class
+            (such as bare `pl.Datetime`).
         RuntimeError
             If called on a closed `Client` instance.
 
@@ -714,7 +687,6 @@ class Client:
         raw_query = _validate_query_str(query)
         _validate_bool(maintain_order, "maintain_order")
         _validate_optional_bool(use_query_cache, "use_query_cache")
-        _validate_maximum_bytes_billed(maximum_bytes_billed)
 
         if not has_non_comment_sql(raw_query):
             raise ValueError("query must be a non-empty SELECT statement")
@@ -829,7 +801,6 @@ class Client:
             arrow_buffer_compression=arrow_buffer_compression,
             use_query_cache=use_query_cache,
             explicit_schema=schema is not None,
-            maximum_bytes_billed=maximum_bytes_billed,
         )
         executor = QueryExecutor(self._arrow_client)
 

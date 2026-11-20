@@ -68,10 +68,7 @@ impl ServiceConfigBuilder {
 
         let retry_throttler = default_retry_throttler();
 
-        let mut bq_builder = BigQueryJobService::builder()
-            .with_retry_policy(crate::bigquery_read_retry::job_service_retry_policy())
-            .with_backoff_policy(crate::bigquery_read_retry::default_backoff_policy())
-            .with_retry_throttler(retry_throttler.clone());
+        let mut bq_builder = BigQueryJobService::builder();
         let mut read_builder = Read::builder()
             .with_retry_policy(crate::bigquery_read_retry::create_read_session_retry_policy())
             .with_backoff_policy(crate::bigquery_read_retry::default_backoff_policy())

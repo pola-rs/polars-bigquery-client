@@ -37,7 +37,6 @@ class QueryScan(PlanNode):
     arrow_buffer_compression: ArrowBufferCompression = "lz4frame"
     use_query_cache: bool | None = None
     explicit_schema: bool = False
-    maximum_bytes_billed: int | None = None
 
     def __post_init__(self) -> None:
         if len(self.columns) == 0:
@@ -46,21 +45,6 @@ class QueryScan(PlanNode):
         if len(set(self.columns)) != len(self.columns):
             msg = "QueryScan columns must be unique."
             raise ValueError(msg)
-        if self.maximum_bytes_billed is not None:
-            if not isinstance(self.maximum_bytes_billed, int) or isinstance(
-                self.maximum_bytes_billed, bool
-            ):
-                msg = (
-                    "QueryScan maximum_bytes_billed must be an int or None, "
-                    f"got {type(self.maximum_bytes_billed).__name__}."
-                )
-                raise TypeError(msg)
-            if self.maximum_bytes_billed < 0:
-                msg = (
-                    "QueryScan maximum_bytes_billed must be non-negative, "
-                    f"got {self.maximum_bytes_billed}."
-                )
-                raise ValueError(msg)
 
     def children(self) -> tuple[PlanNode, ...]:
         return ()

@@ -67,7 +67,6 @@ class Client:
         dry_run: bool = False,
         maintain_order: bool = True,
         use_query_cache: bool | None = None,
-        maximum_bytes_billed: int | None = None,
     ) -> ArrowStreamExporter: ...
 
 class DropFlag:

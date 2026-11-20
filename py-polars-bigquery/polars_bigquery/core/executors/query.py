@@ -709,18 +709,12 @@ class QueryExecutor(PlanExecutor):
                     compiled.degraded_reason,
                 )
 
-        read_kwargs: dict[str, Any] = {
-            "arrow_buffer_compression": source.arrow_buffer_compression,
-            "dry_run": False,
-            "maintain_order": source.maintain_order,
-            "use_query_cache": source.use_query_cache,
-        }
-        if source.maximum_bytes_billed is not None:
-            read_kwargs["maximum_bytes_billed"] = source.maximum_bytes_billed
-
         arrow_stream_exporter = self._arrow_client.read_query(
             compiled.sql,
-            **read_kwargs,
+            arrow_buffer_compression=source.arrow_buffer_compression,
+            dry_run=False,
+            maintain_order=source.maintain_order,
+            use_query_cache=source.use_query_cache,
         )
         return execute_local_plan_batches(
             pl.scan_arrow_c_stream(arrow_stream_exporter),
