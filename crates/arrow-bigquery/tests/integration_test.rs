@@ -28,11 +28,8 @@ async fn consume_receiver(mut receiver: BigQueryRecordBatchReceiver) -> usize {
 async fn test_read_small_public_table() {
     let client = setup_client().await;
 
-    let table = BigQueryTableId {
-        project_id: "bigquery-public-data".to_string(),
-        dataset_id: "usa_names".to_string(),
-        table_id: "usa_1910_2013".to_string(),
-    };
+    let table = BigQueryTableId::new("bigquery-public-data", "usa_names", "usa_1910_2013")
+        .expect("valid table id");
 
     let (_, receiver) = client
         .read_table(
