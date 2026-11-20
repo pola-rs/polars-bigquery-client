@@ -496,7 +496,7 @@ def test_predicate_to_row_restriction_root_recursion_error_fallback(
     def raise_recursion(_expr_json):
         raise RecursionError("Maximum recursion depth exceeded")
 
-    monkeypatch.setattr(compiler, "_json_expr_to_row_restriction", raise_recursion)
+    monkeypatch.setattr(compiler, "_json_expr_to_compiled_predicate", raise_recursion)
     assert compiler.predicate_to_row_restriction(pl.col("a") == 1) == ""
 
 
@@ -3623,3 +3623,124 @@ def test_expr_has_descendant(
 
     # Assert
     assert actual is expected
+
+
+def test_format_conjuncts_sql() -> None:
+    assert compiler.format_conjuncts_sql(()) == ""
+    assert compiler.format_conjuncts_sql(["(`a` = 1)"]) == "(`a` = 1)"
+    assert (
+        compiler.format_conjuncts_sql(["(`a` = 1)", "(`b` = 2)"])
+        == "((`a` = 1) AND (`b` = 2))"
+    )
+    assert (
+        compiler.format_conjuncts_sql(["(`a` = 1)", "(`b` = 2)", "(`c` = 3)"])
+        == "(((`a` = 1) AND (`b` = 2)) AND (`c` = 3))"
+    )
+
+
+def test_compile_ir_to_sql_returns_exactness() -> None:
+    eq_node = compiler.ir.Eq(
+        left=compiler.ir.Column("a"),
+        right=compiler.ir.IntLiteral(1),
+    )
+    assert compiler.sql.compile_ir_to_sql(eq_node) == ("(`a` = 1)", True)
+
+    partial_and = compiler.ir.And(
+        left=eq_node,
+        right=compiler.ir.Unsupported(),
+    )
+    assert compiler.sql.compile_ir_to_sql(partial_and) == ("(`a` = 1)", False)
+
+
+def test_predicate_to_row_restriction_left_associative_and_true_omission() -> None:
+    right_assoc = (pl.col("a") == 1) & ((pl.col("b") == 2) & (pl.col("c") == 3))
+    assert (
+        compiler.predicate_to_row_restriction(right_assoc)
+        == "(((`a` = 1) AND (`b` = 2)) AND (`c` = 3))"
+    )
+    assert compiler.predicate_to_row_restriction(pl.lit(True)) == ""
+
+
+def test_compile_predicate_structured_conjuncts_and_exactness() -> None:
+    # Single exact comparison
+    res_single = compiler.compile_predicate(pl.col("a") == 1)
+    assert res_single == compiler.CompiledPredicate(
+        conjuncts=("(`a` = 1)",), is_exact=True
+    )
+    assert res_single.sql == "(`a` = 1)"
+
+    # Multi-conjunct flattening (including right-associative nesting)
+    expr = (pl.col("a") == 1) & ((pl.col("b") == 2) & (pl.col("c") == 3))
+    res_multi = compiler.compile_predicate(expr)
+    assert res_multi == compiler.CompiledPredicate(
+        conjuncts=("(`a` = 1)", "(`b` = 2)", "(`c` = 3)"),
+        is_exact=True,
+    )
+
+    # Conjuncts from pl.all_horizontal
+    res_all_h = compiler.compile_predicate(
+        pl.all_horizontal(pl.col("a") == 1, pl.col("b") == 2, pl.col("c") == 3)
+    )
+    assert res_all_h.conjuncts == ("(`a` = 1)", "(`b` = 2)", "(`c` = 3)")
+    assert res_all_h.is_exact is True
+
+    # Conjuncts introduced by rewrite_de_morgan: ~(a | b) -> (~a) & (~b)
+    res_dm = compiler.compile_predicate(~((pl.col("a") == 1) | (pl.col("b") == 2)))
+    assert res_dm.conjuncts == ("(NOT (`a` = 1))", "(NOT (`b` = 2))")
+    assert res_dm.is_exact is True
+
+    # Conjuncts introduced by rewrite_drop_nulls
+    res_dn = compiler.compile_predicate((pl.col("a") > 1).drop_nulls())
+    assert res_dn.is_exact is True
+    assert len(res_dn.conjuncts) == 2
+
+    # Trivial TRUE conjunct omitted while keeping is_exact=True
+    res_true = compiler.compile_predicate(pl.lit(True))
+    assert res_true == compiler.CompiledPredicate(conjuncts=(), is_exact=True)
+    assert res_true.sql == ""
+
+    res_and_true = compiler.compile_predicate((pl.col("a") == 1) & pl.lit(True))
+    assert res_and_true == compiler.CompiledPredicate(
+        conjuncts=("(`a` = 1)",), is_exact=True
+    )
+
+    # Partially pushable supported & unsupported
+    res_partial = compiler.compile_predicate(
+        (pl.col("a") == 1) & unsupported(pl.col("b"))
+    )
+    assert res_partial == compiler.CompiledPredicate(
+        conjuncts=("(`a` = 1)",), is_exact=False
+    )
+
+    # Partially pushable inside a single OR conjunct (sql_str non-None, is_exact=False)
+    or_ir = compiler.ir.Or(
+        left=compiler.ir.Eq(compiler.ir.Column("a"), compiler.ir.IntLiteral(1)),
+        right=compiler.ir.And(
+            left=compiler.ir.Eq(compiler.ir.Column("b"), compiler.ir.IntLiteral(2)),
+            right=compiler.ir.Unsupported(),
+        ),
+    )
+    assert compiler.sql.compile_ir_conjuncts_to_sql(or_ir) == (
+        ("((`a` = 1) OR (`b` = 2))",),
+        False,
+    )
+
+    # Completely unpushable
+    res_unpush = compiler.compile_predicate(unsupported(pl.col("a")))
+    assert res_unpush == compiler.CompiledPredicate(conjuncts=(), is_exact=False)
+    assert res_unpush.sql == ""
+
+    # Deep iterative stack for And chains (> Python default recursion limit)
+    deep_ir: compiler.ir.Expr = compiler.ir.Eq(
+        compiler.ir.Column("x"), compiler.ir.IntLiteral(0)
+    )
+    for i in range(1, 1500):
+        deep_ir = compiler.ir.And(
+            left=deep_ir,
+            right=compiler.ir.Eq(compiler.ir.Column("x"), compiler.ir.IntLiteral(i)),
+        )
+    conjuncts, is_exact = compiler.sql.compile_ir_conjuncts_to_sql(deep_ir)
+    assert is_exact is True
+    assert len(conjuncts) == 1500
+    assert conjuncts[0] == "(`x` = 0)"
+    assert conjuncts[-1] == "(`x` = 1499)"

@@ -1,0 +1,289 @@
+"""Unit tests for `polars_bigquery.core.plan` and `core.executors.base`."""
+
+from __future__ import annotations
+
+import dataclasses
+
+import arrow_bigquery
+import polars as pl
+import pytest
+from polars_bigquery.core.executors.base import PlanExecutor, apply_local_plan
+from polars_bigquery.core.plan import (
+    Filter,
+    PlanNode,
+    Project,
+    QueryScan,
+    Slice,
+    TableScan,
+    build_io_source_plan,
+    decompose_linear_plan,
+    validate_and_normalize_linear_plan,
+)
+
+
+def _table_id() -> arrow_bigquery.BigQueryTableId:
+    return arrow_bigquery.BigQueryTableId("proj", "ds", "tbl")
+
+
+def test_query_scan_validation_and_immutability() -> None:
+    scan = QueryScan(raw_query="SELECT a, b FROM t", columns=("a", "b"))
+    assert scan.children() == ()
+    assert scan.maintain_order is True
+    assert scan.arrow_buffer_compression == "lz4frame"
+    assert scan.use_query_cache is None
+    assert scan.explicit_schema is False
+
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        scan.raw_query = "SELECT 2"  # type: ignore[misc]
+
+    with pytest.raises(ValueError, match="at least one column"):
+        QueryScan(raw_query="SELECT 1", columns=())
+
+    with pytest.raises(ValueError, match="unique"):
+        QueryScan(raw_query="SELECT 1", columns=("a", "b", "a"))
+
+
+def test_table_scan_validation_and_mutation_isolation() -> None:
+    caller_schema = pl.Schema({"a": pl.Int64(), "b": pl.String()})
+    scan = TableScan(table_ref=_table_id(), schema=caller_schema)
+    assert scan.children() == ()
+    assert scan.columns == ("a", "b")
+    assert scan.maintain_order is False
+
+    # Mutating caller's schema after construction must not affect TableScan.schema.
+    caller_schema["c"] = pl.Boolean()
+    assert list(scan.schema.keys()) == ["a", "b"]
+    assert scan.columns == ("a", "b")
+
+    # TableScan holds pl.Schema (unhashable OrderedDict subclass).
+    with pytest.raises(TypeError, match="unhashable"):
+        hash(scan)
+
+    with pytest.raises(ValueError, match="non-empty schema"):
+        TableScan(table_ref=_table_id(), schema=pl.Schema())
+
+    with pytest.raises(TypeError):
+        TableScan(
+            table_ref=_table_id(),
+            schema={"a": pl.Datetime},  # type: ignore[arg-type]
+        )
+
+
+def test_filter_equality_and_unhashable() -> None:
+    scan = QueryScan(raw_query="SELECT a FROM t", columns=("a", "b"))
+    f1 = Filter(input=scan, predicate=pl.col("a") == 1)
+    f2 = Filter(input=scan, predicate=pl.col("a") == 1)
+    f3 = Filter(input=scan, predicate=pl.col("a") == 2)
+    other_scan = QueryScan(raw_query="SELECT a FROM other", columns=("a", "b"))
+    f4 = Filter(input=other_scan, predicate=pl.col("a") == 1)
+
+    assert f1.children() == (scan,)
+    assert f1 == f2
+    assert f1 != f3
+    assert f1 != f4
+    assert (f1 == "not-a-filter") is False
+    assert f1.__eq__("not-a-filter") is NotImplemented
+
+    with pytest.raises(TypeError, match="unhashable"):
+        hash(f1)
+
+
+def test_slice_validation_and_children() -> None:
+    scan = QueryScan(raw_query="SELECT a FROM t", columns=("a",))
+
+    s_zero = Slice(input=scan, offset=0, length=0)
+    assert s_zero.children() == (scan,)
+    assert s_zero.offset == 0
+    assert s_zero.length == 0
+
+    for bad_val in (True, False, 1.5, "1", None):
+        with pytest.raises(TypeError, match="Slice offset must be an int"):
+            Slice(input=scan, offset=bad_val, length=1)  # type: ignore[arg-type]
+        with pytest.raises(TypeError, match="Slice length must be an int"):
+            Slice(input=scan, offset=0, length=bad_val)  # type: ignore[arg-type]
+
+    with pytest.raises(ValueError, match="Slice offset must be non-negative"):
+        Slice(input=scan, offset=-1, length=1)
+    with pytest.raises(ValueError, match="Slice length must be non-negative"):
+        Slice(input=scan, offset=0, length=-5)
+
+
+def test_project_validation_and_children() -> None:
+    scan = QueryScan(raw_query="SELECT a, b FROM t", columns=("a", "b"))
+    empty = Project(input=scan, columns=())
+    assert empty.children() == (scan,)
+    assert empty.columns == ()
+
+    with pytest.raises(ValueError, match="Project columns must be unique"):
+        Project(input=scan, columns=("a", "b", "a"))
+
+
+def test_decompose_linear_plan_and_unknown_node() -> None:
+    scan = QueryScan(raw_query="SELECT a, b FROM t", columns=("a", "b"))
+    s_leaf, ops_leaf = decompose_linear_plan(scan)
+    assert s_leaf == scan
+    assert ops_leaf == ()
+
+    @dataclasses.dataclass(frozen=True, slots=True)
+    class _UnknownNode(PlanNode):
+        def children(self) -> tuple[PlanNode, ...]:
+            return ()
+
+    unknown = _UnknownNode()
+    assert unknown.children() == ()
+    with pytest.raises(TypeError, match="Unsupported plan node type: _UnknownNode"):
+        decompose_linear_plan(unknown)
+
+    wrapped = Project(input=unknown, columns=("a",))
+    with pytest.raises(TypeError, match="Unsupported plan node type: _UnknownNode"):
+        decompose_linear_plan(wrapped)
+
+
+def test_validate_and_normalize_linear_plan_visibility_checks() -> None:
+    scan = QueryScan(raw_query="SELECT a, b, c FROM t", columns=("a", "b", "c"))
+
+    # 0-Project plan: unknown column in Filter
+    with pytest.raises(ValueError, match="Filter references unknown or hidden"):
+        validate_and_normalize_linear_plan(
+            Filter(input=scan, predicate=pl.col("z") == 1)
+        )
+
+    # 1-Project plan: unknown column in Project
+    with pytest.raises(ValueError, match="Project references unknown or hidden"):
+        validate_and_normalize_linear_plan(Project(input=scan, columns=("a", "z")))
+
+    # Multi-Project plan: Filter referencing column dropped by earlier Project
+    dropped_before_filter = Filter(
+        input=Project(input=scan, columns=("a", "b")),
+        predicate=pl.col("c") > 0,
+    )
+    with pytest.raises(ValueError, match="'c'"):
+        validate_and_normalize_linear_plan(dropped_before_filter)
+
+    # Multi-Project plan: second Project referencing column dropped by first Project
+    dropped_before_project = Project(
+        input=Project(input=scan, columns=("a",)),
+        columns=("b",),
+    )
+    with pytest.raises(ValueError, match="'b'"):
+        validate_and_normalize_linear_plan(dropped_before_project)
+
+    # Plan with empty Project(()) followed by Filter using column raises
+    with pytest.raises(ValueError, match="'a'"):
+        validate_and_normalize_linear_plan(
+            Filter(input=Project(input=scan, columns=()), predicate=pl.col("a") == 1)
+        )
+
+
+def test_validate_and_normalize_collapses_intermediate_projects() -> None:
+    scan = QueryScan(raw_query="SELECT a, b, c FROM t", columns=("a", "b", "c"))
+    p1 = Filter(input=scan, predicate=pl.col("c") > 0)
+    p2 = Project(input=p1, columns=("a", "b"))
+    p3 = Slice(input=p2, offset=1, length=5)
+    p4 = Filter(input=p3, predicate=pl.col("b") == "x")
+    p5 = Project(input=p4, columns=("a",))
+    p6 = Slice(input=p5, offset=0, length=2)
+
+    source, normalized_ops, normalized_plan = validate_and_normalize_linear_plan(p6)
+    assert source == scan
+    # Superseded p2 Project is removed; final p5 Project stays between Filter and Slice.
+    assert [type(op) for op in normalized_ops] == [
+        Filter,
+        Slice,
+        Filter,
+        Project,
+        Slice,
+    ]
+    assert isinstance(normalized_ops[3], Project)
+    assert normalized_ops[3].columns == ("a",)
+    # Every surviving node is re-chained so there are no stale .input references.
+    assert decompose_linear_plan(normalized_plan) == (source, normalized_ops)
+    assert normalized_ops[0].input == scan
+    assert normalized_ops[1].input == normalized_ops[0]
+    assert normalized_ops[2].input == normalized_ops[1]
+    assert normalized_ops[3].input == normalized_ops[2]
+    assert normalized_ops[4].input == normalized_ops[3]
+
+
+def test_validate_and_normalize_no_ops_and_table_scan() -> None:
+    tscan = TableScan(
+        table_ref=_table_id(),
+        schema=pl.Schema({"a": pl.Int64(), "b": pl.String()}),
+    )
+    src, ops, norm = validate_and_normalize_linear_plan(tscan)
+    assert src == tscan
+    assert ops == ()
+    assert norm == tscan
+
+
+def test_build_io_source_plan_variants() -> None:
+    scan = QueryScan(raw_query="SELECT a, b FROM t", columns=("a", "b"))
+
+    plan_all = build_io_source_plan(
+        scan, with_columns=None, predicate=None, n_rows=None
+    )
+    src, ops = decompose_linear_plan(plan_all)
+    assert src == scan
+    assert ops == (Project(input=scan, columns=("a", "b")),)
+
+    plan_zero_limit = build_io_source_plan(
+        scan, with_columns=[], predicate=pl.col("a") > 1, n_rows=0
+    )
+    src2, ops2 = decompose_linear_plan(plan_zero_limit)
+    assert src2 == scan
+    assert [type(op) for op in ops2] == [Slice, Filter, Project]
+    assert ops2[0] == Slice(input=scan, offset=0, length=0)
+    assert ops2[1] == Filter(input=ops2[0], predicate=pl.col("a") > 1)
+    assert ops2[2] == Project(input=ops2[1], columns=())
+
+
+def test_apply_local_plan_operator_orderings() -> None:
+    scan = QueryScan(raw_query="SELECT a, b FROM t", columns=("a", "b"))
+    base = pl.LazyFrame({"a": [1, 2, 3, 4, 5, 6], "b": ["u", "v", "w", "x", "y", "z"]})
+
+    # Filter -> Slice(1, 2) -> Project(("b", "a"))
+    filter_then_slice = Project(
+        input=Slice(
+            input=Filter(input=scan, predicate=pl.col("a") > 2),
+            offset=1,
+            length=2,
+        ),
+        columns=("b", "a"),
+    )
+    df1 = apply_local_plan(base, filter_then_slice).collect()
+    assert df1.columns == ["b", "a"]
+    assert df1.to_dict(as_series=False) == {"b": ["x", "y"], "a": [4, 5]}
+
+    # Slice(0, 3) -> Filter(a > 2) -> Project(("a",))
+    slice_then_filter = Project(
+        input=Filter(
+            input=Slice(input=scan, offset=0, length=3),
+            predicate=pl.col("a") > 2,
+        ),
+        columns=("a",),
+    )
+    df2 = apply_local_plan(base, slice_then_filter).collect()
+    assert df2.to_dict(as_series=False) == {"a": [3]}
+
+    # Multi-stage Filter -> Slice -> Filter
+    multi = Filter(
+        input=Slice(
+            input=Filter(input=scan, predicate=pl.col("a") >= 2),
+            offset=1,
+            length=3,
+        ),
+        predicate=pl.col("a") != 4,
+    )
+    df3 = apply_local_plan(base, multi).collect()
+    assert df3.to_dict(as_series=False) == {"a": [3, 5], "b": ["w", "y"]}
+
+    # Empty Project(()) drops all columns via .drop(pl.all())
+    zero_col = Project(input=scan, columns=())
+    df_empty_proj = apply_local_plan(base, zero_col).collect()
+    assert df_empty_proj.width == 0
+    assert df_empty_proj.columns == []
+
+
+def test_plan_executor_is_abstract() -> None:
+    with pytest.raises(TypeError, match="abstract"):
+        PlanExecutor()  # type: ignore[abstract]

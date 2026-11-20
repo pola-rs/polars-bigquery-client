@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from collections.abc import Sequence
+from typing import Any
+
 import polars as pl
 from polars.datatypes import (
     Binary,
@@ -90,14 +93,14 @@ def _extract_data_type(field: dict) -> DataType:
     raise TypeError(message)
 
 
-def extract_polars_schema(table_metadata: dict) -> pl.Schema:
-    """Convert a BigQuery table REST response into a Polars schema.
+def extract_polars_schema_from_fields(fields: Sequence[dict[str, Any]]) -> pl.Schema:
+    """Convert BigQuery `TableFieldSchema` entries into a Polars schema.
 
-    See: https://docs.cloud.google.com/bigquery/docs/reference/rest/v2/tables#Table
+    See: https://docs.cloud.google.com/bigquery/docs/reference/rest/v2/tables#TableFieldSchema
     """
     pl_schema = {}
     duplicates: list[str] = []
-    for field in table_metadata.get("schema", {}).get("fields", []):
+    for field in fields:
         name = field.get("name", "")
         if name in pl_schema:
             if name not in duplicates:
@@ -110,6 +113,18 @@ def extract_polars_schema(table_metadata: dict) -> pl.Schema:
         msg = f"BigQuery schema contains duplicate column name(s): {dup_list}."
         raise ValueError(msg)
 
+    return pl.Schema(pl_schema)
+
+
+def extract_polars_schema(table_metadata: dict) -> pl.Schema:
+    """Convert a BigQuery table REST response into a Polars schema.
+
+    See: https://docs.cloud.google.com/bigquery/docs/reference/rest/v2/tables#Table
+    """
+    pl_schema = extract_polars_schema_from_fields(
+        table_metadata.get("schema", {}).get("fields", [])
+    )
+
     # If table is ingestion time partitioned, add pseudocolumns for _PARTITIONDATE
     # and _PARTITIONTIME to allow for partition filters. See:
     # https://cloud.google.com/bigquery/docs/partitioned-tables#ingestion_time
@@ -119,4 +134,4 @@ def extract_polars_schema(table_metadata: dict) -> pl.Schema:
         pl_schema["_PARTITIONDATE"] = Date()
         pl_schema["_PARTITIONTIME"] = Datetime(time_unit="us", time_zone="utc")
 
-    return pl.Schema(pl_schema)
+    return pl_schema

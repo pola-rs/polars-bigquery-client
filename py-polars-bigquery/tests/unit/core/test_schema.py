@@ -1,6 +1,9 @@
 import polars as pl
 import pytest
-from polars_bigquery.core.schema import extract_polars_schema
+from polars_bigquery.core.schema import (
+    extract_polars_schema,
+    extract_polars_schema_from_fields,
+)
 
 
 def test_extract_polars_schema_primitive_types():
@@ -138,3 +141,51 @@ def test_extract_polars_schema_duplicate_column_names():
         match=r"BigQuery schema contains duplicate column name\(s\): 'a', 'b'\.",
     ):
         extract_polars_schema(metadata)
+
+
+def test_extract_polars_schema_from_fields_standard_and_nested():
+    fields = [
+        {"name": "id", "type": "INT64"},
+        {"name": "tags", "type": "STRING", "mode": "REPEATED"},
+        {
+            "name": "info",
+            "type": "STRUCT",
+            "fields": [{"name": "score", "type": "FLOAT64"}],
+        },
+    ]
+    schema = extract_polars_schema_from_fields(fields)
+    assert schema == pl.Schema(
+        {
+            "id": pl.Int64(),
+            "tags": pl.List(pl.String()),
+            "info": pl.Struct([pl.Field("score", pl.Float64())]),
+        }
+    )
+    assert "_PARTITIONDATE" not in schema
+    assert "_PARTITIONTIME" not in schema
+
+
+def test_extract_polars_schema_from_fields_duplicate_names_raises():
+    fields = [
+        {"name": "a", "type": "INT64"},
+        {"name": "a", "type": "STRING"},
+    ]
+    with pytest.raises(
+        ValueError,
+        match=r"BigQuery schema contains duplicate column name\(s\): 'a'\.",
+    ):
+        extract_polars_schema_from_fields(fields)
+
+
+def test_extract_polars_schema_from_fields_case_differing_names_allowed():
+    fields = [
+        {"name": "a", "type": "INT64"},
+        {"name": "A", "type": "STRING"},
+    ]
+    schema = extract_polars_schema_from_fields(fields)
+    assert schema == pl.Schema({"a": pl.Int64(), "A": pl.String()})
+
+
+def test_extract_polars_schema_from_fields_empty():
+    schema = extract_polars_schema_from_fields([])
+    assert schema == pl.Schema()
