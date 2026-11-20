@@ -113,11 +113,22 @@ def get_table_metadata(
     table_metadata_url = _get_table_metadata_url(table_ref=table_ref)
     response = http.get(table_metadata_url, headers=headers, timeout=timeout)
     _raise_for_bigquery_error(response)
-    return response.json()
+    try:
+        payload = response.json()
+    except ValueError as exc:
+        msg = "Invalid JSON response from BigQuery REST API."
+        raise polars_bigquery.exceptions.BigQueryError(msg) from exc
+    if not isinstance(payload, dict):
+        msg = (
+            "Invalid response from BigQuery: expected JSON object for table "
+            f"metadata, got {type(payload).__name__}."
+        )
+        raise polars_bigquery.exceptions.BigQueryError(msg)
+    return payload
 
 
 class BigQueryRestClient:
-    """Stateful BigQuery REST client with connection pooling and metadata caching."""
+    """Stateful BigQuery REST client with connection pooling and exponential-backoff retries."""
 
     def __init__(
         self,

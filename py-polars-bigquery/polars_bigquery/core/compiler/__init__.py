@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 import dataclasses
-import functools
 import io
 import json
+import logging
 from collections.abc import Sequence
 from typing import Any
 
@@ -14,10 +14,13 @@ from polars_bigquery.core.compiler.parser import json_to_ir
 from polars_bigquery.core.compiler.rewriter import rewrite_ir
 from polars_bigquery.core.compiler.sql import ir_to_sql
 
+logger = logging.getLogger(__name__)
+
 __all__ = [
     "CompiledPredicate",
     "compile_predicate",
     "format_conjuncts_sql",
+    "formatted_conjuncts_byte_length",
     "ir",
     "ir_to_sql",
     "json_to_ir",
@@ -30,10 +33,29 @@ __all__ = [
 
 
 def format_conjuncts_sql(conjuncts: Sequence[str]) -> str:
-    """Join SQL conjuncts with left-associative parenthesized `AND`."""
+    """Join SQL conjuncts with flat, single-pass parenthesized `AND`.
+
+    Emits `""` for 0 conjuncts, `conjuncts[0]` for 1 conjunct, and
+    `({c0} AND {c1} AND ...)` for 2+ conjuncts using a single `O(N)` join so
+    large conjunctions avoid `O(N^2)` string reallocation and `(N-1)`-deep
+    parenthesis nesting in BigQuery's SQL parser.
+    """
     if not conjuncts:
         return ""
-    return functools.reduce(lambda acc, c: f"({acc} AND {c})", conjuncts)
+    if len(conjuncts) == 1:
+        return conjuncts[0]
+    return f"({' AND '.join(conjuncts)})"
+
+
+def formatted_conjuncts_byte_length(conjunct_byte_lengths: Sequence[int]) -> int:
+    """Return the exact UTF-8 byte length of `format_conjuncts_sql(...)` in `O(1)` memory."""
+    count = len(conjunct_byte_lengths)
+    if count == 0:
+        return 0
+    if count == 1:
+        return conjunct_byte_lengths[0]
+    # "(" + c0 + " AND " + c1 + ... + ")"  -> 5 bytes per " AND " + 2 outer parens
+    return sum(conjunct_byte_lengths) + 5 * (count - 1) + 2
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -60,12 +82,15 @@ def _json_expr_to_compiled_predicate(expr_json: dict[str, Any]) -> CompiledPredi
 def compile_predicate(predicate: pl.Expr) -> CompiledPredicate:
     """Compile a Polars filter expression into structured SQL conjuncts and exactness."""
     predicate_json_file = io.BytesIO()
-    predicate.meta.serialize(predicate_json_file, format="json")
-    predicate_json_file.seek(0)
     try:
+        predicate.meta.serialize(predicate_json_file, format="json")
+        predicate_json_file.seek(0)
         predicate_json = json.load(predicate_json_file)
         return _json_expr_to_compiled_predicate(predicate_json)
-    except (RecursionError, json.JSONDecodeError):
+    except (RecursionError, json.JSONDecodeError, pl.exceptions.PolarsError):
+        logger.debug(
+            "Predicate could not be serialized or parsed; falling back to local filtering.",
+        )
         return CompiledPredicate(conjuncts=(), is_exact=False)
 
 

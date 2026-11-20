@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import dataclasses
+import heapq
 import logging
 from collections.abc import Iterator, Sequence
 from typing import Any, Literal, cast
@@ -10,7 +11,11 @@ from typing import Any, Literal, cast
 import polars as pl
 
 from polars_bigquery.core import compiler
-from polars_bigquery.core.executors.base import PlanExecutor, apply_local_plan
+from polars_bigquery.core.executors.base import (
+    ArrowQueryClient,
+    PlanExecutor,
+    execute_local_plan_batches,
+)
 from polars_bigquery.core.plan import (
     Filter,
     PlanNode,
@@ -26,6 +31,8 @@ logger = logging.getLogger(__name__)
 
 MAX_UNRESOLVED_SQL_BYTES = 1_000_000
 MAX_BIGQUERY_LIMIT = (1 << 63) - 1
+
+_WHERE_LINE_PREFIX_BYTES = len(b"\n|> WHERE ")
 
 DegradedReason = Literal[
     "sql_length_pruned_conjuncts",
@@ -48,6 +55,184 @@ class CompiledQueryPlan:
     degraded_reason: DegradedReason | None
 
 
+def _scan_sql_trailing_semicolon(sql: str) -> tuple[bool, int | None]:
+    """Scan GoogleSQL tokens once in `O(len(sql))` without backtracking.
+
+    Returns ``(has_non_semicolon_token, last_trailing_semicolon_index)``.
+    `last_trailing_semicolon_index` is the byte/char index of a single `;`
+    token whose only following content consists of whitespace and comments
+    (`-- ...`, `# ...`, or `/* ... */`), or `None` if the last significant
+    token is not `;`. Handles GoogleSQL single/double/triple-quoted strings,
+    raw strings (`r'...'`/`rb'...'`), and backtick-quoted identifiers so
+    semicolons inside strings, identifiers, or comments are never misread.
+    """
+    n = len(sql)
+    i = 0
+    has_non_semi_token = False
+    last_trailing_semi_idx: int | None = None
+
+    while i < n:
+        ch = sql[i]
+
+        # Whitespace trivia
+        if ch.isspace():
+            i += 1
+            continue
+
+        # Line comment: `-- ...`
+        if ch == "-" and i + 1 < n and sql[i + 1] == "-":
+            newline = sql.find("\n", i + 2)
+            i = n if newline == -1 else newline + 1
+            continue
+
+        # Line comment: `# ...`
+        if ch == "#":
+            newline = sql.find("\n", i + 1)
+            i = n if newline == -1 else newline + 1
+            continue
+
+        # Block comment: `/* ... */` (non-nesting in GoogleSQL)
+        if ch == "/" and i + 1 < n and sql[i + 1] == "*":
+            end = sql.find("*/", i + 2)
+            i = n if end == -1 else end + 2
+            continue
+
+        # Semicolon statement terminator
+        if ch == ";":
+            last_trailing_semi_idx = i
+            i += 1
+            continue
+
+        # Any other token marks non-empty SQL and clears a previous trailing `;`
+        has_non_semi_token = True
+        last_trailing_semi_idx = None
+
+        # Backtick-quoted identifier
+        if ch == "`":
+            i += 1
+            while i < n:
+                c = sql[i]
+                if c == "\\":
+                    i += 2
+                elif c == "`":
+                    i += 1
+                    break
+                else:
+                    i += 1
+            continue
+
+        # String / raw-string / byte-string literal prefixes: r'...', b'...', rb'...', etc.
+        # Only recognize prefixes when starting a fresh token (not after an identifier char).
+        is_raw = False
+        at_token_start = i == 0 or not (sql[i - 1].isalnum() or sql[i - 1] == "_")
+        if at_token_start and ch in ("r", "R", "b", "B"):
+            p = i
+            if (
+                p + 2 < n
+                and sql[p + 1] in ("r", "R", "b", "B")
+                and sql[p].lower() != sql[p + 1].lower()
+                and sql[p + 2] in ("'", '"')
+            ):
+                is_raw = True
+                i = p + 2
+                ch = sql[i]
+            elif p + 1 < n and sql[p + 1] in ("'", '"'):
+                is_raw = sql[p] in ("r", "R")
+                i = p + 1
+                ch = sql[i]
+            else:
+                # Regular identifier starting with r/R/b/B: consume contiguous word chars.
+                i += 1
+                while i < n and (sql[i].isalnum() or sql[i] == "_"):
+                    i += 1
+                continue
+
+        # Single / double / triple-quoted string literals
+        if ch in ("'", '"'):
+            quote = ch
+            if i + 2 < n and sql[i + 1] == quote and sql[i + 2] == quote:
+                delim = quote * 3
+                i += 3
+                while i < n:
+                    if not is_raw and sql[i] == "\\":
+                        i += 2
+                        continue
+                    if sql.startswith(delim, i):
+                        i += 3
+                        break
+                    i += 1
+            else:
+                i += 1
+                while i < n:
+                    c = sql[i]
+                    if not is_raw and c == "\\":
+                        i += 2
+                    elif c == quote:
+                        i += 1
+                        break
+                    else:
+                        i += 1
+            continue
+
+        # Consume remaining ordinary non-special characters quickly
+        i += 1
+        while i < n and sql[i] not in (
+            " ",
+            "\t",
+            "\n",
+            "\r",
+            "\v",
+            "\f",
+            "-",
+            "#",
+            "/",
+            ";",
+            "`",
+            "'",
+            '"',
+            "r",
+            "R",
+            "b",
+            "B",
+        ):
+            i += 1
+
+    return has_non_semi_token, last_trailing_semi_idx
+
+
+def has_non_comment_sql(sql: str) -> bool:
+    """Return `True` if `sql` contains at least one token besides whitespace, comments, and `;`."""
+    has_token, _ = _scan_sql_trailing_semicolon(sql)
+    return has_token
+
+
+def _strip_single_trailing_semicolon(sql: str) -> str:
+    """Right-trim `sql` and remove at most one trailing bare statement-terminating `;`.
+
+    Handles comments placed *after* the trailing semicolon (e.g. `SELECT 1; -- note`,
+    `SELECT 1; # note`, `SELECT 1; /* note */`) while leaving leading whitespace/newlines
+    intact (so BigQuery `[line:col]` error coordinates stay unshifted), leaving
+    `;` inside strings/comments/identifiers untouched, and leaving a preceding `;`
+    from invalid double-semicolon SQL (`SELECT 1;;`) so BigQuery rejects it.
+    """
+    _, semi_idx = _scan_sql_trailing_semicolon(sql)
+    if semi_idx is not None:
+        return sql[:semi_idx].rstrip()
+    return sql.rstrip()
+
+
+def _validate_max_sql_bytes(max_sql_bytes: Any) -> int:
+    if not isinstance(max_sql_bytes, int) or isinstance(max_sql_bytes, bool):
+        msg = (
+            f"max_sql_bytes must be a positive int, got {type(max_sql_bytes).__name__}."
+        )
+        raise TypeError(msg)
+    if max_sql_bytes <= 0:
+        msg = f"max_sql_bytes must be positive, got {max_sql_bytes}."
+        raise ValueError(msg)
+    return max_sql_bytes
+
+
 def _choose_dummy_column_name(all_columns: Sequence[str]) -> str:
     """Pick a collision-safe case-insensitive alias for zero-column projections."""
     existing = {col.casefold() for col in all_columns}
@@ -58,6 +243,74 @@ def _choose_dummy_column_name(all_columns: Sequence[str]) -> str:
     while f"{base}_{suffix}" in existing:
         suffix += 1
     return f"{base}_{suffix}"
+
+
+def _where_clause_line_bytes(conjunct_sum: int, conjunct_count: int) -> int:
+    """Return exact UTF-8 bytes contributed by `\\n|> WHERE <formatted_conjuncts>`."""
+    if conjunct_count == 0:
+        return 0
+    if conjunct_count == 1:
+        return _WHERE_LINE_PREFIX_BYTES + conjunct_sum
+    # "\n|> WHERE " + "(" + c0 + " AND " + c1 + ... + ")"
+    return _WHERE_LINE_PREFIX_BYTES + conjunct_sum + 5 * (conjunct_count - 1) + 2
+
+
+def _compute_active_lower_summary(
+    normalized_ops: tuple[UnaryPlanOp, ...],
+    filter_counts: dict[int, tuple[int, int, bool]],
+    inner_bytes: int,
+    select_line_bytes: int,
+) -> tuple[int, set[int]]:
+    """Compute exact assembled UTF-8 byte length and emitted filter indices without string concat.
+
+    `filter_counts[op_idx]` holds ``(active_count, active_byte_sum, is_exact)``.
+    Mirrors `_lower_and_assemble`'s exact state machine in `O(len(normalized_ops))`.
+    """
+    total_bytes = inner_bytes + select_line_bytes
+    emitted_filter_indices: set[int] = set()
+    has_clause = select_line_bytes > 0
+
+    pending_zero_offset_slice: int | None = None
+    partial_filter_barrier = False
+
+    def flush_slice() -> None:
+        nonlocal pending_zero_offset_slice, total_bytes, has_clause
+        if pending_zero_offset_slice is not None:
+            # "\n|> LIMIT <n>"
+            total_bytes += 10 + len(str(pending_zero_offset_slice))
+            has_clause = True
+            pending_zero_offset_slice = None
+
+    for op_idx, op in enumerate(normalized_ops):
+        if isinstance(op, Project):
+            continue
+        if isinstance(op, Filter):
+            count, byte_sum, is_exact = filter_counts[op_idx]
+            if count > 0:
+                total_bytes += _where_clause_line_bytes(byte_sum, count)
+                emitted_filter_indices.add(op_idx)
+                has_clause = True
+            if not is_exact:
+                flush_slice()
+                partial_filter_barrier = True
+            continue
+        # op is Slice
+        flush_slice()
+        if (
+            partial_filter_barrier
+            or op.offset > MAX_BIGQUERY_LIMIT
+            or op.length > MAX_BIGQUERY_LIMIT
+        ):
+            break
+        if op.offset == 0:
+            pending_zero_offset_slice = op.length
+        else:
+            # "\n|> LIMIT <length> OFFSET <offset>"
+            total_bytes += 18 + len(str(op.length)) + len(str(op.offset))
+            has_clause = True
+
+    flush_slice()
+    return (total_bytes if has_clause else inner_bytes), emitted_filter_indices
 
 
 def _lower_and_assemble(
@@ -180,13 +433,14 @@ def compile_query_plan(
     plan: PlanNode, *, max_sql_bytes: int = MAX_UNRESOLVED_SQL_BYTES
 ) -> CompiledQueryPlan:
     """Compile a `QueryScan` logical plan into a GoogleSQL pipe query."""
-    leaf, _ = decompose_linear_plan(plan)
-    if not isinstance(leaf, QueryScan):
-        msg = f"compile_query_plan expects a QueryScan leaf, got {type(leaf).__name__}."
-        raise TypeError(msg)
+    max_sql_bytes = _validate_max_sql_bytes(max_sql_bytes)
 
-    _, normalized_ops, normalized_plan = validate_and_normalize_linear_plan(plan)
-    source = leaf
+    leaf, normalized_ops, normalized_plan = validate_and_normalize_linear_plan(
+        plan,
+        expected_leaf_type=QueryScan,
+        caller="compile_query_plan",
+    )
+    source = cast(QueryScan, leaf)
 
     if source.maintain_order:
         return CompiledQueryPlan(
@@ -200,7 +454,7 @@ def compile_query_plan(
             degraded_reason=None,
         )
 
-    inner_query = source.raw_query.rstrip().removesuffix(";").rstrip()
+    inner_query = _strip_single_trailing_semicolon(source.raw_query)
 
     final_project = next((op for op in normalized_ops if isinstance(op, Project)), None)
     output_cols = final_project.columns if final_project is not None else source.columns
@@ -254,34 +508,97 @@ def compile_query_plan(
         return candidate
 
     # Tier 1: Full piped SQL fits within UTF-8 byte ceiling.
-    if len(candidate.sql.encode("utf-8")) <= max_sql_bytes:
+    candidate_bytes = len(candidate.sql.encode("utf-8"))
+    if candidate_bytes <= max_sql_bytes:
         return candidate
 
+    # Fast-path: if `inner_query` alone already hits or exceeds the ceiling,
+    # no rewritten `inner_query\n|> ...` variant can fit in Tier 2 or Tier 3.
+    inner_bytes = len(inner_query.encode("utf-8"))
+    if inner_bytes >= max_sql_bytes:
+        return CompiledQueryPlan(
+            sql=source.raw_query,
+            rewritten=False,
+            residual_plan=normalized_plan,
+            projected_columns=None,
+            where_clauses=(),
+            pushed_slices=(),
+            dummy_column=None,
+            degraded_reason="sql_length_skipped_pushdown",
+        )
+
     if candidate.where_clauses:
-        # Tier 2: Prune the largest emitted top-level AND conjuncts first.
-        tier2_states = dict(initial_filter_states)
-        while (
-            len(candidate.sql.encode("utf-8")) > max_sql_bytes
-            and candidate.where_clauses
-        ):
-            best_op_idx, best_conj_idx = max(
-                (
-                    (op_idx, conj_idx)
-                    for op_idx in emitted_filter_indices
-                    for conj_idx in range(len(tier2_states[op_idx][0]))
-                ),
-                key=lambda item: (
-                    len(tier2_states[item[0]][0][item[1]].encode("utf-8")),
-                    item[0],
-                    item[1],
-                ),
+        # Tier 2: Prune the largest emitted top-level AND conjuncts first in
+        # O(K log K) by tracking exact UTF-8 byte deltas via a max-heap.
+        select_line_bytes = (
+            1 + len(select_clause.encode("utf-8")) if select_clause is not None else 0
+        )
+        conj_byte_lens: dict[int, list[int]] = {}
+        active_masks: dict[int, list[bool]] = {}
+        filter_counts: dict[int, tuple[int, int, bool]] = {}
+        for op_idx, (conjuncts, is_exact) in initial_filter_states.items():
+            lengths = [len(c.encode("utf-8")) for c in conjuncts]
+            conj_byte_lens[op_idx] = lengths
+            active_masks[op_idx] = [True] * len(conjuncts)
+            filter_counts[op_idx] = (len(lengths), sum(lengths), is_exact)
+
+        emitted: set[int] = set(emitted_filter_indices)
+        has_slice_after: set[int] = {
+            op_idx
+            for op_idx in initial_filter_states
+            if any(
+                isinstance(normalized_ops[j], Slice)
+                for j in range(op_idx + 1, len(normalized_ops))
             )
-            old_conjuncts, _ = tier2_states[best_op_idx]
-            tier2_states[best_op_idx] = (
-                old_conjuncts[:best_conj_idx] + old_conjuncts[best_conj_idx + 1 :],
-                False,
-            )
-            candidate, emitted_filter_indices = _lower_and_assemble(
+        }
+
+        # Max-heap ordered by (byte_len, op_idx, conj_idx) descending for
+        # deterministic rightmost-first tie breaking matching `emitted`.
+        heap: list[tuple[int, int, int]] = [
+            (-conj_byte_lens[op_idx][conj_idx], -op_idx, -conj_idx)
+            for op_idx in emitted
+            for conj_idx in range(len(conj_byte_lens[op_idx]))
+        ]
+        heapq.heapify(heap)
+
+        current_bytes = candidate_bytes
+        while current_bytes > max_sql_bytes and emitted and heap:
+            neg_len, neg_op_idx, neg_conj_idx = heapq.heappop(heap)
+            op_idx = -neg_op_idx
+            conj_idx = -neg_conj_idx
+            if op_idx not in emitted:
+                continue
+
+            conj_len = -neg_len
+            active_masks[op_idx][conj_idx] = False
+            old_count, old_sum, was_exact = filter_counts[op_idx]
+            new_count = old_count - 1
+            new_sum = old_sum - conj_len
+            filter_counts[op_idx] = (new_count, new_sum, False)
+
+            if was_exact and op_idx in has_slice_after:
+                # Changing a filter from exact -> inexact before a Slice can activate
+                # partial_filter_barrier and cascade-withhold downstream slices/filters.
+                current_bytes, emitted = _compute_active_lower_summary(
+                    normalized_ops, filter_counts, inner_bytes, select_line_bytes
+                )
+            else:
+                old_where_bytes = _where_clause_line_bytes(old_sum, old_count)
+                new_where_bytes = _where_clause_line_bytes(new_sum, new_count)
+                current_bytes -= old_where_bytes - new_where_bytes
+                if new_count == 0:
+                    emitted.discard(op_idx)
+
+        if emitted and current_bytes <= max_sql_bytes:
+            pruned_states: dict[int, tuple[tuple[str, ...], bool]] = {}
+            for op_idx, (orig_conjuncts, orig_exact) in initial_filter_states.items():
+                mask = active_masks[op_idx]
+                _, _, is_exact = filter_counts[op_idx]
+                kept = tuple(
+                    c for c, keep in zip(orig_conjuncts, mask, strict=True) if keep
+                )
+                pruned_states[op_idx] = (kept, is_exact and orig_exact)
+            pruned_candidate, _ = _lower_and_assemble(
                 source=source,
                 normalized_ops=normalized_ops,
                 normalized_plan=normalized_plan,
@@ -289,13 +606,10 @@ def compile_query_plan(
                 select_clause=select_clause,
                 projected_columns=projected_columns,
                 dummy_column=dummy_column,
-                filter_states=tier2_states,
+                filter_states=pruned_states,
+                degraded_reason="sql_length_pruned_conjuncts",
             )
-
-        if candidate.where_clauses:
-            return dataclasses.replace(
-                candidate, degraded_reason="sql_length_pruned_conjuncts"
-            )
+            return pruned_candidate
 
         # Tier 3: Drop all remaining |> WHERE clauses while preserving trivial filters.
         tier3_states = {
@@ -335,7 +649,14 @@ def compile_query_plan(
 class QueryExecutor(PlanExecutor):
     """Executes `QueryScan` logical plans via `arrow_bigquery.Client.read_query`."""
 
-    def __init__(self, arrow_client: Any, *, max_sql_bytes: int | None = None) -> None:
+    def __init__(
+        self,
+        arrow_client: ArrowQueryClient,
+        *,
+        max_sql_bytes: int | None = None,
+    ) -> None:
+        if max_sql_bytes is not None:
+            max_sql_bytes = _validate_max_sql_bytes(max_sql_bytes)
         self._arrow_client = arrow_client
         self._max_sql_bytes = max_sql_bytes
 
@@ -348,55 +669,63 @@ class QueryExecutor(PlanExecutor):
             else self._max_sql_bytes
         )
         compiled = compile_query_plan(plan, max_sql_bytes=active_max_sql_bytes)
-        source_leaf, _ = decompose_linear_plan(compiled.residual_plan)
+        source_leaf, residual_ops = decompose_linear_plan(compiled.residual_plan)
         source = cast(QueryScan, source_leaf)
 
-        total_columns = len(source.columns)
-        if compiled.projected_columns is None:
-            projection_summary = f"{total_columns}/{total_columns}"
-        elif len(compiled.projected_columns) == 0:
-            projection_summary = "0-col dummy"
-        else:
-            projection_summary = f"{len(compiled.projected_columns)}/{total_columns}"
+        debug_enabled = logger.isEnabledFor(logging.DEBUG)
+        if compiled.degraded_reason is not None or debug_enabled:
+            sql_bytes = len(compiled.sql.encode("utf-8"))
+            if compiled.degraded_reason is not None:
+                logger.warning(
+                    "Query pushdown degraded (%s): sql_bytes=%d, max_sql_bytes=%d",
+                    compiled.degraded_reason,
+                    sql_bytes,
+                    active_max_sql_bytes,
+                )
+            if debug_enabled:
+                total_columns = len(source.columns)
+                if compiled.projected_columns is None:
+                    projection_summary = f"{total_columns}/{total_columns}"
+                elif len(compiled.projected_columns) == 0:
+                    projection_summary = "0-col dummy"
+                else:
+                    projection_summary = (
+                        f"{len(compiled.projected_columns)}/{total_columns}"
+                    )
+                where_bytes = sum(
+                    len(c.encode("utf-8")) for c in compiled.where_clauses
+                )
+                logger.debug(
+                    "Executing scan_query: maintain_order=%s, rewritten=%s, "
+                    "projected=%s, where_clauses=%d, where_bytes=%d, "
+                    "pushed_slices=%s, sql_bytes=%d, degraded_reason=%s",
+                    source.maintain_order,
+                    compiled.rewritten,
+                    projection_summary,
+                    len(compiled.where_clauses),
+                    where_bytes,
+                    compiled.pushed_slices,
+                    sql_bytes,
+                    compiled.degraded_reason,
+                )
 
-        sql_bytes = len(compiled.sql.encode("utf-8"))
-        where_bytes = sum(len(c.encode("utf-8")) for c in compiled.where_clauses)
-
-        if compiled.degraded_reason is not None:
-            logger.warning(
-                "Query pushdown degraded (%s): sql_bytes=%d, max_sql_bytes=%d",
-                compiled.degraded_reason,
-                sql_bytes,
-                active_max_sql_bytes,
-            )
-
-        logger.debug(
-            "Executing scan_query: maintain_order=%s, rewritten=%s, projected=%s, "
-            "where_clauses=%d, where_bytes=%d, pushed_slices=%s, sql_bytes=%d, "
-            "degraded_reason=%s",
-            source.maintain_order,
-            compiled.rewritten,
-            projection_summary,
-            len(compiled.where_clauses),
-            where_bytes,
-            compiled.pushed_slices,
-            sql_bytes,
-            compiled.degraded_reason,
-        )
+        read_kwargs: dict[str, Any] = {
+            "arrow_buffer_compression": source.arrow_buffer_compression,
+            "dry_run": False,
+            "maintain_order": source.maintain_order,
+            "use_query_cache": source.use_query_cache,
+        }
+        if source.maximum_bytes_billed is not None:
+            read_kwargs["maximum_bytes_billed"] = source.maximum_bytes_billed
 
         arrow_stream_exporter = self._arrow_client.read_query(
             compiled.sql,
-            arrow_buffer_compression=source.arrow_buffer_compression,
-            dry_run=False,
-            maintain_order=source.maintain_order,
-            use_query_cache=source.use_query_cache,
+            **read_kwargs,
         )
-        lazyframe = apply_local_plan(
+        return execute_local_plan_batches(
             pl.scan_arrow_c_stream(arrow_stream_exporter),
-            compiled.residual_plan,
-        )
-        return lazyframe.collect_batches(
-            chunk_size=batch_size,
+            residual_ops,
+            batch_size=batch_size,
             maintain_order=source.maintain_order,
         )
 
@@ -408,4 +737,5 @@ __all__ = [
     "DegradedReason",
     "QueryExecutor",
     "compile_query_plan",
+    "has_non_comment_sql",
 ]

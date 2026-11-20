@@ -805,3 +805,124 @@ def test_query_executor_forwards_maintain_order_to_collect_batches() -> None:
             chunk_size=128,
             maintain_order=maintain_order,
         )
+
+
+def test_compile_query_plan_validates_max_sql_bytes() -> None:
+    scan = _scan("SELECT a FROM t", columns=("a",))
+    for bad in (True, False, 1.5, "100"):
+        with pytest.raises(TypeError, match="positive int"):
+            compile_query_plan(scan, max_sql_bytes=bad)  # type: ignore[arg-type]
+        with pytest.raises(TypeError, match="positive int"):
+            QueryExecutor(MagicMock(), max_sql_bytes=bad)  # type: ignore[arg-type]
+
+    for non_pos in (0, -1, -100):
+        with pytest.raises(ValueError, match="must be positive"):
+            compile_query_plan(scan, max_sql_bytes=non_pos)
+        with pytest.raises(ValueError, match="must be positive"):
+            QueryExecutor(MagicMock(), max_sql_bytes=non_pos)
+
+
+def test_compile_query_plan_trailing_semicolon_with_comments_and_literals() -> None:
+    cases = [
+        ("SELECT a, b FROM t; -- trailing note", "SELECT a, b FROM t"),
+        ("SELECT a, b FROM t; # hash comment", "SELECT a, b FROM t"),
+        ("SELECT a, b FROM t; /* block comment */", "SELECT a, b FROM t"),
+        ("SELECT a, b FROM t;\n-- next line comment\n", "SELECT a, b FROM t"),
+        ("SELECT a, b FROM t; /* a */ -- b", "SELECT a, b FROM t"),
+        # Preserve invalid double semicolon so BigQuery still fails it.
+        ("SELECT a, b FROM t;; -- note", "SELECT a, b FROM t;"),
+        # Semicolon INSIDE a line comment must NOT be stripped.
+        (
+            "SELECT a, b FROM t -- keep semi;",
+            "SELECT a, b FROM t -- keep semi;",
+        ),
+        # Semicolon INSIDE string/raw-string/backtick literals must NOT be stripped.
+        ("SELECT 'x;' AS a, b FROM t", "SELECT 'x;' AS a, b FROM t"),
+        ('SELECT r"x;" AS a, b FROM t', 'SELECT r"x;" AS a, b FROM t'),
+        ("SELECT '''x;''' AS a, b FROM t;", "SELECT '''x;''' AS a, b FROM t"),
+        # Leading newlines/indentation stay unshifted.
+        ("\n\n  SELECT a, b FROM t; -- note\n", "\n\n  SELECT a, b FROM t"),
+        # CREATE TEMP FUNCTION statement retains its internal semicolon.
+        (
+            "CREATE TEMP FUNCTION f(x INT64) AS (x + 1); SELECT f(1) AS a, 2 AS b; -- end",
+            "CREATE TEMP FUNCTION f(x INT64) AS (x + 1); SELECT f(1) AS a, 2 AS b",
+        ),
+    ]
+    for raw_sql, expected_inner in cases:
+        scan = _scan(raw_sql, columns=("a", "b"))
+        compiled = compile_query_plan(Project(input=scan, columns=("a",)))
+        assert compiled.sql == f"{expected_inner}\n|> SELECT `a`", (
+            f"Unexpected rewrite for {raw_sql!r}: {compiled.sql!r}"
+        )
+
+
+def test_has_non_comment_sql_rejects_empty_semicolons_and_comments_only() -> None:
+    from polars_bigquery.core.executors.query import has_non_comment_sql
+
+    for empty in (
+        "",
+        "   \n\t ",
+        ";",
+        " ; ; ",
+        ";;;",
+        "-- only a comment",
+        "# hash comment\n;",
+        "/* block comment */ ; -- trailing",
+        "/* unclosed comment",
+    ):
+        assert has_non_comment_sql(empty) is False, empty
+
+    assert has_non_comment_sql("-- header\nSELECT 1") is True
+    assert has_non_comment_sql("/* note */ SELECT r'\\'") is True
+
+
+def test_compile_query_plan_inner_query_fast_path_and_large_conjunct_scaling() -> None:
+    import time
+
+    # 1. Fast-path directly to Tier 4 when inner_query >= max_sql_bytes
+    scan_big = _scan("SELECT a FROM " + "x" * 100, columns=("a",))
+    expr = pl.all_horizontal(*[pl.col("a") == i for i in range(100)])
+    fast = compile_query_plan(Filter(input=scan_big, predicate=expr), max_sql_bytes=50)
+    assert fast.degraded_reason == "sql_length_skipped_pushdown"
+    assert fast.rewritten is False
+    assert fast.sql == scan_big.raw_query
+
+    # 2. 2,000 conjuncts (~850 KB -> 100 KB) must prune in O(K log K), well under 1 s!
+    many_expr = pl.all_horizontal(
+        *[pl.col("a") == f"val_{i:04d}_" + "x" * 400 for i in range(2000)]
+    )
+    scan = _scan("SELECT a FROM t", columns=("a",))
+    plan = Filter(input=scan, predicate=many_expr)
+    t0 = time.perf_counter()
+    compiled = compile_query_plan(plan, max_sql_bytes=100_000)
+    elapsed = time.perf_counter() - t0
+    assert compiled.degraded_reason == "sql_length_pruned_conjuncts"
+    assert len(compiled.sql.encode("utf-8")) <= 100_000
+    assert len(compiled.sql.encode("utf-8")) > 90_000
+    assert elapsed < 2.0, f"Tier 2 pruning regressed to slow runtime: {elapsed:.2f}s"
+
+
+def test_query_executor_forwards_maximum_bytes_billed_and_handles_huge_slice() -> None:
+    mock_arrow_client = MagicMock()
+    mock_arrow_client.read_query.return_value = MagicMock(name="exporter")
+    scan = QueryScan(
+        raw_query="SELECT a FROM t",
+        columns=("a",),
+        maintain_order=False,
+        maximum_bytes_billed=10_000_000,
+    )
+    plan = Slice(input=scan, offset=0, length=(1 << 64) - 1)
+    executor = QueryExecutor(mock_arrow_client)
+    with patch(
+        "polars.scan_arrow_c_stream", return_value=pl.LazyFrame({"a": [1, 2, 3]})
+    ):
+        batches = list(executor.execute(plan))
+    assert pl.concat(batches).to_dict(as_series=False) == {"a": [1, 2, 3]}
+    mock_arrow_client.read_query.assert_called_once_with(
+        "SELECT a FROM t",
+        arrow_buffer_compression="lz4frame",
+        dry_run=False,
+        maintain_order=False,
+        use_query_cache=None,
+        maximum_bytes_billed=10_000_000,
+    )

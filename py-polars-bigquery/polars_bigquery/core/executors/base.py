@@ -1,18 +1,69 @@
-"""Shared backend executor interface and local Polars residual evaluator."""
+"""Shared backend executor interface, client protocols, and local Polars residual evaluator."""
 
 from __future__ import annotations
 
 import abc
 from collections.abc import Iterator
+from typing import Any, Protocol
 
+import arrow_bigquery
 import polars as pl
 
 from polars_bigquery.core.plan import (
     Filter,
     PlanNode,
+    Project,
     Slice,
+    UnaryPlanOp,
     decompose_linear_plan,
 )
+
+# Polars native `.slice(offset, length)` converts `offset` via signed 64-bit
+# integer (`i64`) and `length` via the runtime's `IdxSize` (`u32` on default
+# `polars-runtime-32`, `u64`/`i64` on `polars-runtime-64`).
+_POLARS_MAX_SLICE_OFFSET = (1 << 63) - 1
+
+
+def _detect_polars_max_slice_length() -> int:
+    """Detect the maximum `length` accepted by `pl.LazyFrame.slice` in this runtime."""
+    probe = pl.LazyFrame({"_p": [1]})
+    try:
+        probe.slice(0, 1 << 32)
+    except OverflowError:
+        return (1 << 32) - 1
+    return (1 << 63) - 1
+
+
+_POLARS_MAX_SLICE_LENGTH = _detect_polars_max_slice_length()
+
+
+class ArrowQueryClient(Protocol):
+    """Minimal protocol satisfied by `arrow_bigquery.Client` for query execution."""
+
+    def read_query(
+        self,
+        query: str,
+        *,
+        arrow_buffer_compression: str = ...,
+        dry_run: bool = ...,
+        maintain_order: bool = ...,
+        use_query_cache: bool | None = ...,
+    ) -> Any:
+        """Execute a GoogleSQL query (or dry run) and return an Arrow C Stream exporter."""
+
+
+class ArrowTableClient(Protocol):
+    """Minimal protocol satisfied by `arrow_bigquery.Client` for table scans."""
+
+    def read_table(
+        self,
+        table: arrow_bigquery.BigQueryTableId,
+        *,
+        maintain_order: bool = ...,
+        selected_fields: list[str] | None = ...,
+        row_restriction: str = ...,
+    ) -> Any:
+        """Open a BigQuery Storage Read API stream and return an Arrow C Stream exporter."""
 
 
 class PlanExecutor(abc.ABC):
@@ -25,12 +76,28 @@ class PlanExecutor(abc.ABC):
         """Execute `plan` and yield streamed Polars `DataFrame` batches."""
 
 
-def apply_local_plan(lazyframe: pl.LazyFrame, plan: PlanNode) -> pl.LazyFrame:
-    """Apply the normalized residual operators of `plan` bottom-to-top."""
-    _, ops = decompose_linear_plan(plan)
+def _slice_fits_polars(op: Slice) -> bool:
+    """Return `True` if `op` fits within native `pl.LazyFrame.slice` integer bounds."""
+    return (
+        op.offset <= _POLARS_MAX_SLICE_OFFSET and op.length <= _POLARS_MAX_SLICE_LENGTH
+    )
+
+
+def _apply_ops_to_frame(
+    lazyframe: pl.LazyFrame, ops: tuple[UnaryPlanOp, ...]
+) -> pl.LazyFrame:
+    """Apply `ops` to `lazyframe` after verifying all `Slice` bounds fit native Polars."""
     result = lazyframe
     for op in ops:
         if isinstance(op, Slice):
+            if not _slice_fits_polars(op):
+                msg = (
+                    f"Slice(offset={op.offset}, length={op.length}) exceeds "
+                    f"Polars native slice limits "
+                    f"(max offset={_POLARS_MAX_SLICE_OFFSET}, "
+                    f"max length={_POLARS_MAX_SLICE_LENGTH})."
+                )
+                raise ValueError(msg)
             result = result.slice(op.offset, op.length)
         elif isinstance(op, Filter):
             result = result.filter(op.predicate)
@@ -41,7 +108,112 @@ def apply_local_plan(lazyframe: pl.LazyFrame, plan: PlanNode) -> pl.LazyFrame:
     return result
 
 
+def apply_local_plan(lazyframe: pl.LazyFrame, plan: PlanNode) -> pl.LazyFrame:
+    """Apply the normalized residual operators of `plan` bottom-to-top."""
+    _, ops = decompose_linear_plan(plan)
+    return _apply_ops_to_frame(lazyframe, ops)
+
+
+def _iter_slice_batches(
+    batches: Iterator[pl.DataFrame],
+    offset: int,
+    length: int,
+) -> Iterator[pl.DataFrame]:
+    """Lazily apply an arbitrary-precision `Slice(offset, length)` to a batch iterator."""
+    if length == 0:
+        for batch in batches:
+            yield batch.clear()
+            break
+        return
+
+    skipped = 0
+    emitted = 0
+    for batch in batches:
+        height = batch.height
+        if height == 0:
+            continue
+        start = 0
+        if skipped < offset:
+            drop_rows = min(height, offset - skipped)
+            skipped += drop_rows
+            start = drop_rows
+            if start >= height:
+                continue
+        remaining = length - emitted
+        take = min(height - start, remaining)
+        if take > 0:
+            yield (batch if start == 0 and take == height else batch.slice(start, take))
+            emitted += take
+        if emitted >= length:
+            break
+
+
+def _apply_project_batch(batch: pl.DataFrame, columns: tuple[str, ...]) -> pl.DataFrame:
+    return batch.select(list(columns)) if columns else batch.drop(pl.all())
+
+
+def _iter_apply_ops(
+    batches: Iterator[pl.DataFrame],
+    ops: tuple[UnaryPlanOp, ...],
+) -> Iterator[pl.DataFrame]:
+    """Stream arbitrary-order residual `Slice`/`Filter`/`Project` over a batch iterator."""
+    stream = batches
+    for op in ops:
+        if isinstance(op, Slice):
+            stream = _iter_slice_batches(stream, op.offset, op.length)
+        elif isinstance(op, Filter):
+            pred = op.predicate
+            stream = (batch for raw in stream if (batch := raw.filter(pred)).height > 0)
+        elif isinstance(op, Project):
+            cols = op.columns
+            stream = (_apply_project_batch(raw, cols) for raw in stream)
+    return stream
+
+
+def execute_local_plan_batches(
+    lazyframe: pl.LazyFrame,
+    ops: tuple[UnaryPlanOp, ...],
+    *,
+    batch_size: int | None = None,
+    maintain_order: bool = False,
+) -> Iterator[pl.DataFrame]:
+    """Execute residual `ops` over `lazyframe`, safely handling `> u32::MAX` / `> i64::MAX` slices.
+
+    When all `Slice` operators fit inside native Polars `slice(offset, length)` bounds,
+    delegates directly to `lazyframe.slice / filter / select` followed by
+    `collect_batches(chunk_size=batch_size, maintain_order=maintain_order)` using default
+    Polars optimizer flags. When any `Slice` exceeds Polars' native integer bounds
+    (for example a `u64::MAX` sentinel or `length >= 2**32` on `polars-runtime-32`),
+    applies the leading native prefix inside Polars and evaluates the oversized
+    `Slice` stage and subsequent operators incrementally with arbitrary-precision
+    Python integers so `OverflowError` cannot occur.
+    """
+    first_oversized = next(
+        (
+            idx
+            for idx, op in enumerate(ops)
+            if isinstance(op, Slice) and not _slice_fits_polars(op)
+        ),
+        None,
+    )
+    if first_oversized is None:
+        return _apply_ops_to_frame(lazyframe, ops).collect_batches(
+            chunk_size=batch_size,
+            maintain_order=maintain_order,
+        )
+
+    prefix_lf = _apply_ops_to_frame(lazyframe, ops[:first_oversized])
+    base_iter = prefix_lf.collect_batches(
+        chunk_size=batch_size,
+        maintain_order=maintain_order,
+    )
+    return _iter_apply_ops(base_iter, ops[first_oversized:])
+
+
 __all__ = [
+    "ArrowQueryClient",
+    "ArrowTableClient",
     "PlanExecutor",
     "apply_local_plan",
+    "execute_local_plan_batches",
 ]

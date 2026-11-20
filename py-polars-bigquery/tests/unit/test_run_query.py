@@ -220,3 +220,30 @@ def test_get_table_metadata_url_rejects_non_string_segments():
     fake_ref = SimpleNamespace(project_id=None, dataset_id="ds", table_id="tab")
     with pytest.raises(TypeError, match="Expected project_id to be a str"):
         _get_table_metadata_url(table_ref=fake_ref)
+
+
+def test_get_table_metadata_rejects_invalid_json_or_non_object():
+    mock_cp = MagicMock(return_value=({"bearer_token": "tok"}, 123))
+    table_ref = arrow_bigquery.api.resources.BigQueryTableId("p", "d", "t")
+
+    mock_session = MagicMock()
+    mock_session.get.return_value.json.side_effect = ValueError("bad json")
+    with pytest.raises(BigQueryError, match="Invalid JSON response"):
+        get_table_metadata(
+            table_ref,
+            quota_project_id="q",
+            credentials_provider=mock_cp,
+            user_agent="ua",
+            session=mock_session,
+        )
+
+    mock_session.get.return_value.json.side_effect = None
+    mock_session.get.return_value.json.return_value = ["unexpected", "list"]
+    with pytest.raises(BigQueryError, match="expected JSON object"):
+        get_table_metadata(
+            table_ref,
+            quota_project_id="q",
+            credentials_provider=mock_cp,
+            user_agent="ua",
+            session=mock_session,
+        )

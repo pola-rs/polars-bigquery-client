@@ -182,7 +182,7 @@ def test_compile_read_api_plan_multiple_filters_and_true_omission() -> None:
         predicate=pl.col("c") == 3,
     )
     compiled = compile_read_api_plan(plan)
-    assert compiled.row_restriction == "(((`a` = 1) AND (`b` = 2)) AND (`c` = 3))"
+    assert compiled.row_restriction == "((`a` = 1) AND (`b` = 2) AND (`c` = 3))"
 
 
 def test_compile_read_api_plan_slice_barriers() -> None:
@@ -249,3 +249,63 @@ def test_read_api_executor_execute() -> None:
         row_restriction="(`hidden` > 10)",
     )
     assert pl.concat(batches).to_dict(as_series=False) == {"visible": ["b"]}
+
+
+def test_compile_read_api_plan_case_insensitive_pseudo_column_fallback() -> None:
+    scan = _tscan({"_partitiondate": pl.Date(), "note": pl.String()})
+    compiled = compile_read_api_plan(Project(input=scan, columns=()))
+    assert compiled.selected_fields == ("note",)
+
+    pseudo_lower = _tscan(
+        {"_partitiondate": pl.Date(), "_PartitionTime": pl.Datetime("us", "utc")}
+    )
+    compiled_pseudo = compile_read_api_plan(Project(input=pseudo_lower, columns=()))
+    assert compiled_pseudo.selected_fields == ("_PartitionTime",)
+
+
+def test_compile_read_api_plan_row_restriction_length_guard(caplog) -> None:
+    import logging
+
+    scan = _tscan({"a": pl.Int64(), "b": pl.String()})
+    pred = (pl.col("a") == 1) & (pl.col("b") == "x" * 60)
+
+    # Validates max_row_restriction_bytes argument.
+    with pytest.raises(TypeError, match="positive int"):
+        compile_read_api_plan(scan, max_row_restriction_bytes=True)
+    with pytest.raises(ValueError, match="must be positive"):
+        compile_read_api_plan(scan, max_row_restriction_bytes=0)
+    with pytest.raises(ValueError, match="must be positive"):
+        ReadApiExecutor(MagicMock(), max_row_restriction_bytes=-5)
+
+    # Prunes largest conjunct while preserving smaller leftmost filter.
+    plan = Filter(input=scan, predicate=pred)
+    pruned = compile_read_api_plan(plan, max_row_restriction_bytes=20)
+    assert pruned.row_restriction == "(`a` = 1)"
+    assert pruned.degraded_reason == "row_restriction_length_pruned_conjuncts"
+
+    # Drops all conjuncts when not even the smallest fits.
+    dropped = compile_read_api_plan(plan, max_row_restriction_bytes=4)
+    assert dropped.row_restriction == ""
+    assert dropped.degraded_reason == "row_restriction_length_dropped_all"
+
+    # Executor emits single PII-safe WARNING on degradation and DEBUG summary.
+    mock_arrow_client = MagicMock()
+    mock_arrow_client.read_table.return_value = MagicMock(name="exporter")
+    executor = ReadApiExecutor(mock_arrow_client, max_row_restriction_bytes=20)
+    with (
+        caplog.at_level(
+            logging.DEBUG, logger="polars_bigquery.core.executors.read_api"
+        ),
+        patch(
+            "polars.scan_arrow_c_stream",
+            return_value=pl.LazyFrame({"a": [1], "b": ["secret"]}),
+        ),
+    ):
+        list(executor.execute(plan))
+    warnings = [r.message for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1
+    assert "row_restriction_length_pruned_conjuncts" in warnings[0]
+    assert "xxx" not in warnings[0]
+    debugs = [r.message for r in caplog.records if r.levelno == logging.DEBUG]
+    assert len(debugs) == 1
+    assert "selected_fields=2/2" in debugs[0]

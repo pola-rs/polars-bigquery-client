@@ -1430,3 +1430,191 @@ def test_client_read_and_scan_reject_malicious_table_ids(mock_arrow_client):
 
         mock_arrow_client.read_table.assert_not_called()
         mock_get_metadata.assert_not_called()
+
+
+def test_client_lazy_rest_client_and_lifecycle_guards(mock_arrow_client):
+    with patch(
+        "polars_bigquery.core.bigquery_rest.BigQueryRestClient"
+    ) as mock_rest_cls:
+        client = Client(quota_project_id="q")
+        # Query-only initialization must NOT allocate an HTTP session pool eagerly.
+        mock_rest_cls.assert_not_called()
+
+        mock_arrow_client.read_query.return_value = MagicMock()
+        with patch("polars.DataFrame"):
+            client.read_query("SELECT 1")
+        mock_rest_cls.assert_not_called()
+
+        # close() closes _arrow_client and is idempotent without opening REST session.
+        client.close()
+        client.close()
+        mock_rest_cls.assert_not_called()
+        mock_arrow_client.close.assert_called_once()
+
+        # Subsequent operations raise RuntimeError when client is closed.
+        with pytest.raises(RuntimeError, match="closed"):
+            client.read_table("p.d.t")
+        with pytest.raises(RuntimeError, match="closed"):
+            client.read_query("SELECT 1")
+        with pytest.raises(RuntimeError, match="closed"):
+            client.scan_table("p.d.t", schema={"a": pl.Int64})
+        with pytest.raises(RuntimeError, match="closed"):
+            client.scan_query("SELECT 1", schema={"a": pl.Int64})
+
+
+def test_client_input_type_and_wire_payload_validation(mock_arrow_client):
+    client = Client(quota_project_id="q")
+
+    # Non-str query rejected eagerly
+    with pytest.raises(TypeError, match="query must be a str"):
+        client.scan_query(123)  # type: ignore[arg-type]
+    with pytest.raises(TypeError, match="query must be a str"):
+        client.read_query(None)  # type: ignore[arg-type]
+
+    # read_query shares _validate_compression parity with scan_query
+    with pytest.raises(ValueError, match="arrow_buffer_compression must be one of"):
+        client.read_query("SELECT 1", arrow_buffer_compression="gzip")  # type: ignore[arg-type]
+
+    # Non-bool flags rejected eagerly (no silent truthiness conversion)
+    with pytest.raises(TypeError, match="maintain_order must be a bool"):
+        client.scan_query("SELECT 1", maintain_order="false")  # type: ignore[arg-type]
+    with pytest.raises(TypeError, match="use_query_cache must be a bool or None"):
+        client.scan_query("SELECT 1", use_query_cache="false")  # type: ignore[arg-type]
+    with pytest.raises(TypeError, match="dry_run must be a bool"):
+        client.read_query("SELECT 1", dry_run=1)  # type: ignore[arg-type]
+    with pytest.raises(TypeError, match="maintain_order must be a bool"):
+        client.read_table("p.d.t", maintain_order="false")  # type: ignore[arg-type]
+
+    # maximum_bytes_billed validation
+    with pytest.raises(TypeError, match="maximum_bytes_billed must be an int or None"):
+        client.scan_query("SELECT 1", schema={"a": pl.Int64}, maximum_bytes_billed=True)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="maximum_bytes_billed must be non-negative"):
+        client.scan_query("SELECT 1", schema={"a": pl.Int64}, maximum_bytes_billed=-1)
+    with pytest.raises(ValueError, match="maximum_bytes_billed must be non-negative"):
+        client.read_query("SELECT 1", maximum_bytes_billed=-10)
+
+    # Semicolon-only / comment-only queries rejected eagerly without RPC
+    for empty_sql in (";;", " ; ; ", "-- just a comment", "/* comment only */"):
+        with pytest.raises(ValueError, match="non-empty SELECT statement"):
+            client.scan_query(empty_sql)
+    mock_arrow_client.read_query.assert_not_called()
+
+    # Wire-payload error boundaries on dry-run response
+    bad_payloads = [
+        pl.DataFrame(schema={"bigquerySchema": pl.String, "statementType": pl.String}),
+        pl.DataFrame({"statementType": ["SELECT"]}),
+        pl.DataFrame({"bigquerySchema": ["{not json"], "statementType": ["SELECT"]}),
+        pl.DataFrame({"bigquerySchema": ["null"], "statementType": ["SELECT"]}),
+        pl.DataFrame({"bigquerySchema": ["[]"], "statementType": ["SELECT"]}),
+        pl.DataFrame(
+            {"bigquerySchema": ['{"fields": "bad"}'], "statementType": ["SELECT"]}
+        ),
+        pl.DataFrame({"bigquerySchema": [123], "statementType": ["SELECT"]}),
+    ]
+    for bad_df in bad_payloads:
+        mock_arrow_client.read_query.return_value = bad_df
+        with pytest.raises(BigQueryError, match="Invalid response from BigQuery"):
+            client.scan_query("SELECT 1")
+
+    # scan_table wire-payload error boundaries
+    for bad_meta in (
+        ["not-a-dict"],
+        {"schema": "bad"},
+        {"schema": None},
+        {"schema": {"fields": "bad"}},
+    ):
+        with (
+            patch(
+                "polars_bigquery.core.bigquery_rest.get_table_metadata",
+                return_value=bad_meta,
+            ),
+            pytest.raises(BigQueryError, match="Invalid response from BigQuery"),
+        ):
+            client.scan_table("p.d.t")
+
+
+def test_client_scan_bignumeric_raises_clear_type_error(mock_arrow_client):
+    client = Client(quota_project_id="q")
+    mock_arrow_client.read_query.return_value = pl.DataFrame(
+        {
+            "bigquerySchema": ['{"fields": [{"name": "bn", "type": "BIGNUMERIC"}]}'],
+            "statementType": ["SELECT"],
+        }
+    )
+    with pytest.raises(TypeError, match="BIGNUMERIC/BIGDECIMAL"):
+        client.scan_query("SELECT bn FROM t")
+
+    with (
+        patch(
+            "polars_bigquery.core.bigquery_rest.get_table_metadata",
+            return_value={"schema": {"fields": [{"name": "bn", "type": "BIGNUMERIC"}]}},
+        ),
+        pytest.raises(TypeError, match="BIGNUMERIC/BIGDECIMAL"),
+    ):
+        client.scan_table("p.d.t")
+
+
+def test_client_forwards_maximum_bytes_billed(mock_arrow_client):
+    client = Client(quota_project_id="q")
+    mock_arrow_client.read_query.return_value = MagicMock()
+    with patch("polars.DataFrame"):
+        client.read_query("SELECT 1", maximum_bytes_billed=1_000_000)
+    mock_arrow_client.read_query.assert_called_with(
+        "SELECT 1",
+        arrow_buffer_compression="lz4frame",
+        dry_run=False,
+        maintain_order=True,
+        use_query_cache=None,
+        maximum_bytes_billed=1_000_000,
+    )
+
+    mock_arrow_client.read_query.reset_mock()
+    with patch("polars.scan_arrow_c_stream", return_value=pl.LazyFrame({"a": [1]})):
+        lf = client.scan_query(
+            "SELECT a FROM t",
+            schema={"a": pl.Int64},
+            maintain_order=False,
+            maximum_bytes_billed=500_000,
+        )
+        assert lf.collect().to_dict(as_series=False) == {"a": [1]}
+    mock_arrow_client.read_query.assert_called_once_with(
+        "SELECT a FROM t\n|> SELECT `a`",
+        arrow_buffer_compression="lz4frame",
+        dry_run=False,
+        maintain_order=False,
+        use_query_cache=None,
+        maximum_bytes_billed=500_000,
+    )
+
+
+def test_client_scan_query_with_udf_filter_degrades_gracefully(mock_arrow_client):
+    import warnings
+
+    from polars_bigquery.core.executors import QueryExecutor
+    from polars_bigquery.core.plan import Filter, Project, QueryScan
+
+    mock_arrow_client.read_query.return_value = MagicMock(name="stream")
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", pl.exceptions.PolarsInefficientMapWarning)
+        udf_pred = pl.col("a").map_elements(lambda x: x > 1, return_dtype=pl.Boolean)
+    scan = QueryScan(
+        raw_query="SELECT a FROM t",
+        columns=("a",),
+        maintain_order=False,
+        explicit_schema=True,
+    )
+    plan = Project(input=Filter(input=scan, predicate=udf_pred), columns=("a",))
+    executor = QueryExecutor(mock_arrow_client)
+    with patch(
+        "polars.scan_arrow_c_stream",
+        return_value=pl.LazyFrame({"a": [1, 2, 3]}),
+    ):
+        batches = list(executor.execute(plan))
+    assert pl.concat(batches).to_dict(as_series=False) == {"a": [2, 3]}
+    mock_arrow_client.read_query.assert_called_once_with(
+        "SELECT a FROM t\n|> SELECT `a`",
+        arrow_buffer_compression="lz4frame",
+        dry_run=False,
+        maintain_order=False,
+        use_query_cache=None,
+    )

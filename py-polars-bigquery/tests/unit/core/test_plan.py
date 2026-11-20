@@ -287,3 +287,85 @@ def test_apply_local_plan_operator_orderings() -> None:
 def test_plan_executor_is_abstract() -> None:
     with pytest.raises(TypeError, match="abstract"):
         PlanExecutor()  # type: ignore[abstract]
+
+
+def test_query_scan_maximum_bytes_billed_validation() -> None:
+    scan_ok = QueryScan(
+        raw_query="SELECT a FROM t",
+        columns=("a",),
+        maximum_bytes_billed=1_000_000,
+    )
+    assert scan_ok.maximum_bytes_billed == 1_000_000
+    assert (
+        QueryScan(
+            raw_query="SELECT a FROM t", columns=("a",), maximum_bytes_billed=0
+        ).maximum_bytes_billed
+        == 0
+    )
+
+    for bad in (True, False, 1.5, "100"):
+        with pytest.raises(TypeError, match="maximum_bytes_billed must be an int"):
+            QueryScan(
+                raw_query="SELECT a FROM t",
+                columns=("a",),
+                maximum_bytes_billed=bad,  # type: ignore[arg-type]
+            )
+
+    with pytest.raises(ValueError, match="maximum_bytes_billed must be non-negative"):
+        QueryScan(
+            raw_query="SELECT a FROM t",
+            columns=("a",),
+            maximum_bytes_billed=-1,
+        )
+
+
+def test_validate_and_normalize_rejects_unexpanded_selectors() -> None:
+    import polars.selectors as cs
+
+    scan = QueryScan(raw_query="SELECT a, b FROM t", columns=("a", "b"))
+    for expr in (
+        pl.all_horizontal(pl.col("a", "b") == 1),
+        pl.any_horizontal(pl.all() > 0),
+        pl.all_horizontal(cs.integer() > 0),
+        pl.col("*") == 1,
+        pl.col("^a.*$") == 1,
+    ):
+        with pytest.raises(ValueError, match="unexpanded selector"):
+            validate_and_normalize_linear_plan(Filter(input=scan, predicate=expr))
+
+
+def test_apply_local_plan_rejects_oversized_slice_and_streaming_handles_it() -> None:
+    from polars_bigquery.core.executors.base import execute_local_plan_batches
+
+    scan = QueryScan(raw_query="SELECT a, b FROM t", columns=("a", "b"))
+    u64_max = (1 << 64) - 1
+    big_slice = Project(
+        input=Filter(
+            input=Slice(input=scan, offset=0, length=u64_max),
+            predicate=pl.col("a") >= 2,
+        ),
+        columns=("b",),
+    )
+    base = pl.LazyFrame({"a": [1, 2, 3], "b": ["x", "y", "z"]})
+
+    with pytest.raises(ValueError, match="exceeds Polars native slice limits"):
+        apply_local_plan(base, big_slice)
+
+    _, ops = decompose_linear_plan(big_slice)
+    batches = list(execute_local_plan_batches(base, ops, batch_size=1))
+    assert pl.concat(batches).to_dict(as_series=False) == {"b": ["y", "z"]}
+
+    # Offset past total rows returns empty cleanly without OverflowError.
+    huge_offset = Slice(input=scan, offset=(1 << 63) + 5, length=10)
+    _, off_ops = decompose_linear_plan(huge_offset)
+    assert list(execute_local_plan_batches(base, off_ops, batch_size=2)) == []
+
+    # Length 0 after oversized offset / direct oversized zero-len slice.
+    zero_after_big = Slice(
+        input=Slice(input=scan, offset=0, length=u64_max),
+        offset=0,
+        length=0,
+    )
+    _, z_ops = decompose_linear_plan(zero_after_big)
+    zero_batches = list(execute_local_plan_batches(base, z_ops, batch_size=1))
+    assert sum(b.height for b in zero_batches) == 0

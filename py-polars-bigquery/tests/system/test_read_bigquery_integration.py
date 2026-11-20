@@ -20,7 +20,8 @@ logger = logging.getLogger(__name__)
 @pytest.fixture(scope="module")
 def client():
     project = os.environ["GOOGLE_CLOUD_PROJECT"]
-    return polars_bigquery.Client(quota_project_id=project)
+    with polars_bigquery.Client(quota_project_id=project) as client:
+        yield client
 
 
 def test_read_bigquery_public_data_ordered(client):

@@ -189,3 +189,90 @@ def test_extract_polars_schema_from_fields_case_differing_names_allowed():
 def test_extract_polars_schema_from_fields_empty():
     schema = extract_polars_schema_from_fields([])
     assert schema == pl.Schema()
+
+
+def test_extract_polars_schema_rejects_duplicate_struct_subfields():
+    fields = [
+        {
+            "name": "info",
+            "type": "STRUCT",
+            "fields": [
+                {"name": "x", "type": "INT64"},
+                {"name": "x", "type": "STRING"},
+            ],
+        }
+    ]
+    with pytest.raises(ValueError, match="duplicate subfield name.*'x'"):
+        extract_polars_schema_from_fields(fields)
+
+    unnamed_fields = [
+        {
+            "name": "anon_struct",
+            "type": "RECORD",
+            "fields": [
+                {"name": "", "type": "INT64"},
+                {"name": "", "type": "STRING"},
+            ],
+        }
+    ]
+    with pytest.raises(ValueError, match="duplicate subfield name.*''"):
+        extract_polars_schema_from_fields(unnamed_fields)
+
+
+def test_extract_polars_schema_handles_null_and_malformed_metadata():
+    from polars_bigquery.exceptions import BigQueryError
+
+    # None mode / schema / fields degrade cleanly instead of AttributeError.
+    assert extract_polars_schema({"schema": None}) == pl.Schema()
+    assert extract_polars_schema({"schema": {"fields": None}}) == pl.Schema()
+    assert extract_polars_schema_from_fields(
+        [{"name": "a", "type": "INT64", "mode": None}]
+    ) == pl.Schema({"a": pl.Int64()})
+    assert extract_polars_schema_from_fields(
+        [{"name": "s", "type": "STRUCT", "fields": None}]
+    ) == pl.Schema({"s": pl.Struct([])})
+
+    with pytest.raises(TypeError, match="got unexpected BigQuery type: "):
+        extract_polars_schema_from_fields([{"name": "a", "type": None}])
+
+    with pytest.raises(BigQueryError, match="expected table metadata object"):
+        extract_polars_schema(["not", "a", "dict"])  # type: ignore[arg-type]
+
+    with pytest.raises(BigQueryError, match="must be an object"):
+        extract_polars_schema({"schema": "bad"})
+
+    with pytest.raises(BigQueryError, match="must be a list"):
+        extract_polars_schema({"schema": {"fields": "bad"}})
+
+    with pytest.raises(BigQueryError, match="expected schema field object"):
+        extract_polars_schema_from_fields(["not_a_dict"])  # type: ignore[list-item]
+
+    with pytest.raises(BigQueryError, match="field 'name' must be a string"):
+        extract_polars_schema_from_fields([{"name": 123, "type": "INT64"}])
+
+    with pytest.raises(BigQueryError, match="field 'mode' must be a string"):
+        extract_polars_schema_from_fields([{"name": "a", "type": "INT64", "mode": 42}])
+
+    with pytest.raises(BigQueryError, match="field 'type' must be a string"):
+        extract_polars_schema_from_fields([{"name": "a", "type": 42}])
+
+    with pytest.raises(BigQueryError, match="STRUCT 'fields' must be a list"):
+        extract_polars_schema_from_fields(
+            [{"name": "s", "type": "STRUCT", "fields": "bad"}]
+        )
+
+    with pytest.raises(BigQueryError, match="expected STRUCT subfield object"):
+        extract_polars_schema_from_fields(
+            [{"name": "s", "type": "STRUCT", "fields": ["bad"]}]
+        )
+
+    with pytest.raises(BigQueryError, match="STRUCT subfield 'name' must be a string"):
+        extract_polars_schema_from_fields(
+            [
+                {
+                    "name": "s",
+                    "type": "STRUCT",
+                    "fields": [{"name": 7, "type": "INT64"}],
+                }
+            ]
+        )

@@ -37,6 +37,7 @@ class QueryScan(PlanNode):
     arrow_buffer_compression: ArrowBufferCompression = "lz4frame"
     use_query_cache: bool | None = None
     explicit_schema: bool = False
+    maximum_bytes_billed: int | None = None
 
     def __post_init__(self) -> None:
         if len(self.columns) == 0:
@@ -45,6 +46,21 @@ class QueryScan(PlanNode):
         if len(set(self.columns)) != len(self.columns):
             msg = "QueryScan columns must be unique."
             raise ValueError(msg)
+        if self.maximum_bytes_billed is not None:
+            if not isinstance(self.maximum_bytes_billed, int) or isinstance(
+                self.maximum_bytes_billed, bool
+            ):
+                msg = (
+                    "QueryScan maximum_bytes_billed must be an int or None, "
+                    f"got {type(self.maximum_bytes_billed).__name__}."
+                )
+                raise TypeError(msg)
+            if self.maximum_bytes_billed < 0:
+                msg = (
+                    "QueryScan maximum_bytes_billed must be non-negative, "
+                    f"got {self.maximum_bytes_billed}."
+                )
+                raise ValueError(msg)
 
     def children(self) -> tuple[PlanNode, ...]:
         return ()
@@ -162,22 +178,43 @@ def decompose_linear_plan(
 
 def validate_and_normalize_linear_plan(
     plan: PlanNode,
+    *,
+    expected_leaf_type: type[LeafScan] | None = None,
+    caller: str = "validate_and_normalize_linear_plan",
 ) -> tuple[LeafScan, tuple[UnaryPlanOp, ...], PlanNode]:
     """Validate uniform column visibility and collapse superseded `Project` nodes.
 
-    Checks bottom-to-top that every `Filter` root column and every `Project`
-    column is visible in the output of the preceding node (`ValueError` otherwise).
-    Superseded intermediate `Project` nodes are stripped while preserving the
-    final `Project` in its original relative position, and every surviving
-    operator is re-chained from `source` so
+    Checks bottom-to-top that every `Filter` expression is expanded (no
+    multi-output selectors, wildcards, or regex column projections where Polars
+    `meta.root_names()` returns `[]`), every `Filter` root column and every
+    `Project` column is visible in the output of the preceding node (`ValueError`
+    otherwise). Superseded intermediate `Project` nodes are stripped while
+    preserving the final `Project` in its original relative position, and every
+    surviving operator is re-chained from `source` so
     `decompose_linear_plan(normalized_plan) == (source, normalized_ops)`.
     """
     source, ops = decompose_linear_plan(plan)
+    if expected_leaf_type is not None and not isinstance(source, expected_leaf_type):
+        msg = (
+            f"{caller} expects a {expected_leaf_type.__name__} leaf, "
+            f"got {type(source).__name__}."
+        )
+        raise TypeError(msg)
     visible_columns = set(source.columns)
     last_project_idx = -1
 
     for idx, op in enumerate(ops):
         if isinstance(op, Filter):
+            if (
+                op.predicate.meta.has_multiple_outputs()
+                or op.predicate.meta.is_regex_projection()
+            ):
+                msg = (
+                    "Filter predicate contains an unexpanded selector, wildcard, "
+                    "or multi-column expression; expand column references explicitly "
+                    "before constructing a Filter plan node."
+                )
+                raise ValueError(msg)
             missing = list(
                 dict.fromkeys(
                     col
