@@ -150,9 +150,18 @@ class Client:
                 single-row metadata batch without executing or billing.
             maintain_order: Preserve query result ordering.
             use_query_cache: Override BigQuery query result caching.
-            maximum_bytes_billed: Optional upper bound on bytes billed for this
-                query (``0 <= maximum_bytes_billed <= (1 << 63) - 1``). When
-                set, also forwarded on dry runs for consistent limit checking.
+            maximum_bytes_billed: Optional upper bound on bytes billed **per
+                ``jobs.query`` attempt** (``0 <= maximum_bytes_billed <= (1 << 63) - 1``).
+                When set, also forwarded on dry runs for consistent limit
+                checking. Transient REST retries reuse a single ``request_id``,
+                which guarantees deduplication for *mutating* (DML/DDL/script)
+                queries within BigQuery's 15-minute window; however, per the
+                BigQuery v2 API contract, read-only ``SELECT`` queries may ignore
+                ``request_id`` and re-execute (and re-bill) on a mid-flight retry
+                if not yet served from the query cache. Because
+                ``maximum_bytes_billed`` applies per attempt rather than
+                cumulatively across retries, keep this in mind for expensive
+                uncached queries.
 
         Note:
             Interrupting a query via ``Ctrl+C`` (``KeyboardInterrupt``) triggers

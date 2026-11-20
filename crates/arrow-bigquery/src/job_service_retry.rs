@@ -127,8 +127,11 @@ pub(crate) fn is_transient_job_service_status_error(error: &Error) -> bool {
 /// Determines whether a `JobService` error is retryable.
 ///
 /// When `retry_timeouts` is `false` (used for `jobs.query` execute calls),
-/// client-side `Error::timeout()` is **not** retried so slow uncached `SELECT`
-/// queries are neither duplicated nor double-billed after a full `timeoutMs` wait.
+/// client-side `Error::timeout()` is **not** retried after waiting out the full
+/// `timeoutMs + buffer` window. Note that `Error::is_io()` (including response
+/// body-read timeouts returned by `google-cloud-gax-internal`) and HTTP `408` /
+/// `504` responses *are* retried using the same `request_id`; see
+/// [`QueryReadRetryPolicy`] for the read-only query duplicate-execution caveat.
 pub(crate) fn is_job_service_retryable_error(
     error: &Error,
     idempotent: bool,
@@ -176,16 +179,28 @@ impl RetryPolicy for JobServiceRetryableErrors {
 
 /// Retry policy tailored for BigQuery v2 `jobs.query` execute requests.
 ///
+/// All retries reuse the identical `request_id` serialized into `QueryRequest`.
+/// Per BigQuery's `jobs.query` API contract, `request_id` guarantees server-side
+/// deduplication for **mutating** (DML/DDL/script) queries within its 15-minute
+/// (`900 s`) lifetime, whereas BigQuery **may ignore `request_id` for read-only
+/// (`SELECT`) queries** ("nullipotent by definition"). Read-only retries hit the
+/// 24-hour query cache free of charge once complete, **unless** the prior attempt
+/// is still running in flight, `use_query_cache = false`, or the query uses
+/// non-deterministic functions — in those cases retrying on `408`/`500`/`502`/
+/// `503`/`504` or `Error::io` (including mid-body timeouts mapped to `Error::io`
+/// by `google-cloud-gax-internal`) may re-execute and bill the query again.
+/// `maximum_bytes_billed` applies **per attempt**, not cumulatively across retries.
+///
 /// Enforces three invariants that standard `with_time_limit` violates for
 /// long-polling `jobs.query` RPCs:
-/// 1. **No client-side timeout retries:** returns [`RetryResult::Exhausted`] on
-///    `error.is_timeout()` so an expired `timeoutMs + buffer` wait stops without
-///    spawning duplicate uncached `SELECT` queries (while still charging the
-///    circuit breaker instead of crediting it as a success).
+/// 1. **No client-side header-timeout retries:** returns [`RetryResult::Exhausted`]
+///    on `error.is_timeout()` so an expired `timeoutMs + buffer` wait terminates
+///    rather than stacking another full wait (while still charging the circuit
+///    breaker instead of crediting it as a success).
 /// 2. **`request_id` TTL bound:** never schedules a retry once elapsed time
 ///    reaches `max_retry_window` (default `600 s`), ensuring mutating DML/DDL
 ///    queries cannot be retried past BigQuery's 15-minute `request_id` window
-///    regardless of how large `initial_wait` (`timeoutMs`) is set.
+///    regardless of how `initial_wait` (`timeoutMs`) is configured.
 /// 3. **No premature HTTP timeout clamping:** returns `None` from
 ///    `remaining_time()` so `google-cloud-gax` does not clamp a retry's
 ///    `reqwest` timeout below `timeoutMs + QUERY_ATTEMPT_TIMEOUT_BUFFER` while
@@ -415,9 +430,12 @@ pub(crate) fn job_service_retry_policy() -> Arc<dyn RetryPolicy> {
 /// Retry policy for `jobs.query` execution calls (`Query::read`).
 ///
 /// Caps retry initiation to [`JOB_SERVICE_RETRY_TIMEOUT`] (`600 s`, strictly
-/// inside BigQuery's 15-minute `request_id` TTL), rejects retrying client-side
-/// timeouts, and preserves the caller's full per-attempt timeout without
-/// truncating below `timeoutMs + buffer`.
+/// inside BigQuery's 15-minute `request_id` TTL so mutating queries are never
+/// duplicated), rejects retrying client-side `Error::timeout()`, and preserves
+/// the caller's full per-attempt timeout without truncating below
+/// `timeoutMs + buffer`. Note: BigQuery may still re-execute uncached or
+/// in-flight read-only `SELECT` queries on transient `408`/`5xx`/`io` retries,
+/// because `request_id` deduplication is only guaranteed for mutating queries.
 pub(crate) fn query_read_retry_policy() -> Arc<dyn RetryPolicy> {
     Arc::new(QueryReadRetryPolicy {
         max_retry_window: JOB_SERVICE_RETRY_TIMEOUT,

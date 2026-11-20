@@ -1,4 +1,3 @@
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -14,6 +13,7 @@ use polars_arrow::record_batch::RecordBatch;
 use uuid::Uuid;
 
 use crate::error::{BigQueryError, JobError, JobFailedError};
+use crate::job_cancel::{JobCancelGuard, JobCancelToken};
 use crate::{BigQueryRecordBatchReceiver, StreamOptions};
 
 /// Minimum estimated remaining compressed bytes in the single job stream
@@ -57,19 +57,34 @@ const MULTI_STREAM_THRESHOLD_ROWS: u64 =
 
 pub(crate) const QUERY_REQUEST_ID_PREFIX: &str = "req_";
 
-/// Default wait time for the call to jobs.query.
+/// Default wait time for the call to `jobs.query` (`200 s` = `200_000 ms`).
 ///
 /// If the query hasn't finished within this time, BigQuery will return a
-/// QueryResonse with a job ID so that we can continue waiting using the
-/// BigQuery Storage Read API default stream for the job.
+/// `QueryResponse` with a job ID (`jobComplete: false`) so that we can continue
+/// waiting using the BigQuery Storage Read API default stream for the job.
 ///
 /// See: https://docs.cloud.google.com/bigquery/docs/reference/rest/v2/jobs/query#QueryRequest.FIELDS.timeout_ms
 const INITIAL_WAIT_MS_DEFAULT: u32 = 200 * 1000;
+
+/// Maximum accepted initial wait (`timeoutMs`) for `Query::with_initial_wait`
+/// (`600 s` = 10 min = `600_000 ms`).
+///
+/// BigQuery's REST `jobs.query` endpoint typically caps open HTTP waits around
+/// ~200 s before returning `jobComplete: false`. Bounding `initial_wait` to
+/// `600 s` rejects accidental unit bugs (e.g. days/months hanging an idle socket)
+/// and keeps a single attempt's timeout (`<= 650 s`) strictly inside BigQuery's
+/// 15-minute (`900 s`) `request_id` TTL.
+pub(crate) const MAX_INITIAL_WAIT_MS: u32 = 600 * 1000;
 
 /// Safety buffer added on top of `timeout_ms` for the per-attempt HTTP timeout
 /// on `jobs.query` so the client does not time out before BigQuery returns
 /// `jobComplete: false` (matches `200s + 50s = 250s` in `polars-bigquery`).
 const QUERY_ATTEMPT_TIMEOUT_BUFFER: Duration = Duration::from_secs(50);
+
+const _: () = assert!(
+    INITIAL_WAIT_MS_DEFAULT <= MAX_INITIAL_WAIT_MS,
+    "default initial wait must fit inside MAX_INITIAL_WAIT_MS"
+);
 
 /// Per-attempt HTTP timeout for fast `JobService` metadata/validation RPCs
 /// (`jobs.get` and `jobs.query` dry runs).
@@ -126,10 +141,11 @@ pub(crate) struct DestinationTableRead {
     job_id: String,
     location: String,
     read_options: crate::ReadOptions,
-    /// Shared disarm flag paired with a [`crate::JobCancelHandle`]. Set to `true`
-    /// once `jobs.get` confirms the backing job is finished so subsequent early
-    /// receiver drops do not emit spurious `jobs.cancel` RPCs.
-    job_cancel_disarmed: Option<Arc<AtomicBool>>,
+    /// Shared cancel-state token paired with a [`crate::job_cancel::JobCancelHandle`].
+    /// Disarmed automatically inside `fetch_job` once `jobs.get` confirms the
+    /// backing job is finished so subsequent early receiver drops (or a cancel
+    /// task still waiting in the concurrency queue) skip spurious `jobs.cancel` RPCs.
+    job_cancel_token: Option<JobCancelToken>,
 }
 
 impl DestinationTableRead {
@@ -140,13 +156,14 @@ impl DestinationTableRead {
         self,
         client: &crate::Client,
     ) -> Result<(crate::BigQueryTableId, crate::ReadOptions), BigQueryError> {
-        let job = fetch_job(client, &self.project_id, &self.job_id, Some(&self.location)).await?;
-        let job_done = is_job_done(&job);
-        if job_done {
-            if let Some(flag) = &self.job_cancel_disarmed {
-                flag.store(true, Ordering::Release);
-            }
-        }
+        let job = fetch_job(
+            client,
+            &self.project_id,
+            &self.job_id,
+            Some(&self.location),
+            self.job_cancel_token.as_ref(),
+        )
+        .await?;
         check_job_status_error(
             job.status,
             &self.project_id,
@@ -189,7 +206,7 @@ pub struct Query<'a> {
     maintain_order: bool,
     use_query_cache: Option<bool>,
     maximum_bytes_billed: Option<i64>,
-    initial_wait_ms: i64,
+    initial_wait: chrono::Duration,
 }
 
 impl<'a> Query<'a> {
@@ -201,7 +218,7 @@ impl<'a> Query<'a> {
             maintain_order: true,
             use_query_cache: None,
             maximum_bytes_billed: None,
-            initial_wait_ms: i64::from(INITIAL_WAIT_MS_DEFAULT),
+            initial_wait: chrono::Duration::milliseconds(i64::from(INITIAL_WAIT_MS_DEFAULT)),
         }
     }
 
@@ -213,9 +230,14 @@ impl<'a> Query<'a> {
         self
     }
 
+    /// Sets how long `jobs.query` should wait synchronously (`timeoutMs`) before
+    /// returning `jobComplete: false` and handing off to `streams/_default`.
+    ///
+    /// Valid range is `0 ms..=600_000 ms` (`10 min`). Any strictly negative
+    /// duration (including sub-millisecond negative values) or duration exceeding
+    /// `10 min` is rejected with [`BigQueryError::InvalidConfig`].
     pub fn with_initial_wait(mut self, initial_wait: impl Into<chrono::Duration>) -> Self {
-        let duration: chrono::Duration = initial_wait.into();
-        self.initial_wait_ms = duration.num_milliseconds();
+        self.initial_wait = initial_wait.into();
         self
     }
 
@@ -229,6 +251,12 @@ impl<'a> Query<'a> {
         self
     }
 
+    /// Sets `maximumBytesBilled` for this query (`>= 0`, also forwarded on dry runs).
+    ///
+    /// Note that BigQuery enforces `maximumBytesBilled` **per `jobs.query` attempt**,
+    /// not cumulatively across retries. While retries share a `request_id` (deduplicating
+    /// mutating DML/DDL/script queries for 15 minutes), BigQuery may ignore `request_id`
+    /// for read-only `SELECT` queries and re-execute uncached queries on transient retries.
     pub fn with_maximum_bytes_billed(
         mut self,
         maximum_bytes_billed: impl Into<Option<i64>>,
@@ -255,11 +283,23 @@ impl<'a> Query<'a> {
     }
 
     fn validate_initial_wait_ms(&self) -> Result<u32, BigQueryError> {
-        u32::try_from(self.initial_wait_ms).map_err(|_| {
+        let max_duration = chrono::Duration::milliseconds(i64::from(MAX_INITIAL_WAIT_MS));
+        if self.initial_wait < chrono::Duration::zero() {
+            return Err(BigQueryError::InvalidConfig(format!(
+                "initial_wait must be between 0 and {MAX_INITIAL_WAIT_MS} ms, got negative duration ({})",
+                self.initial_wait
+            )));
+        }
+        if self.initial_wait > max_duration {
+            return Err(BigQueryError::InvalidConfig(format!(
+                "initial_wait must be between 0 and {MAX_INITIAL_WAIT_MS} ms, got {}",
+                self.initial_wait
+            )));
+        }
+        let ms = self.initial_wait.num_milliseconds();
+        u32::try_from(ms).map_err(|_| {
             BigQueryError::InvalidConfig(format!(
-                "initial_wait must be between 0 and {} ms, got {} ms",
-                u32::MAX,
-                self.initial_wait_ms
+                "initial_wait must be between 0 and {MAX_INITIAL_WAIT_MS} ms, got {ms} ms"
             ))
         })
     }
@@ -281,6 +321,7 @@ impl<'a> Query<'a> {
     }
 
     fn build_dry_run_request(&self) -> Result<QueryRequest, BigQueryError> {
+        let _ = self.validate_initial_wait_ms()?;
         let maximum_bytes_billed = self.validate_maximum_bytes_billed()?;
         Ok(QueryRequest::new()
             .set_dry_run(true)
@@ -319,7 +360,7 @@ impl<'a> Query<'a> {
     fn destination_table_read(
         &self,
         response: &QueryResponse,
-        job_cancel_disarmed: Option<Arc<AtomicBool>>,
+        job_cancel_token: Option<JobCancelToken>,
     ) -> Result<DestinationTableRead, BigQueryError> {
         let (project_id, job_id, location) = extract_required_job_reference(response)?;
         Ok(DestinationTableRead {
@@ -331,7 +372,7 @@ impl<'a> Query<'a> {
                 arrow_buffer_compression: Some(self.arrow_buffer_compression()),
                 ..Default::default()
             },
-            job_cancel_disarmed,
+            job_cancel_token,
         })
     }
 
@@ -374,7 +415,7 @@ impl<'a> Query<'a> {
         response: &QueryResponse,
         stream_name: String,
         serialized_schema: Option<bytes::Bytes>,
-        job_cancel_disarmed: Option<&Arc<AtomicBool>>,
+        job_cancel_token: Option<&JobCancelToken>,
     ) -> Result<
         (
             ArrowSchemaRef,
@@ -389,7 +430,7 @@ impl<'a> Query<'a> {
                     threshold_bytes: MULTI_STREAM_THRESHOLD_BYTES,
                     fallback_total_rows: response.total_rows,
                 },
-                self.destination_table_read(response, job_cancel_disarmed.cloned())?,
+                self.destination_table_read(response, job_cancel_token.cloned())?,
             ))
         } else {
             None
@@ -413,12 +454,12 @@ impl<'a> Query<'a> {
             },
             Ok((None, _receiver)) => {
                 let (schema_ref, receiver) = self
-                    .resolve_empty_job_stream(response, job_cancel_disarmed)
+                    .resolve_empty_job_stream(response, job_cancel_token)
                     .await?;
                 Ok((schema_ref, receiver, JobStreamOutcome::CompletedEmpty))
             },
             Err(err) => Err(self
-                .resolve_job_error(response, err, job_cancel_disarmed)
+                .resolve_job_error(response, err, job_cancel_token)
                 .await),
         }
     }
@@ -479,41 +520,36 @@ impl<'a> Query<'a> {
         &self,
     ) -> Result<(ArrowSchemaRef, BigQueryRecordBatchReceiver), BigQueryError> {
         let request = self.build_read_request()?;
-        let initial_wait_ms = self.validate_initial_wait_ms()?;
+        let initial_wait_ms = request.timeout_ms.unwrap_or(INITIAL_WAIT_MS_DEFAULT);
         let attempt_timeout = Duration::from_millis(u64::from(initial_wait_ms))
             .saturating_add(QUERY_ATTEMPT_TIMEOUT_BUFFER);
         let prepared = self
             .prepare_query(request)
-            // We set `request_id`, so DML/DDL mutations are idempotent inside
-            // BigQuery's 15-minute (900 s) window. `query_read_retry_policy()`
-            // bounds retry initiation to `<= 600 s`, skips client-side timeout
-            // retries (avoiding duplicate uncached `SELECT` queries), and keeps
-            // the full per-attempt timeout unclamped below `timeoutMs + buffer`.
+            // We set a single `request_id` (reused across all retry attempts), so
+            // mutating DML/DDL/script queries are deduplicated inside BigQuery's
+            // 15-minute (`900 s`) window. Per the BigQuery v2 `QueryRequest.request_id`
+            // contract, read-only `SELECT` queries *may* ignore `request_id` and
+            // re-execute (and re-bill) on transient `408`/`5xx`/`io` retries when not
+            // served from the query cache; `maximum_bytes_billed` applies per attempt.
+            // `query_read_retry_policy()` bounds retry initiation to `<= 600 s`, skips
+            // client-side `Error::timeout()` retries, and leaves per-attempt timeouts
+            // unclamped below `timeoutMs + buffer`.
             .with_idempotency(true)
             .with_attempt_timeout(attempt_timeout)
             .with_retry_policy(crate::job_service_retry::query_read_retry_policy());
         let mut response = prepared.send().await.map_err(map_query_error)?;
 
         if response.job_complete == Some(false) {
-            struct CancelOnDrop(Option<crate::JobCancelHandle>);
-            impl Drop for CancelOnDrop {
-                fn drop(&mut self) {
-                    if let Some(handle) = self.0.take() {
-                        handle.trigger();
-                    }
-                }
-            }
-
             let (project_id, job_id, location) = extract_required_job_reference(&response)?;
             let stream_name = format_default_job_stream_path(project_id, location, job_id);
-            let job_cancel_disarmed = Arc::new(AtomicBool::new(false));
-            let mut cancel_guard = CancelOnDrop(match tokio::runtime::Handle::try_current() {
-                Ok(runtime) => Some(self.client.new_job_cancel_handle(
+            let cancel_token = JobCancelToken::armed();
+            let mut cancel_guard = match tokio::runtime::Handle::try_current() {
+                Ok(runtime) => JobCancelGuard::arm(self.client.new_job_cancel_handle(
                     project_id,
                     job_id,
                     location,
                     runtime,
-                    Some(Arc::clone(&job_cancel_disarmed)),
+                    cancel_token.clone(),
                 )),
                 Err(err) => {
                     tracing::warn!(
@@ -523,11 +559,11 @@ impl<'a> Query<'a> {
                         error = %err,
                         "no active Tokio runtime handle; best-effort jobs.cancel disabled"
                     );
-                    None
+                    JobCancelGuard::inactive()
                 },
-            });
+            };
             let result = self
-                .read_job_stream_or_table(&response, stream_name, None, Some(&job_cancel_disarmed))
+                .read_job_stream_or_table(&response, stream_name, None, Some(&cancel_token))
                 .await;
             let (schema, mut receiver, outcome) = match result {
                 Ok(resolved) => resolved,
@@ -535,18 +571,23 @@ impl<'a> Query<'a> {
                     if matches!(err, BigQueryError::JobFailed(_)) {
                         // The job has already terminated with an error on the server;
                         // disarm the guard to avoid a redundant jobs.cancel request.
-                        cancel_guard.0 = None;
+                        cancel_guard.disarm();
                     }
-                    // Note: if `resolve_job_error` or `resolve_empty_job_stream` confirmed
-                    // via `jobs.get` that the job reached state `DONE`, `job_cancel_disarmed`
-                    // is already `true` so dropping `cancel_guard` is a no-op.
+                    // Note: if `fetch_job` inside `resolve_job_error` or
+                    // `resolve_empty_job_stream` confirmed that the job reached `DONE`,
+                    // `cancel_token` is already `Disarmed` so dropping `cancel_guard` is a no-op.
                     return Err(err);
                 },
             };
-            if let Some(handle) = cancel_guard.0.take() {
-                if outcome == JobStreamOutcome::Streaming {
-                    receiver.set_job_cancel(handle);
-                }
+            match outcome {
+                JobStreamOutcome::Streaming => {
+                    if let Some(handle) = cancel_guard.take() {
+                        receiver.set_job_cancel(handle);
+                    }
+                },
+                JobStreamOutcome::CompletedEmpty => {
+                    cancel_guard.disarm();
+                },
             }
             return Ok((schema, receiver));
         }
@@ -666,15 +707,17 @@ impl<'a> Query<'a> {
     async fn resolve_empty_job_stream(
         &self,
         response: &QueryResponse,
-        job_cancel_disarmed: Option<&Arc<AtomicBool>>,
+        job_cancel_token: Option<&JobCancelToken>,
     ) -> Result<(ArrowSchemaRef, BigQueryRecordBatchReceiver), BigQueryError> {
         let (project_id, job_id, location) = extract_required_job_reference(response)?;
-        let job = fetch_job(self.client, project_id, job_id, Some(location)).await?;
-        if is_job_done(&job) {
-            if let Some(flag) = job_cancel_disarmed {
-                flag.store(true, Ordering::Release);
-            }
-        }
+        let job = fetch_job(
+            self.client,
+            project_id,
+            job_id,
+            Some(location),
+            job_cancel_token,
+        )
+        .await?;
         check_job_status_error(job.status, project_id, Some(location), job_id)?;
 
         let query_stats = job.statistics.as_ref().and_then(|s| s.query.as_ref());
@@ -724,7 +767,7 @@ impl<'a> Query<'a> {
         &self,
         response: &QueryResponse,
         original_err: BigQueryError,
-        job_cancel_disarmed: Option<&Arc<AtomicBool>>,
+        job_cancel_token: Option<&JobCancelToken>,
     ) -> BigQueryError {
         if !matches!(original_err, BigQueryError::Grpc(_)) {
             return original_err;
@@ -734,12 +777,8 @@ impl<'a> Query<'a> {
             return original_err;
         };
 
-        if let Ok(job) = fetch_job(self.client, project_id, job_id, location).await {
-            if is_job_done(&job) {
-                if let Some(flag) = job_cancel_disarmed {
-                    flag.store(true, Ordering::Release);
-                }
-            }
+        if let Ok(job) = fetch_job(self.client, project_id, job_id, location, job_cancel_token).await
+        {
             if let Err(job_err) = check_job_status_error(job.status, project_id, location, job_id) {
                 return job_err;
             }
@@ -758,17 +797,12 @@ fn non_empty_str(s: &str) -> Option<&str> {
     (!s.is_empty()).then_some(s)
 }
 
-fn is_job_done(job: &google_cloud_bigquery_v2::model::Job) -> bool {
-    job.status.as_ref().is_some_and(|status| {
-        status.error_result.is_some() || status.state.eq_ignore_ascii_case("DONE")
-    })
-}
-
 async fn fetch_job(
     client: &crate::Client,
     project_id: &str,
     job_id: &str,
     location: Option<&str>,
+    job_cancel_token: Option<&JobCancelToken>,
 ) -> Result<google_cloud_bigquery_v2::model::Job, BigQueryError> {
     let mut get_job = client
         .bq_client
@@ -778,12 +812,16 @@ async fn fetch_job(
     if let Some(location) = location {
         get_job = get_job.set_location(location);
     }
-    Ok(client
+    let job = client
         .apply_request_options(get_job)
         .with_idempotency(true)
         .with_attempt_timeout(JOB_METADATA_ATTEMPT_TIMEOUT)
         .send()
-        .await?)
+        .await?;
+    if let Some(token) = job_cancel_token {
+        token.disarm_if_job_done(&job);
+    }
+    Ok(job)
 }
 
 fn check_job_status_error(
@@ -4037,7 +4075,7 @@ mod tests {
                 assert_eq!(req.location, "US");
                 assert_eq!(
                     *options.attempt_timeout(),
-                    Some(crate::JOB_CANCEL_ATTEMPT_TIMEOUT)
+                    Some(crate::job_cancel::JOB_CANCEL_ATTEMPT_TIMEOUT)
                 );
                 self.cancel_calls.fetch_add(1, Ordering::SeqCst);
                 self.cancel_notify.notify_one();
@@ -4788,7 +4826,7 @@ mod tests {
             "job-503",
             "US",
             tokio::runtime::Handle::current(),
-            None,
+            JobCancelToken::armed(),
         );
         handle.trigger();
 
@@ -4806,13 +4844,12 @@ mod tests {
         );
 
         // Confirm a disarmed handle sends 0 requests while the server is STILL accepting.
-        let disarmed_flag = Arc::new(AtomicBool::new(true));
         let disarmed_handle = client.new_job_cancel_handle(
             "p",
             "job-done",
             "US",
             tokio::runtime::Handle::current(),
-            Some(disarmed_flag),
+            JobCancelToken::disarmed(),
         );
         disarmed_handle.trigger();
         tokio::task::yield_now().await;
@@ -4951,20 +4988,20 @@ mod tests {
             Read::from_stub(CannedReadRowsStub::new(vec![]).0),
             "proj".to_string(),
         );
-        let disarmed = Arc::new(AtomicBool::new(false));
+        let cancel_token = JobCancelToken::armed();
         let (table_id, _) = DestinationTableRead {
             project_id: "proj".to_string(),
             job_id: "job-running".to_string(),
             location: "US".to_string(),
             read_options: crate::ReadOptions::default(),
-            job_cancel_disarmed: Some(Arc::clone(&disarmed)),
+            job_cancel_token: Some(cancel_token.clone()),
         }
         .resolve(&client_running)
         .await
         .unwrap();
         assert_eq!(table_id.table_id(), "anon_tmp");
         assert!(
-            !disarmed.load(Ordering::Acquire),
+            !cancel_token.is_disarmed(),
             "RUNNING job must not disarm job cancellation"
         );
 
@@ -4994,20 +5031,20 @@ mod tests {
             Read::from_stub(CannedReadRowsStub::new(vec![]).0),
             "proj".to_string(),
         );
-        let disarmed_failed = Arc::new(AtomicBool::new(false));
+        let failed_token = JobCancelToken::armed();
         let failed_read = DestinationTableRead {
             project_id: "proj".to_string(),
             job_id: "job-failed".to_string(),
             location: "US".to_string(),
             read_options: crate::ReadOptions::default(),
-            job_cancel_disarmed: Some(Arc::clone(&disarmed_failed)),
+            job_cancel_token: Some(failed_token.clone()),
         };
         let err = match failed_read.resolve(&client_failed).await {
             Err(e) => e,
             Ok(_) => panic!("expected JobFailed error"),
         };
         assert!(matches!(err, BigQueryError::JobFailed(_)));
-        assert!(disarmed_failed.load(Ordering::Acquire));
+        assert!(failed_token.is_disarmed());
     }
 
     #[tokio::test]
@@ -5020,23 +5057,54 @@ mod tests {
             .build()
             .await
             .unwrap();
-        let neg_err = client
-            .query("SELECT 1")
-            .with_initial_wait(chrono::Duration::seconds(-1))
-            .read()
-            .await
-            .err()
-            .unwrap();
-        assert!(matches!(neg_err, BigQueryError::InvalidConfig(_)));
 
-        let huge_err = client
+        // Exact boundary values `0` and `MAX_INITIAL_WAIT_MS` (10 min) are accepted.
+        let zero_req = client
             .query("SELECT 1")
-            .with_initial_wait(chrono::Duration::days(100))
-            .read()
-            .await
-            .err()
+            .with_initial_wait(chrono::Duration::zero())
+            .build_read_request()
             .unwrap();
-        assert!(matches!(huge_err, BigQueryError::InvalidConfig(_)));
+        assert_eq!(zero_req.timeout_ms, Some(0));
+        let max_req = client
+            .query("SELECT 1")
+            .with_initial_wait(chrono::Duration::milliseconds(i64::from(
+                MAX_INITIAL_WAIT_MS,
+            )))
+            .build_read_request()
+            .unwrap();
+        assert_eq!(max_req.timeout_ms, Some(MAX_INITIAL_WAIT_MS));
+
+        for invalid in [
+            chrono::Duration::nanoseconds(-1),
+            chrono::Duration::microseconds(-500),
+            chrono::Duration::seconds(-1),
+            chrono::Duration::milliseconds(i64::from(MAX_INITIAL_WAIT_MS))
+                + chrono::Duration::nanoseconds(1),
+            chrono::Duration::milliseconds(i64::from(MAX_INITIAL_WAIT_MS) + 1),
+            chrono::Duration::days(100),
+        ] {
+            let err = client
+                .query("SELECT 1")
+                .with_initial_wait(invalid)
+                .read()
+                .await
+                .err()
+                .unwrap();
+            assert!(
+                matches!(err, BigQueryError::InvalidConfig(_)),
+                "expected InvalidConfig for initial_wait {invalid:?}, got {err:?}"
+            );
+            let dry_err = client
+                .query("SELECT 1")
+                .with_initial_wait(invalid)
+                .dry_run()
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(dry_err, BigQueryError::InvalidConfig(_)),
+                "expected InvalidConfig on dry_run for initial_wait {invalid:?}, got {dry_err:?}"
+            );
+        }
     }
 
     #[tokio::test]
