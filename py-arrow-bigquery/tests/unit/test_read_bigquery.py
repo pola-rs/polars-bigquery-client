@@ -458,6 +458,11 @@ def test_native_client_close_and_maximum_bytes_billed_validation():
         native_client.read_query("SELECT 1", maximum_bytes_billed=1 << 63)
     with pytest.raises(ValueError, match=f"maximum_bytes_billed must be <= {max_i64}"):
         native_client.read_query("SELECT 1", maximum_bytes_billed=1 << 200)
+    # Must handle ints past CPython's default 4300-digit str() conversion limit.
+    with pytest.raises(ValueError, match=f"maximum_bytes_billed must be <= {max_i64}"):
+        native_client.read_query("SELECT 1", maximum_bytes_billed=10**5000)
+    with pytest.raises(ValueError, match="maximum_bytes_billed must be non-negative"):
+        native_client.read_query("SELECT 1", maximum_bytes_billed=-(10**5000))
 
     with native_client:
         assert not native_client.closed
@@ -487,12 +492,23 @@ def test_client_read_query_maximum_bytes_billed(mock_rust_client):
         mock_rust_client.read_query.call_args.kwargs["maximum_bytes_billed"] == max_i64
     )
 
+
+def test_client_read_query_maximum_bytes_billed_validation():
+    client = Client(
+        quota_project_id="q",
+        credentials_provider=lambda: ({"bearer_token": "tok"}, None),
+    )
+    max_i64 = (1 << 63) - 1
     with pytest.raises(TypeError, match="maximum_bytes_billed must be an int or None"):
         client.read_query("SELECT 1", maximum_bytes_billed=True)  # type: ignore[arg-type]
     with pytest.raises(ValueError, match="maximum_bytes_billed must be non-negative"):
         client.read_query("SELECT 1", maximum_bytes_billed=-1)
+    with pytest.raises(ValueError, match="maximum_bytes_billed must be non-negative"):
+        client.read_query("SELECT 1", maximum_bytes_billed=-(10**5000))
     with pytest.raises(ValueError, match=f"maximum_bytes_billed must be <= {max_i64}"):
         client.read_query("SELECT 1", maximum_bytes_billed=1 << 63)
+    with pytest.raises(ValueError, match=f"maximum_bytes_billed must be <= {max_i64}"):
+        client.read_query("SELECT 1", maximum_bytes_billed=10**5000)
 
 
 def test_client_dry_run_forwards_maximum_bytes_billed_and_worker_thread():

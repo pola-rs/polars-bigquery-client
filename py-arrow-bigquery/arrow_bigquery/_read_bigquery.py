@@ -8,7 +8,6 @@ import arrow_bigquery.core.version
 from arrow_bigquery.api.resources import parse_table_id
 
 _parse_table_id = parse_table_id
-_MAX_INT64 = (1 << 63) - 1
 
 
 def _get_user_agent(user_agent: str | None) -> str:
@@ -59,7 +58,10 @@ class Client:
 
         Idempotent. Releasing the native client drops cached network channels
         and clears the Rust-side credentials reference once any previously
-        returned ``ArrowStreamExporter`` streams finish or are dropped.
+        returned ``ArrowStreamExporter`` streams finish or are dropped (note
+        that an aborted/early-dropped incomplete query stream may spawn a
+        detached best-effort ``jobs.cancel`` task that briefly retains the REST
+        client and credentials provider for up to 10 s until it completes).
 
         Warning:
             Calling ``close()`` (or exiting a ``with Client(...) as client:``
@@ -153,13 +155,16 @@ class Client:
                 set, also forwarded on dry runs for consistent limit checking.
 
         Note:
-            Interrupting a query via ``Ctrl+C`` (``KeyboardInterrupt``) cancels
-            the BigQuery job server-side once a job ID has been returned
-            (``jobComplete=false``). Interrupting during the initial
-            ``jobs.query`` HTTP wait (default 200 s) closes only the client
-            socket because the server-generated job ID is not yet available.
-            On non-main Python threads, blocking waits cannot be interrupted by
-            ``Ctrl+C`` (CPython only delivers signals on the main thread).
+            Interrupting a query via ``Ctrl+C`` (``KeyboardInterrupt``) triggers
+            a detached, best-effort server-side ``jobs.cancel`` RPC once a job ID
+            has been returned (``jobComplete=false``). If the Python process exits
+            immediately upon an unhandled ``KeyboardInterrupt``, background
+            threads may terminate before the detached ``jobs.cancel`` HTTP request
+            flushes. Interrupting during the initial ``jobs.query`` HTTP wait
+            (default 200 s) closes only the client socket because the
+            server-generated job ID is not yet available. On non-main Python
+            threads, blocking waits cannot be interrupted by ``Ctrl+C`` (CPython
+            only delivers signals on the main thread).
 
         Raises:
             RuntimeError: If the client has already been closed via
@@ -170,27 +175,6 @@ class Client:
                 signed 64-bit integer range (``(1 << 63) - 1``).
         """
         native_client = self._ensure_open()
-        if maximum_bytes_billed is not None:
-            if isinstance(maximum_bytes_billed, bool) or not isinstance(
-                maximum_bytes_billed, int
-            ):
-                msg = (
-                    "maximum_bytes_billed must be an int or None, "
-                    f"got {type(maximum_bytes_billed).__name__}"
-                )
-                raise TypeError(msg)
-            if maximum_bytes_billed < 0:
-                msg = (
-                    "maximum_bytes_billed must be non-negative, "
-                    f"got {maximum_bytes_billed}"
-                )
-                raise ValueError(msg)
-            if maximum_bytes_billed > _MAX_INT64:
-                msg = (
-                    f"maximum_bytes_billed must be <= {_MAX_INT64}, "
-                    f"got {maximum_bytes_billed}"
-                )
-                raise ValueError(msg)
         return native_client.read_query(
             query,
             arrow_buffer_compression=arrow_buffer_compression,

@@ -11,7 +11,7 @@ use std::sync::RwLock;
 use google_cloud_auth::credentials::Credentials;
 use google_cloud_bigquery::model::arrow_serialization_options::CompressionCodec;
 use pyo3::exceptions::{
-    PyAttributeError, PyException, PyImportError, PyRuntimeError, PyTypeError, PyValueError,
+    PyAttributeError, PyImportError, PyOverflowError, PyRuntimeError, PyTypeError, PyValueError,
 };
 use pyo3::prelude::*;
 use pyo3::types::{PyBool, PyDateTime, PyInt};
@@ -48,10 +48,16 @@ pub(crate) fn is_main_python_thread(py: Python<'_>) -> PyResult<bool> {
     }
 
     let lookup = (|| -> PyResult<bool> {
+        // Compare thread identifiers instead of calling `current_thread()` so native
+        // worker threads (e.g., Rayon/Polars pool threads) do not instantiate and register
+        // a CPython `threading._DummyThread` entry inside `threading._active`.
         let threading = py.import("threading")?;
-        let current = threading.call_method0("current_thread")?;
-        let main = threading.call_method0("main_thread")?;
-        Ok(current.is(&main))
+        let current_ident = threading.call_method0("get_ident")?;
+        let main_ident = threading.call_method0("main_thread")?.getattr("ident")?;
+        if main_ident.is_none() {
+            return Ok(true);
+        }
+        current_ident.eq(&main_ident)
     })();
 
     match lookup {
@@ -60,9 +66,8 @@ pub(crate) fn is_main_python_thread(py: Python<'_>) -> PyResult<bool> {
             Ok(is_main)
         },
         Err(err)
-            if err.is_instance_of::<PyException>(py)
-                && (err.is_instance_of::<PyImportError>(py)
-                    || err.is_instance_of::<PyAttributeError>(py)) =>
+            if err.is_instance_of::<PyImportError>(py)
+                || err.is_instance_of::<PyAttributeError>(py) =>
         {
             Ok(true)
         },
@@ -118,7 +123,12 @@ where
 
     let rt = pyo3_async_runtimes::tokio::get_runtime();
     if !is_main_python_thread(py)? {
-        return Ok(py.detach(|| rt.block_on(fut)));
+        // Spawn onto Tokio on worker threads too so task panics convert consistently
+        // into `PyRuntimeError` rather than unwinding as `PanicException`.
+        let join_res = py.detach(|| rt.block_on(async move { rt.spawn(fut).await }));
+        return join_res.map_err(|join_err| {
+            PyRuntimeError::new_err(format!("BigQuery task failed unexpectedly: {join_err}"))
+        });
     }
 
     let handle = rt.spawn(fut);
@@ -157,7 +167,10 @@ where
     }
 }
 
-fn extract_maximum_bytes_billed(value: Option<&Bound<'_, PyAny>>) -> PyResult<Option<i64>> {
+fn extract_maximum_bytes_billed(
+    py: Python<'_>,
+    value: Option<&Bound<'_, PyAny>>,
+) -> PyResult<Option<i64>> {
     let Some(obj) = value else {
         return Ok(None);
     };
@@ -170,18 +183,27 @@ fn extract_maximum_bytes_billed(value: Option<&Bound<'_, PyAny>>) -> PyResult<Op
             "maximum_bytes_billed must be an int or None, got {type_name}"
         )));
     }
-    if obj.lt(0)? {
-        return Err(PyValueError::new_err(format!(
-            "maximum_bytes_billed must be non-negative, got {obj}"
-        )));
+    match obj.extract::<i64>() {
+        Ok(limit) if limit < 0 => Err(PyValueError::new_err(format!(
+            "maximum_bytes_billed must be non-negative, got {limit}"
+        ))),
+        Ok(limit) => Ok(Some(limit)),
+        Err(err) if err.is_instance_of::<PyOverflowError>(py) => {
+            // Avoid calling `obj.__str__()` on arbitrarily huge Python ints (e.g., `10**5000`),
+            // which hits CPython 3.11+'s `sys.get_int_max_str_digits()` limit.
+            if obj.lt(0)? {
+                Err(PyValueError::new_err(
+                    "maximum_bytes_billed must be non-negative",
+                ))
+            } else {
+                Err(PyValueError::new_err(format!(
+                    "maximum_bytes_billed must be <= {}",
+                    i64::MAX
+                )))
+            }
+        },
+        Err(err) => Err(err),
     }
-    if obj.gt(i64::MAX)? {
-        return Err(PyValueError::new_err(format!(
-            "maximum_bytes_billed must be <= {}, got {obj}",
-            i64::MAX
-        )));
-    }
-    Ok(Some(obj.extract::<i64>()?))
 }
 
 /// A Python-exposed client that keeps the BigQuery Storage Read API gRPC channel
@@ -360,7 +382,7 @@ impl Client {
     ) -> PyResult<ArrowStreamExporter> {
         let client = self.clone_inner()?;
         let arrow_buffer_compression = parse_compression_codec(arrow_buffer_compression)?;
-        let maximum_bytes_billed = extract_maximum_bytes_billed(maximum_bytes_billed)?;
+        let maximum_bytes_billed = extract_maximum_bytes_billed(py, maximum_bytes_billed)?;
         let query = query.to_owned();
         if dry_run {
             let result = block_on_interruptible(py, async move {
@@ -805,6 +827,44 @@ mod tests {
                 .expect("expected Err for overflowing maximum_bytes_billed");
             assert!(err.is_instance_of::<PyValueError>(py));
 
+            // Negative value below i64::MIN also raises ValueError without hitting
+            // CPython's integer-to-string digit limit.
+            let builtins = py.import("builtins").unwrap();
+            let pow = builtins.getattr("pow").unwrap();
+            let giant_pos = pow.call1((10_i64, 5000_i64)).unwrap();
+            let err = client
+                .read_query(
+                    py,
+                    "SELECT 1",
+                    "lz4frame",
+                    false,
+                    true,
+                    None,
+                    Some(&giant_pos),
+                )
+                .err()
+                .expect("expected Err for giant positive maximum_bytes_billed");
+            assert!(err.is_instance_of::<PyValueError>(py));
+            assert!(err.to_string().contains("maximum_bytes_billed must be <="));
+
+            let giant_neg = giant_pos.neg().unwrap();
+            let err = client
+                .read_query(
+                    py,
+                    "SELECT 1",
+                    "lz4frame",
+                    false,
+                    true,
+                    None,
+                    Some(&giant_neg),
+                )
+                .err()
+                .expect("expected Err for giant negative maximum_bytes_billed");
+            assert!(err.is_instance_of::<PyValueError>(py));
+            assert!(err
+                .to_string()
+                .contains("maximum_bytes_billed must be non-negative"));
+
             // close() rejects subsequent reads with RuntimeError and is idempotent.
             assert!(!client.closed());
             client.close(py);
@@ -816,5 +876,30 @@ mod tests {
                 .expect("expected RuntimeError on closed client");
             assert!(err.is_instance_of::<PyRuntimeError>(py));
         });
+    }
+
+    #[test]
+    fn test_is_main_python_thread_does_not_create_dummy_thread_and_caches_worker() {
+        Python::initialize();
+        let handle = std::thread::spawn(|| {
+            let (is_main, cached, in_active) = Python::attach(|py| {
+                let threading = py.import("threading").unwrap();
+                let ident = threading.call_method0("get_ident").unwrap();
+                let is_main = is_main_python_thread(py).unwrap();
+                let active = threading.getattr("_active").unwrap();
+                let in_active: bool = active.contains(&ident).unwrap();
+                (is_main, cached_is_main_python_thread(), in_active)
+            });
+            assert!(
+                !is_main,
+                "spawned std::thread must not be reported as main thread"
+            );
+            assert_eq!(cached, Some(false));
+            assert!(
+                !in_active,
+                "is_main_python_thread must not register a _DummyThread in threading._active"
+            );
+        });
+        handle.join().unwrap();
     }
 }

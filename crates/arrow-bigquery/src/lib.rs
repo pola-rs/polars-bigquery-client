@@ -3,6 +3,7 @@ mod bigquery_read_stream;
 pub mod client_builder;
 mod decode;
 mod error;
+mod job_service_retry;
 pub mod query;
 
 use std::sync::Arc;
@@ -364,6 +365,8 @@ pub(crate) struct JobCancelHandle {
     location: String,
     runtime: tokio::runtime::Handle,
     cancel_limiter: Arc<tokio::sync::Semaphore>,
+    cancel_queue_limiter: Arc<tokio::sync::Semaphore>,
+    cancel_retry_throttler: SharedRetryThrottler,
     disarmed: Option<Arc<std::sync::atomic::AtomicBool>>,
 }
 
@@ -372,11 +375,21 @@ pub(crate) struct JobCancelHandle {
 pub(crate) const JOB_CANCEL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Per-attempt HTTP timeout applied to each `jobs.cancel` try inside `JOB_CANCEL_TIMEOUT`.
+///
+/// Sized at `3 s` so all `JOB_CANCEL_MAX_ATTEMPTS` (3) tries plus their short
+/// equal-jitter backoff sleeps (`<= 0.3 s`) fit inside `JOB_CANCEL_TIMEOUT` (`10 s`).
 pub(crate) const JOB_CANCEL_ATTEMPT_TIMEOUT: std::time::Duration =
-    std::time::Duration::from_secs(5);
+    std::time::Duration::from_secs(3);
 
-/// Maximum number of concurrent detached `jobs.cancel` HTTP calls per [`Client`].
+/// Maximum number of concurrent in-flight detached `jobs.cancel` HTTP calls per [`Client`].
 const MAX_CONCURRENT_JOB_CANCELS: usize = 16;
+
+/// Maximum number of detached `jobs.cancel` tasks (queued + in-flight) buffered per [`Client`].
+///
+/// Bounds memory and Tokio task counts during bulk drop/cancellation storms; excess
+/// best-effort cancels are shed synchronously with a `tracing::warn!` instead of
+/// queuing unbounded pending tasks.
+const MAX_PENDING_JOB_CANCELS: usize = 128;
 
 fn apply_request_options_parts<B: RequestOptionsBuilder>(
     builder: B,
@@ -399,6 +412,16 @@ impl JobCancelHandle {
         {
             return;
         }
+        let Ok(queue_permit) = self.cancel_queue_limiter.try_acquire_owned() else {
+            tracing::warn!(
+                project_id = %self.project_id,
+                job_id = %self.job_id,
+                location = %self.location,
+                max_pending = MAX_PENDING_JOB_CANCELS,
+                "dropping best-effort BigQuery jobs.cancel: pending cancel queue is full"
+            );
+            return;
+        };
         let bq_client = self.bq_client;
         let quota_project_id = self.quota_project_id;
         let user_agent = self.user_agent;
@@ -406,15 +429,24 @@ impl JobCancelHandle {
         let job_id = self.job_id;
         let location = self.location;
         let cancel_limiter = self.cancel_limiter;
+        let cancel_retry_throttler = self.cancel_retry_throttler;
         self.runtime.spawn(async move {
+            let _queue_permit = queue_permit;
             // Detached cancellation is best-effort cleanup: apply a bounded concurrency
-            // cap, allow up to 3 quick retries within `JOB_CANCEL_TIMEOUT` so a single
-            // stale TCP reset or transient 503 does not abandon a running query job,
-            // and isolate the retry throttler so failures do not affect normal queries.
+            // cap, pass the remaining wall-clock budget after semaphore wait into the
+            // inner retry policy so up to 3 quick retries stay within `JOB_CANCEL_TIMEOUT`,
+            // and share a dedicated cancel circuit breaker isolated from normal queries.
+            let deadline = tokio::time::Instant::now() + JOB_CANCEL_TIMEOUT;
             let work = async {
-                let Ok(_permit) = cancel_limiter.acquire_owned().await else {
+                let Ok(_inflight_permit) = cancel_limiter.acquire_owned().await else {
                     return Ok(());
                 };
+                let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                if remaining.is_zero() {
+                    return Err(google_cloud_bigquery_v2::Error::timeout(
+                        "cancel budget exhausted while queued for concurrency permit",
+                    ));
+                }
                 let cancel_req = apply_request_options_parts(
                     bq_client
                         .cancel_job()
@@ -425,15 +457,15 @@ impl JobCancelHandle {
                     &quota_project_id,
                     user_agent.as_deref(),
                 )
-                .with_attempt_timeout(JOB_CANCEL_ATTEMPT_TIMEOUT)
-                .with_retry_policy(bigquery_read_retry::job_service_cancel_retry_policy(
-                    JOB_CANCEL_TIMEOUT,
+                .with_attempt_timeout(JOB_CANCEL_ATTEMPT_TIMEOUT.min(remaining))
+                .with_retry_policy(job_service_retry::job_service_cancel_retry_policy(
+                    remaining,
                 ))
-                .with_backoff_policy(bigquery_read_retry::job_service_cancel_backoff_policy())
-                .with_retry_throttler(client_builder::job_service_retry_throttler());
+                .with_backoff_policy(job_service_retry::job_service_cancel_backoff_policy())
+                .with_retry_throttler(cancel_retry_throttler);
                 cancel_req.send().await.map(|_| ())
             };
-            match tokio::time::timeout(JOB_CANCEL_TIMEOUT, work).await {
+            match tokio::time::timeout_at(deadline, work).await {
                 Ok(Ok(())) => {},
                 Ok(Err(err)) => {
                     tracing::warn!(
@@ -482,7 +514,9 @@ impl BigQueryRecordBatchReceiver {
         let item = self.rx.recv().await;
         match &item {
             None | Some(Err(BigQueryError::JobFailed(_))) => {
-                // Clean EOF or confirmed server-side job failure: do not issue jobs.cancel.
+                // Clean EOF (or a defensive guard if a stream path emits a confirmed
+                // server-side `JobFailed`, e.g. from cutover `DestinationTableRead::resolve`):
+                // skip issuing a redundant `jobs.cancel`.
                 self.job_cancel = None;
                 self.abort();
             },
@@ -579,6 +613,8 @@ pub struct Client {
     retry_throttler: SharedRetryThrottler,
     retry_config: bigquery_read_retry::StreamRetryConfig,
     cancel_limiter: Arc<tokio::sync::Semaphore>,
+    cancel_queue_limiter: Arc<tokio::sync::Semaphore>,
+    cancel_retry_throttler: SharedRetryThrottler,
 }
 
 fn channel_size() -> usize {
@@ -609,6 +645,8 @@ impl Client {
             retry_throttler,
             retry_config,
             cancel_limiter: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_JOB_CANCELS)),
+            cancel_queue_limiter: Arc::new(tokio::sync::Semaphore::new(MAX_PENDING_JOB_CANCELS)),
+            cancel_retry_throttler: job_service_retry::job_service_retry_throttler(),
         }
     }
 
@@ -662,6 +700,8 @@ impl Client {
             location: location.into(),
             runtime,
             cancel_limiter: Arc::clone(&self.cancel_limiter),
+            cancel_queue_limiter: Arc::clone(&self.cancel_queue_limiter),
+            cancel_retry_throttler: Arc::clone(&self.cancel_retry_throttler),
             disarmed,
         }
     }
@@ -1975,5 +2015,62 @@ pub(crate) mod tests {
             .expect("expected error item")
             .expect_err("expected Grpc error when ReadRows fails");
         assert!(matches!(err, BigQueryError::Grpc(_)));
+    }
+
+    #[tokio::test]
+    async fn test_job_cancel_shares_throttler_and_bounds_pending_queue() {
+        let client = Client::new_for_testing(
+            test_bq_client().await,
+            test_read_client().await,
+            "test-quota-proj".to_string(),
+        );
+        let h1 =
+            client.new_job_cancel_handle("p", "j1", "US", tokio::runtime::Handle::current(), None);
+        let h2 =
+            client.new_job_cancel_handle("p", "j2", "US", tokio::runtime::Handle::current(), None);
+        assert!(
+            Arc::ptr_eq(&h1.cancel_retry_throttler, &h2.cancel_retry_throttler),
+            "detached jobs.cancel tasks must share one circuit breaker across a Client"
+        );
+        assert!(
+            !Arc::ptr_eq(&h1.cancel_retry_throttler, &client.retry_throttler),
+            "cancel circuit breaker must be isolated from Storage Read throttler"
+        );
+
+        // Drain all queue permits to verify `trigger()` sheds excess cancels synchronously
+        // without spawning unbounded background tasks or panicking.
+        let permits = client
+            .cancel_queue_limiter
+            .try_acquire_many(MAX_PENDING_JOB_CANCELS as u32)
+            .expect("all queue permits should be available");
+        assert_eq!(client.cancel_queue_limiter.available_permits(), 0);
+        h1.trigger();
+        // Also confirm `h2` is dropped cleanly without triggering a request.
+        drop(h2);
+        drop(permits);
+        assert_eq!(
+            client.cancel_queue_limiter.available_permits(),
+            MAX_PENDING_JOB_CANCELS
+        );
+    }
+
+    #[tokio::test]
+    async fn test_job_cancel_uses_remaining_deadline_after_semaphore_wait() {
+        let client = Client::new_for_testing(
+            test_bq_client().await,
+            test_read_client().await,
+            "test-quota-proj".to_string(),
+        );
+        // Confirm `JOB_CANCEL_ATTEMPT_TIMEOUT * JOB_CANCEL_MAX_ATTEMPTS <= JOB_CANCEL_TIMEOUT`
+        // so all 3 attempts can realistically run inside the overall cancel budget.
+        assert!(
+            JOB_CANCEL_ATTEMPT_TIMEOUT * job_service_retry::JOB_CANCEL_MAX_ATTEMPTS
+                <= JOB_CANCEL_TIMEOUT
+        );
+        assert!(!client
+            .cancel_retry_throttler
+            .lock()
+            .unwrap()
+            .throttle_retry_attempt());
     }
 }

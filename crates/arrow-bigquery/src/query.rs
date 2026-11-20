@@ -142,21 +142,22 @@ impl DestinationTableRead {
     ) -> Result<(crate::BigQueryTableId, crate::ReadOptions), BigQueryError> {
         let job = fetch_job(client, &self.project_id, &self.job_id, Some(&self.location)).await?;
         let job_done = is_job_done(&job);
-        let destination_table = extract_destination_table(job.configuration)?.ok_or_else(|| {
-            if job_done {
-                if let Some(flag) = &self.job_cancel_disarmed {
-                    flag.store(true, Ordering::Release);
-                }
+        if job_done {
+            if let Some(flag) = &self.job_cancel_disarmed {
+                flag.store(true, Ordering::Release);
             }
+        }
+        check_job_status_error(
+            job.status,
+            &self.project_id,
+            Some(&self.location),
+            &self.job_id,
+        )?;
+        let destination_table = extract_destination_table(job.configuration)?.ok_or_else(|| {
             BigQueryError::Protocol(
                 "Job response is missing configuration.query.destination_table".into(),
             )
         })?;
-        // A populated destination table reached from `streams/_default` cutover
-        // indicates the query job has finished executing; disarm best-effort cancel.
-        if let Some(flag) = &self.job_cancel_disarmed {
-            flag.store(true, Ordering::Release);
-        }
         Ok((destination_table, self.read_options))
     }
 
@@ -188,7 +189,7 @@ pub struct Query<'a> {
     maintain_order: bool,
     use_query_cache: Option<bool>,
     maximum_bytes_billed: Option<i64>,
-    initial_wait_ms: u32,
+    initial_wait_ms: i64,
 }
 
 impl<'a> Query<'a> {
@@ -200,7 +201,7 @@ impl<'a> Query<'a> {
             maintain_order: true,
             use_query_cache: None,
             maximum_bytes_billed: None,
-            initial_wait_ms: INITIAL_WAIT_MS_DEFAULT,
+            initial_wait_ms: i64::from(INITIAL_WAIT_MS_DEFAULT),
         }
     }
 
@@ -214,7 +215,7 @@ impl<'a> Query<'a> {
 
     pub fn with_initial_wait(mut self, initial_wait: impl Into<chrono::Duration>) -> Self {
         let duration: chrono::Duration = initial_wait.into();
-        self.initial_wait_ms = duration.num_milliseconds().clamp(0, i64::from(u32::MAX)) as u32;
+        self.initial_wait_ms = duration.num_milliseconds();
         self
     }
 
@@ -253,8 +254,19 @@ impl<'a> Query<'a> {
         Ok(self.maximum_bytes_billed)
     }
 
+    fn validate_initial_wait_ms(&self) -> Result<u32, BigQueryError> {
+        u32::try_from(self.initial_wait_ms).map_err(|_| {
+            BigQueryError::InvalidConfig(format!(
+                "initial_wait must be between 0 and {} ms, got {} ms",
+                u32::MAX,
+                self.initial_wait_ms
+            ))
+        })
+    }
+
     fn build_read_request(&self) -> Result<QueryRequest, BigQueryError> {
         let maximum_bytes_billed = self.validate_maximum_bytes_billed()?;
+        let initial_wait_ms = self.validate_initial_wait_ms()?;
         let arrow_options = ArrowSerializationOptions::new().set_buffer_compression(
             bq_to_gapic_compression_codec(self.arrow_buffer_compression()),
         );
@@ -265,7 +277,7 @@ impl<'a> Query<'a> {
             .set_arrow_serialization_options(arrow_options)
             .set_or_clear_use_query_cache(self.use_query_cache)
             .set_or_clear_maximum_bytes_billed(maximum_bytes_billed)
-            .set_timeout_ms(self.initial_wait_ms))
+            .set_timeout_ms(initial_wait_ms))
     }
 
     fn build_dry_run_request(&self) -> Result<QueryRequest, BigQueryError> {
@@ -467,21 +479,19 @@ impl<'a> Query<'a> {
         &self,
     ) -> Result<(ArrowSchemaRef, BigQueryRecordBatchReceiver), BigQueryError> {
         let request = self.build_read_request()?;
-        let attempt_timeout = Duration::from_millis(u64::from(self.initial_wait_ms))
+        let initial_wait_ms = self.validate_initial_wait_ms()?;
+        let attempt_timeout = Duration::from_millis(u64::from(initial_wait_ms))
             .saturating_add(QUERY_ATTEMPT_TIMEOUT_BUFFER);
-        let mut prepared = self
+        let prepared = self
             .prepare_query(request)
-            // We set the request ID, so all queries including DML are
-            // idempotent, at least within the lifetime of the request ID.
+            // We set `request_id`, so DML/DDL mutations are idempotent inside
+            // BigQuery's 15-minute (900 s) window. `query_read_retry_policy()`
+            // bounds retry initiation to `<= 600 s`, skips client-side timeout
+            // retries (avoiding duplicate uncached `SELECT` queries), and keeps
+            // the full per-attempt timeout unclamped below `timeoutMs + buffer`.
             .with_idempotency(true)
-            .with_attempt_timeout(attempt_timeout);
-        if attempt_timeout > crate::bigquery_read_retry::JOB_SERVICE_RETRY_TIMEOUT {
-            prepared = prepared.with_retry_policy(
-                crate::bigquery_read_retry::job_service_retry_policy_with_time_limit(
-                    attempt_timeout,
-                ),
-            );
-        }
+            .with_attempt_timeout(attempt_timeout)
+            .with_retry_policy(crate::job_service_retry::query_read_retry_policy());
         let mut response = prepared.send().await.map_err(map_query_error)?;
 
         if response.job_complete == Some(false) {
@@ -497,16 +507,25 @@ impl<'a> Query<'a> {
             let (project_id, job_id, location) = extract_required_job_reference(&response)?;
             let stream_name = format_default_job_stream_path(project_id, location, job_id);
             let job_cancel_disarmed = Arc::new(AtomicBool::new(false));
-            let mut cancel_guard =
-                CancelOnDrop(tokio::runtime::Handle::try_current().ok().map(|runtime| {
-                    self.client.new_job_cancel_handle(
-                        project_id,
-                        job_id,
-                        location,
-                        runtime,
-                        Some(Arc::clone(&job_cancel_disarmed)),
-                    )
-                }));
+            let mut cancel_guard = CancelOnDrop(match tokio::runtime::Handle::try_current() {
+                Ok(runtime) => Some(self.client.new_job_cancel_handle(
+                    project_id,
+                    job_id,
+                    location,
+                    runtime,
+                    Some(Arc::clone(&job_cancel_disarmed)),
+                )),
+                Err(err) => {
+                    tracing::warn!(
+                        project_id = %project_id,
+                        job_id = %job_id,
+                        location = %location,
+                        error = %err,
+                        "no active Tokio runtime handle; best-effort jobs.cancel disabled"
+                    );
+                    None
+                },
+            });
             let result = self
                 .read_job_stream_or_table(&response, stream_name, None, Some(&job_cancel_disarmed))
                 .await;
@@ -888,11 +907,12 @@ fn job_failed_from_gax_status(status: &google_cloud_gax::error::rpc::Status) -> 
 }
 
 fn map_query_error(err: google_cloud_bigquery_v2::Error) -> BigQueryError {
-    // Preserve transient HTTP status / rate-limit errors (e.g., 408/429/500/502/503/504,
-    // or legacy 403 rateLimitExceeded) as `BigQueryError::Grpc` so callers keep the HTTP
+    // Preserve transient HTTP status / rate-limit / RPC errors (using the same
+    // predicate as `job_service_retry::JobServiceRetryableErrors` and
+    // `query_read_retry_policy`) as `BigQueryError::Grpc` so callers keep the HTTP
     // status code, headers, and exhaustion details instead of mistaking an exhausted
     // backend outage for a SQL/job failure.
-    if crate::bigquery_read_retry::is_transient_job_service_http_error(&err) {
+    if crate::job_service_retry::is_transient_job_service_status_error(&err) {
         return BigQueryError::from(err);
     }
     if let Some(status) = err.status() {
@@ -4748,7 +4768,7 @@ mod tests {
                 );
                 let _ = stream.write_all(response.as_bytes()).await;
                 let _ = stream.shutdown().await;
-                if count == crate::bigquery_read_retry::JOB_CANCEL_MAX_ATTEMPTS as usize {
+                if count == crate::job_service_retry::JOB_CANCEL_MAX_ATTEMPTS as usize {
                     server_notify.notify_one();
                 }
             }
@@ -4780,13 +4800,12 @@ mod tests {
         .expect("cancel_job did not execute bounded retry attempts");
         // Confirm retries stop at JOB_CANCEL_MAX_ATTEMPTS (3).
         tokio::time::sleep(std::time::Duration::from_millis(400)).await;
-        server.abort();
         assert_eq!(
             cancel_attempts.load(Ordering::SeqCst),
-            crate::bigquery_read_retry::JOB_CANCEL_MAX_ATTEMPTS as usize
+            crate::job_service_retry::JOB_CANCEL_MAX_ATTEMPTS as usize
         );
 
-        // Also confirm a disarmed handle sends 0 requests.
+        // Confirm a disarmed handle sends 0 requests while the server is STILL accepting.
         let disarmed_flag = Arc::new(AtomicBool::new(true));
         let disarmed_handle = client.new_job_cancel_handle(
             "p",
@@ -4796,6 +4815,13 @@ mod tests {
             Some(disarmed_flag),
         );
         disarmed_handle.trigger();
+        tokio::task::yield_now().await;
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        server.abort();
+        assert_eq!(
+            cancel_attempts.load(Ordering::SeqCst),
+            crate::job_service_retry::JOB_CANCEL_MAX_ATTEMPTS as usize
+        );
     }
 
     #[test]
@@ -4843,6 +4869,174 @@ mod tests {
             map_query_error(err_403_rate),
             BigQueryError::Grpc(ref e) if e.http_status_code() == Some(403)
         ));
+
+        // Status-only transient RPC errors (http_status_code == None) also stay `Grpc`
+        // so map_query_error matches `job_service_retry::is_transient_job_service_status_error`.
+        for code in [
+            Code::Unavailable,
+            Code::ResourceExhausted,
+            Code::DeadlineExceeded,
+            Code::Internal,
+            Code::Aborted,
+        ] {
+            let err = GaxError::service(Status::default().set_code(code).set_message("transient"));
+            assert!(
+                matches!(map_query_error(err), BigQueryError::Grpc(_)),
+                "expected status-only {code:?} to preserve BigQueryError::Grpc"
+            );
+        }
+
+        // Non-retryable HTTP 403 quota error must NOT be treated as transient even when
+        // status maps to `Code::ResourceExhausted`.
+        let body_403_quota = serde_json::json!({
+            "error": {
+                "code": 403,
+                "message": "quota exceeded",
+                "errors": [{"reason": "quotaExceeded", "domain": "usageLimits", "message": "quota exceeded"}],
+                "status": "RESOURCE_EXHAUSTED"
+            }
+        });
+        let status_403_quota =
+            Status::try_from(&bytes::Bytes::from(body_403_quota.to_string())).unwrap();
+        let err_403_quota = GaxError::service_with_http_metadata(status_403_quota, Some(403), None);
+        assert!(matches!(
+            map_query_error(err_403_quota),
+            BigQueryError::JobFailed(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_destination_table_read_resolve_checks_job_done_and_errors() {
+        use google_cloud_bigquery::client::Read;
+        use google_cloud_bigquery_v2::model::{
+            ErrorProto, GetJobRequest, Job, JobConfiguration, JobConfigurationQuery, JobStatus,
+            TableReference,
+        };
+        use google_cloud_gax::options::RequestOptions;
+        use google_cloud_gax::response::Response;
+
+        #[derive(Debug)]
+        struct SingleJobStub {
+            job: std::sync::Mutex<Option<Job>>,
+        }
+
+        impl google_cloud_bigquery_v2::stub::JobService for SingleJobStub {
+            async fn get_job(
+                &self,
+                _req: GetJobRequest,
+                _options: RequestOptions,
+            ) -> google_cloud_bigquery_v2::Result<Response<Job>> {
+                Ok(Response::from(self.job.lock().unwrap().take().unwrap()))
+            }
+        }
+
+        // 1. A job still in state RUNNING with a populated temp destination table must
+        //    NOT disarm best-effort cancellation prematurely.
+        let running_job = Job::new()
+            .set_status(JobStatus::new().set_state("RUNNING"))
+            .set_configuration(
+                JobConfiguration::new().set_query(
+                    JobConfigurationQuery::new().set_destination_table(
+                        TableReference::new()
+                            .set_project_id("proj")
+                            .set_dataset_id("ds")
+                            .set_table_id("anon_tmp"),
+                    ),
+                ),
+            );
+        let client_running = crate::Client::new_for_testing(
+            crate::BigQueryJobService::from_stub(SingleJobStub {
+                job: std::sync::Mutex::new(Some(running_job)),
+            }),
+            Read::from_stub(CannedReadRowsStub::new(vec![]).0),
+            "proj".to_string(),
+        );
+        let disarmed = Arc::new(AtomicBool::new(false));
+        let (table_id, _) = DestinationTableRead {
+            project_id: "proj".to_string(),
+            job_id: "job-running".to_string(),
+            location: "US".to_string(),
+            read_options: crate::ReadOptions::default(),
+            job_cancel_disarmed: Some(Arc::clone(&disarmed)),
+        }
+        .resolve(&client_running)
+        .await
+        .unwrap();
+        assert_eq!(table_id.table_id(), "anon_tmp");
+        assert!(
+            !disarmed.load(Ordering::Acquire),
+            "RUNNING job must not disarm job cancellation"
+        );
+
+        // 2. A job with `error_result` set disarms cancellation and surfaces `JobFailed`.
+        let failed_job = Job::new()
+            .set_status(
+                JobStatus::new().set_state("DONE").set_error_result(
+                    ErrorProto::new()
+                        .set_reason("resourcesExceeded")
+                        .set_message("out of memory"),
+                ),
+            )
+            .set_configuration(
+                JobConfiguration::new().set_query(
+                    JobConfigurationQuery::new().set_destination_table(
+                        TableReference::new()
+                            .set_project_id("proj")
+                            .set_dataset_id("ds")
+                            .set_table_id("anon_tmp"),
+                    ),
+                ),
+            );
+        let client_failed = crate::Client::new_for_testing(
+            crate::BigQueryJobService::from_stub(SingleJobStub {
+                job: std::sync::Mutex::new(Some(failed_job)),
+            }),
+            Read::from_stub(CannedReadRowsStub::new(vec![]).0),
+            "proj".to_string(),
+        );
+        let disarmed_failed = Arc::new(AtomicBool::new(false));
+        let failed_read = DestinationTableRead {
+            project_id: "proj".to_string(),
+            job_id: "job-failed".to_string(),
+            location: "US".to_string(),
+            read_options: crate::ReadOptions::default(),
+            job_cancel_disarmed: Some(Arc::clone(&disarmed_failed)),
+        };
+        let err = match failed_read.resolve(&client_failed).await {
+            Err(e) => e,
+            Ok(_) => panic!("expected JobFailed error"),
+        };
+        assert!(matches!(err, BigQueryError::JobFailed(_)));
+        assert!(disarmed_failed.load(Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn test_with_initial_wait_rejects_out_of_range_durations() {
+        let cred = google_cloud_auth::credentials::anonymous::Builder::new().build();
+        let client = crate::Client::builder()
+            .with_cred(cred)
+            .with_bq_endpoint("http://127.0.0.1:1")
+            .with_quota_project_id(Some("p".to_string()))
+            .build()
+            .await
+            .unwrap();
+        let neg_err = client
+            .query("SELECT 1")
+            .with_initial_wait(chrono::Duration::seconds(-1))
+            .read()
+            .await
+            .err()
+            .unwrap();
+        assert!(matches!(neg_err, BigQueryError::InvalidConfig(_)));
+
+        let huge_err = client
+            .query("SELECT 1")
+            .with_initial_wait(chrono::Duration::days(100))
+            .read()
+            .await
+            .err()
+            .unwrap();
+        assert!(matches!(huge_err, BigQueryError::InvalidConfig(_)));
     }
 
     #[tokio::test]
