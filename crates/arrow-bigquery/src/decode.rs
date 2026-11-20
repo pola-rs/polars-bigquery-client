@@ -783,4 +783,268 @@ mod tests {
         assert_eq!(decoded.len(), 1);
         assert_eq!(decoded[0].arrays()[0].dtype(), &dt_storage);
     }
+
+    #[test]
+    fn test_strip_datetime_extension_in_deeply_nested_structs_and_containers() {
+        use polars_arrow::array::{Array, ListArray, PrimitiveArray, StructArray, Utf8Array};
+        use polars_arrow::datatypes::{ExtensionType, TimeUnit};
+        use polars_arrow::io::ipc::write::{StreamWriter, WriteOptions};
+        use polars_arrow::offset::OffsetsBuffer;
+
+        let dt_storage = ArrowDataType::Timestamp(TimeUnit::Microsecond, None);
+        let dt_ext = ArrowDataType::Extension(Box::new(ExtensionType {
+            name: BQ_DATETIME_EXTENSION_NAME.into(),
+            inner: dt_storage.clone(),
+            metadata: None,
+        }));
+        let dt_list_storage = ArrowDataType::List(Box::new(Field::new(
+            "item".into(),
+            dt_storage.clone(),
+            true,
+        )));
+        let dt_list_ext = ArrowDataType::Extension(Box::new(ExtensionType {
+            name: BQ_DATETIME_EXTENSION_NAME.into(),
+            inner: dt_list_storage.clone(),
+            metadata: None,
+        }));
+        let json_ext = ArrowDataType::Extension(Box::new(ExtensionType {
+            name: "google:sqlType:json".into(),
+            inner: ArrowDataType::Utf8,
+            metadata: None,
+        }));
+
+        // 1. 15-level nested Struct (BigQuery's maximum RECORD nesting depth) containing
+        //    both DATETIME and ARRAY<DATETIME> plus a preserved JSON extension leaf.
+        let mut wire_dtype = ArrowDataType::Struct(vec![
+            Field::new("dt".into(), dt_ext.clone(), true),
+            Field::new("dt_arr".into(), dt_list_ext.clone(), true),
+            Field::new("j".into(), json_ext.clone(), true),
+        ]);
+        let mut expected_dtype = ArrowDataType::Struct(vec![
+            Field::new("dt".into(), dt_storage.clone(), true),
+            Field::new("dt_arr".into(), dt_list_storage.clone(), true),
+            Field::new("j".into(), json_ext.clone(), true),
+        ]);
+        for level in (0..14).rev() {
+            let field_name = format!("level_{level}");
+            wire_dtype = ArrowDataType::Struct(vec![Field::new(
+                field_name.clone().into(),
+                wire_dtype,
+                true,
+            )]);
+            expected_dtype =
+                ArrowDataType::Struct(vec![Field::new(field_name.into(), expected_dtype, true)]);
+        }
+
+        // Also cover LargeList, FixedSizeList, and Map containing DATETIME subfields.
+        let large_list_dt =
+            ArrowDataType::LargeList(Box::new(Field::new("item".into(), dt_ext.clone(), true)));
+        let fixed_list_dt = ArrowDataType::FixedSizeList(
+            Box::new(Field::new("item".into(), dt_ext.clone(), true)),
+            2,
+        );
+        let map_dt = ArrowDataType::Map(
+            Box::new(Field::new(
+                "entries".into(),
+                ArrowDataType::Struct(vec![
+                    Field::new("key".into(), ArrowDataType::Utf8, false),
+                    Field::new("value".into(), dt_ext.clone(), true),
+                ]),
+                false,
+            )),
+            false,
+        );
+
+        let schema = ArrowSchema::from_iter(vec![
+            Field::new("deep".into(), wire_dtype, true),
+            Field::new("large_list".into(), large_list_dt, true),
+            Field::new("fixed_list".into(), fixed_list_dt, true),
+            Field::new("map_col".into(), map_dt, true),
+        ]);
+        let stripped = strip_datetime_extensions(schema);
+        assert_eq!(stripped.get("deep").unwrap().dtype(), &expected_dtype);
+        assert_eq!(
+            stripped.get("large_list").unwrap().dtype(),
+            &ArrowDataType::LargeList(Box::new(Field::new(
+                "item".into(),
+                dt_storage.clone(),
+                true
+            )))
+        );
+        assert_eq!(
+            stripped.get("fixed_list").unwrap().dtype(),
+            &ArrowDataType::FixedSizeList(
+                Box::new(Field::new("item".into(), dt_storage.clone(), true)),
+                2
+            )
+        );
+        assert_eq!(
+            stripped.get("map_col").unwrap().dtype(),
+            &ArrowDataType::Map(
+                Box::new(Field::new(
+                    "entries".into(),
+                    ArrowDataType::Struct(vec![
+                        Field::new("key".into(), ArrowDataType::Utf8, false),
+                        Field::new("value".into(), dt_storage.clone(), true),
+                    ]),
+                    false,
+                )),
+                false,
+            )
+        );
+
+        // 2. Full IPC StreamWriter -> parse_arrow_schema -> decode_arrow_record_batches
+        //    round-trip on STRUCT<mid: STRUCT<items: ARRAY<STRUCT<dt: DATETIME, j: JSON>>>>
+        //    where leaf fields carry Extension(google:sqlType:datetime) / Extension(google:sqlType:json).
+        let leaf_struct_fields = vec![
+            Field::new("dt".into(), dt_ext.clone(), false),
+            Field::new("j".into(), json_ext.clone(), false),
+        ];
+        let leaf_struct_dtype = ArrowDataType::Struct(leaf_struct_fields);
+        let items_list_dtype = ArrowDataType::List(Box::new(Field::new(
+            "item".into(),
+            leaf_struct_dtype.clone(),
+            false,
+        )));
+        let mid_struct_dtype = ArrowDataType::Struct(vec![Field::new(
+            "items".into(),
+            items_list_dtype.clone(),
+            false,
+        )]);
+        let outer_struct_dtype = ArrowDataType::Struct(vec![Field::new(
+            "mid".into(),
+            mid_struct_dtype.clone(),
+            false,
+        )]);
+        let wire_schema = ArrowSchema::from_iter(vec![Field::new(
+            "outer".into(),
+            outer_struct_dtype.clone(),
+            false,
+        )]);
+
+        let dt_vals = vec![1_704_110_400_000_000_i64, 1_704_196_800_000_000_i64];
+        let dt_arr = PrimitiveArray::<i64>::from_vec(dt_vals.clone()).to(dt_ext.clone());
+        let j_arr = Utf8Array::<i32>::from_slice([r#"{"a":1}"#, r#"{"a":2}"#]);
+        let j_ext_arr = Utf8Array::<i32>::try_new(
+            json_ext.clone(),
+            j_arr.offsets().clone(),
+            j_arr.values().clone(),
+            None,
+        )
+        .unwrap();
+        let leaf_struct_arr = StructArray::new(
+            leaf_struct_dtype,
+            2,
+            vec![
+                Box::new(dt_arr) as Box<dyn Array>,
+                Box::new(j_ext_arr) as Box<dyn Array>,
+            ],
+            None,
+        );
+        let items_offsets = OffsetsBuffer::<i32>::try_from(vec![0, 2]).unwrap();
+        let items_list_arr = ListArray::<i32>::new(
+            items_list_dtype,
+            items_offsets,
+            Box::new(leaf_struct_arr),
+            None,
+        );
+        let mid_struct_arr = StructArray::new(
+            mid_struct_dtype,
+            1,
+            vec![Box::new(items_list_arr) as Box<dyn Array>],
+            None,
+        );
+        let outer_struct_arr = StructArray::new(
+            outer_struct_dtype,
+            1,
+            vec![Box::new(mid_struct_arr) as Box<dyn Array>],
+            None,
+        );
+        let batch = RecordBatch::try_new(
+            1,
+            Arc::new(wire_schema.clone()),
+            vec![Box::new(outer_struct_arr) as Box<dyn Array>],
+        )
+        .unwrap();
+
+        let mut schema_bytes = Vec::new();
+        {
+            let mut writer =
+                StreamWriter::new(&mut schema_bytes, WriteOptions { compression: None });
+            writer.start(&wire_schema, None).unwrap();
+        }
+        let mut full_bytes = Vec::new();
+        {
+            let mut writer = StreamWriter::new(&mut full_bytes, WriteOptions { compression: None });
+            writer.start(&wire_schema, None).unwrap();
+            writer.write(&batch, None).unwrap();
+        }
+        let batch_bytes = bytes::Bytes::from(full_bytes[schema_bytes.len()..].to_vec());
+
+        // Confirm the raw serialized IPC metadata actually contains the datetime extension
+        // on the nested leaf before parse_arrow_schema strips it.
+        let raw_metadata = read_stream_metadata(&mut Cursor::new(&schema_bytes)).unwrap();
+        let ArrowDataType::Struct(raw_mid) = raw_metadata.schema.get("outer").unwrap().dtype()
+        else {
+            panic!("expected outer Struct");
+        };
+        let ArrowDataType::Struct(raw_list) = raw_mid[0].dtype() else {
+            panic!("expected mid Struct");
+        };
+        let ArrowDataType::List(raw_item) = raw_list[0].dtype() else {
+            panic!("expected items List");
+        };
+        let ArrowDataType::Struct(raw_inner) = raw_item.dtype() else {
+            panic!("expected inner Struct");
+        };
+        assert_eq!(raw_inner[0].dtype(), &dt_ext);
+        assert_eq!(raw_inner[1].dtype(), &json_ext);
+
+        let parsed = parse_arrow_schema(&schema_bytes).unwrap();
+        let decoded = decode_arrow_record_batches(batch_bytes, 1, parsed.clone()).unwrap();
+        assert_eq!(decoded.len(), 1);
+
+        // Verify the deeply nested dt leaf has its extension stripped while j keeps JSON extension.
+        let outer_arr = decoded[0].arrays()[0]
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap();
+        let mid_arr = outer_arr.values()[0]
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap();
+        let items_arr = mid_arr.values()[0]
+            .as_any()
+            .downcast_ref::<ListArray<i32>>()
+            .unwrap();
+        let leaf_arr = items_arr
+            .values()
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap();
+        assert_eq!(leaf_arr.values()[0].dtype(), &dt_storage);
+        assert_eq!(leaf_arr.values()[1].dtype(), &json_ext);
+        let decoded_dt = leaf_arr.values()[0]
+            .as_any()
+            .downcast_ref::<PrimitiveArray<i64>>()
+            .unwrap();
+        assert_eq!(decoded_dt.values().as_slice(), dt_vals.as_slice());
+
+        // Inspect schema metadata directly on the parsed deepest Struct fields.
+        let ArrowDataType::Struct(mid_fields) = parsed.schema.get("outer").unwrap().dtype() else {
+            panic!("expected outer Struct");
+        };
+        let ArrowDataType::Struct(list_fields) = mid_fields[0].dtype() else {
+            panic!("expected mid Struct");
+        };
+        let ArrowDataType::List(item_field) = list_fields[0].dtype() else {
+            panic!("expected items List");
+        };
+        let ArrowDataType::Struct(inner_fields) = item_field.dtype() else {
+            panic!("expected inner Struct");
+        };
+        assert_eq!(inner_fields[0].dtype(), &dt_storage);
+        assert!(inner_fields[0].metadata.is_none());
+        assert_eq!(inner_fields[1].dtype(), &json_ext);
+    }
 }

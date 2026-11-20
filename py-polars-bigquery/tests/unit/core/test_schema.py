@@ -153,6 +153,94 @@ def test_extract_polars_schema_repeated_and_extension_nesting(monkeypatch):
     }
 
 
+def test_extract_schema_deeply_nested_structs_with_datetime_subfields(monkeypatch):
+    monkeypatch.delenv("POLARS_UNKNOWN_EXTENSION_TYPE_BEHAVIOR", raising=False)
+
+    # Multi-level STRUCT -> STRUCT -> ARRAY<STRUCT<dt DATETIME, dt_arr ARRAY<DATETIME>, ...>>
+    nested_field: dict = {
+        "name": "outer",
+        "type": "STRUCT",
+        "fields": [
+            {
+                "name": "mid",
+                "type": "RECORD",
+                "fields": [
+                    {
+                        "name": "items",
+                        "type": "RECORD",
+                        "mode": "REPEATED",
+                        "fields": [
+                            {"name": "dt", "type": "DATETIME"},
+                            {"name": "dt_arr", "type": "DATETIME", "mode": "REPEATED"},
+                            {"name": "j", "type": "JSON"},
+                            {"name": "g", "type": "GEOGRAPHY"},
+                        ],
+                    }
+                ],
+            }
+        ],
+    }
+
+    # 15-level deeply nested STRUCT (BigQuery's maximum RECORD nesting depth)
+    deep_field: dict = {
+        "name": "leaf",
+        "type": "STRUCT",
+        "fields": [
+            {"name": "dt", "type": "DATETIME"},
+            {"name": "dt_arr", "type": "DATETIME", "mode": "REPEATED"},
+        ],
+    }
+    expected_deep_dtype: pl.DataType = pl.Struct(
+        [
+            pl.Field("dt", pl.Datetime(time_unit="us")),
+            pl.Field("dt_arr", pl.List(pl.Datetime(time_unit="us"))),
+        ]
+    )
+    for level in range(13, -1, -1):
+        sub_name = f"level_{level}"
+        deep_field = {
+            "name": sub_name,
+            "type": "STRUCT",
+            "fields": [{**deep_field, "name": sub_name}],
+        }
+        expected_deep_dtype = pl.Struct([pl.Field(sub_name, expected_deep_dtype)])
+    deep_field["name"] = "deep"
+
+    extracted = extract_schema_metadata(
+        {"schema": {"fields": [nested_field, deep_field]}}
+    )
+    assert extracted.skipped_columns == ()
+    assert extracted.bq_types == {"outer": BQType.STRUCT, "deep": BQType.STRUCT}
+    assert extracted.polars_schema["outer"] == pl.Struct(
+        [
+            pl.Field(
+                "mid",
+                pl.Struct(
+                    [
+                        pl.Field(
+                            "items",
+                            pl.List(
+                                pl.Struct(
+                                    [
+                                        pl.Field("dt", pl.Datetime(time_unit="us")),
+                                        pl.Field(
+                                            "dt_arr",
+                                            pl.List(pl.Datetime(time_unit="us")),
+                                        ),
+                                        pl.Field("j", polars_bigquery.dtypes.JSON),
+                                        pl.Field("g", polars_bigquery.dtypes.GEOGRAPHY),
+                                    ]
+                                )
+                            ),
+                        )
+                    ]
+                ),
+            )
+        ]
+    )
+    assert extracted.polars_schema["deep"] == expected_deep_dtype
+
+
 def test_extract_schema_preserves_bq_types_under_mode_b(monkeypatch):
     monkeypatch.setenv("POLARS_UNKNOWN_EXTENSION_TYPE_BEHAVIOR", "load_as_storage")
     metadata = {
