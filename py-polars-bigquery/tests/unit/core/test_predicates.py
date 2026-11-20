@@ -3535,70 +3535,80 @@ def test_is_null_and_is_not_null_unsupported_and_degraded_cases(
 @pytest.mark.parametrize(
     ("expr", "schema", "expected_sql"),
     [
+        # `drop_nulls()` changes series length and can broadcast length-1 arrays
+        # or raise ShapeError inside Polars `.filter()`, so hoisting `IS NOT NULL`
+        # violates the row-restriction superset invariant. Standalone clauses fall
+        # back to Polars (`""`), while valid `&` siblings are still pushed down.
         pytest.param(
             pl.col("flag").drop_nulls(),
             {"flag": pl.Boolean},
-            "(`flag` AND (`flag` IS NOT NULL))",
+            "",
             id="top_level_boolean_drop_nulls",
         ),
         pytest.param(
             pl.col("a").drop_nulls() == 1,
             {"a": pl.Int64},
-            "((`a` = 1) AND (`a` IS NOT NULL))",
+            "",
             id="drop_nulls_in_equality_comparison",
         ),
         pytest.param(
             pl.col("a").str.to_lowercase().drop_nulls() == "abc",
             {"a": pl.String},
-            "((LOWER(`a`) = 'abc') AND (LOWER(`a`) IS NOT NULL))",
+            "",
             id="drop_nulls_on_string_function",
         ),
         pytest.param(
             pl.col("a").drop_nulls().str.to_lowercase() == "abc",
             {"a": pl.String},
-            "((LOWER(`a`) = 'abc') AND (`a` IS NOT NULL))",
+            "",
             id="string_function_on_drop_nulls",
         ),
         pytest.param(
             pl.col("a").drop_nulls().str.to_lowercase().drop_nulls() == "abc",
             {"a": pl.String},
-            "(((LOWER(`a`) = 'abc') AND (LOWER(`a`) IS NOT NULL)) AND (`a` IS NOT NULL))",
+            "",
             id="nested_drop_nulls_chain",
         ),
         pytest.param(
             (pl.col("a").drop_nulls() == 1) & (pl.col("b").drop_nulls() == 2),
             {"a": pl.Int64, "b": pl.Int64},
-            "((((`a` = 1) AND (`b` = 2)) AND (`a` IS NOT NULL)) AND (`b` IS NOT NULL))",
+            "",
             id="multiple_drop_nulls_in_conjunction",
+        ),
+        pytest.param(
+            (pl.col("a").drop_nulls() > 5) & (pl.col("c") == 1),
+            {"a": pl.Int64, "c": pl.Int64},
+            "(`c` = 1)",
+            id="drop_nulls_in_conjunction_preserves_valid_sibling",
         ),
         pytest.param(
             (pl.col("a").drop_nulls() > 5) & (unsupported(pl.col("c")) == 1),
             {"a": pl.Int64, "c": pl.Int64},
-            "((`a` > 5) AND (`a` IS NOT NULL))",
+            "",
             id="drop_nulls_in_conjunction_with_unsupported_sibling",
         ),
         pytest.param(
             pl.col("a").drop_nulls() == unsupported(pl.col("b")),
             {"a": pl.Int64, "b": pl.Int64},
-            "(`a` IS NOT NULL)",
-            id="drop_nulls_with_unsupported_comparison_sibling_pushes_down_is_not_null",
+            "",
+            id="drop_nulls_with_unsupported_comparison_sibling_falls_back",
         ),
         pytest.param(
-            ~((pl.col("a").drop_nulls() == 1) | (unsupported(pl.col("b")) == 2)),
+            ~((pl.col("a").drop_nulls() == 1) | (pl.col("b") == 2)),
             {"a": pl.Int64, "b": pl.Int64},
-            "((NOT (`a` = 1)) AND (`a` IS NOT NULL))",
-            id="drop_nulls_in_de_morgan_with_unsupported_sibling",
+            "(NOT (`b` = 2))",
+            id="drop_nulls_in_de_morgan_preserves_valid_sibling",
         ),
         pytest.param(
             (~((pl.col("a") == 1) | (pl.col("b") == 2))).drop_nulls(),
             {"a": pl.Int64, "b": pl.Int64},
-            "(((NOT (`a` = 1)) AND (NOT (`b` = 2))) AND (((NOT (`a` = 1)) AND (NOT (`b` = 2))) IS NOT NULL))",
+            "",
             id="de_morgan_rewrite_inside_drop_nulls",
         ),
         pytest.param(
             pl.when(pl.col("a") == 1).then(pl.col("b") == 2).drop_nulls(),
             {"a": pl.Int64, "b": pl.Int64},
-            "(((`a` = 1) AND (`b` = 2)) AND (IF((`a` = 1), (`b` = 2), NULL) IS NOT NULL))",
+            "",
             id="when_without_otherwise_inside_drop_nulls",
         ),
     ],
@@ -3749,6 +3759,32 @@ def test_parse_drop_nulls_and_null_checks_reject_invalid_inputs(
             ),
             compiler.ir.Unsupported(),
             id="drop_nulls_with_unsupported_descendant_rewrites_to_unsupported",
+        ),
+        pytest.param(
+            compiler.ir.And(
+                left=compiler.ir.Eq(
+                    left=compiler.ir.DropNulls(expr=compiler.ir.Column("a")),
+                    right=compiler.ir.IntLiteral(1),
+                ),
+                right=compiler.ir.Eq(
+                    left=compiler.ir.DropNulls(expr=compiler.ir.Column("a")),
+                    right=compiler.ir.IntLiteral(2),
+                ),
+            ),
+            compiler.ir.And(
+                left=compiler.ir.And(
+                    left=compiler.ir.Eq(
+                        left=compiler.ir.Column("a"),
+                        right=compiler.ir.IntLiteral(1),
+                    ),
+                    right=compiler.ir.Eq(
+                        left=compiler.ir.Column("a"),
+                        right=compiler.ir.IntLiteral(2),
+                    ),
+                ),
+                right=compiler.ir.IsNotNull(expr=compiler.ir.Column("a")),
+            ),
+            id="duplicate_drop_nulls_emits_single_is_not_null",
         ),
     ],
 )
@@ -4203,12 +4239,12 @@ def test_opaque_types_allowlist_and_mode_b_bq_types_override() -> None:
             )
             == f"(`{col}` IS NOT NULL)"
         )
-        # Valid drop_nulls on an opaque column hoists IS NOT NULL even when outer op degrades
+        # drop_nulls on an opaque column falls back cleanly to Polars (`""`)
         assert (
             compiler.predicate_to_row_restriction(
                 pl.col(col).drop_nulls() == pl.col(col), schema=schema
             )
-            == f"(`{col}` IS NOT NULL)"
+            == ""
         )
         # Disallowed ops degrade
         assert (
@@ -4420,34 +4456,35 @@ def test_direct_ir_typing_edge_cases_when_isin_drop_nulls_and_unknown_node() -> 
         }
     )
 
-    # Unknown IR node fails closed while preserving valid DropNulls descendant
+    # Unknown IR node fails closed to bare Unsupported() (DropNulls no longer hoisted)
     unknown_plain = _UnknownExpr(child=compiler.ir.Column("a"))
     assert (
         compiler.resolve_and_lower_types(unknown_plain, schema)
         == compiler.ir.Unsupported()
     )
     unknown_with_dn = _UnknownExpr(child=compiler.ir.DropNulls(compiler.ir.Column("a")))
-    assert compiler.resolve_and_lower_types(
-        unknown_with_dn, schema
-    ) == compiler.ir.Unsupported(
-        operands=(compiler.ir.DropNulls(compiler.ir.Column("a")),)
+    assert (
+        compiler.resolve_and_lower_types(unknown_with_dn, schema)
+        == compiler.ir.Unsupported()
     )
 
-    # Invalid DropNulls (e.g., DropNulls(Uppercase(int_col))) degrades to bare Unsupported()
+    # DropNulls degrades to bare Unsupported() for any operand (valid or invalid)
+    valid_dn = compiler.ir.DropNulls(compiler.ir.Column("a"))
+    assert (
+        compiler.resolve_and_lower_types(valid_dn, schema) == compiler.ir.Unsupported()
+    )
     bad_dn = compiler.ir.DropNulls(compiler.ir.Uppercase(compiler.ir.Column("a")))
     assert compiler.resolve_and_lower_types(bad_dn, schema) == compiler.ir.Unsupported()
 
-    # Pre-existing parser Unsupported(operands=...) preserves only valid DropNulls children
+    # Pre-existing parser Unsupported(operands=...) collapses to bare Unsupported()
     pre_unsup = compiler.ir.Unsupported(
         operands=(
             compiler.ir.DropNulls(compiler.ir.Column("a")),
             compiler.ir.Column("b"),
         )
     )
-    assert compiler.resolve_and_lower_types(
-        pre_unsup, schema
-    ) == compiler.ir.Unsupported(
-        operands=(compiler.ir.DropNulls(compiler.ir.Column("a")),)
+    assert (
+        compiler.resolve_and_lower_types(pre_unsup, schema) == compiler.ir.Unsupported()
     )
 
     # Direct scalar literals inside IsIn (Bytes, Time, Decimal, Date, Datetime, Timestamp)
@@ -4977,3 +5014,161 @@ def test_duplication_list_fanout_budget_deep_ast_and_1mb_guard(monkeypatch) -> N
         compiler.predicate_to_row_restriction(pl.col("id") == 1, schema=schema)
         == "(`id` = 1)"
     )
+
+
+def test_drop_nulls_broadcast_superset_differential_regression() -> None:
+    """Verify drop_nulls() broadcasts length-1 arrays in Polars and falls back safely."""
+    df = pl.DataFrame({"flag": [True, False], "s": [None, "a"]})
+    # When `s` has 1 non-null value, `s.drop_nulls()` has length 1 and Polars broadcasts
+    # it across ALL rows, keeping the row where `s` IS NULL!
+    expr_broadcast_eq = pl.col("s").drop_nulls() == "a"
+    assert df.filter(expr_broadcast_eq).height == 2
+    assert (
+        compiler.predicate_to_row_restriction(expr_broadcast_eq, schema=df.schema) == ""
+    )
+
+    expr_broadcast_or = pl.col("flag") | (pl.col("s").drop_nulls() == "b")
+    kept = df.filter(expr_broadcast_or)
+    assert kept["flag"].to_list() == [True]
+    assert kept["s"].to_list() == [None]
+    assert (
+        compiler.predicate_to_row_restriction(expr_broadcast_or, schema=df.schema) == ""
+    )
+
+    # Disjunction/conjunction preserves valid sibling while dropping drop_nulls branch.
+    expr_compound = (pl.col("s").drop_nulls() == "a") & pl.col("flag")
+    assert (
+        compiler.predicate_to_row_restriction(expr_compound, schema=df.schema)
+        == "`flag`"
+    )
+
+
+def test_format_decimal_literal_rejects_non_ascii_unicode_digits() -> None:
+    """Unicode digits like Arabic-Indic `١٢٣` must be rejected by SQL formatter."""
+    from polars_bigquery.core.compiler.sql.numeric import format_decimal_literal
+
+    with pytest.raises(ValueError, match="Invalid DecimalLiteral value"):
+        format_decimal_literal(compiler.ir.DecimalLiteral("١٢٣"))
+
+    with pytest.raises(ValueError, match="Invalid DecimalLiteral value"):
+        format_decimal_literal(compiler.ir.DecimalLiteral("12.٣"))
+
+    assert (
+        format_decimal_literal(compiler.ir.DecimalLiteral("-123.45"))
+        == "NUMERIC '-123.45'"
+    )
+
+
+def test_null_root_and_all_null_logical_branches_regressions() -> None:
+    """Bare/simplified NullLiteral roots must degrade to `""`, preserving valid siblings."""
+    schema = pl.Schema({"flag": pl.Boolean(), "flag2": pl.Boolean()})
+
+    assert compiler.predicate_to_row_restriction(pl.lit(None), schema=schema) == ""
+    assert (
+        compiler.predicate_to_row_restriction(
+            pl.lit(True) & pl.lit(None), schema=schema
+        )
+        == ""
+    )
+    assert (
+        compiler.predicate_to_row_restriction(
+            pl.lit(False) | pl.lit(None), schema=schema
+        )
+        == ""
+    )
+    # Direct resolve_and_lower_types refuses a bare NullLiteral root
+    assert (
+        compiler.resolve_and_lower_types(compiler.ir.NullLiteral(), schema)
+        == compiler.ir.Unsupported()
+    )
+    # Conditional whose branches are all NULL lowers inside `&` without dropping `flag`
+    all_null_when = pl.when(pl.col("flag2")).then(pl.lit(None)).otherwise(pl.lit(None))
+    assert (
+        compiler.predicate_to_row_restriction(
+            pl.col("flag") & all_null_when, schema=schema
+        )
+        == "`flag`"
+    )
+
+
+def test_typing_budget_refunds_expansion_cost_on_degraded_subtrees(
+    monkeypatch,
+) -> None:
+    """Degrading an invalid outer node refunds expansion cost allocated to its dead child."""
+    schema = pl.Schema({"f": pl.Float64(), "s": pl.String()})
+    # Float `is_nan` is cost 0; float comparison `f > 99.0` adds extra_cost=3 (NaN lowering).
+    # `f == 1.0` also consumes extra_cost=4 in Case B, wrapped inside an invalid `== "bad"`
+    # comparison (`BOOL == STRING` -> degrades!). With tight budget, the dead branch's
+    # refunded budget must leave enough room to push down `(f > 99.0)`.
+    dead_branch = (pl.col("f") == 1.0) == pl.col("s")
+    live_branch = pl.col("f") > 99.0
+    combined = dead_branch & live_branch
+
+    # Node count of `combined` is small; allow just enough room for ONE lowered comparison.
+    monkeypatch.setattr(compiler.typing, "MAX_AST_NODES", 14)
+    sql = compiler.predicate_to_row_restriction(combined, schema=schema)
+    assert "99.0" in sql
+    assert "IS_NAN(`f`)" in sql
+
+
+def test_python_udf_predicate_serialization_fallback() -> None:
+    """Expressions containing unserializable Python UDFs fall back safely to `""`."""
+    import warnings
+
+    schema = pl.Schema({"i": pl.Int64()})
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        udf_pred = pl.col("i").map_elements(
+            lambda x: x > 0, return_dtype=pl.Boolean, skip_nulls=False
+        )
+    assert compiler.predicate_to_row_restriction(udf_pred, schema=schema) == ""
+    assert (
+        compiler.predicate_to_row_restriction(
+            udf_pred & (pl.col("i") > 0), schema=schema
+        )
+        == ""
+    )
+
+
+def test_decimal_precision_and_fill_null_strategy_one_bounds() -> None:
+    """Reject NUMERIC `Decimal` widths exceeding 29 integer digits and `one` when P == S."""
+    # Decimal(3, 3): precision - scale == 0 (cannot hold integer `1`, max value is 0.999)
+    schema_frac_only = pl.Schema({"d": pl.Decimal(3, 3)})
+    assert (
+        compiler.predicate_to_row_restriction(
+            pl.col("d").fill_null(strategy="one") == pl.lit(0),
+            schema=schema_frac_only,
+        )
+        == ""
+    )
+    assert (
+        compiler.predicate_to_row_restriction(
+            pl.col("d").fill_null(strategy="zero") == pl.lit(0),
+            schema=schema_frac_only,
+        )
+        == "(IFNULL(`d`, NUMERIC '0') = 0)"
+    )
+
+    # Decimal(38, 0) and Decimal(30, 0) exceed BigQuery's 29 integer-digit NUMERIC limit
+    for dtype in (pl.Decimal(38, 0), pl.Decimal(30, 0), pl.Decimal(38, 2)):
+        assert (
+            compiler.predicate_to_row_restriction(
+                pl.col("d") == 1, schema=pl.Schema({"d": dtype})
+            )
+            == ""
+        )
+
+
+def test_rewrite_boolean_when_expansion_cap_degrades_to_unsupported(
+    monkeypatch,
+) -> None:
+    """Bounding `MAX_BOOLEAN_WHEN_REWRITE_NODES` degrades huge `Ternary` rewrites."""
+    from polars_bigquery.core.compiler.rewriter import boolean as boolean_rewriter
+
+    nested = compiler.ir.Ternary(
+        predicate=compiler.ir.Eq(compiler.ir.Column("a"), compiler.ir.IntLiteral(1)),
+        truthy=compiler.ir.Eq(compiler.ir.Column("b"), compiler.ir.IntLiteral(2)),
+        falsy=compiler.ir.Unsupported(),
+    )
+    monkeypatch.setattr(boolean_rewriter, "MAX_BOOLEAN_WHEN_REWRITE_NODES", 5)
+    assert boolean_rewriter.rewrite_boolean_when(nested) == compiler.ir.Unsupported()

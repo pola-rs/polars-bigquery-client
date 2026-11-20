@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import dataclasses
 import datetime as dt
+import logging
 import os
 import time
 import uuid
@@ -13,6 +14,11 @@ import pytest
 from polars_bigquery.core import bigquery_rest, compiler
 from polars_bigquery.core.types import JSON_EXTENSION_NAME
 from polars_bigquery.exceptions import BigQueryError, UnsupportedTypeWarning
+
+logger = logging.getLogger(__name__)
+
+_REST_QUERY_TIMEOUT_SECONDS = 120.0
+_DELETE_RETRYABLE_STATUS_CODES = frozenset({429, 500, 502, 503, 504})
 
 
 @dataclasses.dataclass(frozen=True)
@@ -54,11 +60,14 @@ class EphemeralDataset:
         bigquery_rest._raise_for_bigquery_error(resp)
         return self.table_name(name)
 
-    def run_sql_rest(self, sql: str) -> None:
+    def run_sql_rest(
+        self, sql: str, *, timeout_seconds: float = _REST_QUERY_TIMEOUT_SECONDS
+    ) -> None:
         """Execute a DDL/DML statement via BigQuery REST without Arrow decoding."""
         queries_url = (
             f"{bigquery_rest._BIGQUERY_ENDPOINT}/projects/{self.project}/queries"
         )
+        deadline = time.monotonic() + timeout_seconds
         resp = self.client._rest_client.session.post(
             queries_url,
             headers=self._headers(),
@@ -67,14 +76,26 @@ class EphemeralDataset:
                 "useLegacySql": False,
                 "useQueryCache": False,
                 "location": "US",
+                # Supply a requestId so any HTTPAdapter retry on POST is idempotent.
+                "requestId": f"req_{uuid.uuid4().hex}",
             },
             timeout=bigquery_rest.DEFAULT_TIMEOUT,
         )
         bigquery_rest._raise_for_bigquery_error(resp)
         body = resp.json()
+        backoff_seconds = 0.5
         while not body.get("jobComplete", False):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                job_id = (body.get("jobReference") or {}).get("jobId", "<unknown>")
+                msg = (
+                    f"Timed out after {timeout_seconds:.1f}s waiting for "
+                    f"BigQuery job {job_id} to complete"
+                )
+                raise TimeoutError(msg)
             job_id = body["jobReference"]["jobId"]
-            time.sleep(0.5)
+            time.sleep(min(backoff_seconds, remaining))
+            backoff_seconds = min(backoff_seconds * 2.0, 5.0)
             poll = self.client._rest_client.session.get(
                 f"{queries_url}/{job_id}?location=US",
                 headers=self._headers(),
@@ -122,17 +143,53 @@ def ephemeral_dataset(client: polars_bigquery.Client):
     try:
         yield ds
     finally:
-        delete_headers = bigquery_rest._get_headers(
-            quota_project_id=project,
-            credentials_provider=client.credentials_provider,
-            user_agent=client._user_agent,
-        )
         delete_url = f"{datasets_url}/{dataset_id}?deleteContents=true"
-        client._rest_client.session.delete(
-            delete_url,
-            headers=delete_headers,
-            timeout=bigquery_rest.DEFAULT_TIMEOUT,
-        )
+        delay = 0.5
+        for attempt in range(4):
+            delete_headers = bigquery_rest._get_headers(
+                quota_project_id=project,
+                credentials_provider=client.credentials_provider,
+                user_agent=client._user_agent,
+            )
+            try:
+                delete_resp = client._rest_client.session.delete(
+                    delete_url,
+                    headers=delete_headers,
+                    timeout=bigquery_rest.DEFAULT_TIMEOUT,
+                )
+            except Exception:
+                logger.warning(
+                    "Transient exception deleting ephemeral dataset %s (attempt %d/4)",
+                    dataset_id,
+                    attempt + 1,
+                    exc_info=True,
+                )
+                if attempt < 3:
+                    time.sleep(delay)
+                    delay *= 2.0
+                continue
+            if delete_resp.ok or delete_resp.status_code == 404:
+                break
+            if (
+                delete_resp.status_code in _DELETE_RETRYABLE_STATUS_CODES
+                and attempt < 3
+            ):
+                logger.warning(
+                    "Retrying delete of ephemeral dataset %s after HTTP %d (attempt %d/4)",
+                    dataset_id,
+                    delete_resp.status_code,
+                    attempt + 1,
+                )
+                time.sleep(delay)
+                delay *= 2.0
+                continue
+            logger.warning(
+                "Failed to delete ephemeral dataset %s: HTTP %d %s",
+                dataset_id,
+                delete_resp.status_code,
+                delete_resp.text[:500],
+            )
+            break
 
 
 @pytest.fixture(scope="module")

@@ -207,17 +207,123 @@ def test_polars_dtype_to_bq_type(dtype, expected):
 
 def test_polars_dtype_to_bq_type_decimal_precision_none():
     # In Polars 2.x, Decimal(precision=None, scale=2) may normalize precision to 38
-    # or retain None depending on the Polars release.
-    defaulted = pl.Decimal(precision=None, scale=2)
-    if defaulted.precision is None:
-        assert polars_dtype_to_bq_type(defaulted) is None
+    # (36 integer digits > BigQuery NUMERIC max of 29 -> None), while scale=9 normalizes
+    # to Decimal(38, 9) (29 integer digits -> BQType.NUMERIC).
+    defaulted_scale2 = pl.Decimal(precision=None, scale=2)
+    assert polars_dtype_to_bq_type(defaulted_scale2) is None
+
+    defaulted_scale9 = pl.Decimal(precision=None, scale=9)
+    if defaulted_scale9.precision is None:
+        assert polars_dtype_to_bq_type(defaulted_scale9) is None
     else:
-        assert polars_dtype_to_bq_type(defaulted) is BQType.NUMERIC
+        assert polars_dtype_to_bq_type(defaulted_scale9) is BQType.NUMERIC
 
     # Explicitly verify precision=None on a Decimal instance returns None.
-    unspecified_precision = pl.Decimal(38, 2)
+    unspecified_precision = pl.Decimal(38, 9)
     unspecified_precision.precision = None
     assert polars_dtype_to_bq_type(unspecified_precision) is None
+
+
+@pytest.mark.parametrize(
+    ("dtype", "expected"),
+    [
+        (pl.Decimal(29, 0), BQType.NUMERIC),
+        (pl.Decimal(38, 9), BQType.NUMERIC),
+        (pl.Decimal(10, 2), BQType.NUMERIC),
+        (pl.Decimal(3, 3), BQType.NUMERIC),
+        (pl.Decimal(30, 0), None),
+        (pl.Decimal(38, 0), None),
+        (pl.Decimal(38, 2), None),
+        (pl.Decimal(38, 8), None),
+        (pl.Decimal(38, 10), None),
+    ],
+)
+def test_polars_dtype_to_bq_type_decimal_integer_digit_bounds(dtype, expected):
+    assert polars_dtype_to_bq_type(dtype) is expected
+
+
+def test_polars_decimal_supports_one():
+    from polars_bigquery.core.types import polars_decimal_supports_one
+
+    assert polars_decimal_supports_one(pl.Decimal(3, 3)) is False
+    assert polars_decimal_supports_one(pl.Decimal(9, 9)) is False
+    assert polars_decimal_supports_one(pl.Decimal(4, 3)) is True
+    assert polars_decimal_supports_one(pl.Decimal(38, 9)) is True
+    assert polars_decimal_supports_one(pl.Int64()) is True
+
+
+def test_build_extension_dtype_explicit_load_as_storage_and_env_warning(
+    monkeypatch, caplog
+):
+    # Explicit override is independent of POLARS_UNKNOWN_EXTENSION_TYPE_BEHAVIOR
+    monkeypatch.setenv("POLARS_UNKNOWN_EXTENSION_TYPE_BEHAVIOR", "load_as_storage")
+    assert build_extension_dtype(
+        JSON_EXTENSION_NAME, pl.String(), load_as_storage=False
+    ) == pl.Extension(JSON_EXTENSION_NAME, pl.String())
+    monkeypatch.delenv("POLARS_UNKNOWN_EXTENSION_TYPE_BEHAVIOR", raising=False)
+    assert (
+        build_extension_dtype(JSON_EXTENSION_NAME, pl.String(), load_as_storage=True)
+        == pl.String()
+    )
+
+    # Changing POLARS_UNKNOWN_EXTENSION_TYPE_BEHAVIOR post-import logs a warning
+    import polars_bigquery.core.types as types_mod
+
+    monkeypatch.setattr(types_mod, "_INITIAL_UNKNOWN_EXTENSION_BEHAVIOR", None)
+    monkeypatch.setenv("POLARS_UNKNOWN_EXTENSION_TYPE_BEHAVIOR", "load_as_storage")
+    with caplog.at_level("WARNING", logger=types_mod.__name__):
+        assert build_extension_dtype(JSON_EXTENSION_NAME, pl.String()) == pl.String()
+    assert "POLARS_UNKNOWN_EXTENSION_TYPE_BEHAVIOR" in caplog.text
+
+
+def test_subprocess_unknown_extension_env_var_matches_arrow_c_stream():
+    """Verify startup env var `load_as_storage` makes schema extraction match Arrow stream."""
+    import os
+    import subprocess
+    import sys
+
+    code = """
+import polars as pl
+from polars_bigquery.core.schema import extract_schema_metadata
+from polars_bigquery.core.types import JSON_EXTENSION_NAME, GEOGRAPHY_EXTENSION_NAME, GEOGRAPHY_EXTENSION_METADATA
+
+meta = {
+    "schema": {
+        "fields": [
+            {"name": "j", "type": "JSON"},
+            {"name": "g", "type": "GEOGRAPHY"},
+            {"name": "j_arr", "type": "JSON", "mode": "REPEATED"},
+        ]
+    }
+}
+extracted = extract_schema_metadata(meta)
+assert extracted.polars_schema == pl.Schema(
+    {"j": pl.String(), "g": pl.String(), "j_arr": pl.List(pl.String())}
+), extracted.polars_schema
+
+src = pl.DataFrame({
+    "j": pl.Series(['{"a": 1}'], dtype=pl.String()).ext.to(
+        pl.Extension(JSON_EXTENSION_NAME, pl.String())
+    ),
+    "g": pl.Series(["POINT(0 0)"], dtype=pl.String()).ext.to(
+        pl.Extension(GEOGRAPHY_EXTENSION_NAME, pl.String(), GEOGRAPHY_EXTENSION_METADATA)
+    ),
+    "j_arr": pl.Series([['{"a": 1}']], dtype=pl.List(pl.String())).ext.to(
+        pl.Extension(JSON_EXTENSION_NAME, pl.List(pl.String()))
+    ),
+})
+roundtrip = pl.scan_arrow_c_stream(src).collect()
+assert roundtrip.schema == extracted.polars_schema, (roundtrip.schema, extracted.polars_schema)
+"""
+    env = {**os.environ, "POLARS_UNKNOWN_EXTENSION_TYPE_BEHAVIOR": "load_as_storage"}
+    result = subprocess.run(
+        [sys.executable, "-c", code],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, f"stdout={result.stdout}\nstderr={result.stderr}"
 
 
 @pytest.mark.parametrize(

@@ -47,7 +47,7 @@ Logical `&`, `|`, and `~` require `BOOL` operands (integer bitwise `&`, `|`, and
 | --- | --- | --- |
 | `expr.is_null()` | `(`expr` IS NULL)` | Supported on all 14 BigQuery types, including `JSON`, `GEOGRAPHY`, `ARRAY`, and `STRUCT`. |
 | `expr.is_not_null()` | `(`expr` IS NOT NULL)` | Supported on all 14 BigQuery types, including `JSON`, `GEOGRAPHY`, `ARRAY`, and `STRUCT`. |
-| `expr.drop_nulls()` | `... AND (`expr` IS NOT NULL)` | Unwraps `expr.drop_nulls()` and conjoins `(`expr` IS NOT NULL)` to the top-level row restriction when `expr` is supported, exact, and non-`Null` (including opaque types). |
+| `expr.drop_nulls()` | *(not pushed down)* | Evaluates in Polars. `drop_nulls()` shrinks Series length and broadcasts length-1 results back across null rows, so hoisting `IS NOT NULL` cannot guarantee a row-level superset without risking silent row loss or masking Polars `ShapeError`. Use `.is_not_null()` for pushdown. |
 | `pl.coalesce(a, b, ...)` | `COALESCE(`a`, `b`, ...)` | Pushed down when all operands are exact, non-`Null`, non-opaque, and type-compatible. |
 | `expr.fill_null(value)` | `IFNULL(`expr`, `value`)` | Pushed down when both `expr` and `value` are exact, non-`Null`, non-opaque, and type-compatible. |
 | `expr.fill_null(strategy="zero" \| "one")` | Type-specific `IFNULL(`expr`, <zero/one>)` | Lowers to the Polars-equivalent BigQuery literal for each type (`FALSE`/`TRUE` for `BOOL`, `0`/`1` for `INT64`, `0.0`/`1.0` for `FLOAT64`, `NUMERIC '0'`/`'1'` for `NUMERIC`, `''` for `STRING` `"zero"`, `b''` for `BYTES` `"zero"`, `DATE`/`DATETIME`/`TIMESTAMP` epoch + 0 or 1 unit for `"ms"`/`"us"`, `TIME '00:00:00'` for `TIME` `"zero"`). Unrepresentable cases (`"one"` on `STRING`/`BYTES`/`TIME`/`Datetime("ns")`, opaque types, and analytical strategies `"forward"`, `"backward"`, `"min"`, `"max"`, `"mean"`) fall back to Polars. |
@@ -84,7 +84,7 @@ All `Expr.str` operators require strict `STRING` operands (never `JSON`, `GEOGRA
 
 ## Per-Type Pushdown Support Matrix
 
-| BigQuery Type | `IS [NOT] NULL` / `drop_nulls` | Comparisons (`==`, `!=`, `<`, `<=`, `>`, `>=`) | `is_in` | `fill_null(val)` / `coalesce` / `when` | `fill_null(strategy=...)` | `is_nan` / `is_inf` / `is_finite` | `str.*` | Logical `&` / `\|` / `~` |
+| BigQuery Type | `IS [NOT] NULL` | Comparisons (`==`, `!=`, `<`, `<=`, `>`, `>=`) | `is_in` | `fill_null(val)` / `coalesce` / `when` | `fill_null(strategy=...)` | `is_nan` / `is_inf` / `is_finite` | `str.*` | Logical `&` / `\|` / `~` |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | `BOOL` | Yes | Same type | `BOOL` | Same type | `"zero"`, `"one"` | No | No | Yes |
 | `INT64` | Yes | `INT64`, `FLOAT64`, `NUMERIC` | `INT64` | `INT64`, `FLOAT64`, `NUMERIC` | `"zero"`, `"one"` | Yes (null-safe 3VL) | No | No (bitwise) |
@@ -111,7 +111,7 @@ All `Expr.str` operators require strict `STRING` operands (never `JSON`, `GEOGRA
 2. **Mixing temporal types (`DATE`, `DATETIME`, `TIMESTAMP`, `TIME`)**: BigQuery rejects cross-temporal comparisons such as `DATE = TIMESTAMP` or `DATETIME = TIMESTAMP`. Always compare each temporal column against a matching literal type.
 3. **Comparing `_PARTITIONTIME` (`TIMESTAMP`) to a timezone-naive `datetime`**: A naive `datetime(2024, 1, 1)` compiles as BigQuery `DATETIME`, which does not match `_PARTITIONTIME` (`TIMESTAMP`). Pass a timezone-aware datetime (`datetime(2024, 1, 1, tzinfo=timezone.utc)`) for partition pruning pushdown.
 4. **Integer bitwise `&`, `|`, `~`**: Polars overloads `&`, `|`, and `~` for both boolean logic and integer bitwise operations. On `INT64` columns these expressions are not pushed down (any sibling boolean `&` filter is still pushed down).
-5. **Filtering `OPAQUE` columns (`JSON`, `GEOGRAPHY`, `ARRAY`, `STRUCT`)**: Only `.is_null()`, `.is_not_null()`, and `.drop_nulls()` push down on opaque columns. Operations such as `.ext.storage().str.starts_with(...)` or equality comparisons execute safely in Polars.
+5. **Filtering `OPAQUE` columns (`JSON`, `GEOGRAPHY`, `ARRAY`, `STRUCT`)**: Only `.is_null()` and `.is_not_null()` push down on opaque columns. Operations such as `.ext.storage().str.starts_with(...)`, `.drop_nulls()`, or equality comparisons execute safely in Polars.
 
 ---
 

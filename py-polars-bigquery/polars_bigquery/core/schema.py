@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import dataclasses
+from collections.abc import Callable, Mapping
+from typing import Any
 
 import polars as pl
 from polars.datatypes import (
@@ -26,6 +28,12 @@ from polars_bigquery.core.types import (
     BQType,
     build_extension_dtype,
 )
+
+# BigQuery limits RECORD/STRUCT nesting depth to 15; cap recursion well above
+# BigQuery's limit to guard against `RecursionError` on malformed REST payloads.
+MAX_SCHEMA_NESTING_DEPTH = 64
+
+ExtensionDtypeBuilder = Callable[[str, DataType, str | None], DataType]
 
 
 @dataclasses.dataclass(frozen=True)
@@ -55,7 +63,30 @@ class _UnsupportedBigQueryType(Exception):
         self.path = path
 
 
-def _extract_data_type(field: dict, path: str) -> tuple[DataType, BQType]:
+def _build_extension_dtype_checked(
+    builder: ExtensionDtypeBuilder,
+    name: str,
+    storage: DataType,
+    metadata: str | None,
+    path: str,
+) -> DataType:
+    """Invoke `builder` within an explicit error boundary for custom `BaseExtension` hooks."""
+    try:
+        return builder(name, storage, metadata)
+    except (TypeError, ValueError, RuntimeError) as exc:
+        raise _UnsupportedBigQueryType(
+            f"extension {name} rejected storage {storage}: {exc}",
+            path,
+        ) from exc
+
+
+def _extract_data_type(
+    field: Any,
+    path: str,
+    *,
+    depth: int = 0,
+    extension_dtype_builder: ExtensionDtypeBuilder = build_extension_dtype,
+) -> tuple[DataType, BQType]:
     """Convert a BigQuery REST TableFieldSchema dict into `(Polars DataType, BQType)`.
 
     Note: the REST API uses the names from the Legacy SQL data types, but if
@@ -64,8 +95,28 @@ def _extract_data_type(field: dict, path: str) -> tuple[DataType, BQType]:
 
     See: https://docs.cloud.google.com/bigquery/docs/reference/rest/v2/tables#TableFieldSchema
     """
-    mode = (field.get("mode") or "").casefold()
-    type_ = (field.get("type") or "").casefold()
+    if depth > MAX_SCHEMA_NESTING_DEPTH:
+        raise _UnsupportedBigQueryType(
+            f"STRUCT nesting depth exceeds {MAX_SCHEMA_NESTING_DEPTH}", path
+        )
+    if not isinstance(field, Mapping):
+        raise _UnsupportedBigQueryType("malformed field metadata", path)
+
+    raw_mode = field.get("mode")
+    if raw_mode is None:
+        mode = ""
+    elif isinstance(raw_mode, str):
+        mode = raw_mode.casefold()
+    else:
+        raise _UnsupportedBigQueryType(f"invalid mode {raw_mode!r}", path)
+
+    raw_type = field.get("type")
+    if raw_type is None:
+        type_ = ""
+    elif isinstance(raw_type, str):
+        type_ = raw_type.casefold()
+    else:
+        raise _UnsupportedBigQueryType(f"invalid type {raw_type!r}", path)
 
     # Check for BQ ARRAY (Polars List) first because the REST API encodes ARRAY
     # via mode="REPEATED" rather than a separate type name.
@@ -74,19 +125,32 @@ def _extract_data_type(field: dict, path: str) -> tuple[DataType, BQType]:
         # ARRAY<JSON> and ARRAY<GEOGRAPHY> rather than the inner String element.
         if type_ == "json":
             return (
-                build_extension_dtype(JSON_EXTENSION_NAME, List(String())),
+                _build_extension_dtype_checked(
+                    extension_dtype_builder,
+                    JSON_EXTENSION_NAME,
+                    List(String()),
+                    None,
+                    path,
+                ),
                 BQType.ARRAY,
             )
         if type_ == "geography":
             return (
-                build_extension_dtype(
+                _build_extension_dtype_checked(
+                    extension_dtype_builder,
                     GEOGRAPHY_EXTENSION_NAME,
                     List(String()),
                     GEOGRAPHY_EXTENSION_METADATA,
+                    path,
                 ),
                 BQType.ARRAY,
             )
-        inner_type, _ = _extract_data_type({**field, "mode": "NULLABLE"}, path)
+        inner_type, _ = _extract_data_type(
+            {**field, "mode": "NULLABLE"},
+            path,
+            depth=depth + 1,
+            extension_dtype_builder=extension_dtype_builder,
+        )
         return List(inner_type), BQType.ARRAY
 
     if type_ in ("bool", "boolean"):
@@ -101,10 +165,12 @@ def _extract_data_type(field: dict, path: str) -> tuple[DataType, BQType]:
         return Datetime(time_unit="us"), BQType.DATETIME
     if type_ == "geography":
         return (
-            build_extension_dtype(
+            _build_extension_dtype_checked(
+                extension_dtype_builder,
                 GEOGRAPHY_EXTENSION_NAME,
                 String(),
                 GEOGRAPHY_EXTENSION_METADATA,
+                path,
             ),
             BQType.GEOGRAPHY,
         )
@@ -119,20 +185,37 @@ def _extract_data_type(field: dict, path: str) -> tuple[DataType, BQType]:
     if type_ in ("bignumeric", "bigdecimal"):
         raise _UnsupportedBigQueryType("BIGNUMERIC", path)
     if type_ == "json":
-        return build_extension_dtype(JSON_EXTENSION_NAME, String()), BQType.JSON
+        return (
+            _build_extension_dtype_checked(
+                extension_dtype_builder,
+                JSON_EXTENSION_NAME,
+                String(),
+                None,
+                path,
+            ),
+            BQType.JSON,
+        )
     if type_ == "interval":
         raise _UnsupportedBigQueryType("INTERVAL", path)
     if type_ == "range":
         raise _UnsupportedBigQueryType("RANGE", path)
     if type_ in ("record", "struct"):
-        subfields = field.get("fields") or []
+        subfields = field.get("fields")
+        if subfields is None:
+            subfields = []
+        if not isinstance(subfields, (list, tuple)):
+            raise _UnsupportedBigQueryType("malformed STRUCT fields", path)
         if not subfields:
             raise _UnsupportedBigQueryType("empty STRUCT", path)
         seen: set[str] = set()
         polars_fields: list[Field] = []
         for idx, subfield in enumerate(subfields):
+            if not isinstance(subfield, Mapping):
+                raise _UnsupportedBigQueryType(
+                    "malformed STRUCT subfield", f"{path}[{idx}]"
+                )
             sub_name = subfield.get("name")
-            if not sub_name:
+            if not isinstance(sub_name, str) or not sub_name:
                 raise _UnsupportedBigQueryType(
                     "unnamed STRUCT subfield", f"{path}[{idx}]"
                 )
@@ -141,7 +224,12 @@ def _extract_data_type(field: dict, path: str) -> tuple[DataType, BQType]:
                     "duplicate STRUCT subfield", f"{path}.{sub_name}"
                 )
             seen.add(sub_name)
-            sub_dtype, _ = _extract_data_type(subfield, f"{path}.{sub_name}")
+            sub_dtype, _ = _extract_data_type(
+                subfield,
+                f"{path}.{sub_name}",
+                depth=depth + 1,
+                extension_dtype_builder=extension_dtype_builder,
+            )
             polars_fields.append(Field(sub_name, sub_dtype))
         return Struct(polars_fields), BQType.STRUCT
     if type_ == "string":
@@ -159,10 +247,16 @@ def _extract_data_type(field: dict, path: str) -> tuple[DataType, BQType]:
     raise _UnsupportedBigQueryType(f"unsupported type {type_ or '<missing>'}", path)
 
 
-def extract_schema_metadata(table_metadata: dict) -> ExtractedSchema:
+def extract_schema_metadata(
+    table_metadata: Mapping[str, Any],
+    *,
+    extension_dtype_builder: ExtensionDtypeBuilder = build_extension_dtype,
+) -> ExtractedSchema:
     """Extract a Polars schema, authoritative BigQuery types, and skipped columns.
 
     Pure metadata transformation with no warning or exception side effects.
+    Pass `extension_dtype_builder` to inject custom `JSON`/`GEOGRAPHY` dtype
+    resolution independently of Polars' global extension registry or `os.environ`.
 
     See: https://docs.cloud.google.com/bigquery/docs/reference/rest/v2/tables#Table
     """
@@ -170,10 +264,25 @@ def extract_schema_metadata(table_metadata: dict) -> ExtractedSchema:
     bq_types: dict[str, BQType] = {}
     skipped_columns: list[SkippedColumn] = []
 
-    fields = (table_metadata.get("schema") or {}).get("fields") or []
+    raw_schema = (
+        table_metadata.get("schema") if isinstance(table_metadata, Mapping) else None
+    )
+    raw_fields = raw_schema.get("fields") if isinstance(raw_schema, Mapping) else None
+    fields = raw_fields if isinstance(raw_fields, (list, tuple)) else []
+
     for idx, field in enumerate(fields):
+        if not isinstance(field, Mapping):
+            placeholder = f"<invalid[{idx}]>"
+            skipped_columns.append(
+                SkippedColumn(
+                    name=placeholder,
+                    reason="malformed field metadata",
+                    path=placeholder,
+                )
+            )
+            continue
         name = field.get("name")
-        if not name:
+        if not isinstance(name, str) or not name:
             placeholder = f"<unnamed[{idx}]>"
             skipped_columns.append(
                 SkippedColumn(
@@ -183,8 +292,21 @@ def extract_schema_metadata(table_metadata: dict) -> ExtractedSchema:
                 )
             )
             continue
+        if name in pl_schema:
+            skipped_columns.append(
+                SkippedColumn(
+                    name=name,
+                    reason="duplicate column",
+                    path=name,
+                )
+            )
+            continue
         try:
-            dtype, bq_type = _extract_data_type(field, name)
+            dtype, bq_type = _extract_data_type(
+                field,
+                name,
+                extension_dtype_builder=extension_dtype_builder,
+            )
         except _UnsupportedBigQueryType as exc:
             skipped_columns.append(
                 SkippedColumn(name=name, reason=exc.reason, path=exc.path)
@@ -196,15 +318,26 @@ def extract_schema_metadata(table_metadata: dict) -> ExtractedSchema:
     # If table is ingestion-time partitioned, add pseudo-columns for partition
     # filters. BigQuery exposes _PARTITIONDATE only on DAY-partitioned tables,
     # whereas _PARTITIONTIME is exposed on all ingestion-time partitioned tables.
+    # Treat both `None` and `""` as an absent partitioning field (protobuf-JSON safe).
     # See: https://cloud.google.com/bigquery/docs/partitioned-tables#ingestion_time
-    if (
-        time_partitioning := table_metadata.get("timePartitioning")
-    ) is not None and time_partitioning.get("field") is None:
-        if (time_partitioning.get("type") or "DAY").casefold() == "day":
+    time_partitioning = (
+        table_metadata.get("timePartitioning")
+        if isinstance(table_metadata, Mapping)
+        else None
+    )
+    if isinstance(time_partitioning, Mapping) and not time_partitioning.get("field"):
+        raw_part_type = time_partitioning.get("type")
+        part_type = (
+            raw_part_type.casefold()
+            if isinstance(raw_part_type, str) and raw_part_type
+            else "day"
+        )
+        if part_type == "day" and "_PARTITIONDATE" not in pl_schema:
             pl_schema["_PARTITIONDATE"] = Date()
             bq_types["_PARTITIONDATE"] = BQType.DATE
-        pl_schema["_PARTITIONTIME"] = Datetime(time_unit="us", time_zone="UTC")
-        bq_types["_PARTITIONTIME"] = BQType.TIMESTAMP
+        if "_PARTITIONTIME" not in pl_schema:
+            pl_schema["_PARTITIONTIME"] = Datetime(time_unit="us", time_zone="UTC")
+            bq_types["_PARTITIONTIME"] = BQType.TIMESTAMP
 
     return ExtractedSchema(
         polars_schema=pl.Schema(pl_schema),
@@ -213,9 +346,16 @@ def extract_schema_metadata(table_metadata: dict) -> ExtractedSchema:
     )
 
 
-def extract_polars_schema(table_metadata: dict) -> pl.Schema:
+def extract_polars_schema(
+    table_metadata: Mapping[str, Any],
+    *,
+    extension_dtype_builder: ExtensionDtypeBuilder = build_extension_dtype,
+) -> pl.Schema:
     """Convert a BigQuery table REST response into a Polars schema.
 
     See: https://docs.cloud.google.com/bigquery/docs/reference/rest/v2/tables#Table
     """
-    return extract_schema_metadata(table_metadata).polars_schema
+    return extract_schema_metadata(
+        table_metadata,
+        extension_dtype_builder=extension_dtype_builder,
+    ).polars_schema

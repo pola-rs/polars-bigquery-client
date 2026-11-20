@@ -469,3 +469,112 @@ def test_extract_schema_all_unsupported_physical_with_ingestion_time_partitionin
     )
     assert extracted.bq_types == {"_PARTITIONTIME": BQType.TIMESTAMP}
     assert extracted.skipped_columns == (SkippedColumn("dur", "INTERVAL", "dur"),)
+
+
+def test_extract_schema_hardens_malformed_deep_and_duplicate_metadata():
+    # Non-mapping root / schema / fields fail safely as empty schema
+    assert extract_schema_metadata("not-a-dict").polars_schema == pl.Schema({})  # type: ignore[arg-type]
+    assert extract_schema_metadata({"schema": "bad"}).polars_schema == pl.Schema({})
+    assert extract_schema_metadata(
+        {"schema": {"fields": "bad"}}
+    ).polars_schema == pl.Schema({})
+
+    # Deeply nested STRUCT beyond MAX_SCHEMA_NESTING_DEPTH skips without RecursionError
+    from polars_bigquery.core.schema import MAX_SCHEMA_NESTING_DEPTH
+
+    deep: dict = {"name": "leaf", "type": "INT64"}
+    for idx in range(MAX_SCHEMA_NESTING_DEPTH + 2):
+        deep = {"name": f"s{idx}", "type": "STRUCT", "fields": [deep]}
+
+    metadata = {
+        "schema": {
+            "fields": [
+                {"name": "ok", "type": "INT64"},
+                {"name": "ok", "type": "STRING"},
+                "not-a-mapping",
+                {"name": 123, "type": "STRING"},
+                {"name": "bad_mode", "type": "STRING", "mode": 42},
+                {"name": "bad_type", "type": 99},
+                {"name": "bad_fields", "type": "STRUCT", "fields": "not-a-list"},
+                {"name": "bad_sub", "type": "STRUCT", "fields": ["not-a-dict"]},
+                deep,
+            ]
+        }
+    }
+    extracted = extract_schema_metadata(metadata)
+    assert extracted.polars_schema == pl.Schema({"ok": pl.Int64()})
+    reasons = {col.name: col.reason for col in extracted.skipped_columns}
+    assert reasons["ok"] == "duplicate column"
+    assert reasons["bad_mode"] == "invalid mode 42"
+    assert reasons["bad_type"] == "invalid type 99"
+    assert reasons["bad_fields"] == "malformed STRUCT fields"
+    assert reasons["bad_sub"] == "malformed STRUCT subfield"
+    assert f"exceeds {MAX_SCHEMA_NESTING_DEPTH}" in reasons[deep["name"]]
+
+
+def test_extract_schema_custom_extension_rejection_becomes_skipped_column():
+    class _ScalarOnlyJson(pl.BaseExtension):
+        @classmethod
+        def ext_from_params(cls, name, storage, metadata):
+            if isinstance(storage, pl.List):
+                raise TypeError("scalar String storage required")
+            return cls(name, storage, metadata)
+
+    pl.register_extension_type(JSON_EXTENSION_NAME, _ScalarOnlyJson)
+    try:
+        metadata = {
+            "schema": {
+                "fields": [
+                    {"name": "j_scalar", "type": "JSON"},
+                    {"name": "j_array", "type": "JSON", "mode": "REPEATED"},
+                ]
+            }
+        }
+        extracted = extract_schema_metadata(metadata)
+        assert list(extracted.polars_schema.keys()) == ["j_scalar"]
+        assert len(extracted.skipped_columns) == 1
+        assert extracted.skipped_columns[0].name == "j_array"
+        assert "rejected storage" in extracted.skipped_columns[0].reason
+    finally:
+        pl.unregister_extension_type(JSON_EXTENSION_NAME)
+
+
+def test_extract_schema_injected_extension_dtype_builder():
+    metadata = {
+        "schema": {
+            "fields": [
+                {"name": "j", "type": "JSON"},
+                {"name": "j_arr", "type": "JSON", "mode": "REPEATED"},
+            ]
+        }
+    }
+    extracted = extract_schema_metadata(
+        metadata,
+        extension_dtype_builder=lambda _name, storage, _meta: storage,
+    )
+    assert extracted.polars_schema == pl.Schema(
+        {"j": pl.String(), "j_arr": pl.List(pl.String())}
+    )
+    assert extracted.bq_types == {"j": BQType.JSON, "j_arr": BQType.ARRAY}
+
+
+def test_extract_schema_empty_partition_field_and_no_overwrite():
+    metadata = {
+        "schema": {
+            "fields": [
+                {"name": "val", "type": "INT64"},
+                {"name": "_PARTITIONDATE", "type": "STRING"},
+            ]
+        },
+        "timePartitioning": {"type": "DAY", "field": ""},
+    }
+    extracted = extract_schema_metadata(metadata)
+    # Empty field "" means ingestion-time partitioned, so _PARTITIONTIME is added,
+    # while an existing physical column named _PARTITIONDATE is not overwritten.
+    assert extracted.polars_schema == pl.Schema(
+        {
+            "val": pl.Int64(),
+            "_PARTITIONDATE": pl.String(),
+            "_PARTITIONTIME": pl.Datetime("us", "UTC"),
+        }
+    )

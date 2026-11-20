@@ -2,8 +2,7 @@
 
 from __future__ import annotations
 
-import collections
-
+from polars_bigquery.core.compiler._traversal import flatten_expr_bfs
 from polars_bigquery.core.compiler.ir import Expr
 from polars_bigquery.core.compiler.sql import (
     base,
@@ -38,23 +37,7 @@ def _compile_ir_to_sql(root: Expr) -> tuple[str | None, bool]:
     then evaluates SQL strings bottom-up in reverse BFS order to avoid stack size
     limitations.
     """
-    nodes: list[Expr] = [root]
-    children_map: list[tuple[int, ...]] = [()]
-    queue: collections.deque[int] = collections.deque([0])
-
-    while queue:
-        curr_idx = queue.popleft()
-        node = nodes[curr_idx]
-        node_children = node.children()
-        if node_children:
-            child_indices: list[int] = []
-            for child in node_children:
-                c_idx = len(nodes)
-                nodes.append(child)
-                children_map.append(())
-                queue.append(c_idx)
-                child_indices.append(c_idx)
-            children_map[curr_idx] = tuple(child_indices)
+    nodes, children_map = flatten_expr_bfs(root)
 
     results: list[tuple[str | None, bool]] = [(None, False)] * len(nodes)
     for idx in range(len(nodes) - 1, -1, -1):

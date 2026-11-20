@@ -141,6 +141,8 @@ impl ArrowStreamExporter {
         requested_schema: Option<Py<PyAny>>,
     ) -> PyResult<Py<PyAny>> {
         let _ = requested_schema;
+        arrow_bigquery_lib::validate_ffi_schema(&self.schema)
+            .map_err(|err| crate::error::to_py_err(py, err))?;
         let mut source_guard = self.source.lock().map_err(|_| {
             pyo3::exceptions::PyRuntimeError::new_err("Stream receiver lock is poisoned")
         })?;

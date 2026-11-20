@@ -3,15 +3,33 @@
 from __future__ import annotations
 
 import enum
+import logging
 import os
 from typing import Literal
 
 import polars as pl
 from polars.datatypes import DataType, DataTypeClass
 
+logger = logging.getLogger(__name__)
+
 JSON_EXTENSION_NAME = "google:sqlType:json"
 GEOGRAPHY_EXTENSION_NAME = "google:sqlType:geography"
 GEOGRAPHY_EXTENSION_METADATA = '{"encoding": "WKT"}'
+
+# BigQuery NUMERIC supports up to 38 total digits, up to 9 fractional digits,
+# and at most 29 integer digits (precision - scale <= 29).
+BQ_NUMERIC_MAX_PRECISION = 38
+BQ_NUMERIC_MAX_SCALE = 9
+BQ_NUMERIC_MAX_INTEGER_DIGITS = 29
+
+# Polars 2.x latches `POLARS_UNKNOWN_EXTENSION_TYPE_BEHAVIOR` once per process
+# on first extension import (even `pl.Config.reload_env_vars()` does not refresh
+# it). Snapshot the value observed at import time so we can warn via DEBUG/WARNING
+# logs if the environment variable is mutated mid-process.
+_UNKNOWN_EXTENSION_ENV_VAR = "POLARS_UNKNOWN_EXTENSION_TYPE_BEHAVIOR"
+_INITIAL_UNKNOWN_EXTENSION_BEHAVIOR: str | None = os.environ.get(
+    _UNKNOWN_EXTENSION_ENV_VAR
+)
 
 
 class BQType(enum.Enum):
@@ -95,6 +113,8 @@ def build_extension_dtype(
     name: str,
     storage: DataType,
     metadata: str | None = None,
+    *,
+    load_as_storage: bool | None = None,
 ) -> DataType:
     """Build a Polars DataType for a BigQuery Arrow extension type.
 
@@ -105,13 +125,35 @@ def build_extension_dtype(
       ``POLARS_UNKNOWN_EXTENSION_TYPE_BEHAVIOR=load_as_storage``): returns
       ``storage``.
     - Default (``load_as_extension``): returns ``pl.Extension(name, storage, metadata)``.
+
+    Note: In Polars 2.x, the Rust Arrow C Stream importer reads
+    ``POLARS_UNKNOWN_EXTENSION_TYPE_BEHAVIOR`` once per process and caches it
+    (``pl.Config.reload_env_vars()`` does not refresh it). Mutating that
+    environment variable *after* Polars imports an extension type can therefore
+    cause schema mismatches on collection; pass ``load_as_storage`` explicitly
+    when deterministic resolution independent of process environment is needed.
     """
     registered = pl.get_extension_type(name)
     if isinstance(registered, type) and issubclass(registered, pl.BaseExtension):
         return registered.ext_from_params(name, storage, metadata)
     if registered == "storage":
         return storage
-    if os.environ.get("POLARS_UNKNOWN_EXTENSION_TYPE_BEHAVIOR") == "load_as_storage":
+    if load_as_storage is not None:
+        return storage if load_as_storage else pl.Extension(name, storage, metadata)
+    current_behavior = os.environ.get(_UNKNOWN_EXTENSION_ENV_VAR)
+    if current_behavior != _INITIAL_UNKNOWN_EXTENSION_BEHAVIOR:
+        logger.warning(
+            "%s changed from %r to %r after module import; Polars 2.x latches "
+            "this setting once per process, so Arrow stream decoding may "
+            "disagree with inferred extension dtypes. Prefer "
+            "polars.register_extension_type(%r, as_storage=True) or setting the "
+            "environment variable before launching Python.",
+            _UNKNOWN_EXTENSION_ENV_VAR,
+            _INITIAL_UNKNOWN_EXTENSION_BEHAVIOR,
+            current_behavior,
+            name,
+        )
+    if current_behavior == "load_as_storage":
         return storage
     return pl.Extension(name, storage, metadata)
 
@@ -146,7 +188,12 @@ def polars_dtype_to_bq_type(dtype: DataType | DataTypeClass) -> BQType | None:
         return BQType.DATETIME if dtype.time_zone is None else BQType.TIMESTAMP
 
     if isinstance(dtype, pl.Decimal):
-        if dtype.precision is not None and dtype.precision <= 38 and dtype.scale <= 9:
+        if (
+            dtype.precision is not None
+            and 0 <= dtype.scale <= BQ_NUMERIC_MAX_SCALE
+            and dtype.scale <= dtype.precision <= BQ_NUMERIC_MAX_PRECISION
+            and (dtype.precision - dtype.scale) <= BQ_NUMERIC_MAX_INTEGER_DIGITS
+        ):
             return BQType.NUMERIC
         return None
 
@@ -170,6 +217,13 @@ def polars_datetime_time_unit(
     return None
 
 
+def polars_decimal_supports_one(dtype: DataType | DataTypeClass) -> bool:
+    """Return True if a Polars ``Decimal`` dtype can represent integer value ``1``."""
+    if isinstance(dtype, pl.Decimal) and dtype.precision is not None:
+        return (dtype.precision - dtype.scale) >= 1
+    return True
+
+
 def column_width_rank(dtype: DataType | DataTypeClass) -> int:
     """Return a deterministic storage-width rank (1=narrowest, 6=widest/unknown)."""
     bq_type = polars_dtype_to_bq_type(dtype)
@@ -177,6 +231,9 @@ def column_width_rank(dtype: DataType | DataTypeClass) -> int:
 
 
 __all__ = [
+    "BQ_NUMERIC_MAX_INTEGER_DIGITS",
+    "BQ_NUMERIC_MAX_PRECISION",
+    "BQ_NUMERIC_MAX_SCALE",
     "GEOGRAPHY_EXTENSION_METADATA",
     "GEOGRAPHY_EXTENSION_NAME",
     "JSON_EXTENSION_NAME",
@@ -185,5 +242,6 @@ __all__ = [
     "build_extension_dtype",
     "column_width_rank",
     "polars_datetime_time_unit",
+    "polars_decimal_supports_one",
     "polars_dtype_to_bq_type",
 ]

@@ -22,6 +22,7 @@ from polars_bigquery.core.compiler.ir.boolean import (
 from polars_bigquery.core.compiler.rewriter.base import replace_children, rewrite_tree
 
 _FALSY_LITERALS = (BoolLiteral(False), NullLiteral())
+MAX_BOOLEAN_WHEN_REWRITE_NODES = 100_000
 
 
 def _is_valid_boolean_ternary(node: Ternary) -> bool:
@@ -115,13 +116,69 @@ def rewrite_boolean_when(root: Expr) -> Expr:
             if in_boolean_context and _is_valid_boolean_ternary(node):
                 boolean_nodes.update(child_indices[1:])
 
+    weights: list[int] = [1] * len(nodes)
+    has_unsup: list[bool] = [isinstance(node, Unsupported) for node in nodes]
     for idx in range(len(nodes) - 1, -1, -1):
-        child_indices = children_map[idx]
-        if child_indices:
-            child_nodes = tuple(nodes[c_idx] for c_idx in child_indices)
+        c_indices = children_map[idx]
+        if c_indices:
+            child_nodes = tuple(nodes[c_idx] for c_idx in c_indices)
             nodes[idx] = replace_children(nodes[idx], child_nodes)
+            weights[idx] = 1 + sum(weights[c_idx] for c_idx in c_indices)
+            has_unsup[idx] = isinstance(nodes[idx], Unsupported) or any(
+                has_unsup[c_idx] for c_idx in c_indices
+            )
         if idx in boolean_nodes:
-            nodes[idx] = rewrite_boolean_when_node(nodes[idx])
+            curr = nodes[idx]
+            if isinstance(curr, Ternary) and _is_valid_boolean_ternary(curr):
+                truthy_is_falsy = curr.truthy in _FALSY_LITERALS
+                falsy_is_falsy = curr.falsy in _FALSY_LITERALS
+                if truthy_is_falsy and falsy_is_falsy:
+                    nodes[idx] = BoolLiteral(value=False)
+                    weights[idx] = 1
+                    has_unsup[idx] = False
+                    continue
+                if falsy_is_falsy:
+                    nodes[idx] = And(left=curr.predicate, right=curr.truthy)
+                    weights[idx] = 1 + weights[c_indices[0]] + weights[c_indices[1]]
+                    has_unsup[idx] = has_unsup[c_indices[0]] or has_unsup[c_indices[1]]
+                    continue
+                if truthy_is_falsy:
+                    negated_pred: Expr = Not(
+                        expr=Coalesce(
+                            operands=(curr.predicate, BoolLiteral(value=False))
+                        )
+                    )
+                    nodes[idx] = And(left=negated_pred, right=curr.falsy)
+                    weights[idx] = 4 + weights[c_indices[0]] + weights[c_indices[2]]
+                    has_unsup[idx] = has_unsup[c_indices[0]] or has_unsup[c_indices[2]]
+                    continue
+                if has_unsup[idx]:
+                    pred_unsup = has_unsup[c_indices[0]]
+                    pred_w = weights[c_indices[0]]
+                    truthy_w = weights[c_indices[1]]
+                    falsy_w = weights[c_indices[2]]
+                    neg_w = 1 if pred_unsup else (pred_w + 3)
+                    est_w = 3 + pred_w + truthy_w + neg_w + falsy_w
+                    if est_w > MAX_BOOLEAN_WHEN_REWRITE_NODES:
+                        nodes[idx] = Unsupported()
+                        weights[idx] = 1
+                        has_unsup[idx] = True
+                        continue
+                    negated_pred = (
+                        Unsupported()
+                        if pred_unsup
+                        else Not(
+                            expr=Coalesce(
+                                operands=(curr.predicate, BoolLiteral(value=False))
+                            )
+                        )
+                    )
+                    nodes[idx] = Or(
+                        left=And(left=curr.predicate, right=curr.truthy),
+                        right=And(left=negated_pred, right=curr.falsy),
+                    )
+                    weights[idx] = est_w
+                    has_unsup[idx] = True
 
     return nodes[0]
 
@@ -251,7 +308,11 @@ def rewrite_drop_nulls(root: Expr) -> Expr:
         not_null_exprs=not_null_exprs,
     )
     result = rewrite_tree(root, node_rewriter)
+    seen: set[Expr] = set()
     for expr in not_null_exprs:
         cleaned_expr = rewrite_tree(expr, _strip_drop_nulls_node)
+        if cleaned_expr in seen:
+            continue
+        seen.add(cleaned_expr)
         result = And(left=result, right=IsNotNull(expr=cleaned_expr))
     return result

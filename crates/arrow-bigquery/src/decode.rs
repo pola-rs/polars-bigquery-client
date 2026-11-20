@@ -12,41 +12,162 @@ use crate::BigQueryError;
 
 const BQ_DATETIME_EXTENSION_NAME: &str = "google:sqlType:datetime";
 
-fn strip_datetime_extension_dtype(dtype: ArrowDataType) -> ArrowDataType {
-    match dtype {
-        ArrowDataType::Extension(mut ext) => {
-            let inner = strip_datetime_extension_dtype(ext.inner);
-            if ext.name.as_str() == BQ_DATETIME_EXTENSION_NAME {
-                inner
-            } else {
-                ext.inner = inner;
-                ArrowDataType::Extension(ext)
-            }
-        },
-        ArrowDataType::List(inner) => {
-            ArrowDataType::List(Box::new(strip_datetime_extension_field(*inner)))
-        },
-        ArrowDataType::LargeList(inner) => {
-            ArrowDataType::LargeList(Box::new(strip_datetime_extension_field(*inner)))
-        },
-        ArrowDataType::FixedSizeList(inner, size) => {
-            ArrowDataType::FixedSizeList(Box::new(strip_datetime_extension_field(*inner)), size)
-        },
-        ArrowDataType::Map(inner, ordered) => {
-            ArrowDataType::Map(Box::new(strip_datetime_extension_field(*inner)), ordered)
-        },
-        ArrowDataType::Struct(fields) => ArrowDataType::Struct(
-            fields
-                .into_iter()
-                .map(strip_datetime_extension_field)
-                .collect(),
-        ),
-        other => other,
+/// Maximum recursive type-nesting depth inspected by `decode.rs` helpers.
+///
+/// BigQuery limits `STRUCT`/`RECORD` nesting to 15 levels, so 64 comfortably covers
+/// every valid BigQuery schema (including nested containers and extension wrappers)
+/// while guarding the Rust call stack against malformed IPC metadata.
+const MAX_SCHEMA_NESTING_DEPTH: usize = 64;
+
+/// Controls schema normalization and FFI validation performed when decoding Arrow IPC
+/// schema metadata.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SchemaDecodeOptions {
+    /// Strip `google:sqlType:datetime` extension metadata so naive microsecond `DATETIME`
+    /// columns expose native Arrow `Timestamp(Microsecond, None)`.
+    pub strip_datetime_extension: bool,
+    /// Reject Arrow data types known to panic/abort during `polars-arrow` C Data
+    /// Interface FFI export (`Interval(MonthDayNano)`, `Interval(MonthDayMillis)`,
+    /// and `Unknown`).
+    pub validate_ffi_types: bool,
+}
+
+impl Default for SchemaDecodeOptions {
+    fn default() -> Self {
+        Self {
+            strip_datetime_extension: true,
+            validate_ffi_types: true,
+        }
     }
 }
 
-fn strip_datetime_extension_field(mut field: Field) -> Field {
-    field.dtype = strip_datetime_extension_dtype(field.dtype);
+fn check_nesting_depth(depth: usize, path: &str) -> Result<(), BigQueryError> {
+    if depth > MAX_SCHEMA_NESTING_DEPTH {
+        return Err(BigQueryError::Protocol(format!(
+            "Arrow schema nesting depth for `{path}` exceeds maximum supported depth ({MAX_SCHEMA_NESTING_DEPTH})"
+        )));
+    }
+    Ok(())
+}
+
+fn dtype_has_datetime_extension(dtype: &ArrowDataType, depth: usize) -> bool {
+    if depth > MAX_SCHEMA_NESTING_DEPTH {
+        return false;
+    }
+    match dtype {
+        ArrowDataType::Extension(ext) => {
+            ext.name.as_str() == BQ_DATETIME_EXTENSION_NAME
+                || dtype_has_datetime_extension(&ext.inner, depth + 1)
+        },
+        ArrowDataType::List(inner)
+        | ArrowDataType::LargeList(inner)
+        | ArrowDataType::FixedSizeList(inner, _)
+        | ArrowDataType::Map(inner, _) => field_has_datetime_extension(inner, depth + 1),
+        ArrowDataType::Struct(fields) => fields
+            .iter()
+            .any(|field| field_has_datetime_extension(field, depth + 1)),
+        ArrowDataType::Dictionary(_, values, _) => dtype_has_datetime_extension(values, depth + 1),
+        ArrowDataType::Union(union) => union
+            .fields
+            .iter()
+            .any(|field| field_has_datetime_extension(field, depth + 1)),
+        _ => false,
+    }
+}
+
+fn field_has_datetime_extension(field: &Field, depth: usize) -> bool {
+    if field.metadata.as_ref().is_some_and(|meta| {
+        meta.get("ARROW:extension:name").map(|v| v.as_str()) == Some(BQ_DATETIME_EXTENSION_NAME)
+    }) {
+        return true;
+    }
+    dtype_has_datetime_extension(field.dtype(), depth)
+}
+
+fn schema_has_datetime_extension(schema: &ArrowSchema) -> bool {
+    schema
+        .iter()
+        .any(|(_, field)| field_has_datetime_extension(field, 0))
+}
+
+fn strip_datetime_extension_dtype(
+    dtype: ArrowDataType,
+    path: &str,
+    depth: usize,
+) -> Result<ArrowDataType, BigQueryError> {
+    check_nesting_depth(depth, path)?;
+    match dtype {
+        ArrowDataType::Extension(mut ext) => {
+            let inner = strip_datetime_extension_dtype(ext.inner, path, depth + 1)?;
+            if ext.name.as_str() == BQ_DATETIME_EXTENSION_NAME {
+                Ok(inner)
+            } else {
+                ext.inner = inner;
+                Ok(ArrowDataType::Extension(ext))
+            }
+        },
+        ArrowDataType::List(inner) => Ok(ArrowDataType::List(Box::new(
+            strip_datetime_extension_field(*inner, path, depth + 1)?,
+        ))),
+        ArrowDataType::LargeList(inner) => Ok(ArrowDataType::LargeList(Box::new(
+            strip_datetime_extension_field(*inner, path, depth + 1)?,
+        ))),
+        ArrowDataType::FixedSizeList(inner, size) => Ok(ArrowDataType::FixedSizeList(
+            Box::new(strip_datetime_extension_field(*inner, path, depth + 1)?),
+            size,
+        )),
+        ArrowDataType::Map(inner, ordered) => Ok(ArrowDataType::Map(
+            Box::new(strip_datetime_extension_field(*inner, path, depth + 1)?),
+            ordered,
+        )),
+        ArrowDataType::Struct(fields) => {
+            let mut stripped = Vec::with_capacity(fields.len());
+            for (idx, field) in fields.into_iter().enumerate() {
+                let child_path = if field.name.is_empty() {
+                    format!("{path}[{idx}]")
+                } else {
+                    format!("{path}.{}", field.name)
+                };
+                stripped.push(strip_datetime_extension_field(
+                    field,
+                    &child_path,
+                    depth + 1,
+                )?);
+            }
+            Ok(ArrowDataType::Struct(stripped))
+        },
+        ArrowDataType::Dictionary(key, values, is_ordered) => Ok(ArrowDataType::Dictionary(
+            key,
+            Box::new(strip_datetime_extension_dtype(*values, path, depth + 1)?),
+            is_ordered,
+        )),
+        ArrowDataType::Union(mut union) => {
+            let mut stripped = Vec::with_capacity(union.fields.len());
+            for (idx, field) in union.fields.into_iter().enumerate() {
+                let child_path = if field.name.is_empty() {
+                    format!("{path}[{idx}]")
+                } else {
+                    format!("{path}.{}", field.name)
+                };
+                stripped.push(strip_datetime_extension_field(
+                    field,
+                    &child_path,
+                    depth + 1,
+                )?);
+            }
+            union.fields = stripped;
+            Ok(ArrowDataType::Union(union))
+        },
+        other => Ok(other),
+    }
+}
+
+fn strip_datetime_extension_field(
+    mut field: Field,
+    path: &str,
+    depth: usize,
+) -> Result<Field, BigQueryError> {
+    field.dtype = strip_datetime_extension_dtype(field.dtype, path, depth)?;
     if let Some(meta) = field.metadata.as_ref() {
         if meta.get("ARROW:extension:name").map(|v| v.as_str()) == Some(BQ_DATETIME_EXTENSION_NAME)
         {
@@ -60,17 +181,27 @@ fn strip_datetime_extension_field(mut field: Field) -> Field {
             };
         }
     }
-    field
+    Ok(field)
 }
 
-fn strip_datetime_extensions(schema: ArrowSchema) -> ArrowSchema {
-    schema
-        .into_iter()
-        .map(|(_, field)| strip_datetime_extension_field(field))
-        .collect()
+fn strip_datetime_extensions(schema: ArrowSchema) -> Result<ArrowSchema, BigQueryError> {
+    if !schema_has_datetime_extension(&schema) {
+        return Ok(schema);
+    }
+    let mut fields = Vec::with_capacity(schema.len());
+    for (_, field) in schema.into_iter() {
+        let name = field.name.to_string();
+        fields.push(strip_datetime_extension_field(field, &name, 0)?);
+    }
+    Ok(ArrowSchema::from_iter(fields))
 }
 
-fn validate_supported_arrow_dtype(dtype: &ArrowDataType, path: &str) -> Result<(), BigQueryError> {
+fn validate_supported_arrow_dtype(
+    dtype: &ArrowDataType,
+    path: &str,
+    depth: usize,
+) -> Result<(), BigQueryError> {
+    check_nesting_depth(depth, path)?;
     match dtype {
         ArrowDataType::Interval(IntervalUnit::MonthDayNano) => {
             Err(BigQueryError::UnsupportedType(format!(
@@ -80,10 +211,20 @@ fn validate_supported_arrow_dtype(dtype: &ArrowDataType, path: &str) -> Result<(
                  https://github.com/pola-rs/polars/issues/30921)"
             )))
         },
+        ArrowDataType::Interval(IntervalUnit::MonthDayMillis) => {
+            Err(BigQueryError::UnsupportedType(format!(
+                "column `{path}` uses Arrow Interval(MonthDayMillis), which is not supported by Arrow C Data Interface FFI export"
+            )))
+        },
+        ArrowDataType::Unknown => Err(BigQueryError::UnsupportedType(format!(
+            "column `{path}` uses ArrowDataType::Unknown, which is not supported by Arrow C Data Interface FFI export"
+        ))),
         ArrowDataType::List(inner)
         | ArrowDataType::LargeList(inner)
         | ArrowDataType::FixedSizeList(inner, _)
-        | ArrowDataType::Map(inner, _) => validate_supported_arrow_dtype(inner.dtype(), path),
+        | ArrowDataType::Map(inner, _) => {
+            validate_supported_arrow_dtype(inner.dtype(), path, depth + 1)
+        },
         ArrowDataType::Struct(fields) => {
             for (idx, field) in fields.iter().enumerate() {
                 let child_path = if field.name.is_empty() {
@@ -91,33 +232,60 @@ fn validate_supported_arrow_dtype(dtype: &ArrowDataType, path: &str) -> Result<(
                 } else {
                     format!("{path}.{}", field.name)
                 };
-                validate_supported_arrow_dtype(field.dtype(), &child_path)?;
+                validate_supported_arrow_dtype(field.dtype(), &child_path, depth + 1)?;
             }
             Ok(())
         },
-        ArrowDataType::Extension(ext) => validate_supported_arrow_dtype(&ext.inner, path),
+        ArrowDataType::Dictionary(_, values, _) => {
+            validate_supported_arrow_dtype(values, path, depth + 1)
+        },
+        ArrowDataType::Union(union) => {
+            for (idx, field) in union.fields.iter().enumerate() {
+                let child_path = if field.name.is_empty() {
+                    format!("{path}[{idx}]")
+                } else {
+                    format!("{path}.{}", field.name)
+                };
+                validate_supported_arrow_dtype(field.dtype(), &child_path, depth + 1)?;
+            }
+            Ok(())
+        },
+        ArrowDataType::Extension(ext) => {
+            validate_supported_arrow_dtype(&ext.inner, path, depth + 1)
+        },
         _ => Ok(()),
     }
 }
 
-fn validate_supported_arrow_schema(schema: &ArrowSchema) -> Result<(), BigQueryError> {
+/// Validates that an [`ArrowSchema`] does not contain any types known to panic or abort
+/// when exported over the `polars-arrow` Arrow C Data Interface FFI layer.
+pub fn validate_ffi_schema(schema: &ArrowSchema) -> Result<(), BigQueryError> {
     for (_, field) in schema.iter() {
-        validate_supported_arrow_dtype(field.dtype(), field.name.as_str())?;
+        validate_supported_arrow_dtype(field.dtype(), field.name.as_str(), 0)?;
     }
     Ok(())
 }
 
-/// Parses IPC-serialized Arrow schema bytes into [`StreamMetadata`].
-///
-/// Rejects unsupported `Interval(MonthDayNano)` fields (BigQuery `INTERVAL`) and
-/// strips the `google:sqlType:datetime` extension wrapper so naive microsecond
-/// `DATETIME` columns expose native Arrow `Timestamp(Microsecond, None)`.
-pub(crate) fn parse_arrow_schema(schema_bytes: &[u8]) -> Result<StreamMetadata, BigQueryError> {
+/// Parses IPC-serialized Arrow schema bytes into [`StreamMetadata`] using [`SchemaDecodeOptions`].
+pub(crate) fn parse_arrow_schema_with_options(
+    schema_bytes: &[u8],
+    options: SchemaDecodeOptions,
+) -> Result<StreamMetadata, BigQueryError> {
     let mut cursor = Cursor::new(schema_bytes);
     let mut metadata = read_stream_metadata(&mut cursor)?;
-    validate_supported_arrow_schema(&metadata.schema)?;
-    metadata.schema = strip_datetime_extensions(metadata.schema);
+    if options.validate_ffi_types {
+        validate_ffi_schema(&metadata.schema)?;
+    }
+    if options.strip_datetime_extension {
+        metadata.schema = strip_datetime_extensions(metadata.schema)?;
+    }
     Ok(metadata)
+}
+
+/// Convenience wrapper using default [`SchemaDecodeOptions`] for unit tests.
+#[cfg(test)]
+pub(crate) fn parse_arrow_schema(schema_bytes: &[u8]) -> Result<StreamMetadata, BigQueryError> {
+    parse_arrow_schema_with_options(schema_bytes, SchemaDecodeOptions::default())
 }
 
 /// Validates that an optional serialized Arrow record batch payload is consistent
@@ -649,7 +817,7 @@ mod tests {
             })),
             true,
         )]);
-        let err = validate_supported_arrow_schema(&ext_schema)
+        let err = validate_ffi_schema(&ext_schema)
             .expect_err("Extension<MonthDayNano> should be rejected");
         assert!(matches!(err, BigQueryError::UnsupportedType(_)));
         assert!(err.to_string().contains("dur_ext"));
@@ -713,7 +881,7 @@ mod tests {
             Field::new("geo_col".into(), geo_ext.clone(), true),
         ]);
 
-        let stripped = strip_datetime_extensions(schema);
+        let stripped = strip_datetime_extensions(schema).unwrap();
         assert_eq!(stripped.get("dt").unwrap().dtype(), &dt_storage);
         let dt_meta_field = stripped.get("dt_meta").unwrap();
         assert_eq!(dt_meta_field.dtype(), &dt_storage);
@@ -861,7 +1029,7 @@ mod tests {
             Field::new("fixed_list".into(), fixed_list_dt, true),
             Field::new("map_col".into(), map_dt, true),
         ]);
-        let stripped = strip_datetime_extensions(schema);
+        let stripped = strip_datetime_extensions(schema).unwrap();
         assert_eq!(stripped.get("deep").unwrap().dtype(), &expected_dtype);
         assert_eq!(
             stripped.get("large_list").unwrap().dtype(),
@@ -1046,5 +1214,203 @@ mod tests {
         assert_eq!(inner_fields[0].dtype(), &dt_storage);
         assert!(inner_fields[0].metadata.is_none());
         assert_eq!(inner_fields[1].dtype(), &json_ext);
+    }
+
+    #[test]
+    fn test_array_datetime_ipc_roundtrip_strips_outer_extension() {
+        use polars_arrow::array::{Array, ListArray, PrimitiveArray};
+        use polars_arrow::datatypes::{ExtensionType, TimeUnit};
+        use polars_arrow::io::ipc::write::{StreamWriter, WriteOptions};
+        use polars_arrow::offset::OffsetsBuffer;
+
+        let dt_storage = ArrowDataType::Timestamp(TimeUnit::Microsecond, None);
+        let list_storage = ArrowDataType::List(Box::new(Field::new(
+            "item".into(),
+            dt_storage.clone(),
+            false,
+        )));
+        let dt_array_ext = ArrowDataType::Extension(Box::new(ExtensionType {
+            name: BQ_DATETIME_EXTENSION_NAME.into(),
+            inner: list_storage.clone(),
+            metadata: None,
+        }));
+        let wire_schema = ArrowSchema::from_iter(vec![Field::new(
+            "dt_arr".into(),
+            dt_array_ext.clone(),
+            false,
+        )]);
+
+        let dt_vals = vec![1_704_110_400_000_000_i64, 1_704_196_800_000_000_i64];
+        let inner = PrimitiveArray::<i64>::from_vec(dt_vals.clone()).to(dt_storage.clone());
+        let offsets = OffsetsBuffer::<i32>::try_from(vec![0, 2]).unwrap();
+        let list_arr = ListArray::<i32>::new(dt_array_ext.clone(), offsets, Box::new(inner), None);
+        let batch = RecordBatch::try_new(
+            1,
+            Arc::new(wire_schema.clone()),
+            vec![Box::new(list_arr) as Box<dyn Array>],
+        )
+        .unwrap();
+
+        let mut schema_bytes = Vec::new();
+        {
+            let mut writer =
+                StreamWriter::new(&mut schema_bytes, WriteOptions { compression: None });
+            writer.start(&wire_schema, None).unwrap();
+        }
+        let mut full_bytes = Vec::new();
+        {
+            let mut writer = StreamWriter::new(&mut full_bytes, WriteOptions { compression: None });
+            writer.start(&wire_schema, None).unwrap();
+            writer.write(&batch, None).unwrap();
+        }
+        let batch_bytes = bytes::Bytes::from(full_bytes[schema_bytes.len()..].to_vec());
+
+        // Default options strip outer `google:sqlType:datetime` extension on ARRAY<DATETIME>.
+        let parsed = parse_arrow_schema(&schema_bytes).unwrap();
+        assert_eq!(parsed.schema.get("dt_arr").unwrap().dtype(), &list_storage);
+        let decoded = decode_arrow_record_batches(batch_bytes.clone(), 1, parsed).unwrap();
+        assert_eq!(decoded[0].arrays()[0].dtype(), &list_storage);
+        let decoded_list = decoded[0].arrays()[0]
+            .as_any()
+            .downcast_ref::<ListArray<i32>>()
+            .unwrap();
+        let inner_arr = decoded_list
+            .values()
+            .as_any()
+            .downcast_ref::<PrimitiveArray<i64>>()
+            .unwrap();
+        assert_eq!(inner_arr.values().as_slice(), dt_vals.as_slice());
+
+        // Preserving extension metadata leaves `dt_arr` untouched for lossless consumers.
+        let preserved = parse_arrow_schema_with_options(
+            &schema_bytes,
+            SchemaDecodeOptions {
+                strip_datetime_extension: false,
+                validate_ffi_types: true,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            preserved.schema.get("dt_arr").unwrap().dtype(),
+            &dt_array_ext
+        );
+    }
+
+    #[test]
+    fn test_validate_and_strip_dictionary_union_month_day_millis_unknown_and_depth() {
+        use polars_arrow::datatypes::{ExtensionType, IntegerType, TimeUnit, UnionMode, UnionType};
+
+        let dt_storage = ArrowDataType::Timestamp(TimeUnit::Microsecond, None);
+        let dt_ext = ArrowDataType::Extension(Box::new(ExtensionType {
+            name: BQ_DATETIME_EXTENSION_NAME.into(),
+            inner: dt_storage.clone(),
+            metadata: None,
+        }));
+
+        // Dictionary<Int32, Interval(MonthDayNano)> rejected
+        let dict_bad = ArrowSchema::from_iter(vec![Field::new(
+            "d_bad".into(),
+            ArrowDataType::Dictionary(
+                IntegerType::Int32,
+                Box::new(ArrowDataType::Interval(IntervalUnit::MonthDayNano)),
+                false,
+            ),
+            true,
+        )]);
+        assert!(matches!(
+            validate_ffi_schema(&dict_bad),
+            Err(BigQueryError::UnsupportedType(_))
+        ));
+
+        // Union containing Interval(MonthDayNano) rejected
+        let union_bad = ArrowSchema::from_iter(vec![Field::new(
+            "u_bad".into(),
+            ArrowDataType::Union(Box::new(UnionType {
+                fields: vec![Field::new(
+                    "dur".into(),
+                    ArrowDataType::Interval(IntervalUnit::MonthDayNano),
+                    true,
+                )],
+                ids: Some(vec![0]),
+                mode: UnionMode::Sparse,
+            })),
+            true,
+        )]);
+        let err = validate_ffi_schema(&union_bad).unwrap_err();
+        assert!(matches!(err, BigQueryError::UnsupportedType(_)));
+        assert!(err.to_string().contains("u_bad.dur"));
+
+        // Interval(MonthDayMillis) and Unknown rejected
+        let millis_schema = ArrowSchema::from_iter(vec![Field::new(
+            "ms".into(),
+            ArrowDataType::Interval(IntervalUnit::MonthDayMillis),
+            true,
+        )]);
+        assert!(matches!(
+            validate_ffi_schema(&millis_schema),
+            Err(BigQueryError::UnsupportedType(_))
+        ));
+        let unknown_schema =
+            ArrowSchema::from_iter(vec![Field::new("unk".into(), ArrowDataType::Unknown, true)]);
+        assert!(matches!(
+            validate_ffi_schema(&unknown_schema),
+            Err(BigQueryError::UnsupportedType(_))
+        ));
+
+        // Dictionary and Union wrapping datetime extension are stripped
+        let container_dt = ArrowSchema::from_iter(vec![
+            Field::new(
+                "dict_dt".into(),
+                ArrowDataType::Dictionary(IntegerType::Int32, Box::new(dt_ext.clone()), false),
+                true,
+            ),
+            Field::new(
+                "union_dt".into(),
+                ArrowDataType::Union(Box::new(UnionType {
+                    fields: vec![Field::new("dt".into(), dt_ext, true)],
+                    ids: Some(vec![0]),
+                    mode: UnionMode::Sparse,
+                })),
+                true,
+            ),
+        ]);
+        let stripped = strip_datetime_extensions(container_dt).unwrap();
+        assert_eq!(
+            stripped.get("dict_dt").unwrap().dtype(),
+            &ArrowDataType::Dictionary(IntegerType::Int32, Box::new(dt_storage.clone()), false)
+        );
+        match stripped.get("union_dt").unwrap().dtype() {
+            ArrowDataType::Union(u) => assert_eq!(u.fields[0].dtype(), &dt_storage),
+            other => panic!("expected Union, got {other:?}"),
+        }
+
+        // Excessive nesting depth is rejected cleanly with Protocol error instead of stack overflow
+        let mut deep_dtype = ArrowDataType::Int64;
+        for _ in 0..=MAX_SCHEMA_NESTING_DEPTH + 1 {
+            deep_dtype = ArrowDataType::List(Box::new(Field::new("item".into(), deep_dtype, true)));
+        }
+        let deep_schema = ArrowSchema::from_iter(vec![Field::new("deep".into(), deep_dtype, true)]);
+        let depth_err = validate_ffi_schema(&deep_schema).unwrap_err();
+        assert!(matches!(depth_err, BigQueryError::Protocol(_)));
+
+        // Disabling validate_ffi_types allows pure-Rust consumers to inspect MonthDayNano IPC
+        let interval_schema = ArrowSchema::from_iter(vec![Field::new(
+            "dur".into(),
+            ArrowDataType::Interval(IntervalUnit::MonthDayNano),
+            true,
+        )]);
+        let raw_bytes = serialize_arrow_schema(&interval_schema);
+        let parsed_unchecked = parse_arrow_schema_with_options(
+            &raw_bytes,
+            SchemaDecodeOptions {
+                strip_datetime_extension: true,
+                validate_ffi_types: false,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            parsed_unchecked.schema.get("dur").unwrap().dtype(),
+            &ArrowDataType::Interval(IntervalUnit::MonthDayNano)
+        );
     }
 }

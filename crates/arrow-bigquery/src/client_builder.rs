@@ -4,6 +4,7 @@ use google_cloud_gax::retry_throttler::{
     AdaptiveThrottler, RetryThrottlerArg, SharedRetryThrottler,
 };
 
+use crate::decode::SchemaDecodeOptions;
 use crate::{BigQueryError, BigQueryJobService, Client};
 
 static INIT_CRYPTO: std::sync::Once = std::sync::Once::new();
@@ -26,6 +27,7 @@ pub struct ServiceConfigBuilder {
     bqstorage_endpoint: Option<String>,
     user_agent: Option<String>,
     quota_project_id: Option<String>,
+    schema_decode_options: SchemaDecodeOptions,
 }
 
 impl ServiceConfigBuilder {
@@ -55,6 +57,29 @@ impl ServiceConfigBuilder {
 
     pub fn with_quota_project_id(mut self, quota_project_id: Option<String>) -> Self {
         self.quota_project_id = quota_project_id;
+        self
+    }
+
+    /// Configures whether BigQuery `google:sqlType:datetime` extension metadata
+    /// is preserved on decoded Arrow schemas instead of being stripped to native
+    /// `Timestamp(Microsecond, None)`.
+    ///
+    /// Defaults to `false` (stripped for Polars Arrow compatibility). Pure-Rust
+    /// or non-Polars consumers that wish to preserve the original extension type
+    /// may enable this option.
+    pub fn with_preserve_datetime_extension(mut self, preserve: bool) -> Self {
+        self.schema_decode_options.strip_datetime_extension = !preserve;
+        self
+    }
+
+    /// Configures whether decoded Arrow schemas reject types unsupported by the
+    /// `polars-arrow` C Data Interface FFI layer (`Interval(MonthDayNano)`,
+    /// `Interval(MonthDayMillis)`, `Unknown`).
+    ///
+    /// Defaults to `true`. Pure-Rust consumers that decode `RecordBatch` values
+    /// directly without exporting over the Arrow C Data Interface may disable this.
+    pub fn with_validate_ffi_types(mut self, validate: bool) -> Self {
+        self.schema_decode_options.validate_ffi_types = validate;
         self
     }
 
@@ -90,12 +115,13 @@ impl ServiceConfigBuilder {
         let bq_client = bq_builder.build().await?;
         let read_client = read_builder.build().await?;
 
-        Ok(Client::from_parts(
+        Ok(Client::from_parts_with_options(
             bq_client,
             read_client,
             quota_project_id,
             self.user_agent,
             retry_throttler,
+            self.schema_decode_options,
         ))
     }
 }

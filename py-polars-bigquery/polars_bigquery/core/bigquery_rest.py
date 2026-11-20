@@ -117,7 +117,7 @@ def get_table_metadata(
 
 
 class BigQueryRestClient:
-    """Stateful BigQuery REST client with connection pooling and metadata caching."""
+    """Stateful BigQuery REST client with connection pooling and retry handling."""
 
     def __init__(
         self,

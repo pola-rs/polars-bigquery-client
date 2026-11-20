@@ -1033,3 +1033,69 @@ def test_client_read_and_scan_reject_malicious_table_ids(mock_arrow_client):
 
         mock_arrow_client.read_table.assert_not_called()
         mock_get_metadata.assert_not_called()
+
+
+def test_scan_table_udf_predicate_falls_back_cleanly(mock_arrow_client):
+    source_df = pl.DataFrame({"id": [1, 2, 3]})
+    mock_arrow_client.read_table.side_effect = (
+        lambda table_ref, *, selected_fields, **kwargs: _FakeArrowStreamExporter(
+            source_df.select(selected_fields)
+        )
+    )
+    client = Client(quota_project_id="q")
+
+    # Pass a predicate that cannot be JSON-serialized via Polars `meta.serialize()`
+    # without requiring optional `cloudpickle` in `.collect()`.
+    def is_gt_one(val: int) -> bool:
+        return val > 1
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        udf_expr = pl.col("id").map_elements(is_gt_one, return_dtype=pl.Boolean)
+
+    with patch(
+        "polars_bigquery.core.compiler.predicate_to_row_restriction",
+        wraps=polars_bigquery.core.compiler.predicate_to_row_restriction,
+    ) as spy:
+        # Exercise compiler.predicate_to_row_restriction directly with the UDF
+        assert (
+            polars_bigquery.core.compiler.predicate_to_row_restriction(
+                udf_expr, schema={"id": pl.Int64}
+            )
+            == ""
+        )
+        # Also verify scan_table collects without raising if predicate pushdown
+        # raises PolarsError during meta.serialize() (e.g. local UDF fallback).
+        lf = client.scan_table("p.d.t", schema={"id": pl.Int64}).filter(
+            pl.col("id") > 1
+        )
+        with patch.object(
+            pl.expr.expr.ExprMetaNameSpace,
+            "serialize",
+            side_effect=pl.exceptions.ComputeError("cannot serialize UDF"),
+        ):
+            df = lf.collect()
+    assert df["id"].to_list() == [2, 3]
+    assert mock_arrow_client.read_table.call_args.kwargs["row_restriction"] == ""
+    assert spy.call_count >= 1
+
+
+def test_drop_columns_iter_closes_underlying_batch_iterator():
+    from polars_bigquery._read_bigquery import _drop_columns_iter
+
+    closed = False
+
+    def batch_gen():
+        nonlocal closed
+        try:
+            yield pl.DataFrame({"a": [1, 2]})
+            yield pl.DataFrame({"a": [3, 4]})
+        finally:
+            closed = True
+
+    it = _drop_columns_iter(batch_gen())
+    first = next(it)
+    assert first.shape == (2, 0)
+    assert not closed
+    it.close()
+    assert closed

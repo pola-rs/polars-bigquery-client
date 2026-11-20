@@ -39,6 +39,17 @@ def _format_skipped_columns(
     return ", ".join(entries)
 
 
+def _drop_columns_iter(batches: Iterator[pl.DataFrame]) -> Iterator[pl.DataFrame]:
+    """Yield height-preserving zero-width frames and promptly close the stream on exit."""
+    try:
+        for batch in batches:
+            yield batch.drop(batch.columns)
+    finally:
+        close = getattr(batches, "close", None)
+        if callable(close):
+            close()
+
+
 def _get_user_agent(user_agent: str | None) -> str:
     ua = f"polars-bigquery/{polars_bigquery.core.version.__version__}"
 
@@ -318,6 +329,8 @@ class Client:
             `POLARS_UNKNOWN_EXTENSION_TYPE_BEHAVIOR=load_as_storage`) is not
             supported with an explicit `schema` because `pl.String` cannot be
             distinguished from BigQuery `STRING` without table metadata.
+            Passing an empty mapping (`schema={}`) skips both `tables.get` and
+            `CreateReadSession`, yielding an empty 0-row, 0-column `DataFrame`.
 
         Returns
         -------
@@ -410,6 +423,9 @@ class Client:
             n_rows: int | None,
             batch_size: int | None,
         ) -> Iterator[pl.DataFrame]:
+            # Explicit empty `schema={}` is treated identically to a 0-column table:
+            # short-circuit without calling `CreateReadSession` (BigQuery rejects empty
+            # schemas with FAILED_PRECONDITION).
             if len(polars_schema) == 0:
                 logger.debug(
                     "Short-circuiting empty schema scan for table '%s' without "
@@ -451,6 +467,9 @@ class Client:
                 row_restriction,
             )
 
+            # Note: even when `row_restriction == "FALSE"` (e.g. `int_col.is_nan()`),
+            # we intentionally open a Storage Read API session so server-side table
+            # existence and IAM authorization errors surface consistently.
             arrow_stream_exporter = self._arrow_client.read_table(
                 table_ref,
                 maintain_order=False,
@@ -466,9 +485,8 @@ class Client:
                 lazyframe = lazyframe.limit(n_rows)
 
             if columns == []:
-                return (
-                    batch.drop(batch.columns)
-                    for batch in lazyframe.collect_batches(chunk_size=batch_size)
+                return _drop_columns_iter(
+                    lazyframe.collect_batches(chunk_size=batch_size)
                 )
 
             return lazyframe.select(columns).collect_batches(chunk_size=batch_size)

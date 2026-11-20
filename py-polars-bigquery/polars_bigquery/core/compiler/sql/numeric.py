@@ -17,7 +17,7 @@ from polars_bigquery.core.compiler.sql.base import (
     literal_ir_to_sql,
 )
 
-_DECIMAL_LITERAL_RE = re.compile(r"[+-]?\d+(?:\.\d+)?")
+_DECIMAL_LITERAL_RE = re.compile(r"[+-]?[0-9]+(?:\.[0-9]+)?")
 
 
 @literal_ir_to_sql.register
