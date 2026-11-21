@@ -249,6 +249,7 @@ def test_client_read_query_calls_rust(mock_rust_client):
         dry_run=False,
         maintain_order=True,
         use_query_cache=None,
+        maximum_bytes_billed=None,
     )
     assert result is placeholder
 
@@ -272,6 +273,7 @@ def test_client_read_query_passes_additional_parameters(mock_rust_client):
         dry_run=True,
         maintain_order=False,
         use_query_cache=False,
+        maximum_bytes_billed=None,
     )
     assert result is placeholder
 
@@ -413,3 +415,220 @@ def test_bigquery_error_hierarchy_and_empty_quota_project():
 
     with pytest.raises(ValueError, match="quota_project_id is required"):
         Client(quota_project_id="   ")
+
+
+def test_client_close_and_context_manager(mock_rust_client):
+    client = Client(quota_project_id="q")
+    assert not client.closed
+    with client as ctx_client:
+        assert ctx_client is client
+        assert client.quota_project_id == "q"
+        assert not client.closed
+
+    assert client.closed
+    mock_rust_client.close.assert_called_once_with()
+
+    # Calling close() repeatedly is idempotent and does not invoke native close() again.
+    client.close()
+    assert client.closed
+    mock_rust_client.close.assert_called_once_with()
+
+    with pytest.raises(RuntimeError, match="closed"), client:
+        pass
+    with pytest.raises(RuntimeError, match="closed"):
+        client.read_table("p.d.t")
+    with pytest.raises(RuntimeError, match="closed"):
+        client.read_query("SELECT 1")
+
+
+def test_native_client_close_and_maximum_bytes_billed_validation():
+    native_client = _native.Client(
+        quota_project_id="test-proj",
+        credentials_provider=lambda: ({"bearer_token": "tok"}, None),
+    )
+    assert not native_client.closed
+    with pytest.raises(TypeError, match="maximum_bytes_billed must be an int or None"):
+        native_client.read_query("SELECT 1", maximum_bytes_billed=True)  # type: ignore[arg-type]
+    with pytest.raises(TypeError, match="maximum_bytes_billed must be an int or None"):
+        native_client.read_query("SELECT 1", maximum_bytes_billed=False)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="maximum_bytes_billed must be non-negative"):
+        native_client.read_query("SELECT 1", maximum_bytes_billed=-1)
+    max_i64 = (1 << 63) - 1
+    with pytest.raises(ValueError, match=f"maximum_bytes_billed must be <= {max_i64}"):
+        native_client.read_query("SELECT 1", maximum_bytes_billed=1 << 63)
+    with pytest.raises(ValueError, match=f"maximum_bytes_billed must be <= {max_i64}"):
+        native_client.read_query("SELECT 1", maximum_bytes_billed=1 << 200)
+    # Must handle ints past CPython's default 4300-digit str() conversion limit.
+    with pytest.raises(ValueError, match=f"maximum_bytes_billed must be <= {max_i64}"):
+        native_client.read_query("SELECT 1", maximum_bytes_billed=10**5000)
+    with pytest.raises(ValueError, match="maximum_bytes_billed must be non-negative"):
+        native_client.read_query("SELECT 1", maximum_bytes_billed=-(10**5000))
+
+    with native_client:
+        assert not native_client.closed
+    assert native_client.closed
+    native_client.close()
+    with pytest.raises(RuntimeError, match="closed"), native_client:
+        pass
+    with pytest.raises(RuntimeError, match="closed"):
+        native_client.read_query("SELECT 1")
+
+
+def test_client_read_query_maximum_bytes_billed(mock_rust_client):
+    client = Client(quota_project_id="q")
+    client.read_query("SELECT 1", maximum_bytes_billed=10_000)
+    mock_rust_client.read_query.assert_called_once_with(
+        "SELECT 1",
+        arrow_buffer_compression="lz4frame",
+        dry_run=False,
+        maintain_order=True,
+        use_query_cache=None,
+        maximum_bytes_billed=10_000,
+    )
+
+    max_i64 = (1 << 63) - 1
+    client.read_query("SELECT 1", maximum_bytes_billed=max_i64)
+    assert (
+        mock_rust_client.read_query.call_args.kwargs["maximum_bytes_billed"] == max_i64
+    )
+
+
+def test_client_read_query_maximum_bytes_billed_validation():
+    client = Client(
+        quota_project_id="q",
+        credentials_provider=lambda: ({"bearer_token": "tok"}, None),
+    )
+    max_i64 = (1 << 63) - 1
+    with pytest.raises(TypeError, match="maximum_bytes_billed must be an int or None"):
+        client.read_query("SELECT 1", maximum_bytes_billed=True)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="maximum_bytes_billed must be non-negative"):
+        client.read_query("SELECT 1", maximum_bytes_billed=-1)
+    with pytest.raises(ValueError, match="maximum_bytes_billed must be non-negative"):
+        client.read_query("SELECT 1", maximum_bytes_billed=-(10**5000))
+    with pytest.raises(ValueError, match=f"maximum_bytes_billed must be <= {max_i64}"):
+        client.read_query("SELECT 1", maximum_bytes_billed=1 << 63)
+    with pytest.raises(ValueError, match=f"maximum_bytes_billed must be <= {max_i64}"):
+        client.read_query("SELECT 1", maximum_bytes_billed=10**5000)
+
+
+def test_client_dry_run_forwards_maximum_bytes_billed_and_worker_thread():
+    import json
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+
+    received_bodies: list[dict[str, object]] = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self):
+            length = int(self.headers.get("Content-Length", "0"))
+            body = json.loads(self.rfile.read(length).decode("utf-8"))
+            received_bodies.append(body)
+            resp = {
+                "jobReference": {"projectId": "test-proj", "location": "US"},
+                "totalBytesProcessed": "16",
+                "cacheHit": False,
+                "statementType": "SELECT",
+                "creationTime": "1767037135155",
+                "schema": {"fields": [{"name": "x", "type": "INT64"}]},
+            }
+            payload = json.dumps(resp).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+        def log_message(self, format, *args):
+            pass
+
+    server = HTTPServer(("127.0.0.1", 0), Handler)
+    port = server.server_address[1]
+    srv_thread = threading.Thread(target=server.serve_forever, daemon=True)
+    srv_thread.start()
+    try:
+        client = Client(
+            quota_project_id="test-proj",
+            credentials_provider=lambda: ({"bearer_token": "tok"}, None),
+            bq_endpoint=f"http://127.0.0.1:{port}",
+        )
+        # Dry run on the main thread forwards maximumBytesBilled.
+        exporter = client.read_query(
+            "SELECT 1 AS x", dry_run=True, maximum_bytes_billed=1024
+        )
+        assert len(nanoarrow.ArrayStream(exporter).read_all()) == 1
+
+        # Dry run on a worker (non-main) thread exercises the direct wait path.
+        from concurrent.futures import ThreadPoolExecutor
+
+        def run_in_worker() -> int:
+            exp = client.read_query("SELECT 1 AS x", dry_run=True)
+            return len(nanoarrow.ArrayStream(exp).read_all())
+
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            assert pool.submit(run_in_worker).result(timeout=5.0) == 1
+    finally:
+        server.shutdown()
+        server.server_close()
+
+    assert len(received_bodies) == 2
+    assert received_bodies[0].get("dryRun") is True
+    assert str(received_bodies[0].get("maximumBytesBilled")) == "1024"
+    assert received_bodies[1].get("dryRun") is True
+    assert "maximumBytesBilled" not in received_bodies[1]
+
+
+def test_read_query_interruptible_during_wait():
+    import socket
+
+    # Hold a TCP connection open without responding so `jobs.query` blocks waiting.
+    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(1)
+    port = srv.getsockname()[1]
+    accepted: list[socket.socket] = []
+    connected_event = threading.Event()
+    stop_event = threading.Event()
+
+    def accept_and_hold():
+        try:
+            conn, _ = srv.accept()
+            accepted.append(conn)
+            connected_event.set()
+            stop_event.wait(timeout=10.0)
+        except OSError:
+            pass
+
+    server_thread = threading.Thread(target=accept_and_hold, daemon=True)
+    server_thread.start()
+
+    def send_interrupt():
+        # Wait until the TCP connection from `jobs.query` is actually accepted so
+        # `_thread.interrupt_main()` is guaranteed to fire while inside
+        # `block_on_interruptible` instead of racing client setup on slow runners.
+        if connected_event.wait(timeout=5.0):
+            _thread.interrupt_main()
+
+    irq_thread = threading.Thread(target=send_interrupt, daemon=True)
+    client = Client(
+        quota_project_id="test-proj",
+        credentials_provider=lambda: ({"bearer_token": "tok"}, None),
+        bq_endpoint=f"http://127.0.0.1:{port}",
+    )
+    irq_thread.start()
+    try:
+        t0 = time.monotonic()
+        with pytest.raises(KeyboardInterrupt):
+            client.read_query("SELECT 1", dry_run=True)
+        elapsed = time.monotonic() - t0
+        assert connected_event.is_set(), (
+            "interrupt fired before read_query connected to mock server"
+        )
+        assert elapsed < 3.0, (
+            f"read_query took too long to notice KeyboardInterrupt: {elapsed:.2f}s"
+        )
+    finally:
+        stop_event.set()
+        for conn in accepted:
+            conn.close()
+        srv.close()
+        irq_thread.join(timeout=1.0)
+        server_thread.join(timeout=1.0)
