@@ -1,8 +1,11 @@
-//! Retry and backoff policies for the BigQuery Storage Read API.
+//! Retry and backoff policies for the BigQuery Storage Read API (gRPC).
 //!
 //! Adapts the BigQuery Storage Read API retry parameters and reconnection session
 //! tracking to [`google_cloud_gax`] policies (`RetryPolicy`, `BackoffPolicy`,
 //! `SharedRetryThrottler`).
+//!
+//! BigQuery v2 `JobService` (REST) retry/backoff/circuit-breaker policies live in
+//! [`crate::job_service_retry`].
 
 use std::sync::Arc;
 use std::time::Duration;
