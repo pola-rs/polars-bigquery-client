@@ -18,6 +18,13 @@ class StringLiteral(Literal):
 
 
 @dataclasses.dataclass(frozen=True)
+class BytesLiteral(Literal):
+    """Internal IR node representing a BigQuery BYTES literal."""
+
+    value: bytes
+
+
+@dataclasses.dataclass(frozen=True)
 class Uppercase(UnaryExpr):
     """IR node representing a string UPPER conversion."""
 

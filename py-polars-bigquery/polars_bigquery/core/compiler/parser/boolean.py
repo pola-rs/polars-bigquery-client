@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import functools
-from collections.abc import Mapping, Sequence
+from collections.abc import Sequence
 from typing import Any
 
 from polars_bigquery.core.compiler.ir.base import Expr, Unsupported
@@ -11,13 +11,13 @@ from polars_bigquery.core.compiler.ir.boolean import (
     Coalesce,
     DropNulls,
     FillNull,
+    FillNullWithStrategy,
     IsNotNull,
     IsNull,
     Not,
     Or,
     Ternary,
 )
-from polars_bigquery.core.compiler.ir.numeric import IntLiteral
 from polars_bigquery.core.compiler.parser.base import (
     UNSUPPORTED_RECORD,
     ParseRecord,
@@ -109,37 +109,23 @@ def parse_fill_null(spec: Any, expr_json: Any) -> ParseRecord:
     return parse_binary_function(expr_json, FillNull, func_spec=spec)
 
 
-_FILL_NULL_STRATEGY_VALUES: Mapping[str, int] = {
-    "Zero": 0,
-    "One": 1,
-}
-
-
-def _construct_fill_null_with_strategy(fill_value: int, *, expr: Expr) -> FillNull:
-    """Construct a `FillNull(left=expr, right=IntLiteral(fill_value))` IR node for a Unary `ParseRecord`."""
-    return FillNull(left=expr, right=IntLiteral(value=fill_value))
-
-
 @register_parser("$.Function.function.FillNullWithStrategy")
 def parse_fill_null_with_strategy(spec: Any, expr_json: Any) -> ParseRecord:
-    """Parse a Polars `FillNullWithStrategy` Function node into an IR `FillNull` record.
+    """Parse a Polars `FillNullWithStrategy` Function node into a `FillNullWithStrategy` record.
 
     Only scalar constant strategies (`"Zero"` and `"One"`) are supported;
     analytical and aggregate strategies (`"Forward"`, `"Backward"`, `"Min"`,
     `"Max"`, `"Mean"`) cannot be evaluated per-row by the BigQuery Storage Read
     API and return `UNSUPPORTED_RECORD`.
     """
-    if not isinstance(spec, str) or spec not in _FILL_NULL_STRATEGY_VALUES:
+    if not isinstance(spec, str) or spec not in ("Zero", "One"):
         return UNSUPPORTED_RECORD
     inputs = extract_function_inputs(expr_json, require_unit_leaf=True)
     if inputs is None or len(inputs) != 1:
         return UNSUPPORTED_RECORD
     return ParseRecord(
         "Unary",
-        functools.partial(
-            _construct_fill_null_with_strategy,
-            _FILL_NULL_STRATEGY_VALUES[spec],
-        ),
+        functools.partial(FillNullWithStrategy, strategy=spec),
         (inputs[0],),
     )
 

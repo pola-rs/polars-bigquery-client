@@ -26,6 +26,7 @@ from polars_bigquery.core.compiler.ir.boolean import (
     Coalesce,
     DropNulls,
     FillNull,
+    FillNullWithStrategy,
     IsNotNull,
     IsNull,
     Not,
@@ -43,6 +44,7 @@ from polars_bigquery.core.compiler.ir.comparison import (
 )
 from polars_bigquery.core.compiler.ir.list_ import IsIn, ListLiteral
 from polars_bigquery.core.compiler.ir.numeric import (
+    DecimalLiteral,
     FloatLiteral,
     IntLiteral,
     IsFinite,
@@ -51,6 +53,7 @@ from polars_bigquery.core.compiler.ir.numeric import (
     IsNotNan,
 )
 from polars_bigquery.core.compiler.ir.string import (
+    BytesLiteral,
     Contains,
     EndsWith,
     Lowercase,
@@ -60,6 +63,7 @@ from polars_bigquery.core.compiler.ir.string import (
 )
 from polars_bigquery.core.compiler.ir.temporal import (
     DateLiteral,
+    TimeLiteral,
     TimestampLiteral,
     TimestampUnit,
 )
@@ -68,15 +72,18 @@ __all__ = [
     "And",
     "BinaryExpr",
     "BoolLiteral",
+    "BytesLiteral",
     "Coalesce",
     "Column",
     "Contains",
     "DateLiteral",
+    "DecimalLiteral",
     "DropNulls",
     "EndsWith",
     "Eq",
     "Expr",
     "FillNull",
+    "FillNullWithStrategy",
     "FloatLiteral",
     "Gt",
     "GtEq",
@@ -101,6 +108,7 @@ __all__ = [
     "StringLiteral",
     "Ternary",
     "TernaryExpr",
+    "TimeLiteral",
     "TimestampLiteral",
     "TimestampUnit",
     "UnaryExpr",

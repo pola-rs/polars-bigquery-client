@@ -4,9 +4,13 @@ from typing import Any, Self
 class BigQueryError(RuntimeError):
     """Error raised when a BigQuery API request, stream, or query job fails or times out."""
 
+class UnsupportedTypeError(BigQueryError):
+    """Error raised when a BigQuery schema contains a data type that cannot be decoded or exported over FFI."""
+
 class ArrowStreamExporter:
     """Bridge exporting BigQuery Arrow record batches via the Arrow C Stream interface."""
 
+    def close(self) -> None: ...
     def __arrow_c_stream__(self, requested_schema: Any = None) -> Any: ...
 
 class BigQueryTableId:
@@ -46,6 +50,7 @@ class Client:
         user_agent: str | None = None,
         bq_endpoint: str | None = None,
         bqstorage_endpoint: str | None = None,
+        preserve_datetime_extension: bool = False,
     ) -> None: ...
     def close(self) -> None: ...
     @property

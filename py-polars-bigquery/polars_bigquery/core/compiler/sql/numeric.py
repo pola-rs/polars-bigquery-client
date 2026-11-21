@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import math
+import re
 
 from polars_bigquery.core.compiler.ir.numeric import (
+    DecimalLiteral,
     FloatLiteral,
     IntLiteral,
     IsFinite,
@@ -14,6 +16,8 @@ from polars_bigquery.core.compiler.sql.base import (
     format_operator_sql,
     literal_ir_to_sql,
 )
+
+_DECIMAL_LITERAL_RE = re.compile(r"[+-]?[0-9]+(?:\.[0-9]+)?")
 
 
 @literal_ir_to_sql.register
@@ -30,6 +34,18 @@ def format_float_literal(node: FloatLiteral) -> str:
     if math.isinf(node.value):
         return "CAST('-inf' AS FLOAT64)" if node.value < 0 else "CAST('inf' AS FLOAT64)"
     return repr(node.value)
+
+
+@literal_ir_to_sql.register
+def format_decimal_literal(node: DecimalLiteral) -> str:
+    """Format a DecimalLiteral IR node as a BigQuery SQL NUMERIC literal."""
+    if (
+        not isinstance(node.value, str)
+        or _DECIMAL_LITERAL_RE.fullmatch(node.value) is None
+    ):
+        msg = f"Invalid DecimalLiteral value {node.value!r}."
+        raise ValueError(msg)
+    return f"NUMERIC '{node.value}'"
 
 
 @format_operator_sql.register

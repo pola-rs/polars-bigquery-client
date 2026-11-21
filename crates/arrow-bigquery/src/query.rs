@@ -652,7 +652,10 @@ impl<'a> Query<'a> {
         match (first_page_bytes, stream_name) {
             (None, None) => {
                 if let Some(serialized_schema) = serialized_schema {
-                    let metadata = crate::decode::parse_arrow_schema(&serialized_schema)?;
+                    let metadata = crate::decode::parse_arrow_schema_with_options(
+                        &serialized_schema,
+                        self.client.schema_decode_options(),
+                    )?;
                     return Ok((Arc::new(metadata.schema), empty_receiver()));
                 }
                 extract_required_job_reference(&response)?;
@@ -674,7 +677,10 @@ impl<'a> Query<'a> {
                         "QueryResponse is missing Arrow schema".into(),
                     ));
                 };
-                let metadata = crate::decode::parse_arrow_schema(&serialized_schema)?;
+                let metadata = crate::decode::parse_arrow_schema_with_options(
+                    &serialized_schema,
+                    self.client.schema_decode_options(),
+                )?;
                 let read_rows = stream_name.map(|name| {
                     self.client.prepare_read_rows(
                         name,
@@ -753,7 +759,10 @@ impl<'a> Query<'a> {
                 },
             )
             .await?;
-        let metadata = crate::decode::parse_arrow_schema(&serialized_schema)?;
+        let metadata = crate::decode::parse_arrow_schema_with_options(
+            &serialized_schema,
+            self.client.schema_decode_options(),
+        )?;
         Ok((Arc::new(metadata.schema), empty_receiver()))
     }
 

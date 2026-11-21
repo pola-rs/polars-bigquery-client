@@ -1,6 +1,8 @@
 from __future__ import annotations
 
-from collections.abc import Iterator, Mapping
+import logging
+import warnings
+from collections.abc import Iterator, Mapping, Sequence
 from typing import Any
 
 import arrow_bigquery
@@ -10,8 +12,59 @@ import polars.io.plugins
 from polars.datatypes import DataType, DataTypeClass
 
 import polars_bigquery.core.schema
+import polars_bigquery.core.types
 import polars_bigquery.core.version
+import polars_bigquery.exceptions
 from polars_bigquery.core import bigquery_rest, compiler
+
+logger = logging.getLogger(__name__)
+
+_MAX_SKIPPED_COLUMNS_DISPLAY = 5
+# Cap `read_table` fanout to a single stream when Polars pushes a small row
+# limit (`n_rows`), avoiding spinning up `available_parallelism()` parallel gRPC
+# streams and prefetch buffers only to discard nearly all rows.
+_SINGLE_STREAM_ROW_LIMIT = 10_000
+
+
+def _format_skipped_columns(
+    skipped_columns: Sequence[polars_bigquery.core.schema.SkippedColumn],
+) -> str:
+    """Format omitted top-level columns with reasons/paths, capped at 5 entries."""
+    entries = [
+        f"{col.name} ({col.reason})"
+        if col.path == col.name
+        else f"{col.name} ({col.reason} at {col.path})"
+        for col in skipped_columns[:_MAX_SKIPPED_COLUMNS_DISPLAY]
+    ]
+    if len(skipped_columns) > _MAX_SKIPPED_COLUMNS_DISPLAY:
+        entries.append(
+            f"... and {len(skipped_columns) - _MAX_SKIPPED_COLUMNS_DISPLAY} more"
+        )
+    return ", ".join(entries)
+
+
+def _drop_columns_iter(batches: Iterator[pl.DataFrame]) -> Iterator[pl.DataFrame]:
+    """Yield height-preserving zero-width frames and close the iterator if supported.
+
+    Note: Polars 2.x's ``_CollectBatches`` iterator does not expose a ``.close()``
+    method; its underlying native stream is released when this generator finishes
+    or is garbage-collected. Calling ``.close()`` when present ensures prompt
+    cleanup for generator-backed or custom iterators.
+    """
+    try:
+        for batch in batches:
+            yield batch.drop(batch.columns)
+    finally:
+        close = getattr(batches, "close", None)
+        if callable(close):
+            close()
+
+
+def _close_exporter(exporter: Any) -> None:
+    """Close an `ArrowStreamExporter` immediately when supported to abort background streams."""
+    close = getattr(exporter, "close", None)
+    if callable(close):
+        close()
 
 
 def _get_user_agent(user_agent: str | None) -> str:
@@ -80,11 +133,15 @@ class Client:
             credentials_provider=credentials_provider,
             user_agent=self._user_agent,
         )
-        self._arrow_client = arrow_bigquery.Client(
-            quota_project_id=quota_project_id,
-            credentials_provider=credentials_provider,
-            user_agent=self._user_agent,
-        )
+        try:
+            self._arrow_client = arrow_bigquery.Client(
+                quota_project_id=quota_project_id,
+                credentials_provider=credentials_provider,
+                user_agent=self._user_agent,
+            )
+        except BaseException:
+            self._rest_client.close()
+            raise
 
     def close(self) -> None:
         """Close underlying REST session resources."""
@@ -117,6 +174,16 @@ class Client:
         Reads the entire table directly via the BigQuery Storage Read API. For
         projection and filter pushdown, prefer [`Client.scan_table`][polars_bigquery.Client.scan_table].
 
+        Unlike [`Client.scan_table`][polars_bigquery.Client.scan_table] (which
+        omits unsupported BigQuery columns with an
+        [`UnsupportedTypeWarning`][polars_bigquery.exceptions.UnsupportedTypeWarning]),
+        `read_table` streams all table columns directly from the Storage Read
+        API. Tables containing BigQuery `INTERVAL` or `BIGNUMERIC` columns fail
+        immediately with [`UnsupportedTypeError`][polars_bigquery.exceptions.UnsupportedTypeError]
+        (a subclass of [`BigQueryError`][polars_bigquery.exceptions.BigQueryError])
+        before Arrow decoding / FFI export. See [Data types](data-types.md) for the complete mapping and
+        [`Client.read_query`][polars_bigquery.Client.read_query] workarounds.
+
         Parameters
         ----------
         table
@@ -134,6 +201,15 @@ class Client:
         pl.DataFrame
             A Polars `DataFrame` containing the table data.
 
+        Raises
+        ------
+        polars_bigquery.exceptions.UnsupportedTypeError
+            If the table contains an Arrow data type that cannot be decoded or
+            exported over Arrow C Data Interface FFI (such as BigQuery
+            `INTERVAL` or `BIGNUMERIC`).
+        polars_bigquery.exceptions.BigQueryError
+            If the Storage Read API call fails.
+
         Examples
         --------
         ```python
@@ -145,7 +221,11 @@ class Client:
             table_ref,
             maintain_order=maintain_order,
         )
-        return pl.DataFrame(arrow_stream_exporter)
+        try:
+            return pl.DataFrame(arrow_stream_exporter)
+        except BaseException:
+            _close_exporter(arrow_stream_exporter)
+            raise
 
     def read_query(
         self,
@@ -219,7 +299,11 @@ class Client:
             maintain_order=maintain_order,
             use_query_cache=use_query_cache,
         )
-        return pl.DataFrame(arrow_stream_exporter)
+        try:
+            return pl.DataFrame(arrow_stream_exporter)
+        except BaseException:
+            _close_exporter(arrow_stream_exporter)
+            raise
 
     def scan_table(
         self,
@@ -235,15 +319,26 @@ class Client:
         execution (`.collect()` or `.collect_batches()`).
 
         Supports both **projection pushdown** (only reading referenced columns)
-        and **row predicate pushdown** (translating `.filter()` expressions into
-        BigQuery Storage Read API `row_restriction` SQL clauses). See the
-        [Row predicate pushdown](predicate-pushdown.md) page for the complete
-        list of supported Polars expressions and data types.
+        and **schema-aware row predicate pushdown** (translating `.filter()`
+        expressions into BigQuery Storage Read API `row_restriction` SQL
+        clauses). See [Data types](data-types.md) for the BigQuery-to-Polars
+        schema mapping (including `TIMESTAMP` `"UTC"`, `JSON`/`GEOGRAPHY`
+        extension types, and unsupported columns) and
+        [Row predicate pushdown](predicate-pushdown.md) for the supported
+        expressions per type.
 
-        For ingestion-time partitioned tables, `_PARTITIONDATE` (`pl.Date`) and
-        `_PARTITIONTIME` (`pl.Datetime("us", "utc")`) pseudo-columns are
-        automatically added to the `LazyFrame` schema when `schema` is not
-        provided, so partition pruning filters can be pushed down.
+        When `schema` is `None`, top-level columns whose type (or any nested
+        `STRUCT`/`ARRAY` subfield) is unsupported (`BIGNUMERIC`, `INTERVAL`,
+        `RANGE<T>`, picosecond `TIMESTAMP`, or empty/unnamed/duplicate `STRUCT`)
+        are omitted with an
+        [`UnsupportedTypeWarning`][polars_bigquery.exceptions.UnsupportedTypeWarning],
+        rather than failing the entire scan as [`Client.read_table`][polars_bigquery.Client.read_table]
+        can.
+
+        For ingestion-time partitioned tables, `_PARTITIONTIME`
+        (`pl.Datetime("us", "UTC")`) is always added to the `LazyFrame` schema
+        when `schema` is `None`; `_PARTITIONDATE` (`pl.Date`) is additionally
+        added when the table uses daily (`DAY`) partitioning.
 
         Parameters
         ----------
@@ -257,25 +352,46 @@ class Client:
             to Polars data types) for the table. When provided, `scan_table`
             avoids calling the BigQuery `tables.get` REST API to fetch table
             metadata. For ingestion-time partitioned tables, include
-            `"_PARTITIONDATE": pl.Date` and/or
-            `"_PARTITIONTIME": pl.Datetime("us", "utc")` in `schema` if you want
-            to filter or select those pseudo-columns.
+            `"_PARTITIONTIME": pl.Datetime("us", "UTC")` and (for `DAY`
+            partitions) `"_PARTITIONDATE": pl.Date` in `schema` if you want to
+            filter or select those pseudo-columns. For `JSON` and `GEOGRAPHY`
+            columns, use [`polars_bigquery.dtypes.JSON`][polars_bigquery.dtypes.JSON]
+            and [`polars_bigquery.dtypes.GEOGRAPHY`][polars_bigquery.dtypes.GEOGRAPHY]
+            (or a registered `polars.BaseExtension` subclass). Loading
+            extension types as plain storage (`as_storage=True` or
+            `POLARS_UNKNOWN_EXTENSION_TYPE_BEHAVIOR=load_as_storage`) is not
+            supported with an explicit `schema` because `pl.String` cannot be
+            distinguished from BigQuery `STRING` without table metadata.
+            Passing an empty mapping (`schema={}`) skips both `tables.get` and
+            `CreateReadSession`, yielding an empty 0-row, 0-column `DataFrame`.
 
         Returns
         -------
         pl.LazyFrame
             A Polars `LazyFrame` backed by the BigQuery Storage Read API.
 
+        Warns
+        -----
+        polars_bigquery.exceptions.UnsupportedTypeWarning
+            If `schema` is `None` and one or more unsupported columns are
+            omitted while at least one supported column (or partition
+            pseudo-column) remains.
+
         Raises
         ------
         polars_bigquery.exceptions.BigQueryError
-            If `schema` is `None` and fetching the table metadata from the
-            BigQuery REST API fails.
+            If `schema` is `None` and fetching table metadata from the BigQuery
+            REST API fails or returns malformed schema/partition metadata, or if
+            reading from the Storage Read API fails during collection.
+        ValueError
+            If `schema` is `None` and a non-empty table has zero supported
+            columns remaining after omitting unsupported columns.
 
         Examples
         --------
         ```python
         import polars as pl
+        import polars_bigquery
 
         lf = client.scan_table("bigquery-public-data.usa_names.usa_1910_2013")
         df = (
@@ -283,18 +399,60 @@ class Client:
             .select(["name", "state", "year", "number"])
             .collect()
         )
+
+        # Skip the tables.get metadata call with an explicit schema:
+        lf_typed = client.scan_table(
+            "my-project.my_dataset.events",
+            schema={
+                "ts": pl.Datetime("us", "UTC"),
+                "payload": polars_bigquery.dtypes.JSON,
+                "location": polars_bigquery.dtypes.GEOGRAPHY,
+            },
+        )
         ```
         """
         table_ref = arrow_bigquery.api.resources.parse_table_id(table)
+        bq_types: Mapping[str, polars_bigquery.core.types.BQType] | None
         if schema is None:
             table_metadata = self._rest_client.get_table_metadata(table_ref)
-            polars_schema = polars_bigquery.core.schema.extract_polars_schema(
-                table_metadata
-            )
+            try:
+                extracted = polars_bigquery.core.schema.extract_schema_metadata(
+                    table_metadata
+                )
+            except (TypeError, ValueError) as exc:
+                msg = f"Invalid BigQuery table metadata for '{table_ref}': {exc}"
+                raise polars_bigquery.exceptions.BigQueryError(msg) from exc
+            polars_schema = extracted.polars_schema
+            bq_types = extracted.bq_types
+            if extracted.skipped_columns:
+                skipped_summary = _format_skipped_columns(extracted.skipped_columns)
+                if len(polars_schema) == 0:
+                    msg = (
+                        f"Table '{table_ref}' has no supported columns to scan. "
+                        f"Skipped {len(extracted.skipped_columns)} unsupported "
+                        f"column(s): {skipped_summary}. "
+                        "Use client.read_query() to cast or exclude unsupported "
+                        "columns in SQL."
+                    )
+                    raise ValueError(msg)
+                logger.debug(
+                    "Omitting %d unsupported column(s) from table '%s': %s",
+                    len(extracted.skipped_columns),
+                    table_ref,
+                    skipped_summary,
+                )
+                warnings.warn(
+                    f"Skipping {len(extracted.skipped_columns)} unsupported column(s) "
+                    f"in table '{table_ref}': {skipped_summary}. "
+                    "Use client.read_query() to cast or select these columns in SQL.",
+                    polars_bigquery.exceptions.UnsupportedTypeWarning,
+                    stacklevel=2,
+                )
         else:
             polars_schema = (
                 schema if isinstance(schema, pl.Schema) else pl.Schema(schema)
             )
+            bq_types = None
 
         def source_generator(
             with_columns: list[str] | None,
@@ -302,6 +460,17 @@ class Client:
             n_rows: int | None,
             batch_size: int | None,
         ) -> Iterator[pl.DataFrame]:
+            # Explicit empty `schema={}` is treated identically to a 0-column table:
+            # short-circuit without calling `CreateReadSession` (BigQuery rejects empty
+            # schemas with FAILED_PRECONDITION).
+            if len(polars_schema) == 0:
+                logger.debug(
+                    "Short-circuiting empty schema scan for table '%s' without "
+                    "CreateReadSession",
+                    table_ref,
+                )
+                return iter([pl.DataFrame(schema=polars_schema)])
+
             columns = (
                 with_columns if with_columns is not None else list(polars_schema.keys())
             )
@@ -309,28 +478,69 @@ class Client:
                 predicate.meta.root_names() if predicate is not None else []
             )
             selected_fields = list(dict.fromkeys([*columns, *predicate_cols]))
+            if not selected_fields:
+                narrowest_col = min(
+                    polars_schema.items(),
+                    key=lambda item: polars_bigquery.core.types.column_width_rank(
+                        item[1],
+                        bq_type=bq_types.get(item[0]) if bq_types is not None else None,
+                    ),
+                )[0]
+                selected_fields = [narrowest_col]
 
-            arrow_stream_exporter = self._arrow_client.read_table(
-                table_ref,
-                maintain_order=False,
-                selected_fields=selected_fields,
-                row_restriction=compiler.predicate_to_row_restriction(
-                    predicate=predicate
+            row_restriction = (
+                compiler.predicate_to_row_restriction(
+                    predicate=predicate,
+                    schema=polars_schema,
+                    bq_types=bq_types,
                 )
                 if predicate is not None
-                else "",
+                else ""
             )
-            lazyframe = pl.scan_arrow_c_stream(arrow_stream_exporter)
+            logger.debug(
+                "Reading BigQuery table '%s' with selected_fields=%r, "
+                "row_restriction=%r",
+                table_ref,
+                selected_fields,
+                row_restriction,
+            )
 
-            if predicate is not None:
-                lazyframe = lazyframe.filter(predicate)
+            # Note: even when `row_restriction == "FALSE"` (e.g. `int_col.is_nan()`),
+            # we intentionally open a Storage Read API session so server-side table
+            # existence and IAM authorization errors surface consistently.
+            read_kwargs: dict[str, Any] = {
+                "maintain_order": False,
+                "selected_fields": selected_fields,
+                "row_restriction": row_restriction,
+            }
+            if (
+                predicate is None
+                and n_rows is not None
+                and n_rows <= _SINGLE_STREAM_ROW_LIMIT
+            ):
+                read_kwargs["max_stream_count"] = 1
+            arrow_stream_exporter = self._arrow_client.read_table(
+                table_ref,
+                **read_kwargs,
+            )
+            try:
+                lazyframe = pl.scan_arrow_c_stream(arrow_stream_exporter)
 
-            lazyframe = lazyframe.select(columns)
+                if predicate is not None:
+                    lazyframe = lazyframe.filter(predicate)
 
-            if n_rows is not None:
-                lazyframe = lazyframe.limit(n_rows)
+                if n_rows is not None:
+                    lazyframe = lazyframe.limit(n_rows)
 
-            return lazyframe.collect_batches(chunk_size=batch_size)
+                if columns == []:
+                    return _drop_columns_iter(
+                        lazyframe.collect_batches(chunk_size=batch_size)
+                    )
+
+                return lazyframe.select(columns).collect_batches(chunk_size=batch_size)
+            except BaseException:
+                _close_exporter(arrow_stream_exporter)
+                raise
 
         return polars.io.plugins.register_io_source(
             io_source=source_generator,

@@ -35,6 +35,7 @@ from polars_bigquery.core.compiler.parser.temporal import (
     parse_ticks_and_unit,
     parse_timezone,
 )
+from polars_bigquery.core.types import FLOAT_DTYPE_CLASSES, INT_DTYPE_CLASSES
 
 MAX_IN_LIST_ELEMENTS = 10_000
 MAX_IPC_BYTES = 1_048_576
@@ -42,7 +43,6 @@ MAX_IPC_BYTES = 1_048_576
 _DATETIME_UNIT_NAMES: dict[str, str] = {
     "us": "Microseconds",
     "ms": "Milliseconds",
-    "ns": "Nanoseconds",
 }
 
 
@@ -90,7 +90,7 @@ def parse_ipc_series_to_list_literal(raw_bytes: bytes) -> Expr:
     if series.null_count() > 0:
         return Unsupported()
 
-    if series.dtype.is_integer():
+    if isinstance(series.dtype, INT_DTYPE_CLASSES):
         min_val = series.min()
         max_val = series.max()
         if (
@@ -101,7 +101,7 @@ def parse_ipc_series_to_list_literal(raw_bytes: bytes) -> Expr:
         ):
             return Unsupported()
         return ListLiteral(values=tuple(IntLiteral(value=v) for v in series.to_list()))
-    if series.dtype.is_float():
+    if isinstance(series.dtype, FLOAT_DTYPE_CLASSES):
         if series.is_nan().any():
             return Unsupported()
         return ListLiteral(

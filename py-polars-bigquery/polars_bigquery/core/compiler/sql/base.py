@@ -65,7 +65,7 @@ def _is_valid_column_character(ch: str) -> bool:
     return (
         _is_allowed_unicode_category(ch)
         or ch in _ALLOWED_FLEXIBLE_SPECIAL_CHARS
-        or ch.isspace()
+        or unicodedata.category(ch) == "Zs"
     )
 
 

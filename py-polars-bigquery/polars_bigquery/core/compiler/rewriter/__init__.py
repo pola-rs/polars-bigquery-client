@@ -9,12 +9,14 @@ from polars_bigquery.core.compiler.rewriter.boolean import (
     rewrite_boolean_literals,
     rewrite_boolean_when,
     rewrite_de_morgan,
-    rewrite_drop_nulls,
     rewrite_when,
 )
 
 _REWRITERS: tuple[RewriterFunc, ...] = (
-    rewrite_drop_nulls,
+    # Note: `DropNulls` is intentionally degraded to `Unsupported()` in `typing/`
+    # rather than rewritten here: Polars `drop_nulls()` shrinks Series length and
+    # broadcasts length-1 results across null rows, so hoisting `IS NOT NULL` can
+    # drop matching rows and suppress Polars `ShapeError`.
     rewrite_boolean_when,
     rewrite_boolean_literals,
     rewrite_when,

@@ -10,6 +10,7 @@ pub mod query;
 use std::sync::Arc;
 
 pub use client_builder::*;
+pub use decode::{validate_ffi_schema, SchemaDecodeOptions};
 pub use error::{BigQueryError, JobError, JobFailedError};
 pub use google_cloud_bigquery::model::arrow_serialization_options::CompressionCodec;
 use google_cloud_bigquery::model::{
@@ -478,6 +479,7 @@ pub struct Client {
     user_agent: Option<Arc<str>>,
     retry_throttler: SharedRetryThrottler,
     retry_config: bigquery_read_retry::StreamRetryConfig,
+    decode_options: SchemaDecodeOptions,
     cancel_pool: job_cancel::JobCancelPool,
 }
 
@@ -490,12 +492,31 @@ impl Client {
         ServiceConfigBuilder::new()
     }
 
+    #[cfg(any(test, feature = "testing"))]
     pub(crate) fn from_parts(
         bq_client: BigQueryJobService,
         read_client: BigQueryReadClient,
         quota_project_id: String,
         user_agent: Option<String>,
         retry_throttler: SharedRetryThrottler,
+    ) -> Self {
+        Self::from_parts_with_options(
+            bq_client,
+            read_client,
+            quota_project_id,
+            user_agent,
+            retry_throttler,
+            SchemaDecodeOptions::default(),
+        )
+    }
+
+    pub(crate) fn from_parts_with_options(
+        bq_client: BigQueryJobService,
+        read_client: BigQueryReadClient,
+        quota_project_id: String,
+        user_agent: Option<String>,
+        retry_throttler: SharedRetryThrottler,
+        decode_options: SchemaDecodeOptions,
     ) -> Self {
         // Always attach the Client-wide shared retry throttler so all stream readers
         // share a unified adaptive retry budget instead of isolated per-stream defaults.
@@ -508,8 +529,13 @@ impl Client {
             user_agent: user_agent.map(Arc::from),
             retry_throttler,
             retry_config,
+            decode_options,
             cancel_pool: job_cancel::JobCancelPool::new(),
         }
+    }
+
+    pub(crate) fn schema_decode_options(&self) -> SchemaDecodeOptions {
+        self.decode_options
     }
 
     /// Creates a client for testing purposes.
@@ -621,6 +647,7 @@ impl Client {
                 maintain_order,
                 cancel_tx: Arc::clone(&cancel_tx),
                 cancel_rx,
+                schema_decode_options: self.schema_decode_options(),
             },
         ));
         BigQueryRecordBatchReceiver::new(rx, Some(cancel_tx), vec![handle])
@@ -676,7 +703,11 @@ impl Client {
     ) -> Result<(ArrowSchemaRef, Vec<bigquery_read_stream::ReadStreamOptions>), BigQueryError> {
         let maintain_order = options.maintain_order;
         let (schema, streams) = self.create_table_read_session(table, options).await?;
-        let metadata = Arc::new(decode::parse_arrow_schema(&schema)?);
+        let decode_options = self.schema_decode_options();
+        let metadata = Arc::new(decode::parse_arrow_schema_with_options(
+            &schema,
+            decode_options,
+        )?);
         let schema_ref = Arc::new(metadata.schema.clone());
         let retry_config = self.stream_retry_config();
         let stream_options = streams
@@ -692,6 +723,7 @@ impl Client {
                 maintain_order,
                 cancel_tx: Arc::clone(cancel_tx),
                 cancel_rx: cancel_rx.clone(),
+                schema_decode_options: decode_options,
             })
             .collect();
         Ok((schema_ref, stream_options))
@@ -783,9 +815,13 @@ impl Client {
             query::DestinationTableRead,
         )>,
     ) -> Result<(Option<ArrowSchemaRef>, BigQueryRecordBatchReceiver), BigQueryError> {
+        let decode_options = self.schema_decode_options();
         let (metadata, schema_ref, schema_tx, schema_rx) = match &options.schema {
             Some(schema) => {
-                let metadata = Arc::new(decode::parse_arrow_schema(schema)?);
+                let metadata = Arc::new(decode::parse_arrow_schema_with_options(
+                    schema,
+                    decode_options,
+                )?);
                 let schema_ref = Arc::new(metadata.schema.clone());
                 (Some(metadata), Some(schema_ref), None, None)
             },
@@ -822,6 +858,7 @@ impl Client {
                     maintain_order,
                     cancel_tx: Arc::clone(&task_cancel_tx),
                     cancel_rx: cancel_rx.clone(),
+                    schema_decode_options: decode_options,
                 })
                 .await;
 

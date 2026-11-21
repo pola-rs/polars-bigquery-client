@@ -1,14 +1,22 @@
-from datetime import date
+import warnings
+from datetime import date, datetime, timezone
 from unittest.mock import MagicMock, patch
 
 import arrow_bigquery
 import polars as pl
+import polars_bigquery
 import pytest
 from polars_bigquery import (
     Client,
     __version__,
 )
 from polars_bigquery._read_bigquery import _get_user_agent
+from polars_bigquery.core.types import (
+    GEOGRAPHY_EXTENSION_METADATA,
+    GEOGRAPHY_EXTENSION_NAME,
+    JSON_EXTENSION_NAME,
+)
+from polars_bigquery.exceptions import BigQueryError, UnsupportedTypeWarning
 
 
 @pytest.fixture
@@ -503,6 +511,506 @@ def test_client_read_query_dry_run_returns_polars_dataframe():
     assert df["statementType"].to_list() == ["SELECT"]
 
 
+@pytest.mark.parametrize("dry_run", [False, True])
+def test_client_read_query_invalid_sql_raises_polars_bigquery_error(dry_run):
+    import json
+    import threading
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self):
+            length = int(self.headers.get("Content-Length", "0"))
+            _ = self.rfile.read(length)
+            payload = json.dumps(
+                {
+                    "error": {
+                        "code": 400,
+                        "message": 'Syntax error: Unexpected identifier "BROKEN"',
+                        "status": "INVALID_ARGUMENT",
+                    }
+                }
+            ).encode("utf-8")
+            self.send_response(400)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+        def log_message(self, format, *args):
+            pass
+
+    server = HTTPServer(("127.0.0.1", 0), Handler)
+    port = server.server_port
+    server_thread = threading.Thread(target=server.handle_request)
+    server_thread.start()
+
+    try:
+
+        def creds():
+            return ({"bearer_token": "fake-tok"}, None)
+
+        with Client(quota_project_id="test-proj", credentials_provider=creds) as client:
+            client._arrow_client = arrow_bigquery.Client(
+                quota_project_id="test-proj",
+                credentials_provider=creds,
+                bq_endpoint=f"http://127.0.0.1:{port}",
+            )
+            with pytest.raises(BigQueryError, match="Syntax error"):
+                client.read_query("SELECT BROKEN", dry_run=dry_run)
+    finally:
+        server_thread.join()
+        server.server_close()
+
+
+class _FakeArrowStreamExporter:
+    """Single-use Arrow C Stream exporter backed by a real Polars DataFrame."""
+
+    def __init__(self, df: pl.DataFrame) -> None:
+        self._df = df
+
+    def __arrow_c_stream__(self, requested_schema=None):
+        return self._df.__arrow_c_stream__(requested_schema=requested_schema)
+
+
+def test_scan_table_emits_unsupported_type_warning_and_formats_paths(mock_arrow_client):
+    metadata = {
+        "schema": {
+            "fields": [
+                {"name": "id", "type": "INT64"},
+                {"name": "dur", "type": "INTERVAL"},
+                {
+                    "name": "meta",
+                    "type": "STRUCT",
+                    "fields": [
+                        {"name": "ok", "type": "INT64"},
+                        {"name": "bad", "type": "BIGNUMERIC"},
+                    ],
+                },
+            ]
+        }
+    }
+    with patch(
+        "polars_bigquery.core.bigquery_rest.get_table_metadata", return_value=metadata
+    ):
+        client = Client(quota_project_id="q")
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            lf = client.scan_table("p.d.t")
+
+    assert lf.collect_schema() == pl.Schema({"id": pl.Int64()})
+    assert len(caught) == 1
+    w = caught[0]
+    assert issubclass(w.category, UnsupportedTypeWarning)
+    assert w.filename == __file__
+    msg = str(w.message)
+    assert "Skipping 2 unsupported column(s)" in msg
+    assert "dur (INTERVAL)" in msg
+    assert "meta (BIGNUMERIC at meta.bad)" in msg
+    assert "client.read_query()" in msg
+
+
+def test_scan_table_unsupported_type_warning_caps_at_five_entries(mock_arrow_client):
+    metadata = {
+        "schema": {
+            "fields": [
+                {"name": "id", "type": "INT64"},
+                *[{"name": f"bad_{i}", "type": "INTERVAL"} for i in range(7)],
+            ]
+        }
+    }
+    with patch(
+        "polars_bigquery.core.bigquery_rest.get_table_metadata", return_value=metadata
+    ):
+        client = Client(quota_project_id="q")
+        with pytest.warns(UnsupportedTypeWarning) as record:
+            lf = client.scan_table("p.d.t")
+
+    assert lf.collect_schema() == pl.Schema({"id": pl.Int64()})
+    msg = str(record[0].message)
+    assert "Skipping 7 unsupported column(s)" in msg
+    for i in range(5):
+        assert f"bad_{i} (INTERVAL)" in msg
+    assert "bad_5" not in msg
+    assert "... and 2 more" in msg
+    assert "client.read_query()" in msg
+
+
+def test_scan_table_all_unsupported_non_partitioned_raises_value_error_without_warning(
+    mock_arrow_client,
+):
+    metadata = {
+        "schema": {
+            "fields": [
+                {"name": "dur", "type": "INTERVAL"},
+                {"name": "amt", "type": "BIGNUMERIC"},
+            ]
+        }
+    }
+    with patch(
+        "polars_bigquery.core.bigquery_rest.get_table_metadata", return_value=metadata
+    ):
+        client = Client(quota_project_id="q")
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            with pytest.raises(
+                ValueError, match="has no supported columns to scan"
+            ) as exc_info:
+                client.scan_table("p.d.t")
+
+    assert caught == []
+    msg = str(exc_info.value)
+    assert "dur (INTERVAL)" in msg
+    assert "amt (BIGNUMERIC)" in msg
+    assert "client.read_query()" in msg
+
+
+@pytest.mark.parametrize(
+    ("partition_type", "expected_cols", "expected_fallback_field"),
+    [
+        ("DAY", ["_PARTITIONDATE", "_PARTITIONTIME"], "_PARTITIONDATE"),
+        ("HOUR", ["_PARTITIONTIME"], "_PARTITIONTIME"),
+    ],
+)
+def test_scan_table_all_unsupported_physical_retains_ingestion_partition_pseudo_columns(
+    mock_arrow_client, partition_type, expected_cols, expected_fallback_field
+):
+    metadata = {
+        "schema": {"fields": [{"name": "dur", "type": "INTERVAL"}]},
+        "timePartitioning": {"type": partition_type},
+    }
+    if expected_fallback_field == "_PARTITIONDATE":
+        stream_df = pl.DataFrame(
+            {"_PARTITIONDATE": [date(2024, 1, 1), date(2024, 1, 2)]}
+        )
+    else:
+        stream_df = pl.DataFrame(
+            {
+                "_PARTITIONTIME": pl.Series(
+                    [
+                        datetime(2024, 1, 1, 0, tzinfo=timezone.utc),
+                        datetime(2024, 1, 1, 1, tzinfo=timezone.utc),
+                    ],
+                    dtype=pl.Datetime("us", "UTC"),
+                )
+            }
+        )
+    mock_arrow_client.read_table.return_value = _FakeArrowStreamExporter(stream_df)
+
+    with patch(
+        "polars_bigquery.core.bigquery_rest.get_table_metadata", return_value=metadata
+    ):
+        client = Client(quota_project_id="q")
+        with pytest.warns(UnsupportedTypeWarning, match=r"dur \(INTERVAL\)"):
+            lf = client.scan_table("p.d.t")
+
+    assert lf.collect_schema().names() == expected_cols
+    count_df = lf.select(pl.len()).collect()
+    assert count_df.item() == 2
+    mock_arrow_client.read_table.assert_called_once_with(
+        arrow_bigquery.BigQueryTableId("p", "d", "t"),
+        maintain_order=False,
+        selected_fields=[expected_fallback_field],
+        row_restriction="",
+    )
+
+
+@pytest.mark.parametrize("use_explicit_schema", [False, True])
+def test_scan_table_empty_schema_short_circuits_without_read_table(
+    mock_arrow_client, use_explicit_schema
+):
+    with patch(
+        "polars_bigquery.core.bigquery_rest.get_table_metadata", return_value={}
+    ) as mock_get_metadata:
+        client = Client(quota_project_id="q")
+        lf = (
+            client.scan_table("p.d.t", schema={})
+            if use_explicit_schema
+            else client.scan_table("p.d.t")
+        )
+        assert lf.collect_schema() == pl.Schema({})
+        df = lf.collect()
+
+    assert df.shape == (0, 0)
+    mock_arrow_client.read_table.assert_not_called()
+    if use_explicit_schema:
+        mock_get_metadata.assert_not_called()
+    else:
+        mock_get_metadata.assert_called_once()
+
+
+def test_scan_table_zero_column_projection_picks_narrowest_column_and_preserves_height(
+    mock_arrow_client,
+):
+    metadata = {
+        "schema": {
+            "fields": [
+                {"name": "payload", "type": "STRING"},
+                {"name": "num", "type": "INT64"},
+                {"name": "dt", "type": "DATE"},
+                {"name": "flag", "type": "BOOL"},
+                {"name": "flag2", "type": "BOOL"},
+            ]
+        }
+    }
+    full_df = pl.DataFrame(
+        {
+            "payload": ["a", "b", "c", "d"],
+            "num": [1, 20, 30, 4],
+            "dt": [
+                date(2024, 1, 1),
+                date(2024, 1, 2),
+                date(2024, 1, 3),
+                date(2024, 1, 4),
+            ],
+            "flag": [True, False, True, True],
+            "flag2": [False, True, False, True],
+        }
+    )
+
+    def fake_read_table(table_ref, *, selected_fields, **kwargs):
+        return _FakeArrowStreamExporter(full_df.select(selected_fields))
+
+    mock_arrow_client.read_table.side_effect = fake_read_table
+
+    with (
+        patch(
+            "polars_bigquery.core.bigquery_rest.get_table_metadata",
+            return_value=metadata,
+        ),
+        patch(
+            "polars.io.plugins.register_io_source",
+            wraps=pl.io.plugins.register_io_source,
+        ) as mock_register,
+    ):
+        client = Client(quota_project_id="q")
+        lf = client.scan_table("p.d.t")
+        io_source = mock_register.call_args.kwargs["io_source"]
+
+        # 1. Direct zero-column invocation picks narrowest column (tie-broken to first BOOL: "flag")
+        #    and preserves row height without collapsing to 0 rows.
+        batches = list(io_source([], None, None, None))
+        assert sum(b.height for b in batches) == 4
+        assert all(b.width == 0 for b in batches)
+        assert mock_arrow_client.read_table.call_args_list[0].kwargs[
+            "selected_fields"
+        ] == ["flag"]
+
+        # 2. Direct zero-column invocation with n_rows limit preserves limited height.
+        limited_batches = list(io_source([], None, 2, None))
+        assert sum(b.height for b in limited_batches) == 2
+        assert all(b.width == 0 for b in limited_batches)
+        assert mock_arrow_client.read_table.call_args_list[1].kwargs[
+            "selected_fields"
+        ] == ["flag"]
+
+        # 3. Direct zero-column invocation with predicate selects only the predicate column.
+        filtered_batches = list(io_source([], pl.col("num") > 10, None, None))
+        assert sum(b.height for b in filtered_batches) == 2
+        assert all(b.width == 0 for b in filtered_batches)
+        assert mock_arrow_client.read_table.call_args_list[2].kwargs[
+            "selected_fields"
+        ] == ["num"]
+
+        # 4. End-to-end Polars LazyFrame row counts with limit and filter
+        assert lf.select(pl.len()).collect().item() == 4
+        assert lf.limit(2).select(pl.len()).collect().item() == 2
+        assert lf.filter(pl.col("num") > 10).select(pl.len()).collect().item() == 2
+
+
+def test_scan_table_non_mocked_arrow_c_stream_utc_and_extension_types(
+    mock_arrow_client, monkeypatch
+):
+    monkeypatch.delenv("POLARS_UNKNOWN_EXTENSION_TYPE_BEHAVIOR", raising=False)
+    metadata = {
+        "schema": {
+            "fields": [
+                {"name": "ts", "type": "TIMESTAMP"},
+                {"name": "j", "type": "JSON"},
+                {"name": "g", "type": "GEOGRAPHY"},
+                {"name": "j_arr", "type": "JSON", "mode": "REPEATED"},
+                {"name": "g_arr", "type": "GEOGRAPHY", "mode": "REPEATED"},
+            ]
+        }
+    }
+    json_arr_dtype = pl.Extension(JSON_EXTENSION_NAME, pl.List(pl.String()))
+    geo_arr_dtype = pl.Extension(
+        GEOGRAPHY_EXTENSION_NAME,
+        pl.List(pl.String()),
+        GEOGRAPHY_EXTENSION_METADATA,
+    )
+    source_df = pl.DataFrame(
+        {
+            "ts": pl.Series(
+                [datetime(2024, 6, 15, 12, 30, tzinfo=timezone.utc)],
+                dtype=pl.Datetime("us", "UTC"),
+            ),
+            "j": pl.Series(['{"k": 1}'], dtype=pl.String()).ext.to(
+                polars_bigquery.dtypes.JSON
+            ),
+            "g": pl.Series(["POINT(1 2)"], dtype=pl.String()).ext.to(
+                polars_bigquery.dtypes.GEOGRAPHY
+            ),
+            "j_arr": pl.Series(
+                [['{"a": 1}', "null"]], dtype=pl.List(pl.String())
+            ).ext.to(json_arr_dtype),
+            "g_arr": pl.Series([["POINT(0 0)"]], dtype=pl.List(pl.String())).ext.to(
+                geo_arr_dtype
+            ),
+        }
+    )
+    mock_arrow_client.read_table.return_value = _FakeArrowStreamExporter(source_df)
+
+    with patch(
+        "polars_bigquery.core.bigquery_rest.get_table_metadata", return_value=metadata
+    ):
+        client = Client(quota_project_id="q")
+        lf = client.scan_table("p.d.t")
+        assert lf.collect_schema() == source_df.schema
+        collected = lf.collect()
+
+    assert collected.schema == source_df.schema
+    assert collected.equals(source_df)
+
+
+def test_scan_table_explicit_schema_with_dtypes_and_mismatch_error(
+    mock_arrow_client, monkeypatch
+):
+    monkeypatch.delenv("POLARS_UNKNOWN_EXTENSION_TYPE_BEHAVIOR", raising=False)
+    source_df = pl.DataFrame(
+        {
+            "ts": pl.Series(
+                [datetime(2024, 6, 15, 12, 30, tzinfo=timezone.utc)],
+                dtype=pl.Datetime("us", "UTC"),
+            ),
+            "j": pl.Series(['{"k": 1}'], dtype=pl.String()).ext.to(
+                polars_bigquery.dtypes.JSON
+            ),
+            "g": pl.Series(["POINT(1 2)"], dtype=pl.String()).ext.to(
+                polars_bigquery.dtypes.GEOGRAPHY
+            ),
+        }
+    )
+
+    client = Client(quota_project_id="q")
+
+    # Matching explicit schema succeeds through real Arrow C stream FFI
+    mock_arrow_client.read_table.return_value = _FakeArrowStreamExporter(source_df)
+    lf_ok = client.scan_table(
+        "p.d.t",
+        schema={
+            "ts": pl.Datetime("us", "UTC"),
+            "j": polars_bigquery.dtypes.JSON,
+            "g": polars_bigquery.dtypes.GEOGRAPHY,
+        },
+    )
+    assert lf_ok.collect().equals(source_df)
+
+    # Mismatched explicit schema (plain pl.String for JSON) raises native Polars SchemaError
+    mock_arrow_client.read_table.return_value = _FakeArrowStreamExporter(
+        source_df.select("j")
+    )
+    lf_bad = client.scan_table("p.d.t", schema={"j": pl.String()})
+    with pytest.raises(pl.exceptions.SchemaError, match="google:sqlType:json"):
+        lf_bad.collect()
+
+
+def test_scan_table_threads_authoritative_bq_types_under_mode_b(
+    mock_arrow_client, monkeypatch
+):
+    monkeypatch.delenv("POLARS_UNKNOWN_EXTENSION_TYPE_BEHAVIOR", raising=False)
+    metadata = {
+        "schema": {
+            "fields": [
+                {"name": "id", "type": "INT64"},
+                {"name": "j", "type": "JSON"},
+            ]
+        }
+    }
+    full_df = pl.DataFrame({"id": [1, 2], "j": ['{"a": 1}', None]})
+    mock_arrow_client.read_table.side_effect = (
+        lambda table_ref, *, selected_fields, **kwargs: _FakeArrowStreamExporter(
+            full_df.select(selected_fields)
+        )
+    )
+
+    pl.register_extension_type(JSON_EXTENSION_NAME, as_storage=True)
+    try:
+        with patch(
+            "polars_bigquery.core.bigquery_rest.get_table_metadata",
+            return_value=metadata,
+        ):
+            client = Client(quota_project_id="q")
+            lf = client.scan_table("p.d.t")
+
+            # Under Mode B, j is pl.String in polars_schema, yet bq_types keeps it JSON
+            assert lf.collect_schema() == pl.Schema(
+                {"id": pl.Int64(), "j": pl.String()}
+            )
+
+            # String method on JSON column must NOT push down STARTS_WITH to BigQuery,
+            # while sibling INT64 filter still pushes down cleanly.
+            df = lf.filter(
+                pl.col("j").str.starts_with("{") & (pl.col("id") == 1)
+            ).collect()
+            assert df.to_dict(as_series=False) == {"id": [1], "j": ['{"a": 1}']}
+            assert (
+                mock_arrow_client.read_table.call_args_list[0].kwargs["row_restriction"]
+                == "(`id` = 1)"
+            )
+
+            # Null check on JSON column pushes down even under Mode B
+            df_nn = lf.filter(pl.col("j").is_not_null()).collect()
+            assert df_nn.height == 1
+            assert (
+                mock_arrow_client.read_table.call_args_list[1].kwargs["row_restriction"]
+                == "(`j` IS NOT NULL)"
+            )
+    finally:
+        pl.unregister_extension_type(JSON_EXTENSION_NAME)
+
+
+def test_scan_table_explicit_schema_derives_compiler_types(
+    mock_arrow_client, monkeypatch
+):
+    monkeypatch.delenv("POLARS_UNKNOWN_EXTENSION_TYPE_BEHAVIOR", raising=False)
+    source_df = pl.DataFrame(
+        {
+            "id": [1, 2],
+            "j": pl.Series(['{"a": 1}', None], dtype=pl.String()).ext.to(
+                polars_bigquery.dtypes.JSON
+            ),
+        }
+    )
+    mock_arrow_client.read_table.side_effect = (
+        lambda table_ref, *, selected_fields, **kwargs: _FakeArrowStreamExporter(
+            source_df.select(selected_fields)
+        )
+    )
+
+    client = Client(quota_project_id="q")
+    lf = client.scan_table(
+        "p.d.t",
+        schema={"id": pl.Int64, "j": polars_bigquery.dtypes.JSON},
+    )
+
+    df = lf.filter(pl.col("j").is_not_null() & (pl.col("id") >= 1)).collect()
+    assert df.height == 1
+    assert mock_arrow_client.read_table.call_args_list[0].kwargs["row_restriction"] in (
+        "((`j` IS NOT NULL) AND (`id` >= 1))",
+        "((`id` >= 1) AND (`j` IS NOT NULL))",
+    )
+
+    # .ext.storage().str.starts_with(...) falls back cleanly without breaking sibling pushdown
+    df2 = lf.filter(
+        pl.col("j").ext.storage().str.starts_with("{") & (pl.col("id") == 1)
+    ).collect()
+    assert df2.height == 1
+    assert (
+        mock_arrow_client.read_table.call_args_list[1].kwargs["row_restriction"]
+        == "(`id` = 1)"
+    )
+
+
 def test_client_read_and_scan_reject_malicious_table_ids(mock_arrow_client):
     class FakeTable:
         project = "proj/../../evil"
@@ -525,3 +1033,383 @@ def test_client_read_and_scan_reject_malicious_table_ids(mock_arrow_client):
 
         mock_arrow_client.read_table.assert_not_called()
         mock_get_metadata.assert_not_called()
+
+
+def test_scan_table_udf_predicate_falls_back_cleanly(mock_arrow_client):
+    source_df = pl.DataFrame({"id": [1, 2, 3]})
+    mock_arrow_client.read_table.side_effect = (
+        lambda table_ref, *, selected_fields, **kwargs: _FakeArrowStreamExporter(
+            source_df.select(selected_fields)
+        )
+    )
+    client = Client(quota_project_id="q")
+
+    # Pass a predicate that cannot be JSON-serialized via Polars `meta.serialize()`
+    # without requiring optional `cloudpickle` in `.collect()`.
+    def is_gt_one(val: int) -> bool:
+        return val > 1
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        udf_expr = pl.col("id").map_elements(is_gt_one, return_dtype=pl.Boolean)
+
+    with patch(
+        "polars_bigquery.core.compiler.predicate_to_row_restriction",
+        wraps=polars_bigquery.core.compiler.predicate_to_row_restriction,
+    ) as spy:
+        # Exercise compiler.predicate_to_row_restriction directly with the UDF
+        assert (
+            polars_bigquery.core.compiler.predicate_to_row_restriction(
+                udf_expr, schema={"id": pl.Int64}
+            )
+            == ""
+        )
+        # Also verify scan_table collects without raising if predicate pushdown
+        # raises PolarsError during meta.serialize() (e.g. local UDF fallback).
+        lf = client.scan_table("p.d.t", schema={"id": pl.Int64}).filter(
+            pl.col("id") > 1
+        )
+        with patch.object(
+            pl.expr.expr.ExprMetaNameSpace,
+            "serialize",
+            side_effect=pl.exceptions.ComputeError("cannot serialize UDF"),
+        ):
+            df = lf.collect()
+    assert df["id"].to_list() == [2, 3]
+    assert mock_arrow_client.read_table.call_args.kwargs["row_restriction"] == ""
+    assert spy.call_count >= 1
+
+
+def test_drop_columns_iter_closes_underlying_batch_iterator():
+    from polars_bigquery._read_bigquery import _drop_columns_iter
+
+    closed = False
+
+    def batch_gen():
+        nonlocal closed
+        try:
+            yield pl.DataFrame({"a": [1, 2]})
+            yield pl.DataFrame({"a": [3, 4]})
+        finally:
+            closed = True
+
+    it = _drop_columns_iter(batch_gen())
+    first = next(it)
+    assert first.shape == (2, 0)
+    assert not closed
+    it.close()
+    assert closed
+
+
+def test_client_init_closes_rest_session_when_arrow_client_fails():
+    mock_rest_instance = MagicMock()
+    with (
+        patch(
+            "polars_bigquery.core.bigquery_rest.BigQueryRestClient",
+            return_value=mock_rest_instance,
+        ),
+        patch(
+            "arrow_bigquery.Client",
+            side_effect=ValueError("quota_project_id is required"),
+        ),
+        pytest.raises(ValueError, match="quota_project_id"),
+    ):
+        Client(quota_project_id="")
+
+    mock_rest_instance.close.assert_called_once()
+
+
+def test_scan_table_wraps_malformed_metadata_as_bigquery_error(mock_arrow_client):
+    with patch(
+        "polars_bigquery.core.bigquery_rest.get_table_metadata",
+        return_value={"schema": "corrupted"},
+    ):
+        client = Client(quota_project_id="test-proj")
+        with pytest.raises(BigQueryError, match="Invalid BigQuery table metadata"):
+            client.scan_table("my-project.my_dataset.bad_table")
+
+
+def test_scan_table_caps_stream_count_on_small_limit(mock_arrow_client):
+    from polars_bigquery._read_bigquery import _SINGLE_STREAM_ROW_LIMIT
+
+    df_source = pl.DataFrame({"id": [1, 2, 3, 4, 5]})
+    mock_arrow_client.read_table.side_effect = [
+        _FakeArrowStreamExporter(df_source),
+        _FakeArrowStreamExporter(df_source),
+    ]
+    client = Client(quota_project_id="test-proj")
+    lf = client.scan_table("my-project.my_dataset.tbl", schema={"id": pl.Int64()})
+
+    small = lf.limit(3).collect()
+    assert small.height == 3
+    assert (
+        mock_arrow_client.read_table.call_args_list[0].kwargs["max_stream_count"] == 1
+    )
+
+    large = lf.limit(_SINGLE_STREAM_ROW_LIMIT + 1).collect()
+    assert large.height == 5
+    assert (
+        "max_stream_count" not in mock_arrow_client.read_table.call_args_list[1].kwargs
+    )
+
+
+def test_bigquery_rest_retry_has_jitter_and_handles_401_and_errors(monkeypatch):
+    import requests
+    from polars_bigquery.core import bigquery_rest
+
+    session = bigquery_rest.create_resilient_session()
+    try:
+        adapter = session.get_adapter("https://bigquery.googleapis.com")
+        assert adapter.max_retries.backoff_jitter > 0
+        # Automatic retries are strictly limited to safe, idempotent GET requests.
+        assert adapter.max_retries.allowed_methods == frozenset(["GET"])
+    finally:
+        session.close()
+
+    # Verify compatibility with urllib3 1.x where Retry does not accept `backoff_jitter`.
+    monkeypatch.setattr(bigquery_rest, "_RETRY_SUPPORTS_BACKOFF_JITTER", False)
+    seen_retry_kwargs: list[dict[str, object]] = []
+    orig_retry = bigquery_rest.Retry
+
+    def _recording_retry(**kwargs):
+        seen_retry_kwargs.append(kwargs)
+        return orig_retry(**kwargs)
+
+    monkeypatch.setattr(bigquery_rest, "Retry", _recording_retry)
+    fallback_session = bigquery_rest.create_resilient_session()
+    fallback_session.close()
+    assert len(seen_retry_kwargs) == 1
+    assert "backoff_jitter" not in seen_retry_kwargs[0]
+    monkeypatch.undo()
+
+    table_id = arrow_bigquery.BigQueryTableId("p", "d", "t")
+
+    # Simulate a Polars `CachingCredentialProvider` subclass (caches token until cleared
+    # explicitly via `clear_cached_credentials()`, matching real `CredentialProviderGCP`).
+    class _StubCachingCreds:
+        def __init__(self) -> None:
+            self._cached: str | None = "stale-tok"
+            self.clear_calls = 0
+
+        def __call__(self):
+            if self._cached is None:
+                self._cached = "fresh-tok"
+            return ({"bearer_token": self._cached}, 9_999_999_999)
+
+        def clear_cached_credentials(self) -> None:
+            self.clear_calls += 1
+            self._cached = None
+
+    creds = _StubCachingCreds()
+
+    resp_401 = MagicMock()
+    resp_401.status_code = 401
+    resp_200 = MagicMock()
+    resp_200.status_code = 200
+    resp_200.raise_for_status.return_value = None
+    resp_200.json.return_value = {"schema": {"fields": []}}
+
+    mock_session = MagicMock()
+    mock_session.get.side_effect = [resp_401, resp_200]
+    result = bigquery_rest.get_table_metadata(
+        table_id,
+        quota_project_id="q",
+        credentials_provider=creds,
+        user_agent="test-ua",
+        session=mock_session,
+    )
+    assert result == {"schema": {"fields": []}}
+    assert creds.clear_calls == 1
+    assert mock_session.get.call_count == 2
+    assert (
+        mock_session.get.call_args_list[0].kwargs["headers"]["Authorization"]
+        == "Bearer stale-tok"
+    )
+    assert (
+        mock_session.get.call_args_list[1].kwargs["headers"]["Authorization"]
+        == "Bearer fresh-tok"
+    )
+    assert (
+        mock_session.get.call_args_list[0].kwargs["timeout"]
+        == bigquery_rest.METADATA_TIMEOUT
+    )
+    resp_401.close.assert_called_once()
+    resp_200.close.assert_called_once()
+
+    # Credentials provider failures wrap as BigQueryError instead of leaking raw errors.
+    def _failing_creds():
+        raise RuntimeError("refresh failed")
+
+    with pytest.raises(BigQueryError, match="Failed to obtain credentials"):
+        bigquery_rest.get_table_metadata(
+            table_id,
+            quota_project_id="q",
+            credentials_provider=_failing_creds,
+            user_agent="test-ua",
+            session=mock_session,
+        )
+
+    # Network exceptions wrap as BigQueryError
+    mock_session.get.side_effect = requests.exceptions.Timeout("timed out")
+    with pytest.raises(BigQueryError, match="Failed to fetch table metadata"):
+        bigquery_rest.get_table_metadata(
+            table_id,
+            quota_project_id="q",
+            credentials_provider=lambda: ({"bearer_token": "tok"}, None),
+            user_agent="test-ua",
+            session=mock_session,
+        )
+
+    # Non-JSON 200 response (e.g. proxy HTML error page) wraps as BigQueryError and closes
+    bad_json_resp = MagicMock()
+    bad_json_resp.status_code = 200
+    bad_json_resp.raise_for_status.return_value = None
+    bad_json_resp.json.side_effect = ValueError("Expecting value")
+    mock_session.get.side_effect = [bad_json_resp]
+    with pytest.raises(BigQueryError, match="invalid JSON"):
+        bigquery_rest.get_table_metadata(
+            table_id,
+            quota_project_id="q",
+            credentials_provider=lambda: ({"bearer_token": "tok"}, None),
+            user_agent="test-ua",
+            session=mock_session,
+        )
+    bad_json_resp.close.assert_called_once()
+
+    # Non-dict JSON payload wraps as BigQueryError and closes
+    list_resp = MagicMock()
+    list_resp.status_code = 200
+    list_resp.raise_for_status.return_value = None
+    list_resp.json.return_value = ["unexpected"]
+    mock_session.get.side_effect = [list_resp]
+    with pytest.raises(BigQueryError, match="unexpected metadata payload type list"):
+        bigquery_rest.get_table_metadata(
+            table_id,
+            quota_project_id="q",
+            credentials_provider=lambda: ({"bearer_token": "tok"}, None),
+            user_agent="test-ua",
+            session=mock_session,
+        )
+    list_resp.close.assert_called_once()
+
+
+def test_unsupported_type_error_export_and_arrow_client_decode_options():
+    import time
+
+    from arrow_bigquery import _native
+    from arrow_bigquery.exceptions import UnsupportedTypeError as ArrowUnsupported
+    from polars_bigquery.exceptions import UnsupportedTypeError
+
+    assert UnsupportedTypeError is ArrowUnsupported
+    assert issubclass(UnsupportedTypeError, BigQueryError)
+
+    # Verify arrow_bigquery.Client accepts `preserve_datetime_extension` and does NOT
+    # expose the Rust-only `validate_ffi_types` knob on the Python FFI surface.
+    client = arrow_bigquery.Client(
+        quota_project_id="test-proj",
+        credentials_provider=lambda: ({"bearer_token": "tok"}, None),
+        preserve_datetime_extension=True,
+    )
+    assert client.quota_project_id == "test-proj"
+    with pytest.raises(TypeError):
+        arrow_bigquery.Client(
+            quota_project_id="test-proj",
+            credentials_provider=lambda: ({"bearer_token": "tok"}, None),
+            validate_ffi_types=False,  # type: ignore[call-arg]
+        )
+
+    # Verify native `ArrowStreamExporter.close()` aborts background tasks immediately.
+    exporter, drop_flag = _native._test_create_exporter_with_drop_flag()
+    assert not drop_flag.is_set()
+    exporter.close()
+    deadline = time.monotonic() + 1.0
+    while not drop_flag.is_set() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert drop_flag.is_set()
+
+
+def test_client_closes_exporter_when_stream_consumption_fails(mock_arrow_client):
+    close_calls = 0
+
+    class _ExplodingExporter:
+        def __arrow_c_stream__(self, requested_schema=None):
+            raise RuntimeError("boom during stream import")
+
+        def close(self) -> None:
+            nonlocal close_calls
+            close_calls += 1
+
+    client = Client(quota_project_id="test-proj")
+
+    mock_arrow_client.read_table.return_value = _ExplodingExporter()
+    with pytest.raises(RuntimeError, match="boom during stream import"):
+        client.read_table("my-project.my_dataset.tbl")
+    assert close_calls == 1
+
+    mock_arrow_client.read_query.return_value = _ExplodingExporter()
+    with pytest.raises(RuntimeError, match="boom during stream import"):
+        client.read_query("SELECT 1")
+    assert close_calls == 2
+
+    mock_arrow_client.read_table.return_value = _ExplodingExporter()
+    lf = client.scan_table("my-project.my_dataset.tbl", schema={"id": pl.Int64()})
+    with pytest.raises(RuntimeError, match="boom during stream import"):
+        lf.collect()
+    assert close_calls == 3
+
+
+def test_scan_table_keeps_parallel_streams_when_predicate_and_n_rows_combined(
+    mock_arrow_client, monkeypatch
+):
+    """Do not force `max_stream_count=1` if a caller passes both predicate and small n_rows."""
+    captured_io_source = {}
+    orig_register = pl.io.plugins.register_io_source
+
+    def _capture(io_source, schema):
+        captured_io_source["fn"] = io_source
+        return orig_register(io_source=io_source, schema=schema)
+
+    monkeypatch.setattr(pl.io.plugins, "register_io_source", _capture)
+    df_source = pl.DataFrame({"id": [1, 2, 3]})
+    mock_arrow_client.read_table.return_value = _FakeArrowStreamExporter(df_source)
+
+    client = Client(quota_project_id="test-proj")
+    client.scan_table("my-project.my_dataset.tbl", schema={"id": pl.Int64()})
+
+    batches = list(
+        captured_io_source["fn"](
+            with_columns=["id"],
+            predicate=pl.col("id") > 1,
+            n_rows=5,
+            batch_size=None,
+        )
+    )
+    assert sum(b.height for b in batches) == 2
+    assert "max_stream_count" not in mock_arrow_client.read_table.call_args.kwargs
+
+
+def test_arrow_bigquery_dependency_pin_tracks_polars_bigquery_version():
+    """Guard against releasing polars-bigquery with a stale `arrow-bigquery` floor."""
+    import re
+    from pathlib import Path
+
+    import tomllib
+
+    def _release_tuple(ver: str) -> tuple[int, ...]:
+        m = re.match(r"^([0-9]+(?:\.[0-9]+)*)", ver.strip())
+        assert m is not None, f"Unparseable PEP 440 version {ver!r}"
+        return tuple(int(p) for p in m.group(1).split("."))
+
+    pyproject_path = Path(__file__).resolve().parents[2] / "pyproject.toml"
+    data = tomllib.loads(pyproject_path.read_text(encoding="utf-8"))
+    pkg_version = _release_tuple(data["project"]["version"])
+    deps = data["project"]["dependencies"]
+    arrow_deps = [d for d in deps if d.startswith("arrow-bigquery")]
+    assert len(arrow_deps) == 1
+    match = re.search(r">=\s*([0-9]+(?:\.[0-9]+)*(?:[a-zA-Z0-9._+-]*)?)", arrow_deps[0])
+    assert match is not None, f"Missing '>=' lower pin on {arrow_deps[0]!r}"
+    min_version = _release_tuple(match.group(1))
+    assert min_version >= pkg_version, (
+        f"py-polars-bigquery {data['project']['version']} must pin "
+        f"arrow-bigquery >= {data['project']['version']} (found {arrow_deps[0]!r})"
+    )
