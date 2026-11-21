@@ -90,6 +90,11 @@ def test_build_extension_dtype_mode_b_as_storage(monkeypatch):
 
 
 def test_build_extension_dtype_mode_b_env_var(monkeypatch):
+    import polars_bigquery.core.types as types_mod
+
+    monkeypatch.setattr(
+        types_mod, "_INITIAL_UNKNOWN_EXTENSION_BEHAVIOR", "load_as_storage"
+    )
     monkeypatch.setenv("POLARS_UNKNOWN_EXTENSION_TYPE_BEHAVIOR", "load_as_storage")
     dtype = build_extension_dtype(
         GEOGRAPHY_EXTENSION_NAME,
@@ -267,10 +272,22 @@ def test_build_extension_dtype_explicit_load_as_storage_and_env_warning(
     )
 
     # Changing POLARS_UNKNOWN_EXTENSION_TYPE_BEHAVIOR post-import logs a warning
+    # and keeps the latched startup behavior so schemas stay aligned with Polars 2.x.
     import polars_bigquery.core.types as types_mod
 
     monkeypatch.setattr(types_mod, "_INITIAL_UNKNOWN_EXTENSION_BEHAVIOR", None)
     monkeypatch.setenv("POLARS_UNKNOWN_EXTENSION_TYPE_BEHAVIOR", "load_as_storage")
+    with caplog.at_level("WARNING", logger=types_mod.__name__):
+        assert build_extension_dtype(JSON_EXTENSION_NAME, pl.String()) == pl.Extension(
+            JSON_EXTENSION_NAME, pl.String()
+        )
+    assert "POLARS_UNKNOWN_EXTENSION_TYPE_BEHAVIOR" in caplog.text
+
+    caplog.clear()
+    monkeypatch.setattr(
+        types_mod, "_INITIAL_UNKNOWN_EXTENSION_BEHAVIOR", "load_as_storage"
+    )
+    monkeypatch.delenv("POLARS_UNKNOWN_EXTENSION_TYPE_BEHAVIOR", raising=False)
     with caplog.at_level("WARNING", logger=types_mod.__name__):
         assert build_extension_dtype(JSON_EXTENSION_NAME, pl.String()) == pl.String()
     assert "POLARS_UNKNOWN_EXTENSION_TYPE_BEHAVIOR" in caplog.text
@@ -324,6 +341,41 @@ assert roundtrip.schema == extracted.polars_schema, (roundtrip.schema, extracted
         check=False,
     )
     assert result.returncode == 0, f"stdout={result.stdout}\nstderr={result.stderr}"
+
+    # Verify mutating POLARS_UNKNOWN_EXTENSION_TYPE_BEHAVIOR mid-process still aligns
+    # `extract_schema_metadata()` with what Polars' Rust importer actually latched.
+    drift_unset_to_storage = """
+import os
+import polars as pl
+from polars_bigquery.core.schema import extract_schema_metadata
+from polars_bigquery.core.types import JSON_EXTENSION_NAME
+
+os.environ["POLARS_UNKNOWN_EXTENSION_TYPE_BEHAVIOR"] = "load_as_storage"
+meta = {"schema": {"fields": [{"name": "j", "type": "JSON"}]}}
+extracted = extract_schema_metadata(meta)
+src = pl.DataFrame({
+    "j": pl.Series(['{"a": 1}'], dtype=pl.String()).ext.to(
+        pl.Extension(JSON_EXTENSION_NAME, pl.String())
+    ),
+})
+roundtrip = pl.scan_arrow_c_stream(src).collect()
+assert roundtrip.schema == extracted.polars_schema, (roundtrip.schema, extracted.polars_schema)
+"""
+    clean_env = {
+        k: v
+        for k, v in os.environ.items()
+        if k != "POLARS_UNKNOWN_EXTENSION_TYPE_BEHAVIOR"
+    }
+    res_drift = subprocess.run(
+        [sys.executable, "-c", drift_unset_to_storage],
+        env=clean_env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert res_drift.returncode == 0, (
+        f"stdout={res_drift.stdout}\nstderr={res_drift.stderr}"
+    )
 
 
 @pytest.mark.parametrize(

@@ -81,7 +81,9 @@ class Client:
 
     Wraps an `arrow_bigquery.Client` and a REST session to keep connections open
     and reuse credentials across multiple operations. Can be used as a context
-    manager to automatically close the underlying REST session on exit.
+    manager to automatically close both the REST session and native Arrow client
+    on exit. Lazy scans created via `scan_table` must be collected before calling
+    `close()` or exiting the `with` block.
 
     Examples
     --------
@@ -128,6 +130,7 @@ class Client:
         self._credentials_provider = credentials_provider
         self._user_agent = _get_user_agent(user_agent)
         self._quota_project_id = quota_project_id
+        self._closed = False
         self._rest_client = bigquery_rest.BigQueryRestClient(
             quota_project_id=quota_project_id,
             credentials_provider=credentials_provider,
@@ -144,10 +147,36 @@ class Client:
             raise
 
     def close(self) -> None:
-        """Close underlying REST session resources."""
-        self._rest_client.close()
+        """Close the underlying REST session and native Arrow client.
+
+        Idempotent. Releases pooled REST connections, cached native gRPC/HTTP
+        channels, and the Rust-side credentials provider reference.
+
+        Calling `close()` (or exiting a `with Client(...) as client:` block)
+        invalidates this `Client` for subsequent operations: later calls to
+        [`read_table`][polars_bigquery.Client.read_table],
+        [`read_query`][polars_bigquery.Client.read_query], or
+        [`scan_table`][polars_bigquery.Client.scan_table]—including collecting a
+        `LazyFrame` created before closing—raise `RuntimeError`.
+        """
+        self._closed = True
+        try:
+            self._rest_client.close()
+        finally:
+            self._arrow_client.close()
+
+    @property
+    def closed(self) -> bool:
+        """Return `True` if [`close`][polars_bigquery.Client.close] has been called."""
+        return self._closed
+
+    def _ensure_open(self) -> None:
+        if self._closed:
+            msg = "Cannot use a closed polars_bigquery.Client instance."
+            raise RuntimeError(msg)
 
     def __enter__(self) -> Client:  # noqa: PYI034
+        self._ensure_open()
         return self
 
     def __exit__(self, *exc_info: object) -> None:
@@ -216,6 +245,7 @@ class Client:
         df = client.read_table("bigquery-public-data.utility_us.country_code_iso")
         ```
         """
+        self._ensure_open()
         table_ref = arrow_bigquery.api.resources.parse_table_id(table)
         arrow_stream_exporter = self._arrow_client.read_table(
             table_ref,
@@ -292,6 +322,7 @@ class Client:
         )
         ```
         """
+        self._ensure_open()
         arrow_stream_exporter = self._arrow_client.read_query(
             query,
             arrow_buffer_compression=arrow_buffer_compression,
@@ -411,6 +442,7 @@ class Client:
         )
         ```
         """
+        self._ensure_open()
         table_ref = arrow_bigquery.api.resources.parse_table_id(table)
         bq_types: Mapping[str, polars_bigquery.core.types.BQType] | None
         if schema is None:
@@ -460,6 +492,7 @@ class Client:
             n_rows: int | None,
             batch_size: int | None,
         ) -> Iterator[pl.DataFrame]:
+            self._ensure_open()
             # Explicit empty `schema={}` is treated identically to a 0-column table:
             # short-circuit without calling `CreateReadSession` (BigQuery rejects empty
             # schemas with FAILED_PRECONDITION).
@@ -523,6 +556,7 @@ class Client:
                 table_ref,
                 **read_kwargs,
             )
+            lazyframe: pl.LazyFrame | None = None
             try:
                 lazyframe = pl.scan_arrow_c_stream(arrow_stream_exporter)
 
@@ -539,6 +573,9 @@ class Client:
 
                 return lazyframe.select(columns).collect_batches(chunk_size=batch_size)
             except BaseException:
+                # Clear `lazyframe` before re-raising so the exception traceback frame
+                # does not retain the exported Arrow C Stream PyCapsule in `f_locals`.
+                lazyframe = None
                 _close_exporter(arrow_stream_exporter)
                 raise
 

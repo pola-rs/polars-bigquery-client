@@ -431,13 +431,59 @@ def test_client_scan_ingestion_time_partitioned_table(mock_arrow_client):
         assert df_compound["val"].to_list() == [20]
 
 
-def test_client_context_manager_closes_rest_session(mock_arrow_client):
+def test_client_context_manager_closes_rest_and_arrow_clients(mock_arrow_client):
+    client = Client(quota_project_id="q")
+    assert not client.closed
     with patch.object(
-        Client, "close", wraps=Client(quota_project_id="q").close
-    ) as mock_close:
-        with Client(quota_project_id="q") as client:
+        client._rest_client, "close", wraps=client._rest_client.close
+    ) as mock_rest_close:
+        with client as ctx_client:
+            assert ctx_client is client
             assert client.quota_project_id == "q"
-        mock_close.assert_called_once()
+            assert not client.closed
+        mock_rest_close.assert_called_once_with()
+    mock_arrow_client.close.assert_called_once_with()
+    assert client.closed
+
+    # Calling close() repeatedly is idempotent and leaves client closed.
+    client.close()
+    assert client.closed
+
+    # Any use after closing raises RuntimeError.
+    with pytest.raises(RuntimeError, match="closed"), client:
+        pass
+    with pytest.raises(RuntimeError, match="closed"):
+        client.read_table("p.d.t")
+    with pytest.raises(RuntimeError, match="closed"):
+        client.read_query("SELECT 1")
+    with pytest.raises(RuntimeError, match="closed"):
+        client.scan_table("p.d.t", schema={"id": pl.Int64()})
+
+
+def test_client_close_closes_arrow_client_even_if_rest_close_fails(mock_arrow_client):
+    client = Client(quota_project_id="q")
+    with (
+        patch.object(
+            client._rest_client, "close", side_effect=OSError("socket close failed")
+        ),
+        pytest.raises(OSError, match="socket close failed"),
+    ):
+        client.close()
+    assert client.closed
+    mock_arrow_client.close.assert_called_once_with()
+
+
+def test_client_close_invalidates_pending_lazy_scan(mock_arrow_client):
+    client = Client(quota_project_id="q")
+    lf = client.scan_table("my-project.my_dataset.tbl", schema={"id": pl.Int64()})
+    lf_empty = client.scan_table("my-project.my_dataset.empty", schema={})
+    client.close()
+
+    with pytest.raises(RuntimeError, match="closed"):
+        lf.collect()
+    with pytest.raises(RuntimeError, match="closed"):
+        lf_empty.collect()
+    mock_arrow_client.read_table.assert_not_called()
 
 
 def test_client_read_query_dry_run_returns_polars_dataframe():
@@ -1166,20 +1212,29 @@ def test_bigquery_rest_retry_has_jitter_and_handles_401_and_errors(monkeypatch):
     finally:
         session.close()
 
-    # Verify compatibility with urllib3 1.x where Retry does not accept `backoff_jitter`.
+    # Verify compatibility with older urllib3 where Retry lacks `backoff_jitter`
+    # and `retry_after_max`, while still bounding `Retry-After` sleeps.
     monkeypatch.setattr(bigquery_rest, "_RETRY_SUPPORTS_BACKOFF_JITTER", False)
+    monkeypatch.setattr(bigquery_rest, "_RETRY_SUPPORTS_RETRY_AFTER_MAX", False)
     seen_retry_kwargs: list[dict[str, object]] = []
-    orig_retry = bigquery_rest.Retry
+    orig_retry = bigquery_rest._BoundedRetry
 
     def _recording_retry(**kwargs):
         seen_retry_kwargs.append(kwargs)
         return orig_retry(**kwargs)
 
-    monkeypatch.setattr(bigquery_rest, "Retry", _recording_retry)
+    monkeypatch.setattr(bigquery_rest, "_BoundedRetry", _recording_retry)
     fallback_session = bigquery_rest.create_resilient_session()
-    fallback_session.close()
+    try:
+        adapter = fallback_session.get_adapter("https://bigquery.googleapis.com")
+        assert adapter.max_retries.parse_retry_after("999999") == float(
+            bigquery_rest.MAX_RETRY_AFTER_SECONDS
+        )
+    finally:
+        fallback_session.close()
     assert len(seen_retry_kwargs) == 1
     assert "backoff_jitter" not in seen_retry_kwargs[0]
+    assert "retry_after_max" not in seen_retry_kwargs[0]
     monkeypatch.undo()
 
     table_id = arrow_bigquery.BigQueryTableId("p", "d", "t")
@@ -1356,6 +1411,74 @@ def test_client_closes_exporter_when_stream_consumption_fails(mock_arrow_client)
     with pytest.raises(RuntimeError, match="boom during stream import"):
         lf.collect()
     assert close_calls == 3
+
+
+def test_scan_table_releases_lazyframe_and_aborts_task_on_post_export_error(
+    mock_arrow_client, monkeypatch
+):
+    """Post-`scan_arrow_c_stream` errors must drop `lazyframe` and abort the stream."""
+    import time
+
+    from arrow_bigquery import _native
+
+    captured_io_source = {}
+    orig_register = pl.io.plugins.register_io_source
+
+    def _capture(io_source, schema):
+        captured_io_source["fn"] = io_source
+        return orig_register(io_source=io_source, schema=schema)
+
+    monkeypatch.setattr(pl.io.plugins, "register_io_source", _capture)
+
+    exporter, drop_flag = _native._test_create_exporter_with_drop_flag()
+    mock_arrow_client.read_table.return_value = exporter
+
+    client = Client(quota_project_id="test-proj")
+    client.scan_table("my-project.my_dataset.tbl", schema={"placeholder": pl.Int32()})
+
+    with pytest.raises(ValueError, match="negative slice lengths") as exc_info:
+        # `n_rows=-1` causes `lazyframe.limit(-1)` to raise AFTER
+        # `pl.scan_arrow_c_stream(exporter)` consumes `__arrow_c_stream__()`.
+        captured_io_source["fn"](
+            with_columns=["placeholder"],
+            predicate=None,
+            n_rows=-1,
+            batch_size=None,
+        )
+
+    # Walk traceback while exception (and its `f_locals`) is still alive.
+    tb = exc_info.tb
+    source_gen_locals = None
+    while tb is not None:
+        if tb.tb_frame.f_code.co_name == "source_generator":
+            source_gen_locals = tb.tb_frame.f_locals
+            break
+        tb = tb.tb_next
+    assert source_gen_locals is not None
+    assert source_gen_locals.get("lazyframe") is None
+
+    deadline = time.monotonic() + 1.0
+    while not drop_flag.is_set() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert drop_flag.is_set(), (
+        "background Tokio task was not aborted on post-export error"
+    )
+
+    # Also verify `ArrowStreamExporter.close()` aborts a background task even when
+    # a consumed `LazyFrame` stays alive holding the exported PyCapsule, and that
+    # reading from the closed stream raises instead of returning a silent empty EOF.
+    exporter2, drop_flag2 = _native._test_create_exporter_with_drop_flag()
+    held_lf = pl.scan_arrow_c_stream(exporter2)
+    assert not drop_flag2.is_set()
+    exporter2.close()
+    deadline = time.monotonic() + 1.0
+    while not drop_flag2.is_set() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert drop_flag2.is_set(), (
+        "exporter.close() must abort background task while LazyFrame holds capsule"
+    )
+    with pytest.raises(pl.exceptions.ComputeError, match="closed before completion"):
+        held_lf.collect()
 
 
 def test_scan_table_keeps_parallel_streams_when_predicate_and_n_rows_combined(

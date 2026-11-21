@@ -37,8 +37,6 @@ INT_TYPES = frozenset(
     }
 )
 
-FLOAT_TYPES = frozenset({"Float", "Float32", "Float64"})
-
 BQ_INT64_MIN = -(1 << 63)
 BQ_INT64_MAX = (1 << 63) - 1
 

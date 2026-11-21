@@ -23,9 +23,9 @@ BQ_NUMERIC_MAX_SCALE = 9
 BQ_NUMERIC_MAX_INTEGER_DIGITS = 29
 
 # Polars 2.x latches `POLARS_UNKNOWN_EXTENSION_TYPE_BEHAVIOR` once per process
-# on first extension import (even `pl.Config.reload_env_vars()` does not refresh
-# it). Snapshot the value observed at import time so we can warn via DEBUG/WARNING
-# logs if the environment variable is mutated mid-process.
+# on import (even `pl.Config.reload_env_vars()` does not refresh it). Latch the
+# same startup value here so schema inference matches Arrow C Stream decoding,
+# and warn if `os.environ` is mutated mid-process.
 _UNKNOWN_EXTENSION_ENV_VAR = "POLARS_UNKNOWN_EXTENSION_TYPE_BEHAVIOR"
 _INITIAL_UNKNOWN_EXTENSION_BEHAVIOR: str | None = os.environ.get(
     _UNKNOWN_EXTENSION_ENV_VAR
@@ -126,12 +126,13 @@ def build_extension_dtype(
       ``storage``.
     - Default (``load_as_extension``): returns ``pl.Extension(name, storage, metadata)``.
 
-    Note: In Polars 2.x, the Rust Arrow C Stream importer reads
-    ``POLARS_UNKNOWN_EXTENSION_TYPE_BEHAVIOR`` once per process and caches it
-    (``pl.Config.reload_env_vars()`` does not refresh it). Mutating that
-    environment variable *after* Polars imports an extension type can therefore
-    cause schema mismatches on collection; pass ``load_as_storage`` explicitly
-    when deterministic resolution independent of process environment is needed.
+    Note: In Polars 2.x, the Rust Arrow C Stream importer latches
+    ``POLARS_UNKNOWN_EXTENSION_TYPE_BEHAVIOR`` once per process on import
+    (``pl.Config.reload_env_vars()`` does not refresh it). This helper follows
+    the value latched at module import time and logs a warning if the
+    environment variable is mutated mid-process; pass ``load_as_storage``
+    explicitly when deterministic resolution independent of process environment
+    is needed.
     """
     registered = pl.get_extension_type(name)
     if isinstance(registered, type) and issubclass(registered, pl.BaseExtension):
@@ -144,16 +145,17 @@ def build_extension_dtype(
     if current_behavior != _INITIAL_UNKNOWN_EXTENSION_BEHAVIOR:
         logger.warning(
             "%s changed from %r to %r after module import; Polars 2.x latches "
-            "this setting once per process, so Arrow stream decoding may "
-            "disagree with inferred extension dtypes. Prefer "
+            "this setting once per process, so keeping the initial value %r to "
+            "stay aligned with Arrow stream decoding. Prefer "
             "polars.register_extension_type(%r, as_storage=True) or setting the "
             "environment variable before launching Python.",
             _UNKNOWN_EXTENSION_ENV_VAR,
             _INITIAL_UNKNOWN_EXTENSION_BEHAVIOR,
             current_behavior,
+            _INITIAL_UNKNOWN_EXTENSION_BEHAVIOR,
             name,
         )
-    if current_behavior == "load_as_storage":
+    if _INITIAL_UNKNOWN_EXTENSION_BEHAVIOR == "load_as_storage":
         return storage
     return pl.Extension(name, storage, metadata)
 

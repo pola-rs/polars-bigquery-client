@@ -24,7 +24,24 @@ DEFAULT_TIMEOUT: tuple[float, float] = (_CONNECT_TIMEOUT, _READ_TIMEOUT)
 # Lightweight timeout for `tables.get` schema metadata lookups so a stalled
 # endpoint fails fast rather than blocking for 30+ minutes across retries.
 METADATA_TIMEOUT: tuple[float, float] = (10.0, 30.0)
+# Upper bound (in seconds) on a single `Retry-After` sleep so a `429`/`503` response
+# (or clock-skewed proxy) cannot hang callers for hours (`urllib3` 2.7+ defaults
+# `retry_after_max` to 6 hours; older versions impose no cap at all).
+MAX_RETRY_AFTER_SECONDS: int = 60
 _RETRY_SUPPORTS_BACKOFF_JITTER = "backoff_jitter" in inspect.signature(Retry).parameters
+_RETRY_SUPPORTS_RETRY_AFTER_MAX = (
+    "retry_after_max" in inspect.signature(Retry).parameters
+)
+
+
+class _BoundedRetry(Retry):
+    """`urllib3.util.retry.Retry` that caps parsed `Retry-After` sleeps."""
+
+    def parse_retry_after(self, retry_after: str) -> float:
+        return min(
+            float(super().parse_retry_after(retry_after)),
+            float(MAX_RETRY_AFTER_SECONDS),
+        )
 
 
 def create_resilient_session() -> requests.Session:
@@ -41,7 +58,9 @@ def create_resilient_session() -> requests.Session:
     }
     if _RETRY_SUPPORTS_BACKOFF_JITTER:
         retry_kwargs["backoff_jitter"] = 0.5
-    retry_strategy = Retry(**retry_kwargs)
+    if _RETRY_SUPPORTS_RETRY_AFTER_MAX:
+        retry_kwargs["retry_after_max"] = MAX_RETRY_AFTER_SECONDS
+    retry_strategy = _BoundedRetry(**retry_kwargs)
     adapter = HTTPAdapter(
         max_retries=retry_strategy,
         pool_connections=10,

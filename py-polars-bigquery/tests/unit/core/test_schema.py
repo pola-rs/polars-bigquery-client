@@ -242,6 +242,11 @@ def test_extract_schema_deeply_nested_structs_with_datetime_subfields(monkeypatc
 
 
 def test_extract_schema_preserves_bq_types_under_mode_b(monkeypatch):
+    import polars_bigquery.core.types as types_mod
+
+    monkeypatch.setattr(
+        types_mod, "_INITIAL_UNKNOWN_EXTENSION_BEHAVIOR", "load_as_storage"
+    )
     monkeypatch.setenv("POLARS_UNKNOWN_EXTENSION_TYPE_BEHAVIOR", "load_as_storage")
     metadata = {
         "schema": {

@@ -423,6 +423,21 @@ def test_exporter_close_aborts_background_task():
         nanoarrow.c_array_stream(exporter)
 
 
+def test_exporter_close_after_stream_export_aborts_background_task():
+    exporter, drop_flag = _native._test_create_exporter_with_drop_flag()
+    # Keep the exported PyCapsule alive (simulating a caller or traceback frame).
+    capsule = exporter.__arrow_c_stream__()
+    assert not drop_flag.is_set()
+    exporter.close()
+    deadline = time.monotonic() + 1.0
+    while not drop_flag.is_set() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert drop_flag.is_set(), (
+        "close() should abort the background task even after __arrow_c_stream__()"
+    )
+    del capsule
+
+
 def test_bigquery_error_hierarchy_and_empty_quota_project():
     from arrow_bigquery import BigQueryError
     from arrow_bigquery.exceptions import BigQueryError as ExceptionsBigQueryError

@@ -22,12 +22,39 @@ def test_bigquery_error_is_unified_with_arrow_bigquery():
 
 
 def test_create_resilient_session_configures_retries_and_pooling():
+    from email.utils import formatdate
+
+    from polars_bigquery.core.bigquery_rest import MAX_RETRY_AFTER_SECONDS
+    from urllib3.exceptions import InvalidHeader
+
     session = create_resilient_session()
-    adapter = session.get_adapter("https://bigquery.googleapis.com")
-    assert adapter.max_retries.total == 5
-    assert adapter.max_retries.backoff_factor == 0.5
-    assert set(adapter.max_retries.status_forcelist) == {429, 500, 502, 503, 504}
-    assert adapter.max_retries.respect_retry_after_header is True
+    try:
+        adapter = session.get_adapter("https://bigquery.googleapis.com")
+        retry = adapter.max_retries
+        assert retry.total == 5
+        assert retry.backoff_factor == 0.5
+        assert set(retry.status_forcelist) == {429, 500, 502, 503, 504}
+        assert retry.respect_retry_after_header is True
+
+        # Retry-After durations are bounded to prevent multi-hour/indefinite sleeps.
+        assert retry.parse_retry_after("5") == 5.0
+        assert retry.parse_retry_after("0") == 0.0
+        assert retry.parse_retry_after("86400") == float(MAX_RETRY_AFTER_SECONDS)
+        far_future = formatdate(timeval=4_000_000_000, usegmt=True)
+        assert retry.parse_retry_after(far_future) == float(MAX_RETRY_AFTER_SECONDS)
+        past_date = formatdate(timeval=0, usegmt=True)
+        assert retry.parse_retry_after(past_date) == 0.0
+        with pytest.raises(InvalidHeader):
+            retry.parse_retry_after("not-a-valid-retry-after")
+
+        # Verify the cap stays enforced across `Retry.increment()` / `Retry.new()`.
+        next_retry = retry.increment(
+            method="GET", url="https://bigquery.googleapis.com"
+        )
+        assert type(next_retry) is type(retry)
+        assert next_retry.parse_retry_after("86400") == float(MAX_RETRY_AFTER_SECONDS)
+    finally:
+        session.close()
 
 
 def test_raise_for_bigquery_error_extracts_structured_json_message():
