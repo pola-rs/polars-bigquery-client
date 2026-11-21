@@ -247,3 +247,28 @@ def test_get_table_metadata_rejects_invalid_json_or_non_object():
             user_agent="ua",
             session=mock_session,
         )
+
+
+@pytest.mark.parametrize(
+    "exc",
+    [
+        requests.exceptions.Timeout("timed out"),
+        requests.exceptions.ConnectionError("connection reset"),
+        requests.exceptions.RetryError("max retries exceeded"),
+    ],
+)
+def test_get_table_metadata_wraps_request_exceptions_as_bigquery_error(exc):
+    mock_cp = MagicMock(return_value=({"bearer_token": "tok"}, 123))
+    table_ref = arrow_bigquery.api.resources.BigQueryTableId("p", "d", "t")
+    mock_session = MagicMock()
+    mock_session.get.side_effect = exc
+
+    with pytest.raises(BigQueryError, match="BigQuery REST request failed") as raised:
+        get_table_metadata(
+            table_ref,
+            quota_project_id="q",
+            credentials_provider=mock_cp,
+            user_agent="ua",
+            session=mock_session,
+        )
+    assert raised.value.__cause__ is exc

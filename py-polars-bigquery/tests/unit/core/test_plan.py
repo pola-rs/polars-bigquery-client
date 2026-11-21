@@ -289,6 +289,55 @@ def test_plan_executor_is_abstract() -> None:
         PlanExecutor()  # type: ignore[abstract]
 
 
+def test_query_scan_maximum_bytes_billed_validation() -> None:
+    from polars_bigquery.core.plan import MAX_BIGQUERY_INT64
+
+    assert (
+        QueryScan(
+            raw_query="SELECT a FROM t",
+            columns=("a",),
+            maximum_bytes_billed=0,
+        ).maximum_bytes_billed
+        == 0
+    )
+    assert (
+        QueryScan(
+            raw_query="SELECT a FROM t",
+            columns=("a",),
+            maximum_bytes_billed=MAX_BIGQUERY_INT64,
+        ).maximum_bytes_billed
+        == MAX_BIGQUERY_INT64
+    )
+
+    for bad_type in (True, False, 1.5, "100"):
+        with pytest.raises(TypeError, match="maximum_bytes_billed must be an int"):
+            QueryScan(
+                raw_query="SELECT a FROM t",
+                columns=("a",),
+                maximum_bytes_billed=bad_type,  # type: ignore[arg-type]
+            )
+
+    for bad_neg in (-1, -(10**5000)):
+        with pytest.raises(
+            ValueError, match="maximum_bytes_billed must be non-negative"
+        ):
+            QueryScan(
+                raw_query="SELECT a FROM t",
+                columns=("a",),
+                maximum_bytes_billed=bad_neg,
+            )
+
+    for bad_huge in (MAX_BIGQUERY_INT64 + 1, 10**5000):
+        with pytest.raises(
+            ValueError, match=f"maximum_bytes_billed must be <= {MAX_BIGQUERY_INT64}"
+        ):
+            QueryScan(
+                raw_query="SELECT a FROM t",
+                columns=("a",),
+                maximum_bytes_billed=bad_huge,
+            )
+
+
 def test_validate_and_normalize_rejects_unexpanded_selectors() -> None:
     import polars.selectors as cs
 
@@ -323,7 +372,7 @@ def test_apply_local_plan_rejects_oversized_slice_and_streaming_handles_it() -> 
 
     _, ops = decompose_linear_plan(big_slice)
     batches = list(execute_local_plan_batches(base, ops, batch_size=1))
-    assert pl.concat(batches).to_dict(as_series=False) == {"b": ["y", "z"]}
+    assert sorted(pl.concat(batches)["b"].to_list()) == ["y", "z"]
 
     # Offset past total rows returns empty cleanly without OverflowError.
     huge_offset = Slice(input=scan, offset=(1 << 63) + 5, length=10)
@@ -339,3 +388,112 @@ def test_apply_local_plan_rejects_oversized_slice_and_streaming_handles_it() -> 
     _, z_ops = decompose_linear_plan(zero_after_big)
     zero_batches = list(execute_local_plan_batches(base, z_ops, batch_size=1))
     assert sum(b.height for b in zero_batches) == 0
+
+
+def test_iter_apply_ops_binds_chained_filters_and_projects_independently() -> None:
+    """Regression test: loop-variable closure aliasing must not drop earlier Filter/Project ops."""
+    from polars_bigquery.core.executors.base import (
+        _iter_apply_ops,
+        execute_local_plan_batches,
+    )
+
+    scan = QueryScan(raw_query="SELECT a, b FROM t", columns=("a", "b"))
+    df = pl.DataFrame({"a": [1, 2, 3, 4], "b": [10, 10, 10, 20]})
+
+    chained_filters = (
+        Slice(input=scan, offset=0, length=1 << 63),
+        Filter(input=scan, predicate=pl.col("a") > 2),
+        Filter(input=scan, predicate=pl.col("b") == 10),
+    )
+    out = pl.concat(list(execute_local_plan_batches(df.lazy(), chained_filters)))
+    assert out.to_dict(as_series=False) == {"a": [3], "b": [10]}
+
+    # First filter rejects every row; second filter must NOT revive them.
+    empty_filters = (
+        Slice(input=scan, offset=0, length=1 << 63),
+        Filter(input=scan, predicate=pl.col("a") == 999),
+        Filter(input=scan, predicate=pl.col("b") == 10),
+    )
+    assert list(execute_local_plan_batches(df.lazy(), empty_filters)) == []
+
+    # Distinct chained Project operators must each bind their own column tuple.
+    chained_projects = (
+        Project(input=scan, columns=("a", "b")),
+        Filter(input=scan, predicate=pl.col("a") >= 3),
+        Project(input=scan, columns=()),
+    )
+    projected_batches = list(_iter_apply_ops(iter([df]), chained_projects))
+    assert len(projected_batches) == 1
+    assert projected_batches[0].shape == (2, 0)
+
+
+def test_iter_apply_ops_closes_upstream_iterator_on_early_exit() -> None:
+    from polars_bigquery.core.executors.base import _iter_apply_ops
+
+    scan = QueryScan(raw_query="SELECT a FROM t", columns=("a",))
+
+    closed_zero = False
+    pulled_zero = 0
+
+    def upstream_zero():
+        nonlocal closed_zero, pulled_zero
+        try:
+            pulled_zero += 1
+            yield pl.DataFrame({"a": [1, 2, 3]})
+        finally:
+            closed_zero = True
+
+    gen0 = upstream_zero()
+    assert list(_iter_apply_ops(gen0, (Slice(scan, offset=0, length=0),))) == []
+    assert pulled_zero == 0
+    assert (
+        closed_zero is False
+    )  # unstarted generator's close() completes cleanly without pulling
+
+    # Started generator must trigger its `finally` immediately on slice stop.
+    closed_limit = False
+
+    def upstream_many():
+        nonlocal closed_limit
+        try:
+            yield pl.DataFrame({"a": [1, 2]})
+            yield pl.DataFrame({"a": [3, 4]})
+            yield pl.DataFrame({"a": [5, 6]})
+        finally:
+            closed_limit = True
+
+    limited = list(
+        _iter_apply_ops(
+            upstream_many(),
+            (
+                Filter(scan, predicate=pl.col("a") >= 1),
+                Slice(scan, offset=0, length=2),
+                Project(scan, columns=("a",)),
+            ),
+        )
+    )
+    assert pl.concat(limited)["a"].to_list() == [1, 2]
+    assert closed_limit is True
+
+    # Explicit downstream `.close()` cascades through chained filter/project generators.
+    closed_downstream = False
+
+    def upstream_cascading():
+        nonlocal closed_downstream
+        try:
+            yield pl.DataFrame({"a": [1]})
+            yield pl.DataFrame({"a": [2]})
+        finally:
+            closed_downstream = True
+
+    stream = _iter_apply_ops(
+        upstream_cascading(),
+        (
+            Filter(scan, predicate=pl.col("a") >= 1),
+            Project(scan, columns=("a",)),
+        ),
+    )
+    first = next(stream)
+    assert first.to_dict(as_series=False) == {"a": [1]}
+    stream.close()  # type: ignore[attr-defined]
+    assert closed_downstream is True

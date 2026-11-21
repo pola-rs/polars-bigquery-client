@@ -21,6 +21,7 @@ __all__ = [
     "compile_predicate",
     "format_conjuncts_sql",
     "formatted_conjuncts_byte_length",
+    "formatted_conjuncts_byte_length_from_stats",
     "ir",
     "ir_to_sql",
     "json_to_ir",
@@ -39,6 +40,12 @@ def format_conjuncts_sql(conjuncts: Sequence[str]) -> str:
     `({c0} AND {c1} AND ...)` for 2+ conjuncts using a single `O(N)` join so
     large conjunctions avoid `O(N^2)` string reallocation and `(N-1)`-deep
     parenthesis nesting in BigQuery's SQL parser.
+
+    Precondition: each item in `conjuncts` MUST be an atomic or already
+    parenthesized SQL boolean expression that binds at least as tightly as
+    `AND` (for example, conjuncts produced by `compile_ir_conjuncts_to_sql`).
+    Passing an unparenthesized `OR` expression (such as ``"a = 1 OR b = 2"``)
+    would change operator precedence relative to `AND`.
     """
     if not conjuncts:
         return ""
@@ -47,15 +54,22 @@ def format_conjuncts_sql(conjuncts: Sequence[str]) -> str:
     return f"({' AND '.join(conjuncts)})"
 
 
-def formatted_conjuncts_byte_length(conjunct_byte_lengths: Sequence[int]) -> int:
-    """Return the exact UTF-8 byte length of `format_conjuncts_sql(...)` in `O(1)` memory."""
-    count = len(conjunct_byte_lengths)
-    if count == 0:
+def formatted_conjuncts_byte_length_from_stats(count: int, total_bytes: int) -> int:
+    """Return the exact UTF-8 byte length of `format_conjuncts_sql(...)` from `(count, total_bytes)`."""
+    if count <= 0:
         return 0
     if count == 1:
-        return conjunct_byte_lengths[0]
+        return total_bytes
     # "(" + c0 + " AND " + c1 + ... + ")"  -> 5 bytes per " AND " + 2 outer parens
-    return sum(conjunct_byte_lengths) + 5 * (count - 1) + 2
+    return total_bytes + 5 * (count - 1) + 2
+
+
+def formatted_conjuncts_byte_length(conjunct_byte_lengths: Sequence[int]) -> int:
+    """Return the exact UTF-8 byte length of `format_conjuncts_sql(...)` in `O(1)` memory."""
+    return formatted_conjuncts_byte_length_from_stats(
+        len(conjunct_byte_lengths),
+        sum(conjunct_byte_lengths),
+    )
 
 
 @dataclasses.dataclass(frozen=True, slots=True)

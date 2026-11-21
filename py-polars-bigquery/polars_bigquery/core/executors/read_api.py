@@ -25,6 +25,7 @@ from polars_bigquery.core.plan import (
     decompose_linear_plan,
     validate_and_normalize_linear_plan,
 )
+from polars_bigquery.core.schema import has_bignumeric_dtype
 
 logger = logging.getLogger(__name__)
 
@@ -82,7 +83,7 @@ def _dtype_fallback_rank(dtype: pl.DataType) -> int:
     if isinstance(dtype, (pl.Duration, pl.Null, pl.Unknown, pl.Object)):
         return 8
     if dtype.is_nested():
-        return 7
+        return 8 if has_bignumeric_dtype(dtype) else 7
     return 6
 
 
@@ -127,8 +128,8 @@ def _prune_conjuncts_to_budget(
     heapq.heapify(heap)
 
     while active_count > 0 and heap:
-        current_bytes = (
-            active_sum if active_count == 1 else active_sum + 5 * (active_count - 1) + 2
+        current_bytes = compiler.formatted_conjuncts_byte_length_from_stats(
+            active_count, active_sum
         )
         if current_bytes <= max_bytes:
             break

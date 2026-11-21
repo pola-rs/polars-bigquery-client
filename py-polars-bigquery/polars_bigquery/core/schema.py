@@ -23,8 +23,36 @@ from polars.datatypes import (
 
 import polars_bigquery.exceptions
 
+# BigQuery enforces a maximum STRUCT nesting depth of 15. Cap schema parsing
+# well above that ceiling so pathological/corrupted payloads fail with a clear
+# BigQueryError instead of Python RecursionError.
+MAX_SCHEMA_NESTING_DEPTH = 64
 
-def _extract_data_type(field: Mapping[str, Any]) -> DataType:
+
+def has_bignumeric_dtype(dtype: pl.DataType) -> bool:
+    """Return `True` if `dtype` is or nests a `BIGNUMERIC` (`Decimal(precision > 38)`)."""
+    map_cls = getattr(pl, "Map", None)
+    stack: list[pl.DataType] = [dtype]
+    while stack:
+        current = stack.pop()
+        if isinstance(current, pl.Decimal):
+            if current.precision > 38:
+                return True
+        elif isinstance(current, (pl.List, pl.Array)):
+            if current.inner is not None:
+                stack.append(current.inner)
+        elif isinstance(current, pl.Struct):
+            for field in current.fields:
+                stack.append(field.dtype)
+        elif map_cls is not None and isinstance(current, map_cls):
+            if current.key is not None:
+                stack.append(current.key)
+            if current.value is not None:
+                stack.append(current.value)
+    return False
+
+
+def _extract_data_type(field: Mapping[str, Any], *, _depth: int = 0) -> DataType:
     """Convert a BigQuery type into a Polars type.
 
     Note: the REST API uses the names from the Legacy SQL data types, but if
@@ -33,6 +61,13 @@ def _extract_data_type(field: Mapping[str, Any]) -> DataType:
 
     See: https://docs.cloud.google.com/bigquery/docs/reference/rest/v2/tables#TableFieldSchema
     """
+    if _depth > MAX_SCHEMA_NESTING_DEPTH:
+        msg = (
+            "Invalid response from BigQuery: schema nesting depth exceeds "
+            f"maximum supported depth ({MAX_SCHEMA_NESTING_DEPTH})."
+        )
+        raise polars_bigquery.exceptions.BigQueryError(msg)
+
     if not isinstance(field, Mapping):
         msg = (
             "Invalid response from BigQuery: expected schema field object, "
@@ -66,7 +101,8 @@ def _extract_data_type(field: Mapping[str, Any]) -> DataType:
                 "type": raw_type or "",
                 "fields": field.get("fields", []),
                 "mode": "NULLABLE",
-            }
+            },
+            _depth=_depth + 1,
         )
         return List(inner_type)
 
@@ -138,13 +174,20 @@ def _extract_data_type(field: Mapping[str, Any]) -> DataType:
                     dup_seen.add(sub_name)
                 continue
             seen_names.add(sub_name)
-            polars_fields.append(Field(sub_name, _extract_data_type(subfield)))
+            polars_fields.append(
+                Field(sub_name, _extract_data_type(subfield, _depth=_depth + 1))
+            )
         if dup_names:
             dup_list = ", ".join(repr(name) for name in dup_names)
             struct_name = field.get("name") or "<unnamed>"
+            hint = (
+                " Alias unnamed STRUCT fields explicitly with `AS`."
+                if "" in dup_seen
+                else ""
+            )
             msg = (
                 f"BigQuery STRUCT field {struct_name!r} contains duplicate "
-                f"subfield name(s): {dup_list}."
+                f"subfield name(s): {dup_list}.{hint}"
             )
             raise ValueError(msg)
         return Struct(polars_fields)
@@ -176,11 +219,17 @@ def extract_polars_schema_from_fields(
                 f"got {type(field).__name__}."
             )
             raise polars_bigquery.exceptions.BigQueryError(msg)
-        raw_name = field.get("name", "")
+        raw_name = field.get("name")
         if not isinstance(raw_name, str):
             msg = (
                 "Invalid response from BigQuery: schema field 'name' must be a string, "
                 f"got {type(raw_name).__name__}."
+            )
+            raise polars_bigquery.exceptions.BigQueryError(msg)
+        if raw_name == "":
+            msg = (
+                "Invalid response from BigQuery: schema field 'name' must be a "
+                "non-empty string."
             )
             raise polars_bigquery.exceptions.BigQueryError(msg)
         if raw_name in pl_schema:
@@ -198,8 +247,15 @@ def extract_polars_schema_from_fields(
     return pl.Schema(pl_schema)
 
 
-def extract_polars_schema(table_metadata: Mapping[str, Any]) -> pl.Schema:
+def extract_polars_schema(
+    table_metadata: Mapping[str, Any],
+    *,
+    require_non_empty: bool = False,
+) -> pl.Schema:
     """Convert a BigQuery table REST response into a Polars schema.
+
+    When `require_non_empty=True`, raises `BigQueryError` if `schema.fields` is
+    missing or empty *before* appending ingestion-time partitioning pseudo-columns.
 
     See: https://docs.cloud.google.com/bigquery/docs/reference/rest/v2/tables#Table
     """
@@ -231,6 +287,13 @@ def extract_polars_schema(table_metadata: Mapping[str, Any]) -> pl.Schema:
         msg = (
             "Invalid response from BigQuery: table metadata 'schema' must be an object, "
             f"got {type(raw_schema).__name__}."
+        )
+        raise polars_bigquery.exceptions.BigQueryError(msg)
+
+    if require_non_empty and not raw_fields:
+        msg = (
+            "Invalid response from BigQuery: table metadata did not "
+            "contain any schema fields."
         )
         raise polars_bigquery.exceptions.BigQueryError(msg)
 

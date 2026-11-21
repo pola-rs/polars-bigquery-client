@@ -11,6 +11,29 @@ import arrow_bigquery
 import polars as pl
 
 ArrowBufferCompression = Literal["lz4frame", "zstd", "unspecified"]
+MAX_BIGQUERY_INT64 = (1 << 63) - 1
+
+
+def validate_maximum_bytes_billed(value: object) -> int | None:
+    """Validate optional `maximum_bytes_billed` (`0 <= value <= (1 << 63) - 1`).
+
+    Avoids formatting arbitrarily huge Python `int` values into strings so
+    inputs like `10**5000` cannot trip CPython's `int_max_str_digits` limit.
+    """
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int):
+        msg = (
+            f"maximum_bytes_billed must be an int or None, got {type(value).__name__}."
+        )
+        raise TypeError(msg)
+    if value < 0:
+        msg = "maximum_bytes_billed must be non-negative."
+        raise ValueError(msg)
+    if value > MAX_BIGQUERY_INT64:
+        msg = f"maximum_bytes_billed must be <= {MAX_BIGQUERY_INT64}."
+        raise ValueError(msg)
+    return value
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -37,6 +60,7 @@ class QueryScan(PlanNode):
     arrow_buffer_compression: ArrowBufferCompression = "lz4frame"
     use_query_cache: bool | None = None
     explicit_schema: bool = False
+    maximum_bytes_billed: int | None = None
 
     def __post_init__(self) -> None:
         if len(self.columns) == 0:
@@ -45,6 +69,7 @@ class QueryScan(PlanNode):
         if len(set(self.columns)) != len(self.columns):
             msg = "QueryScan columns must be unique."
             raise ValueError(msg)
+        validate_maximum_bytes_billed(self.maximum_bytes_billed)
 
     def children(self) -> tuple[PlanNode, ...]:
         return ()
@@ -253,6 +278,7 @@ def build_io_source_plan(
 
 
 __all__ = [
+    "MAX_BIGQUERY_INT64",
     "ArrowBufferCompression",
     "Filter",
     "LeafScan",
@@ -265,4 +291,5 @@ __all__ = [
     "build_io_source_plan",
     "decompose_linear_plan",
     "validate_and_normalize_linear_plan",
+    "validate_maximum_bytes_billed",
 ]

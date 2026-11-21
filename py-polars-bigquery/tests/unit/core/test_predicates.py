@@ -3757,6 +3757,13 @@ def test_formatted_conjuncts_byte_length_matches_utf8() -> None:
         expected = len(compiler.format_conjuncts_sql(conjuncts).encode("utf-8"))
         lengths = [len(c.encode("utf-8")) for c in conjuncts]
         assert compiler.formatted_conjuncts_byte_length(lengths) == expected
+        assert (
+            compiler.formatted_conjuncts_byte_length_from_stats(
+                len(lengths), sum(lengths)
+            )
+            == expected
+        )
+    assert compiler.formatted_conjuncts_byte_length_from_stats(0, 0) == 0
 
 
 def test_compile_predicate_handles_polars_serialization_error_on_udf() -> None:

@@ -90,6 +90,7 @@ def test_client_read_query(mock_arrow_client):
             dry_run=False,
             maintain_order=True,
             use_query_cache=None,
+            maximum_bytes_billed=None,
         )
         mock_df_cls.assert_called_once_with(mock_exporter)
         assert result is mock_df
@@ -118,6 +119,7 @@ def test_client_read_query_passes_additional_parameters(mock_arrow_client):
             dry_run=True,
             maintain_order=False,
             use_query_cache=False,
+            maximum_bytes_billed=None,
         )
         mock_df_cls.assert_called_once_with(mock_exporter)
         assert result is mock_df
@@ -156,6 +158,7 @@ def test_client_scan_query_with_schema_pushes_projection_and_filter(mock_arrow_c
         dry_run=False,
         maintain_order=False,
         use_query_cache=None,
+        maximum_bytes_billed=None,
     )
     assert result.to_dict(as_series=False) == {"visible": ["b"]}
 
@@ -196,6 +199,7 @@ def test_client_scan_query_without_schema_pushes_projection_and_filter_when_unor
         "dry_run": True,
         "maintain_order": True,
         "use_query_cache": None,
+        "maximum_bytes_billed": None,
     }
     expected_sql = (
         "SELECT visible, hidden, unused FROM `p.d.t`\n"
@@ -208,6 +212,7 @@ def test_client_scan_query_without_schema_pushes_projection_and_filter_when_unor
         "dry_run": False,
         "maintain_order": False,
         "use_query_cache": None,
+        "maximum_bytes_billed": None,
     }
     assert result.to_dict(as_series=False) == {"visible": ["b"]}
 
@@ -337,6 +342,7 @@ def test_client_scan_query_dry_run_skips_pipe_for_unpushable_predicate_and_all_c
         "dry_run": False,
         "maintain_order": False,
         "use_query_cache": None,
+        "maximum_bytes_billed": None,
     }
     assert result.to_dict(as_series=False) == {"a": [1, 1]}
 
@@ -360,6 +366,7 @@ def test_client_scan_query_projection_only_without_filter(mock_arrow_client):
         dry_run=False,
         maintain_order=False,
         use_query_cache=None,
+        maximum_bytes_billed=None,
     )
     assert result.to_dict(as_series=False) == {"visible": ["a", "b"]}
 
@@ -414,6 +421,7 @@ def test_client_scan_query_maintain_order_true_runs_verbatim_and_filters_locally
         "dry_run": True,
         "maintain_order": True,
         "use_query_cache": None,
+        "maximum_bytes_billed": None,
     }
     assert mock_arrow_client.read_query.call_args_list[1].args == (
         "SELECT visible, hidden FROM `p.d.t`",
@@ -423,6 +431,7 @@ def test_client_scan_query_maintain_order_true_runs_verbatim_and_filters_locally
         "dry_run": False,
         "maintain_order": True,
         "use_query_cache": None,
+        "maximum_bytes_billed": None,
     }
     assert result.to_dict(as_series=False) == {"visible": ["b"]}
 
@@ -561,8 +570,9 @@ def test_client_scan_query_invalid_sql_raises_polars_bigquery_error():
             pass
 
     server = HTTPServer(("127.0.0.1", 0), Handler)
+    server.timeout = 2.0
     port = server.server_port
-    server_thread = threading.Thread(target=server.handle_request)
+    server_thread = threading.Thread(target=server.handle_request, daemon=True)
     server_thread.start()
 
     try:
@@ -576,7 +586,7 @@ def test_client_scan_query_invalid_sql_raises_polars_bigquery_error():
         with pytest.raises(BigQueryError, match="Syntax error"):
             client.scan_query("SELECT BROKEN")
     finally:
-        server_thread.join()
+        server_thread.join(timeout=2.0)
         server.server_close()
 
 
@@ -922,8 +932,9 @@ def test_client_read_query_dry_run_returns_polars_dataframe():
             pass
 
     server = HTTPServer(("127.0.0.1", 0), Handler)
+    server.timeout = 2.0
     port = server.server_port
-    server_thread = threading.Thread(target=server.handle_request)
+    server_thread = threading.Thread(target=server.handle_request, daemon=True)
     server_thread.start()
 
     try:
@@ -936,7 +947,7 @@ def test_client_read_query_dry_run_returns_polars_dataframe():
         )
         df = client.read_query("SELECT 1 AS one", dry_run=True)
     finally:
-        server_thread.join()
+        server_thread.join(timeout=2.0)
         server.server_close()
 
     assert isinstance(df, pl.DataFrame)
@@ -1323,6 +1334,7 @@ def test_client_scan_query_limit_pushdown_unordered(mock_arrow_client):
         dry_run=False,
         maintain_order=False,
         use_query_cache=None,
+        maximum_bytes_billed=None,
     )
     assert df.to_dict(as_series=False) == {"a": [1, 2]}
 
@@ -1398,6 +1410,7 @@ def test_client_scan_query_forwards_compression_and_cache_options(mock_arrow_cli
         "dry_run": True,
         "maintain_order": True,
         "use_query_cache": None,
+        "maximum_bytes_billed": None,
     }
     assert mock_arrow_client.read_query.call_args_list[1].args == (raw,)
     assert mock_arrow_client.read_query.call_args_list[1].kwargs == {
@@ -1405,6 +1418,7 @@ def test_client_scan_query_forwards_compression_and_cache_options(mock_arrow_cli
         "dry_run": False,
         "maintain_order": True,
         "use_query_cache": False,
+        "maximum_bytes_billed": None,
     }
 
 
@@ -1451,7 +1465,10 @@ def test_client_lazy_rest_client_and_lifecycle_guards(mock_arrow_client):
         mock_rest_cls.assert_not_called()
         mock_arrow_client.close.assert_called_once()
 
-        # Subsequent operations raise RuntimeError when client is closed.
+        # Subsequent operations (including direct _rest_client access) raise RuntimeError when closed.
+        with pytest.raises(RuntimeError, match="closed"):
+            _ = client._rest_client
+        mock_rest_cls.assert_not_called()
         with pytest.raises(RuntimeError, match="closed"):
             client.read_table("p.d.t")
         with pytest.raises(RuntimeError, match="closed"):
@@ -1460,6 +1477,37 @@ def test_client_lazy_rest_client_and_lifecycle_guards(mock_arrow_client):
             client.scan_table("p.d.t", schema={"a": pl.Int64})
         with pytest.raises(RuntimeError, match="closed"):
             client.scan_query("SELECT 1", schema={"a": pl.Int64})
+
+
+def test_client_rest_client_lazy_init_is_thread_safe(mock_arrow_client):
+    import threading
+
+    with patch(
+        "polars_bigquery.core.bigquery_rest.BigQueryRestClient"
+    ) as mock_rest_cls:
+        sentinel = MagicMock(name="rest_client")
+        mock_rest_cls.return_value = sentinel
+        client = Client(quota_project_id="q")
+
+        barrier = threading.Barrier(8)
+        results: list[object] = []
+        results_lock = threading.Lock()
+
+        def worker():
+            barrier.wait()
+            rc = client._rest_client
+            with results_lock:
+                results.append(rc)
+
+        threads = [threading.Thread(target=worker) for _ in range(8)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        assert len(results) == 8
+        assert all(r is sentinel for r in results)
+        mock_rest_cls.assert_called_once()
 
 
 def test_client_input_type_and_wire_payload_validation(mock_arrow_client):
@@ -1545,6 +1593,49 @@ def test_client_scan_bignumeric_raises_clear_type_error(mock_arrow_client):
     ):
         client.scan_table("p.d.t")
 
+    # Nested BIGNUMERIC inside ARRAY (`mode="REPEATED"`) and STRUCT also raise TypeError.
+    for schema_json, col_name in (
+        (
+            '{"fields": [{"name": "arr_bn", "type": "BIGNUMERIC", "mode": "REPEATED"}]}',
+            "arr_bn",
+        ),
+        (
+            '{"fields": [{"name": "st_bn", "type": "STRUCT", "fields": [{"name": "x", "type": "BIGNUMERIC"}]}]}',
+            "st_bn",
+        ),
+    ):
+        mock_arrow_client.read_query.return_value = pl.DataFrame(
+            {"bigquerySchema": [schema_json], "statementType": ["SELECT"]}
+        )
+        with pytest.raises(TypeError, match=f"BIGNUMERIC/BIGDECIMAL.*{col_name}"):
+            client.scan_query("SELECT col FROM t")
+
+    # Explicit schema with nested BIGNUMERIC also produces a clear TypeError.
+    with pytest.raises(TypeError, match="BIGNUMERIC/BIGDECIMAL.*'s'"):
+        client.scan_query(
+            "SELECT s FROM t",
+            schema={"s": pl.Struct([pl.Field("x", pl.Decimal(76, 38))])},
+        )
+
+
+def test_client_scan_query_sanitizes_control_chars_in_explain_location(
+    mock_arrow_client,
+):
+    client = Client(quota_project_id="q")
+    mock_arrow_client.read_query.return_value = pl.DataFrame(
+        {
+            "bigquerySchema": ['{"fields": [{"name": "a", "type": "INT64"}]}'],
+            "statementType": ["SELECT"],
+            "location": ["US\nINJECTED\r\t"],
+        }
+    )
+    lf = client.scan_query("SELECT 1 AS a")
+    explain = lf.explain()
+    info_lines = [line for line in explain.splitlines() if "INFO:" in line]
+    assert len(info_lines) == 1
+    assert "location=US INJECTED" in info_lines[0]
+    assert "INJECTED\n" not in explain
+
 
 def test_client_scan_query_with_udf_filter_degrades_gracefully(mock_arrow_client):
     import warnings
@@ -1569,11 +1660,208 @@ def test_client_scan_query_with_udf_filter_degrades_gracefully(mock_arrow_client
         return_value=pl.LazyFrame({"a": [1, 2, 3]}),
     ):
         batches = list(executor.execute(plan))
-    assert pl.concat(batches).to_dict(as_series=False) == {"a": [2, 3]}
+    assert sorted(pl.concat(batches)["a"].to_list()) == [2, 3]
     mock_arrow_client.read_query.assert_called_once_with(
         "SELECT a FROM t\n|> SELECT `a`",
         arrow_buffer_compression="lz4frame",
         dry_run=False,
         maintain_order=False,
         use_query_cache=None,
+        maximum_bytes_billed=None,
     )
+
+
+def test_client_forwards_and_validates_maximum_bytes_billed(mock_arrow_client):
+    from polars_bigquery.core.plan import MAX_BIGQUERY_INT64
+
+    client = Client(quota_project_id="q")
+
+    # Eager type and range checks on both read_query and scan_query (including
+    # huge integers that would exceed sys.get_int_max_str_digits() if formatted).
+    for bad_type in (True, False, 1.5, "100"):
+        with pytest.raises(TypeError, match="maximum_bytes_billed must be an int"):
+            client.read_query("SELECT 1", maximum_bytes_billed=bad_type)  # type: ignore[arg-type]
+        with pytest.raises(TypeError, match="maximum_bytes_billed must be an int"):
+            client.scan_query(
+                "SELECT 1",
+                schema={"a": pl.Int64},
+                maximum_bytes_billed=bad_type,  # type: ignore[arg-type]
+            )
+
+    for bad_neg in (-1, -100, -(10**5000)):
+        with pytest.raises(
+            ValueError, match="maximum_bytes_billed must be non-negative"
+        ):
+            client.read_query("SELECT 1", maximum_bytes_billed=bad_neg)
+        with pytest.raises(
+            ValueError, match="maximum_bytes_billed must be non-negative"
+        ):
+            client.scan_query(
+                "SELECT 1",
+                schema={"a": pl.Int64},
+                maximum_bytes_billed=bad_neg,
+            )
+
+    for bad_huge in (MAX_BIGQUERY_INT64 + 1, 10**5000):
+        with pytest.raises(
+            ValueError, match=f"maximum_bytes_billed must be <= {MAX_BIGQUERY_INT64}"
+        ):
+            client.read_query("SELECT 1", maximum_bytes_billed=bad_huge)
+        with pytest.raises(
+            ValueError, match=f"maximum_bytes_billed must be <= {MAX_BIGQUERY_INT64}"
+        ):
+            client.scan_query(
+                "SELECT 1",
+                schema={"a": pl.Int64},
+                maximum_bytes_billed=bad_huge,
+            )
+    mock_arrow_client.read_query.assert_not_called()
+
+    # read_query forwards maximum_bytes_billed for both live and dry-run calls.
+    mock_arrow_client.read_query.return_value = MagicMock()
+    with patch("polars.DataFrame"):
+        client.read_query("SELECT 1", maximum_bytes_billed=1_000_000)
+        client.read_query("SELECT 1", dry_run=True, maximum_bytes_billed=0)
+    assert (
+        mock_arrow_client.read_query.call_args_list[0].kwargs["maximum_bytes_billed"]
+        == 1_000_000
+    )
+    assert (
+        mock_arrow_client.read_query.call_args_list[1].kwargs["maximum_bytes_billed"]
+        == 0
+    )
+
+    # scan_query does NOT forward maximum_bytes_billed on its construction-time
+    # dry run (so pruning can shrink the query before execution), DOES surface it
+    # in explain_detail, and DOES forward it at .collect() time.
+    mock_arrow_client.read_query.reset_mock()
+    dry_run_df = pl.DataFrame(
+        {
+            "bigquerySchema": ['{"fields": [{"name": "a", "type": "INT64"}]}'],
+            "statementType": ["SELECT"],
+            "location": ["US"],
+        }
+    )
+    mock_arrow_client.read_query.return_value = dry_run_df
+    lf = client.scan_query(
+        "SELECT a FROM t",
+        maintain_order=False,
+        maximum_bytes_billed=500_000,
+    )
+    assert mock_arrow_client.read_query.call_args_list[0].kwargs["dry_run"] is True
+    assert (
+        mock_arrow_client.read_query.call_args_list[0].kwargs["maximum_bytes_billed"]
+        is None
+    )
+    explain = lf.explain()
+    assert "maximum_bytes_billed=500000" in explain
+
+    mock_arrow_client.read_query.reset_mock()
+    mock_arrow_client.read_query.return_value = MagicMock(name="stream")
+    with patch("polars.scan_arrow_c_stream", return_value=pl.LazyFrame({"a": [1]})):
+        assert lf.collect().to_dict(as_series=False) == {"a": [1]}
+    mock_arrow_client.read_query.assert_called_once_with(
+        "SELECT a FROM t",
+        arrow_buffer_compression="lz4frame",
+        dry_run=False,
+        maintain_order=False,
+        use_query_cache=None,
+        maximum_bytes_billed=500_000,
+    )
+
+    # Default maximum_bytes_billed=None omits it from explain_detail.
+    lf_default = client.scan_query("SELECT a FROM t", schema={"a": pl.Int64})
+    assert "maximum_bytes_billed" not in lf_default.explain()
+
+
+def test_client_maximum_bytes_billed_wire_serialization():
+    import json
+    import threading
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+
+    captured_bodies: list[dict] = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self):
+            length = int(self.headers.get("Content-Length", "0"))
+            body = json.loads(self.rfile.read(length).decode("utf-8"))
+            captured_bodies.append(body)
+            if body.get("dryRun"):
+                resp = {
+                    "jobReference": {
+                        "projectId": "test-proj",
+                        "location": "US",
+                    },
+                    "totalBytesProcessed": "16",
+                    "statementType": "SELECT",
+                    "schema": {"fields": [{"name": "one", "type": "INT64"}]},
+                }
+                status = 200
+            else:
+                resp = {
+                    "error": {
+                        "code": 400,
+                        "message": "Query exceeded limit for bytes billed: 500000.",
+                        "status": "INVALID_ARGUMENT",
+                    }
+                }
+                status = 400
+            payload = json.dumps(resp).encode("utf-8")
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+        def log_message(self, format, *args):
+            pass
+
+    server = HTTPServer(("127.0.0.1", 0), Handler)
+    server.timeout = 2.0
+    port = server.server_port
+
+    def serve_three():
+        for _ in range(3):
+            server.handle_request()
+
+    server_thread = threading.Thread(target=serve_three, daemon=True)
+    server_thread.start()
+
+    try:
+        creds = lambda: ({"bearer_token": "fake-tok"}, None)
+        client = Client(quota_project_id="test-proj", credentials_provider=creds)
+        client._arrow_client = arrow_bigquery.Client(
+            quota_project_id="test-proj",
+            credentials_provider=creds,
+            bq_endpoint=f"http://127.0.0.1:{port}",
+        )
+        # 1. Explicit dry-run read_query forwards maximumBytesBilled on the wire.
+        client.read_query(
+            "SELECT 1 AS one",
+            dry_run=True,
+            maximum_bytes_billed=1_048_576,
+        )
+        # 2. scan_query schema discovery omits maximumBytesBilled on its dry run.
+        lf = client.scan_query(
+            "SELECT 1 AS one",
+            maintain_order=False,
+            maximum_bytes_billed=500_000,
+        )
+        assert "maximum_bytes_billed=500000" in lf.explain()
+        # 3. scan_query execution (.collect()) forwards maximumBytesBilled on the wire.
+        with pytest.raises(
+            (BigQueryError, pl.exceptions.ComputeError),
+            match="exceeded limit for bytes billed",
+        ):
+            lf.collect()
+    finally:
+        server_thread.join(timeout=2.0)
+        server.server_close()
+
+    assert len(captured_bodies) == 3
+    assert captured_bodies[0].get("maximumBytesBilled") == "1048576"
+    assert captured_bodies[0].get("dryRun") is True
+    assert "maximumBytesBilled" not in captured_bodies[1]
+    assert captured_bodies[1].get("dryRun") is True
+    assert captured_bodies[2].get("maximumBytesBilled") == "500000"
+    assert not captured_bodies[2].get("dryRun")

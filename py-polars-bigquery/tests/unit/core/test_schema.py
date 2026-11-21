@@ -276,3 +276,41 @@ def test_extract_polars_schema_handles_null_and_malformed_metadata():
                 }
             ]
         )
+
+    with pytest.raises(BigQueryError, match="field 'name' must be a string"):
+        extract_polars_schema_from_fields([{"type": "INT64"}])
+
+    with pytest.raises(BigQueryError, match="must be a non-empty string"):
+        extract_polars_schema_from_fields([{"name": "", "type": "INT64"}])
+
+    with pytest.raises(BigQueryError, match="did not contain any schema fields"):
+        extract_polars_schema({"schema": {"fields": []}}, require_non_empty=True)
+
+
+def test_extract_polars_schema_rejects_excessive_nesting_depth():
+    from polars_bigquery.core.schema import MAX_SCHEMA_NESTING_DEPTH
+    from polars_bigquery.exceptions import BigQueryError
+
+    node: dict = {"name": "leaf", "type": "INT64"}
+    for _ in range(MAX_SCHEMA_NESTING_DEPTH + 2):
+        node = {"name": "s", "type": "STRUCT", "fields": [node]}
+
+    with pytest.raises(BigQueryError, match="nesting depth exceeds maximum"):
+        extract_polars_schema_from_fields([node])
+
+
+def test_has_bignumeric_dtype_nested():
+    from polars_bigquery.core.schema import has_bignumeric_dtype
+
+    bn = pl.Decimal(precision=76, scale=38)
+    num = pl.Decimal(precision=38, scale=9)
+    assert has_bignumeric_dtype(bn) is True
+    assert has_bignumeric_dtype(pl.List(bn)) is True
+    assert has_bignumeric_dtype(pl.Array(bn, 2)) is True
+    assert has_bignumeric_dtype(pl.Struct([pl.Field("x", pl.List(bn))])) is True
+    assert has_bignumeric_dtype(num) is False
+    assert has_bignumeric_dtype(pl.List(num)) is False
+    assert has_bignumeric_dtype(pl.Struct([pl.Field("x", pl.Int64())])) is False
+    if hasattr(pl, "Map"):
+        assert has_bignumeric_dtype(pl.Map(pl.String(), bn)) is True
+        assert has_bignumeric_dtype(pl.Map(pl.String(), pl.Int64())) is False

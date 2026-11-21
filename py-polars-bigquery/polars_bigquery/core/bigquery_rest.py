@@ -111,7 +111,11 @@ def get_table_metadata(
         user_agent=user_agent,
     )
     table_metadata_url = _get_table_metadata_url(table_ref=table_ref)
-    response = http.get(table_metadata_url, headers=headers, timeout=timeout)
+    try:
+        response = http.get(table_metadata_url, headers=headers, timeout=timeout)
+    except requests.exceptions.RequestException as exc:
+        msg = f"BigQuery REST request failed: {exc}"
+        raise polars_bigquery.exceptions.BigQueryError(msg) from exc
     _raise_for_bigquery_error(response)
     try:
         payload = response.json()

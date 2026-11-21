@@ -309,3 +309,15 @@ def test_compile_read_api_plan_row_restriction_length_guard(caplog) -> None:
     debugs = [r.message for r in caplog.records if r.levelno == logging.DEBUG]
     assert len(debugs) == 1
     assert "selected_fields=2/2" in debugs[0]
+
+
+def test_zero_column_fallback_deprioritizes_nested_bignumeric() -> None:
+    scan = _tscan(
+        {
+            "arr_bn": pl.List(pl.Decimal(precision=76, scale=38)),
+            "struct_bn": pl.Struct([pl.Field("x", pl.Decimal(precision=76, scale=38))]),
+            "nested_ok": pl.List(pl.String()),
+        }
+    )
+    compiled = compile_read_api_plan(Project(input=scan, columns=()))
+    assert compiled.selected_fields == ("nested_ok",)

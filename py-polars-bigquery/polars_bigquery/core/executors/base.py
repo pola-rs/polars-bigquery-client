@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import abc
+import functools
 from collections.abc import Iterator
 from typing import Any, Protocol
 
@@ -12,7 +13,6 @@ import polars as pl
 from polars_bigquery.core.plan import (
     Filter,
     PlanNode,
-    Project,
     Slice,
     UnaryPlanOp,
     decompose_linear_plan,
@@ -24,17 +24,15 @@ from polars_bigquery.core.plan import (
 _POLARS_MAX_SLICE_OFFSET = (1 << 63) - 1
 
 
-def _detect_polars_max_slice_length() -> int:
-    """Detect the maximum `length` accepted by `pl.LazyFrame.slice` in this runtime."""
+@functools.cache
+def _polars_max_slice_length() -> int:
+    """Lazily detect the maximum `length` accepted by `pl.LazyFrame.slice` in this runtime."""
     probe = pl.LazyFrame({"_p": [1]})
     try:
         probe.slice(0, 1 << 32)
     except OverflowError:
         return (1 << 32) - 1
     return (1 << 63) - 1
-
-
-_POLARS_MAX_SLICE_LENGTH = _detect_polars_max_slice_length()
 
 
 class ArrowQueryClient(Protocol):
@@ -48,6 +46,7 @@ class ArrowQueryClient(Protocol):
         dry_run: bool = ...,
         maintain_order: bool = ...,
         use_query_cache: bool | None = ...,
+        maximum_bytes_billed: int | None = ...,
     ) -> Any:
         """Execute a GoogleSQL query (or dry run) and return an Arrow C Stream exporter."""
 
@@ -78,8 +77,8 @@ class PlanExecutor(abc.ABC):
 
 def _slice_fits_polars(op: Slice) -> bool:
     """Return `True` if `op` fits within native `pl.LazyFrame.slice` integer bounds."""
-    return (
-        op.offset <= _POLARS_MAX_SLICE_OFFSET and op.length <= _POLARS_MAX_SLICE_LENGTH
+    return op.offset <= _POLARS_MAX_SLICE_OFFSET and (
+        op.length <= (1 << 32) - 1 or op.length <= _polars_max_slice_length()
     )
 
 
@@ -91,11 +90,12 @@ def _apply_ops_to_frame(
     for op in ops:
         if isinstance(op, Slice):
             if not _slice_fits_polars(op):
+                max_length = _polars_max_slice_length()
                 msg = (
                     f"Slice(offset={op.offset}, length={op.length}) exceeds "
                     f"Polars native slice limits "
                     f"(max offset={_POLARS_MAX_SLICE_OFFSET}, "
-                    f"max length={_POLARS_MAX_SLICE_LENGTH})."
+                    f"max length={max_length})."
                 )
                 raise ValueError(msg)
             result = result.slice(op.offset, op.length)
@@ -114,42 +114,77 @@ def apply_local_plan(lazyframe: pl.LazyFrame, plan: PlanNode) -> pl.LazyFrame:
     return _apply_ops_to_frame(lazyframe, ops)
 
 
+def _close_iterator(iterator: Iterator[pl.DataFrame]) -> None:
+    """Close an upstream generator/iterator eagerly if it exposes `.close()`."""
+    close = getattr(iterator, "close", None)
+    if callable(close):
+        close()
+
+
 def _iter_slice_batches(
     batches: Iterator[pl.DataFrame],
     offset: int,
     length: int,
 ) -> Iterator[pl.DataFrame]:
     """Lazily apply an arbitrary-precision `Slice(offset, length)` to a batch iterator."""
-    if length == 0:
-        for batch in batches:
-            yield batch.clear()
-            break
-        return
+    try:
+        if length == 0:
+            return
 
-    skipped = 0
-    emitted = 0
-    for batch in batches:
-        height = batch.height
-        if height == 0:
-            continue
-        start = 0
-        if skipped < offset:
-            drop_rows = min(height, offset - skipped)
-            skipped += drop_rows
-            start = drop_rows
-            if start >= height:
+        skipped = 0
+        emitted = 0
+        for batch in batches:
+            height = batch.height
+            if height == 0:
                 continue
-        remaining = length - emitted
-        take = min(height - start, remaining)
-        if take > 0:
-            yield (batch if start == 0 and take == height else batch.slice(start, take))
-            emitted += take
-        if emitted >= length:
-            break
+            start = 0
+            if skipped < offset:
+                drop_rows = min(height, offset - skipped)
+                skipped += drop_rows
+                start = drop_rows
+                if start >= height:
+                    continue
+            remaining = length - emitted
+            take = min(height - start, remaining)
+            if take > 0:
+                yield (
+                    batch if start == 0 and take == height else batch.slice(start, take)
+                )
+                emitted += take
+            if emitted >= length:
+                break
+    finally:
+        _close_iterator(batches)
 
 
 def _apply_project_batch(batch: pl.DataFrame, columns: tuple[str, ...]) -> pl.DataFrame:
     return batch.select(list(columns)) if columns else batch.drop(pl.all())
+
+
+def _iter_filter_batches(
+    batches: Iterator[pl.DataFrame],
+    predicate: pl.Expr,
+) -> Iterator[pl.DataFrame]:
+    """Lazily filter batches, binding `predicate` per call frame (no loop-closure aliasing)."""
+    try:
+        for raw in batches:
+            batch = raw.filter(predicate)
+            if batch.height > 0:
+                yield batch
+    finally:
+        _close_iterator(batches)
+
+
+def _iter_project_batches(
+    batches: Iterator[pl.DataFrame],
+    columns: tuple[str, ...],
+) -> Iterator[pl.DataFrame]:
+    """Lazily project batches, binding `columns` per call frame (no loop-closure aliasing)."""
+    try:
+        for raw in batches:
+            yield _apply_project_batch(raw, columns)
+    finally:
+        _close_iterator(batches)
 
 
 def _iter_apply_ops(
@@ -162,11 +197,9 @@ def _iter_apply_ops(
         if isinstance(op, Slice):
             stream = _iter_slice_batches(stream, op.offset, op.length)
         elif isinstance(op, Filter):
-            pred = op.predicate
-            stream = (batch for raw in stream if (batch := raw.filter(pred)).height > 0)
-        elif isinstance(op, Project):
-            cols = op.columns
-            stream = (_apply_project_batch(raw, cols) for raw in stream)
+            stream = _iter_filter_batches(stream, op.predicate)
+        else:
+            stream = _iter_project_batches(stream, op.columns)
     return stream
 
 

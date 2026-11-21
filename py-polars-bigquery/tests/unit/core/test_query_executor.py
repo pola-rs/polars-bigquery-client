@@ -730,13 +730,14 @@ def test_query_executor_execute_logging_and_arguments(caplog) -> None:
     ):
         batches = list(executor.execute(plan, batch_size=2))
 
-    assert pl.concat(batches).to_dict(as_series=False) == {"a": [1, 3]}
+    assert sorted(pl.concat(batches)["a"].to_list()) == [1, 3]
     mock_arrow_client.read_query.assert_called_once_with(
         "SELECT a, b, c FROM secret_tbl\n|> WHERE (`b` = 'secret_keep')\n|> SELECT `a`, `b`",
         arrow_buffer_compression="zstd",
         dry_run=False,
         maintain_order=False,
         use_query_cache=False,
+        maximum_bytes_billed=None,
     )
     warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
     assert warnings == []
@@ -824,13 +825,38 @@ def test_compile_query_plan_validates_max_sql_bytes() -> None:
 
 def test_compile_query_plan_trailing_semicolon_with_comments_and_literals() -> None:
     cases = [
-        ("SELECT a, b FROM t; -- trailing note", "SELECT a, b FROM t"),
-        ("SELECT a, b FROM t; # hash comment", "SELECT a, b FROM t"),
-        ("SELECT a, b FROM t; /* block comment */", "SELECT a, b FROM t"),
-        ("SELECT a, b FROM t;\n-- next line comment\n", "SELECT a, b FROM t"),
-        ("SELECT a, b FROM t; /* a */ -- b", "SELECT a, b FROM t"),
+        # Trailing comments placed after a single `;` are preserved (e.g.
+        # SQLCommenter / dbt tracing tags) while removing only the bare `;`.
+        ("SELECT a, b FROM t; -- trailing note", "SELECT a, b FROM t -- trailing note"),
+        ("SELECT a, b FROM t; # hash comment", "SELECT a, b FROM t # hash comment"),
+        (
+            "SELECT a, b FROM t; /* trace_id: abc */",
+            "SELECT a, b FROM t /* trace_id: abc */",
+        ),
+        (
+            "SELECT a, b FROM t;\n-- next line comment\n",
+            "SELECT a, b FROM t\n-- next line comment",
+        ),
+        (
+            "SELECT a, b FROM t; /* a */ -- b",
+            "SELECT a, b FROM t /* a */ -- b",
+        ),
+        # Classic CR-only (`\r`) line-comment terminators.
+        ("SELECT a, b FROM t\r-- note\r;", "SELECT a, b FROM t\r-- note"),
+        ("SELECT a, b FROM t\r# note\r;", "SELECT a, b FROM t\r# note"),
         # Preserve invalid double semicolon so BigQuery still fails it.
-        ("SELECT a, b FROM t;; -- note", "SELECT a, b FROM t;"),
+        ("SELECT a, b FROM t;; -- note", "SELECT a, b FROM t; -- note"),
+        ("SELECT a, b FROM t; /* a */;", "SELECT a, b FROM t; /* a */"),
+        # Unterminated block comment/string must NOT strip a preceding `;`
+        # (prevents silently swallowing syntax errors).
+        (
+            "SELECT a, b FROM t; /* unterminated",
+            "SELECT a, b FROM t; /* unterminated",
+        ),
+        (
+            "SELECT a, b FROM t; /*/",
+            "SELECT a, b FROM t; /*/",
+        ),
         # Semicolon INSIDE a line comment must NOT be stripped.
         (
             "SELECT a, b FROM t -- keep semi;",
@@ -840,12 +866,27 @@ def test_compile_query_plan_trailing_semicolon_with_comments_and_literals() -> N
         ("SELECT 'x;' AS a, b FROM t", "SELECT 'x;' AS a, b FROM t"),
         ('SELECT r"x;" AS a, b FROM t', 'SELECT r"x;" AS a, b FROM t'),
         ("SELECT '''x;''' AS a, b FROM t;", "SELECT '''x;''' AS a, b FROM t"),
+        # Raw strings with backslash-escaped quotes keep literal boundaries in sync.
+        (r"SELECT r'a\'b' AS a, b FROM t;", r"SELECT r'a\'b' AS a, b FROM t"),
+        (r'SELECT r"a\"b" AS a, b FROM t;', r'SELECT r"a\"b" AS a, b FROM t'),
+        (r"SELECT r'a\\' AS a, b FROM t;", r"SELECT r'a\\' AS a, b FROM t"),
+        (
+            r"SELECT rb'''a\'''b''' AS a, b FROM t;",
+            r"SELECT rb'''a\'''b''' AS a, b FROM t",
+        ),
+        (
+            r"SELECT a, b FROM t WHERE a = r'x\'y' AND b = '/*;*/;   -- comment'",
+            r"SELECT a, b FROM t WHERE a = r'x\'y' AND b = '/*;*/;   -- comment'",
+        ),
+        # Backtick identifiers with escaped backslash / backtick.
+        (r"SELECT `a\`b` AS a, b FROM t;", r"SELECT `a\`b` AS a, b FROM t"),
+        (r"SELECT `a\\` AS a, b FROM t;", r"SELECT `a\\` AS a, b FROM t"),
         # Leading newlines/indentation stay unshifted.
-        ("\n\n  SELECT a, b FROM t; -- note\n", "\n\n  SELECT a, b FROM t"),
+        ("\n\n  SELECT a, b FROM t; -- note\n", "\n\n  SELECT a, b FROM t -- note"),
         # CREATE TEMP FUNCTION statement retains its internal semicolon.
         (
             "CREATE TEMP FUNCTION f(x INT64) AS (x + 1); SELECT f(1) AS a, 2 AS b; -- end",
-            "CREATE TEMP FUNCTION f(x INT64) AS (x + 1); SELECT f(1) AS a, 2 AS b",
+            "CREATE TEMP FUNCTION f(x INT64) AS (x + 1); SELECT f(1) AS a, 2 AS b -- end",
         ),
     ]
     for raw_sql, expected_inner in cases:
@@ -857,7 +898,7 @@ def test_compile_query_plan_trailing_semicolon_with_comments_and_literals() -> N
 
 
 def test_has_non_comment_sql_rejects_empty_semicolons_and_comments_only() -> None:
-    from polars_bigquery.core.executors.query import has_non_comment_sql
+    from polars_bigquery.core.executors import has_non_comment_sql
 
     for empty in (
         "",
@@ -873,7 +914,29 @@ def test_has_non_comment_sql_rejects_empty_semicolons_and_comments_only() -> Non
         assert has_non_comment_sql(empty) is False, empty
 
     assert has_non_comment_sql("-- header\nSELECT 1") is True
-    assert has_non_comment_sql("/* note */ SELECT r'\\'") is True
+    assert has_non_comment_sql("/* note */ SELECT r'\\\\'") is True
+    # Unterminated raw/quoted literal or backtick is still non-empty SQL so BigQuery
+    # reports the syntax error rather than claiming query is empty.
+    assert has_non_comment_sql("SELECT 'unterminated\\") is True
+    assert has_non_comment_sql("SELECT `unterminated") is True
+
+
+def test_sql_trailing_semicolon_scanner_scales_linearly() -> None:
+    import time
+
+    from polars_bigquery.core.executors.query import _strip_single_trailing_semicolon
+
+    adversarial_cases = [
+        "SELECT '" + ("\\\\" * 100_000) + "a';",
+        "SELECT 1 - " + ("1 - " * 100_000) + "1;",
+        "SELECT a FROM t WHERE x IN (" + ",".join(["123"] * 100_000) + "); -- tail",
+    ]
+    for sql in adversarial_cases:
+        t0 = time.perf_counter()
+        stripped = _strip_single_trailing_semicolon(sql)
+        elapsed = time.perf_counter() - t0
+        assert not stripped.endswith(";")
+        assert elapsed < 0.5, f"SQL scanner took {elapsed:.3f}s on len={len(sql)}"
 
 
 def test_compile_query_plan_inner_query_fast_path_and_large_conjunct_scaling() -> None:
@@ -916,11 +979,43 @@ def test_query_executor_handles_huge_slice() -> None:
         "polars.scan_arrow_c_stream", return_value=pl.LazyFrame({"a": [1, 2, 3]})
     ):
         batches = list(executor.execute(plan))
-    assert pl.concat(batches).to_dict(as_series=False) == {"a": [1, 2, 3]}
+    assert sorted(pl.concat(batches)["a"].to_list()) == [1, 2, 3]
     mock_arrow_client.read_query.assert_called_once_with(
         "SELECT a FROM t",
         arrow_buffer_compression="lz4frame",
         dry_run=False,
         maintain_order=False,
         use_query_cache=None,
+        maximum_bytes_billed=None,
     )
+
+
+def test_query_executor_forwards_maximum_bytes_billed(caplog) -> None:
+    import logging
+
+    mock_arrow_client = MagicMock()
+    mock_arrow_client.read_query.return_value = MagicMock(name="exporter")
+    scan = QueryScan(
+        raw_query="SELECT a FROM t",
+        columns=("a",),
+        maintain_order=False,
+        maximum_bytes_billed=10_000_000,
+    )
+    executor = QueryExecutor(mock_arrow_client)
+    with (
+        caplog.at_level(logging.DEBUG, logger="polars_bigquery.core.executors.query"),
+        patch("polars.scan_arrow_c_stream", return_value=pl.LazyFrame({"a": [1]})),
+    ):
+        batches = list(executor.execute(scan))
+    assert pl.concat(batches).to_dict(as_series=False) == {"a": [1]}
+    mock_arrow_client.read_query.assert_called_once_with(
+        "SELECT a FROM t",
+        arrow_buffer_compression="lz4frame",
+        dry_run=False,
+        maintain_order=False,
+        use_query_cache=None,
+        maximum_bytes_billed=10_000_000,
+    )
+    debug_msgs = [r.message for r in caplog.records if r.levelno == logging.DEBUG]
+    assert len(debug_msgs) == 1
+    assert "maximum_bytes_billed=10000000" in debug_msgs[0]

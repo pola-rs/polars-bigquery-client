@@ -13,6 +13,7 @@ from polars_bigquery.core.executors.query import (
     CompiledQueryPlan,
     QueryExecutor,
     compile_query_plan,
+    has_non_comment_sql,
 )
 from polars_bigquery.core.executors.read_api import (
     CompiledReadApiPlan,
@@ -34,4 +35,5 @@ __all__ = [
     "compile_query_plan",
     "compile_read_api_plan",
     "execute_local_plan_batches",
+    "has_non_comment_sql",
 ]

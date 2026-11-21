@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import logging
+import re
+import threading
 from collections.abc import Iterator, Mapping, Sequence
 from typing import Any
 
@@ -15,18 +17,28 @@ import polars_bigquery.core.schema
 import polars_bigquery.core.version
 import polars_bigquery.exceptions
 from polars_bigquery.core import bigquery_rest
-from polars_bigquery.core.executors import QueryExecutor, ReadApiExecutor
-from polars_bigquery.core.executors.query import has_non_comment_sql
+from polars_bigquery.core.executors import (
+    QueryExecutor,
+    ReadApiExecutor,
+    has_non_comment_sql,
+)
 from polars_bigquery.core.plan import (
     ArrowBufferCompression,
     QueryScan,
     TableScan,
     build_io_source_plan,
+    validate_maximum_bytes_billed,
 )
 
 logger = logging.getLogger(__name__)
 
 _VALID_ARROW_BUFFER_COMPRESSIONS = frozenset({"lz4frame", "zstd", "unspecified"})
+_EXPLAIN_CONTROL_CHARS_RE = re.compile(r"[\x00-\x1f\x7f\u2028\u2029]+")
+
+
+def _sanitize_explain_value(value: str) -> str:
+    """Normalize an `explain_detail` token value so output remains single-line."""
+    return _EXPLAIN_CONTROL_CHARS_RE.sub(" ", value).strip()
 
 
 def _get_user_agent(user_agent: str | None) -> str:
@@ -94,7 +106,7 @@ def _extract_bignumeric_columns(schema: pl.Schema) -> list[str]:
     return [
         name
         for name, dtype in schema.items()
-        if isinstance(dtype, pl.Decimal) and dtype.precision > 38
+        if polars_bigquery.core.schema.has_bignumeric_dtype(dtype)
     ]
 
 
@@ -128,9 +140,11 @@ def _register_io_source_safe(
 class Client:
     """Client for reading data from Google BigQuery into Polars.
 
-    Wraps an `arrow_bigquery.Client` and a REST session to keep connections open
-    and reuse credentials across multiple operations. Can be used as a context
-    manager to automatically close the underlying REST session on exit.
+    Wraps an `arrow_bigquery.Client` and a lazily created REST session to keep
+    connections open and reuse credentials across multiple operations. Can be
+    used as a context manager to automatically close both the REST session and
+    the underlying `arrow_bigquery.Client` on exit; collect or sink any
+    returned `LazyFrame` inside the `with Client(...) as client:` block.
 
     Examples
     --------
@@ -178,6 +192,7 @@ class Client:
         self._user_agent = _get_user_agent(user_agent)
         self._quota_project_id = quota_project_id
         self._rest_client_instance: bigquery_rest.BigQueryRestClient | None = None
+        self._lifecycle_lock = threading.Lock()
         self._closed = False
         self._arrow_client = arrow_bigquery.Client(
             quota_project_id=quota_project_id,
@@ -188,35 +203,45 @@ class Client:
     @property
     def _rest_client(self) -> bigquery_rest.BigQueryRestClient:
         """Lazily initialize the REST client pool only when table metadata is needed."""
-        if self._rest_client_instance is None:
-            self._rest_client_instance = bigquery_rest.BigQueryRestClient(
-                quota_project_id=self._quota_project_id,
-                credentials_provider=self._credentials_provider,
-                user_agent=self._user_agent,
-            )
-        return self._rest_client_instance
+        with self._lifecycle_lock:
+            if self._closed:
+                msg = "Cannot use a closed polars_bigquery.Client instance."
+                raise RuntimeError(msg)
+            if self._rest_client_instance is None:
+                self._rest_client_instance = bigquery_rest.BigQueryRestClient(
+                    quota_project_id=self._quota_project_id,
+                    credentials_provider=self._credentials_provider,
+                    user_agent=self._user_agent,
+                )
+            return self._rest_client_instance
 
     @_rest_client.setter
     def _rest_client(self, client: bigquery_rest.BigQueryRestClient | None) -> None:
-        self._rest_client_instance = client
+        with self._lifecycle_lock:
+            self._rest_client_instance = client
 
     def _ensure_open(self) -> None:
-        if self._closed:
-            msg = "Cannot use a closed polars_bigquery.Client instance."
-            raise RuntimeError(msg)
+        with self._lifecycle_lock:
+            if self._closed:
+                msg = "Cannot use a closed polars_bigquery.Client instance."
+                raise RuntimeError(msg)
 
     def close(self) -> None:
         """Close underlying REST and native Arrow client resources."""
-        if self._closed:
-            return
-        self._closed = True
-        rest_client = self._rest_client_instance
-        self._rest_client_instance = None
-        if rest_client is not None:
-            rest_client.close()
-        close_arrow = getattr(self._arrow_client, "close", None)
-        if callable(close_arrow):
-            close_arrow()
+        with self._lifecycle_lock:
+            if self._closed:
+                return
+            self._closed = True
+            rest_client = self._rest_client_instance
+            self._rest_client_instance = None
+            arrow_client = self._arrow_client
+        try:
+            if rest_client is not None:
+                rest_client.close()
+        finally:
+            close_arrow = getattr(arrow_client, "close", None)
+            if callable(close_arrow):
+                close_arrow()
 
     def __enter__(self) -> Client:  # noqa: PYI034
         return self
@@ -240,12 +265,16 @@ class Client:
         *,
         arrow_buffer_compression: ArrowBufferCompression,
     ) -> pl.DataFrame:
+        # Never forward maximum_bytes_billed on scan_query schema discovery:
+        # dry runs are unbilled, and downstream .filter()/.select() pushdown
+        # may prune the query below the caller's byte cap at .collect() time.
         arrow_stream_exporter = self._arrow_client.read_query(
             query,
             arrow_buffer_compression=arrow_buffer_compression,
             dry_run=True,
             maintain_order=True,
             use_query_cache=None,
+            maximum_bytes_billed=None,
         )
         return pl.DataFrame(arrow_stream_exporter)
 
@@ -300,6 +329,7 @@ class Client:
         dry_run: bool = False,
         maintain_order: bool = True,
         use_query_cache: bool | None = None,
+        maximum_bytes_billed: int | None = None,
     ) -> pl.DataFrame:
         """Execute a GoogleSQL query and read the result into a Polars `DataFrame`.
 
@@ -334,6 +364,15 @@ class Client:
         use_query_cache
             Whether to look for the result in the query cache. If `None`, the
             BigQuery API default (`True`) is used.
+        maximum_bytes_billed
+            Optional ceiling on bytes billed **per `jobs.query` attempt**
+            (`0 <= maximum_bytes_billed <= 2**63 - 1`). Queries whose estimated
+            billed bytes exceed this limit fail in BigQuery without incurring a
+            charge. When `dry_run=True`, this limit is also forwarded to
+            BigQuery. Note that because BigQuery may re-execute an uncached
+            read-only `SELECT` on a transient retry, this limit applies per
+            attempt rather than cumulatively across retries. Defaults to `None`
+            (no client-side limit).
 
         Returns
         -------
@@ -343,8 +382,16 @@ class Client:
 
         Raises
         ------
+        ValueError
+            If `arrow_buffer_compression` is invalid, or if
+            `maximum_bytes_billed` is negative or exceeds `(1 << 63) - 1`.
+        TypeError
+            If `query`, `dry_run`, `maintain_order`, `use_query_cache`, or
+            `maximum_bytes_billed` have invalid types.
         polars_bigquery.exceptions.BigQueryError
             If the BigQuery query fails.
+        RuntimeError
+            If called on a closed `Client` instance.
 
         Examples
         --------
@@ -366,12 +413,14 @@ class Client:
         _validate_bool(dry_run, "dry_run")
         _validate_bool(maintain_order, "maintain_order")
         _validate_optional_bool(use_query_cache, "use_query_cache")
+        validate_maximum_bytes_billed(maximum_bytes_billed)
         arrow_stream_exporter = self._arrow_client.read_query(
             query,
             arrow_buffer_compression=arrow_buffer_compression,
             dry_run=dry_run,
             maintain_order=maintain_order,
             use_query_cache=use_query_cache,
+            maximum_bytes_billed=maximum_bytes_billed,
         )
         return pl.DataFrame(arrow_stream_exporter)
 
@@ -452,38 +501,9 @@ class Client:
         table_ref = arrow_bigquery.api.resources.parse_table_id(table)
         if schema is None:
             table_metadata = self._rest_client.get_table_metadata(table_ref)
-            if not isinstance(table_metadata, Mapping):
-                msg = (
-                    "Invalid response from BigQuery: expected table metadata object, "
-                    f"got {type(table_metadata).__name__}."
-                )
-                raise polars_bigquery.exceptions.BigQueryError(msg)
-            schema_obj = table_metadata.get("schema")
-            if schema_obj is not None and not isinstance(schema_obj, Mapping):
-                msg = (
-                    "Invalid response from BigQuery: table metadata 'schema' must be an object, "
-                    f"got {type(schema_obj).__name__}."
-                )
-                raise polars_bigquery.exceptions.BigQueryError(msg)
-            fields = (
-                schema_obj.get("fields") if isinstance(schema_obj, Mapping) else None
-            )
-            if fields is not None and (
-                not isinstance(fields, Sequence) or isinstance(fields, (str, bytes))
-            ):
-                msg = (
-                    "Invalid response from BigQuery: table metadata 'schema.fields' "
-                    f"must be a list, got {type(fields).__name__}."
-                )
-                raise polars_bigquery.exceptions.BigQueryError(msg)
-            if not fields:
-                msg = (
-                    "Invalid response from BigQuery: table metadata did not "
-                    "contain any schema fields."
-                )
-                raise polars_bigquery.exceptions.BigQueryError(msg)
             polars_schema = polars_bigquery.core.schema.extract_polars_schema(
-                table_metadata
+                table_metadata,
+                require_non_empty=True,
             )
             schema_mode = "metadata"
         else:
@@ -527,6 +547,7 @@ class Client:
         arrow_buffer_compression: ArrowBufferCompression = "lz4frame",
         maintain_order: bool = True,
         use_query_cache: bool | None = None,
+        maximum_bytes_billed: int | None = None,
     ) -> pl.LazyFrame:
         """Lazily execute a GoogleSQL `SELECT` query into a Polars `LazyFrame`.
 
@@ -583,16 +604,20 @@ class Client:
         - **Trailing comments after a semicolon**: A single bare statement-terminating
           `;` is stripped when appending pipe operators, including when followed by
           trailing whitespace or GoogleSQL comments (`; -- note`, `; # note`,
-          `; /* note */`). Invalid double semicolons (`;;`) retain the extra `;`
-          so BigQuery rejects them.
+          `; /* note */`), while **preserving** the trailing comments themselves
+          (e.g., SQLCommenter/dbt tracing tags). Unterminated block comments
+          (`; /* ...`) and invalid double semicolons (`;;`) retain `;` so BigQuery
+          rejects them as syntax errors.
         - **`lf.filter(p).limit(n)` vs. `lf.limit(n)`**: Because Polars retains
           a post-filter `.limit(n)` above the I/O scan node, BigQuery executes
           the query with `|> WHERE` and *without* SQL `LIMIT`. The full filtered
-          query executes and bills, remains subject to the ~10 GB anonymous
-          table cap, and blocks uninterruptibly for up to ~200 s during the
-          initial `jobs.query` wait before Polars stops pulling batches. Put a
-          `LIMIT` inside the SQL query or use `lf.limit(n)` when a server-side
-          row cap is needed.
+          query executes and bills, and remains subject to the ~10 GB anonymous
+          table cap. In the initial `jobs.query` wait (~200 s default), Python
+          signals (`Ctrl+C`) interrupt the client wait promptly, though queries
+          interrupted *before* BigQuery returns a job reference continue running
+          server-side; incomplete jobs dropped after a job reference is received
+          trigger a best-effort `jobs.cancel`. Put a `LIMIT` inside the SQL query
+          or use `lf.limit(n)` when a server-side row cap is needed.
         - **Read API / Query length guard**: Oversized `row_restriction` filters
           in `scan_table` (and `|> WHERE` clauses in `scan_query`) degrade
           automatically in tiers (pruning largest top-level `AND` conjuncts first)
@@ -634,6 +659,17 @@ class Client:
         use_query_cache
             Whether BigQuery should use the query cache. If `None`, BigQuery's
             API default (`True`) is used.
+        maximum_bytes_billed
+            Optional ceiling on bytes billed **per `jobs.query` attempt** at
+            execution time (`0 <= maximum_bytes_billed <= 2**63 - 1`). Not
+            applied to the construction-time dry run used for schema discovery
+            (`schema=None`) so downstream `.filter()` / `.select()` pushdown can
+            prune the query below this limit before BigQuery executes it. Useful
+            as a cost guardrail when `maintain_order=False` degrades oversized
+            predicates locally. Because BigQuery may re-execute an uncached
+            read-only `SELECT` on a transient retry, this limit applies per
+            attempt rather than cumulatively across retries. Defaults to `None`
+            (no client-side limit).
 
         Returns
         -------
@@ -645,7 +681,8 @@ class Client:
         ------
         ValueError
             If `arrow_buffer_compression` is invalid, `query` is empty (or contains
-            only comments/semicolons), an explicit `schema` is empty, the dry run
+            only comments/semicolons), `maximum_bytes_billed` is negative or
+            exceeds `(1 << 63) - 1`, an explicit `schema` is empty, the dry run
             reports a non-`SELECT` statement type, or the dry-run result schema
             contains exact duplicate column names (or duplicate nested `STRUCT`
             subfield names).
@@ -654,11 +691,11 @@ class Client:
             unshifted `[line:col]` positions on `query`) or returns a missing,
             malformed, or empty schema response.
         TypeError
-            If `query`, `maintain_order`, or `use_query_cache` have invalid
-            types, if the dry-run result schema contains an unsupported
-            BigQuery field type (including `BIGNUMERIC` / `BIGDECIMAL`), or if
-            an explicit `schema` contains an unspecified Polars data type class
-            (such as bare `pl.Datetime`).
+            If `query`, `maintain_order`, `use_query_cache`, or
+            `maximum_bytes_billed` have invalid types, if the dry-run result
+            schema contains an unsupported BigQuery field type (including
+            `BIGNUMERIC` / `BIGDECIMAL`), or if an explicit `schema` contains an
+            unspecified Polars data type class (such as bare `pl.Datetime`).
         RuntimeError
             If called on a closed `Client` instance.
 
@@ -687,6 +724,7 @@ class Client:
         raw_query = _validate_query_str(query)
         _validate_bool(maintain_order, "maintain_order")
         _validate_optional_bool(use_query_cache, "use_query_cache")
+        validate_maximum_bytes_billed(maximum_bytes_billed)
 
         if not has_non_comment_sql(raw_query):
             raise ValueError("query must be a non-empty SELECT statement")
@@ -790,8 +828,12 @@ class Client:
             f"pushdown={pushdown_state}",
             f"schema={schema_mode}",
         ]
-        if isinstance(location, str) and bool(location):
-            explain_parts.append(f"location={location}")
+        if isinstance(location, str):
+            safe_location = _sanitize_explain_value(location)
+            if safe_location:
+                explain_parts.append(f"location={safe_location}")
+        if maximum_bytes_billed is not None:
+            explain_parts.append(f"maximum_bytes_billed={maximum_bytes_billed}")
         explain_detail = ", ".join(explain_parts)
 
         source = QueryScan(
@@ -801,6 +843,7 @@ class Client:
             arrow_buffer_compression=arrow_buffer_compression,
             use_query_cache=use_query_cache,
             explicit_schema=schema is not None,
+            maximum_bytes_billed=maximum_bytes_billed,
         )
         executor = QueryExecutor(self._arrow_client)
 

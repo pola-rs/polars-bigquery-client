@@ -5,6 +5,7 @@ from __future__ import annotations
 import dataclasses
 import heapq
 import logging
+import re
 from collections.abc import Iterator, Sequence
 from typing import Any, Literal, cast
 
@@ -17,6 +18,7 @@ from polars_bigquery.core.executors.base import (
     execute_local_plan_batches,
 )
 from polars_bigquery.core.plan import (
+    MAX_BIGQUERY_INT64,
     Filter,
     PlanNode,
     Project,
@@ -30,7 +32,7 @@ from polars_bigquery.core.plan import (
 logger = logging.getLogger(__name__)
 
 MAX_UNRESOLVED_SQL_BYTES = 1_000_000
-MAX_BIGQUERY_LIMIT = (1 << 63) - 1
+MAX_BIGQUERY_LIMIT = MAX_BIGQUERY_INT64
 
 _WHERE_LINE_PREFIX_BYTES = len(b"\n|> WHERE ")
 
@@ -55,16 +57,59 @@ class CompiledQueryPlan:
     degraded_reason: DegradedReason | None
 
 
+_SQL_WS_RE = re.compile(r"\s+")
+_SQL_SPECIAL_RE = re.compile(r"""--|[;#`'"]|/\*""")
+
+
+def _scan_line_comment_end(sql: str, start: int) -> int:
+    """Return the index immediately past the first `\\r` or `\\n` ending a line comment."""
+    nl = sql.find("\n", start)
+    cr = sql.find("\r", start)
+    if nl == -1:
+        return len(sql) if cr == -1 else cr + 1
+    if cr == -1 or nl < cr:
+        return nl + 1
+    return cr + 1
+
+
+def _scan_quoted_literal(sql: str, start: int, delim: str) -> int | None:
+    """Advance past a quoted string literal or backtick identifier in strict `O(N)`.
+
+    Caches `str.find` positions so every character in `sql` is visited at most
+    once, even on adversarial runs of backslashes. Backslashes escape the next
+    character for both standard and raw GoogleSQL string literals (`r'...'`,
+    `r\"...\"`, triple-quoted variants), matching BigQuery/GoogleSQL's lexical
+    rule that a literal cannot terminate right after an odd number of backslashes.
+
+    Returns the index immediately past the closing delimiter, or `None` if the
+    literal reaches EOF unterminated.
+    """
+    dlen = len(delim)
+    next_bs = sql.find("\\", start)
+    next_delim = sql.find(delim, start)
+
+    while next_delim != -1:
+        if next_bs != -1 and next_bs < next_delim:
+            # Since `next_bs < next_delim <= len(sql) - dlen`, `next_bs + 2 <= len(sql)`.
+            i = next_bs + 2
+            next_bs = sql.find("\\", i)
+            if next_delim < i:
+                next_delim = sql.find(delim, i)
+        else:
+            return next_delim + dlen
+
+    return None
+
+
 def _scan_sql_trailing_semicolon(sql: str) -> tuple[bool, int | None]:
-    """Scan GoogleSQL tokens once in `O(len(sql))` without backtracking.
+    """Scan GoogleSQL tokens in strict `O(len(sql))` using C-accelerated jumps.
 
     Returns ``(has_non_semicolon_token, last_trailing_semicolon_index)``.
-    `last_trailing_semicolon_index` is the byte/char index of a single `;`
-    token whose only following content consists of whitespace and comments
-    (`-- ...`, `# ...`, or `/* ... */`), or `None` if the last significant
-    token is not `;`. Handles GoogleSQL single/double/triple-quoted strings,
-    raw strings (`r'...'`/`rb'...'`), and backtick-quoted identifiers so
-    semicolons inside strings, identifiers, or comments are never misread.
+    `last_trailing_semicolon_index` is the index of a single `;` token whose
+    only following content consists of whitespace and well-formed comments
+    (`-- ...`, `# ...`, or closed `/* ... */`), or `None` if the last
+    significant token is not `;` or an unterminated block comment/string/identifier
+    reaches EOF (so syntax errors are never silently discarded).
     """
     n = len(sql)
     i = 0
@@ -72,29 +117,32 @@ def _scan_sql_trailing_semicolon(sql: str) -> tuple[bool, int | None]:
     last_trailing_semi_idx: int | None = None
 
     while i < n:
+        # Whitespace trivia
+        ws_match = _SQL_WS_RE.match(sql, i)
+        if ws_match is not None:
+            i = ws_match.end()
+            continue
+
         ch = sql[i]
 
-        # Whitespace trivia
-        if ch.isspace():
-            i += 1
-            continue
-
-        # Line comment: `-- ...`
+        # Line comment: `-- ...` (terminated by `\n` or `\r`)
         if ch == "-" and i + 1 < n and sql[i + 1] == "-":
-            newline = sql.find("\n", i + 2)
-            i = n if newline == -1 else newline + 1
+            i = _scan_line_comment_end(sql, i + 2)
             continue
 
-        # Line comment: `# ...`
+        # Line comment: `# ...` (terminated by `\n` or `\r`)
         if ch == "#":
-            newline = sql.find("\n", i + 1)
-            i = n if newline == -1 else newline + 1
+            i = _scan_line_comment_end(sql, i + 1)
             continue
 
         # Block comment: `/* ... */` (non-nesting in GoogleSQL)
         if ch == "/" and i + 1 < n and sql[i + 1] == "*":
             end = sql.find("*/", i + 2)
-            i = n if end == -1 else end + 2
+            if end == -1:
+                # Unterminated block comment: never strip a preceding semicolon,
+                # so BigQuery still surfaces the syntax error.
+                return has_non_semi_token, None
+            i = end + 2
             continue
 
         # Semicolon statement terminator
@@ -109,93 +157,29 @@ def _scan_sql_trailing_semicolon(sql: str) -> tuple[bool, int | None]:
 
         # Backtick-quoted identifier
         if ch == "`":
-            i += 1
-            while i < n:
-                c = sql[i]
-                if c == "\\":
-                    i += 2
-                elif c == "`":
-                    i += 1
-                    break
-                else:
-                    i += 1
+            after = _scan_quoted_literal(sql, i + 1, "`")
+            if after is None:
+                return True, None
+            i = after
             continue
 
-        # String / raw-string / byte-string literal prefixes: r'...', b'...', rb'...', etc.
-        # Only recognize prefixes when starting a fresh token (not after an identifier char).
-        is_raw = False
-        at_token_start = i == 0 or not (sql[i - 1].isalnum() or sql[i - 1] == "_")
-        if at_token_start and ch in ("r", "R", "b", "B"):
-            p = i
-            if (
-                p + 2 < n
-                and sql[p + 1] in ("r", "R", "b", "B")
-                and sql[p].lower() != sql[p + 1].lower()
-                and sql[p + 2] in ("'", '"')
-            ):
-                is_raw = True
-                i = p + 2
-                ch = sql[i]
-            elif p + 1 < n and sql[p + 1] in ("'", '"'):
-                is_raw = sql[p] in ("r", "R")
-                i = p + 1
-                ch = sql[i]
-            else:
-                # Regular identifier starting with r/R/b/B: consume contiguous word chars.
-                i += 1
-                while i < n and (sql[i].isalnum() or sql[i] == "_"):
-                    i += 1
-                continue
-
-        # Single / double / triple-quoted string literals
+        # Single / double / triple-quoted string literals (including r/b/rb/br
+        # prefixed raw and byte literals, which share backslash quote-escaping).
         if ch in ("'", '"'):
             quote = ch
             if i + 2 < n and sql[i + 1] == quote and sql[i + 2] == quote:
-                delim = quote * 3
-                i += 3
-                while i < n:
-                    if not is_raw and sql[i] == "\\":
-                        i += 2
-                        continue
-                    if sql.startswith(delim, i):
-                        i += 3
-                        break
-                    i += 1
+                after = _scan_quoted_literal(sql, i + 3, quote * 3)
             else:
-                i += 1
-                while i < n:
-                    c = sql[i]
-                    if not is_raw and c == "\\":
-                        i += 2
-                    elif c == quote:
-                        i += 1
-                        break
-                    else:
-                        i += 1
+                after = _scan_quoted_literal(sql, i + 1, quote)
+            if after is None:
+                return True, None
+            i = after
             continue
 
-        # Consume remaining ordinary non-special characters quickly
-        i += 1
-        while i < n and sql[i] not in (
-            " ",
-            "\t",
-            "\n",
-            "\r",
-            "\v",
-            "\f",
-            "-",
-            "#",
-            "/",
-            ";",
-            "`",
-            "'",
-            '"',
-            "r",
-            "R",
-            "b",
-            "B",
-        ):
-            i += 1
+        # Jump in C past ordinary SQL tokens directly to the next comment,
+        # quote delimiter, backtick, or semicolon.
+        match = _SQL_SPECIAL_RE.search(sql, i + 1)
+        i = n if match is None else match.start()
 
     return has_non_semi_token, last_trailing_semi_idx
 
@@ -210,14 +194,17 @@ def _strip_single_trailing_semicolon(sql: str) -> str:
     """Right-trim `sql` and remove at most one trailing bare statement-terminating `;`.
 
     Handles comments placed *after* the trailing semicolon (e.g. `SELECT 1; -- note`,
-    `SELECT 1; # note`, `SELECT 1; /* note */`) while leaving leading whitespace/newlines
-    intact (so BigQuery `[line:col]` error coordinates stay unshifted), leaving
-    `;` inside strings/comments/identifiers untouched, and leaving a preceding `;`
-    from invalid double-semicolon SQL (`SELECT 1;;`) so BigQuery rejects it.
+    `SELECT 1; # note`, `SELECT 1; /* trace_id: 123 */`) **without discarding those
+    comments**, so tracing/audit metadata (such as SQLCommenter/dbt tags) is kept
+    intact. Unterminated block comments (`SELECT 1; /* unterminated`) are left
+    untouched so BigQuery rejects the syntax error rather than executing them.
+    Leading whitespace/newlines stay intact so `[line:col]` error coordinates remain
+    unshifted, `;` inside strings/comments/identifiers are untouched, and preceding `;`
+    from invalid double-semicolon SQL (`SELECT 1;;`) remain so BigQuery rejects them.
     """
     _, semi_idx = _scan_sql_trailing_semicolon(sql)
     if semi_idx is not None:
-        return sql[:semi_idx].rstrip()
+        return f"{sql[:semi_idx]}{sql[semi_idx + 1 :]}".rstrip()
     return sql.rstrip()
 
 
@@ -249,10 +236,12 @@ def _where_clause_line_bytes(conjunct_sum: int, conjunct_count: int) -> int:
     """Return exact UTF-8 bytes contributed by `\\n|> WHERE <formatted_conjuncts>`."""
     if conjunct_count == 0:
         return 0
-    if conjunct_count == 1:
-        return _WHERE_LINE_PREFIX_BYTES + conjunct_sum
-    # "\n|> WHERE " + "(" + c0 + " AND " + c1 + ... + ")"
-    return _WHERE_LINE_PREFIX_BYTES + conjunct_sum + 5 * (conjunct_count - 1) + 2
+    return (
+        _WHERE_LINE_PREFIX_BYTES
+        + compiler.formatted_conjuncts_byte_length_from_stats(
+            conjunct_count, conjunct_sum
+        )
+    )
 
 
 def _compute_active_lower_summary(
@@ -609,7 +598,8 @@ def compile_query_plan(
                 filter_states=pruned_states,
                 degraded_reason="sql_length_pruned_conjuncts",
             )
-            return pruned_candidate
+            if len(pruned_candidate.sql.encode("utf-8")) <= max_sql_bytes:
+                return pruned_candidate
 
         # Tier 3: Drop all remaining |> WHERE clauses while preserving trivial filters.
         tier3_states = {
@@ -698,7 +688,8 @@ class QueryExecutor(PlanExecutor):
                 logger.debug(
                     "Executing scan_query: maintain_order=%s, rewritten=%s, "
                     "projected=%s, where_clauses=%d, where_bytes=%d, "
-                    "pushed_slices=%s, sql_bytes=%d, degraded_reason=%s",
+                    "pushed_slices=%s, sql_bytes=%d, maximum_bytes_billed=%s, "
+                    "degraded_reason=%s",
                     source.maintain_order,
                     compiled.rewritten,
                     projection_summary,
@@ -706,6 +697,7 @@ class QueryExecutor(PlanExecutor):
                     where_bytes,
                     compiled.pushed_slices,
                     sql_bytes,
+                    source.maximum_bytes_billed,
                     compiled.degraded_reason,
                 )
 
@@ -715,6 +707,7 @@ class QueryExecutor(PlanExecutor):
             dry_run=False,
             maintain_order=source.maintain_order,
             use_query_cache=source.use_query_cache,
+            maximum_bytes_billed=source.maximum_bytes_billed,
         )
         return execute_local_plan_batches(
             pl.scan_arrow_c_stream(arrow_stream_exporter),
