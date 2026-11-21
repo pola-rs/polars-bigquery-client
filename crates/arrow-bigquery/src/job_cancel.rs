@@ -519,7 +519,8 @@ impl JobCancelGuard {
 
     /// Permanently disarms the guard so dropping it becomes a no-op.
     pub(crate) fn disarm(&mut self) {
-        if let GuardState::Armed(handle) = std::mem::replace(&mut self.state, GuardState::Inactive) {
+        if let GuardState::Armed(handle) = std::mem::replace(&mut self.state, GuardState::Inactive)
+        {
             handle.disarm();
         }
     }
@@ -535,7 +536,8 @@ impl JobCancelGuard {
 
 impl Drop for JobCancelGuard {
     fn drop(&mut self) {
-        if let GuardState::Armed(handle) = std::mem::replace(&mut self.state, GuardState::Inactive) {
+        if let GuardState::Armed(handle) = std::mem::replace(&mut self.state, GuardState::Inactive)
+        {
             handle.trigger();
         }
     }

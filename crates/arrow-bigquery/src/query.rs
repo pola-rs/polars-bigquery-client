@@ -777,7 +777,8 @@ impl<'a> Query<'a> {
             return original_err;
         };
 
-        if let Ok(job) = fetch_job(self.client, project_id, job_id, location, job_cancel_token).await
+        if let Ok(job) =
+            fetch_job(self.client, project_id, job_id, location, job_cancel_token).await
         {
             if let Err(job_err) = check_job_status_error(job.status, project_id, location, job_id) {
                 return job_err;
