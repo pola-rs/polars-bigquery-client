@@ -3,6 +3,8 @@ mod bigquery_read_stream;
 pub mod client_builder;
 mod decode;
 mod error;
+mod job_cancel;
+mod job_service_retry;
 pub mod query;
 
 use std::sync::Arc;
@@ -345,6 +347,18 @@ pub struct StreamOptions {
     pub arrow_buffer_compression: Option<arrow_serialization_options::CompressionCodec>,
 }
 
+pub(crate) fn apply_request_options_parts<B: RequestOptionsBuilder>(
+    builder: B,
+    quota_project_id: &str,
+    user_agent: Option<&str>,
+) -> B {
+    let builder = builder.with_quota_project(quota_project_id);
+    match user_agent {
+        Some(user_agent) => builder.with_user_agent(user_agent),
+        None => builder,
+    }
+}
+
 /// A receiver that yields [`RecordBatch`]es read from BigQuery.
 ///
 /// It manages the background tasks reading from the BigQuery Storage API streams
@@ -360,18 +374,35 @@ pub struct BigQueryRecordBatchReceiver {
     /// the receiver is dropped or encounters a fatal error, preventing resource leaks
     /// from orphan background tasks.
     handles: Vec<tokio::task::JoinHandle<()>>,
+    /// Best-effort `jobs.cancel` slot triggered if dropped/aborted before clean EOF.
+    job_cancel: job_cancel::JobCancelSlot,
 }
 
 impl BigQueryRecordBatchReceiver {
     pub async fn recv(&mut self) -> Option<Result<RecordBatch, BigQueryError>> {
         let item = self.rx.recv().await;
-        if matches!(item, None | Some(Err(_))) {
-            self.abort();
+        match &item {
+            None | Some(Err(BigQueryError::JobFailed(_))) => {
+                // Clean EOF (or a defensive guard if a stream path emits a confirmed
+                // server-side `JobFailed`, e.g. from cutover `DestinationTableRead::resolve`):
+                // disarm cancellation to skip issuing a redundant `jobs.cancel`.
+                self.job_cancel.disarm();
+                self.abort();
+            },
+            Some(Err(_)) => {
+                // Mid-stream transport, protocol, or decode error: keep `job_cancel` armed
+                // so `abort()` triggers best-effort `jobs.cancel` if the job is still running.
+                self.abort();
+            },
+            Some(Ok(_)) => {},
         }
         item
     }
 
     /// Immediately cancels and aborts all background stream tasks owned by this receiver.
+    ///
+    /// If attached to an incomplete BigQuery query job that has not yet reached EOF,
+    /// spawns a best-effort detached `jobs.cancel` RPC to release server-side resources.
     pub fn abort(&mut self) {
         if let Some(cancel_tx) = self.cancel_tx.take() {
             let _ = cancel_tx.send_replace(true);
@@ -380,6 +411,11 @@ impl BigQueryRecordBatchReceiver {
         for handle in self.handles.drain(..) {
             handle.abort();
         }
+        self.job_cancel.trigger();
+    }
+
+    pub(crate) fn set_job_cancel(&mut self, handle: job_cancel::JobCancelHandle) {
+        self.job_cancel.arm(handle);
     }
 
     pub(crate) fn new(
@@ -391,6 +427,7 @@ impl BigQueryRecordBatchReceiver {
             rx,
             cancel_tx,
             handles,
+            job_cancel: job_cancel::JobCancelSlot::Inactive,
         }
     }
 
@@ -443,6 +480,7 @@ pub struct Client {
     retry_throttler: SharedRetryThrottler,
     retry_config: bigquery_read_retry::StreamRetryConfig,
     decode_options: SchemaDecodeOptions,
+    cancel_pool: job_cancel::JobCancelPool,
 }
 
 fn channel_size() -> usize {
@@ -492,6 +530,7 @@ impl Client {
             retry_throttler,
             retry_config,
             decode_options,
+            cancel_pool: job_cancel::JobCancelPool::new(),
         }
     }
 
@@ -529,11 +568,38 @@ impl Client {
     }
 
     pub(crate) fn apply_request_options<B: RequestOptionsBuilder>(&self, builder: B) -> B {
-        let builder = builder.with_quota_project(&*self.quota_project_id);
-        match &self.user_agent {
-            Some(user_agent) => builder.with_user_agent(&**user_agent),
-            None => builder,
-        }
+        apply_request_options_parts(builder, &self.quota_project_id, self.user_agent.as_deref())
+    }
+
+    pub(crate) fn new_job_cancel_handle(
+        &self,
+        project_id: impl Into<String>,
+        job_id: impl Into<String>,
+        location: impl Into<String>,
+        runtime: tokio::runtime::Handle,
+        token: job_cancel::JobCancelToken,
+    ) -> job_cancel::JobCancelHandle {
+        job_cancel::JobCancelHandle::new(
+            self.bq_client.clone(),
+            Arc::clone(&self.quota_project_id),
+            self.user_agent.clone(),
+            project_id,
+            job_id,
+            location,
+            runtime,
+            self.cancel_pool.clone(),
+            token,
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn cancel_pool(&self) -> &job_cancel::JobCancelPool {
+        &self.cancel_pool
+    }
+
+    #[cfg(test)]
+    pub(crate) fn read_retry_throttler(&self) -> &SharedRetryThrottler {
+        &self.retry_throttler
     }
 
     pub(crate) fn stream_retry_config(&self) -> bigquery_read_retry::StreamRetryConfig {

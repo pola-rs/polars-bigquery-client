@@ -1,5 +1,5 @@
 import datetime
-from typing import Any
+from typing import Any, Self
 
 class BigQueryError(RuntimeError):
     """Error raised when a BigQuery API request, stream, or query job fails or times out."""
@@ -52,6 +52,16 @@ class Client:
         bqstorage_endpoint: str | None = None,
         preserve_datetime_extension: bool = False,
     ) -> None: ...
+    def close(self) -> None: ...
+    @property
+    def closed(self) -> bool: ...
+    def __enter__(self) -> Self: ...
+    def __exit__(
+        self,
+        exc_type: object = None,
+        exc_value: object = None,
+        traceback: object = None,
+    ) -> None: ...
     def read_table(
         self,
         table: BigQueryTableId,
@@ -72,6 +82,7 @@ class Client:
         dry_run: bool = False,
         maintain_order: bool = True,
         use_query_cache: bool | None = None,
+        maximum_bytes_billed: int | None = None,
     ) -> ArrowStreamExporter: ...
 
 class DropFlag:

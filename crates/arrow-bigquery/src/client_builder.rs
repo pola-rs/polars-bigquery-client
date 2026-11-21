@@ -95,13 +95,19 @@ impl ServiceConfigBuilder {
 
         init_crypto();
 
-        let retry_throttler = default_retry_throttler();
+        // Decouple retry throttlers so REST 429 bursts on BigQueryJobService do
+        // not throttle active gRPC ReadRows reconnects (and vice versa).
+        let bq_retry_throttler = crate::job_service_retry::job_service_retry_throttler();
+        let read_retry_throttler = default_retry_throttler();
 
-        let mut bq_builder = BigQueryJobService::builder();
+        let mut bq_builder = BigQueryJobService::builder()
+            .with_retry_policy(crate::job_service_retry::job_service_retry_policy())
+            .with_backoff_policy(crate::job_service_retry::job_service_backoff_policy())
+            .with_retry_throttler(bq_retry_throttler);
         let mut read_builder = Read::builder()
             .with_retry_policy(crate::bigquery_read_retry::create_read_session_retry_policy())
             .with_backoff_policy(crate::bigquery_read_retry::default_backoff_policy())
-            .with_retry_throttler(retry_throttler.clone());
+            .with_retry_throttler(read_retry_throttler.clone());
 
         if let Some(cred) = self.cred {
             bq_builder = bq_builder.with_credentials(cred.clone());
@@ -124,7 +130,7 @@ impl ServiceConfigBuilder {
             read_client,
             quota_project_id,
             self.user_agent,
-            retry_throttler,
+            read_retry_throttler,
             self.schema_decode_options,
         ))
     }

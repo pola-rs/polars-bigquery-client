@@ -97,29 +97,59 @@ impl Iterator for ReceiverIterator {
         loop {
             let rx = self.rx.as_mut()?;
 
-            let step = Python::attach(|py| {
-                // We need to be able to stop if the Python side decides to, so
-                // occasionally check to see if there were any interrupts.
-                if let Err(py_err) = py.check_signals() {
-                    py_err.restore(py);
-                    return Err(());
+            // True zero-GIL fast path for cached non-main threads (e.g., Polars/Rayon
+            // streaming engine threads). `py.check_signals()` is a no-op outside the
+            // main thread, so avoid touching the GIL on every batch.
+            let result = if crate::cached_is_main_python_thread() == Some(false) {
+                Ok(rt.block_on(rx.recv()))
+            } else {
+                let step = Python::attach(|py| {
+                    let is_main = match crate::is_main_python_thread(py) {
+                        Ok(v) => v,
+                        Err(py_err) => {
+                            let is_interrupt =
+                                py_err.is_instance_of::<pyo3::exceptions::PyKeyboardInterrupt>(py);
+                            let msg = if is_interrupt {
+                                "Python interrupt".to_string()
+                            } else {
+                                format!("Python error while checking thread state: {py_err}")
+                            };
+                            py_err.restore(py);
+                            return Err(msg);
+                        },
+                    };
+
+                    if !is_main {
+                        // First call on this non-main thread: cache is now populated so
+                        // subsequent batches skip `Python::attach` entirely.
+                        return Ok(Ok(py.detach(|| rt.block_on(rx.recv()))));
+                    }
+
+                    // We need to be able to stop if the Python side decides to, so
+                    // occasionally check to see if there were any interrupts.
+                    if let Err(py_err) = py.check_signals() {
+                        py_err.restore(py);
+                        return Err("Python interrupt".to_string());
+                    }
+
+                    Ok(py.detach(|| {
+                        rt.block_on(async {
+                            tokio::time::timeout(timeout_duration, rx.recv()).await
+                        })
+                    }))
+                });
+
+                match step {
+                    Ok(res) => res,
+                    Err(msg) => {
+                        self.rx = None;
+                        return Some(Err(
+                            pyo3_polars::export::polars_error::PolarsError::ComputeError(
+                                msg.into(),
+                            ),
+                        ));
+                    },
                 }
-
-                Ok(py.detach(|| {
-                    rt.block_on(async { tokio::time::timeout(timeout_duration, rx.recv()).await })
-                }))
-            });
-
-            let result = match step {
-                Ok(res) => res,
-                Err(()) => {
-                    self.rx = None;
-                    return Some(Err(
-                        pyo3_polars::export::polars_error::PolarsError::ComputeError(
-                            "Python interrupt".into(),
-                        ),
-                    ));
-                },
             };
 
             match result {
@@ -209,5 +239,91 @@ impl ArrowStreamExporter {
 
         let capsule = pyo3::types::PyCapsule::new(py, stream, Some(c"arrow_array_stream".into()))?;
         Ok(capsule.into())
+    }
+}
+
+#[cfg(all(test, feature = "testing"))]
+mod tests {
+    use std::sync::Arc;
+
+    use polars_arrow::array::{Array, Int64Array};
+    use polars_arrow::datatypes::{ArrowDataType, ArrowSchema, Field};
+    use polars_arrow::record_batch::RecordBatch;
+
+    use super::*;
+
+    #[test]
+    fn test_receiver_iterator_worker_thread_skips_gil_after_caching() {
+        Python::initialize();
+
+        let field = Field::new("x".into(), ArrowDataType::Int64, false);
+        let schema = ArrowSchema::from_iter([field.clone()]);
+        let dtype = ArrowDataType::Struct(vec![field]);
+        let rt = pyo3_async_runtimes::tokio::get_runtime();
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        let batch1 = RecordBatch::try_new(
+            1,
+            Arc::new(schema.clone()),
+            vec![Box::new(Int64Array::from_slice([1])) as Box<dyn Array>],
+        )
+        .unwrap();
+        let batch2 = RecordBatch::try_new(
+            1,
+            Arc::new(schema),
+            vec![Box::new(Int64Array::from_slice([2])) as Box<dyn Array>],
+        )
+        .unwrap();
+        rt.block_on(async {
+            tx.send(Ok(batch1)).await.unwrap();
+            tx.send(Ok(batch2)).await.unwrap();
+            drop(tx);
+        });
+        let receiver = arrow_bigquery_lib::BigQueryRecordBatchReceiver::new_for_testing(rx, vec![]);
+
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let cache_ready = Arc::new(AtomicBool::new(false));
+        let gil_held = Arc::new(AtomicBool::new(false));
+        let batch2_done = Arc::new(AtomicBool::new(false));
+        let cache_ready_w = Arc::clone(&cache_ready);
+        let gil_held_w = Arc::clone(&gil_held);
+        let batch2_done_w = Arc::clone(&batch2_done);
+
+        let worker = std::thread::spawn(move || {
+            let mut iter = ReceiverIterator {
+                rx: Some(receiver),
+                dtype,
+            };
+            // First batch populates `IS_MAIN_THREAD_CACHE` on this worker thread.
+            assert!(iter.next().unwrap().is_ok());
+            assert_eq!(crate::cached_is_main_python_thread(), Some(false));
+            cache_ready_w.store(true, Ordering::Release);
+            // Briefly yield until the parent thread actually holds the Python GIL.
+            while !gil_held_w.load(Ordering::Acquire) {
+                std::hint::spin_loop();
+            }
+            // Pulling the second batch and EOF must complete WITHOUT acquiring the GIL!
+            assert!(iter.next().unwrap().is_ok());
+            assert!(iter.next().is_none());
+            batch2_done_w.store(true, Ordering::Release);
+        });
+
+        while !cache_ready.load(Ordering::Acquire) {
+            std::thread::yield_now();
+        }
+        // Hold the GIL on the test thread briefly (typically < 1 ms) and verify the
+        // worker thread drains `batch2` + EOF without deadlocking on the GIL.
+        Python::attach(|_py| {
+            gil_held.store(true, Ordering::Release);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            while !batch2_done.load(Ordering::Acquire) {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "worker thread deadlocked trying to acquire GIL on cached non-main path"
+                );
+                std::thread::yield_now();
+            }
+        });
+        worker.join().unwrap();
     }
 }
