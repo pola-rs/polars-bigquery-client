@@ -1,8 +1,6 @@
 from __future__ import annotations
 
-import collections
-import functools
-
+from polars_bigquery.core.compiler._traversal import flatten_expr_bfs
 from polars_bigquery.core.compiler.ir.base import (
     Expr,
     NullLiteral,
@@ -12,16 +10,48 @@ from polars_bigquery.core.compiler.ir.boolean import (
     And,
     BoolLiteral,
     Coalesce,
-    DropNulls,
-    IsNotNull,
     Not,
     Or,
     Ternary,
     When,
 )
+from polars_bigquery.core.compiler.ir.list_ import ListLiteral
 from polars_bigquery.core.compiler.rewriter.base import replace_children, rewrite_tree
 
 _FALSY_LITERALS = (BoolLiteral(False), NullLiteral())
+MAX_BOOLEAN_WHEN_REWRITE_NODES = 20_000
+
+
+def _node_self_weight(node: Expr) -> int:
+    """Return the intrinsic AST weight of a single IR node (matching `typing/`)."""
+    if isinstance(node, ListLiteral):
+        return 1 + len(node.values)
+    return 1
+
+
+def _is_trivial_truthy_or_unsup(node: Expr) -> bool:
+    """Return True if evaluating `node` in a filter imposes no SQL row restriction.
+
+    Iterative single-node check matching `rewrite_boolean_when`'s bottom-up
+    `is_unconstrained` tracker:
+    - `Unsupported` / `BoolLiteral(True)` impose no restriction.
+    - `And(l, r)` is unconstrained iff both `l` and `r` are unconstrained.
+    - `Or(l, r)` is unconstrained iff either `l` or `r` is unconstrained (`emit_or_sql`
+      drops an entire `Or` when either child is `None`/`Unsupported` or `TRUE`).
+    """
+    nodes, children_map = flatten_expr_bfs(node)
+    flags = [False] * len(nodes)
+    for idx in range(len(nodes) - 1, -1, -1):
+        curr = nodes[idx]
+        if isinstance(curr, Unsupported) or curr == BoolLiteral(True):
+            flags[idx] = True
+        elif isinstance(curr, And):
+            left_idx, right_idx = children_map[idx]
+            flags[idx] = flags[left_idx] and flags[right_idx]
+        elif isinstance(curr, Or):
+            left_idx, right_idx = children_map[idx]
+            flags[idx] = flags[left_idx] or flags[right_idx]
+    return flags[0]
 
 
 def _is_valid_boolean_ternary(node: Ternary) -> bool:
@@ -40,6 +70,60 @@ def _is_valid_boolean_ternary(node: Ternary) -> bool:
     return has_non_null_leaf
 
 
+def _make_negated_pred(predicate: Expr) -> Expr:
+    """Build `NOT COALESCE(predicate, FALSE)` preserving 3-valued NULL fallthrough."""
+    return Not(expr=Coalesce(operands=(predicate, BoolLiteral(value=False))))
+
+
+def _rewrite_boolean_ternary_step(
+    node: Ternary,
+    *,
+    has_unsup: bool,
+    pred_unsup: bool,
+    truthy_unconstrained: bool,
+    falsy_unconstrained: bool,
+) -> tuple[Expr, bool]:
+    """Shared single-node lowering for a validated boolean-context `Ternary`.
+
+    Returns `(rewritten_expr, needs_budget_duplication)` where the rewritten node
+    is one of:
+    - `BoolLiteral(False)` when both branches are falsy (`False` / `Null`).
+    - `And(p, t)` when `falsy` is falsy.
+    - `And(NOT COALESCE(p, False), f)` when `truthy` is falsy.
+    - `BoolLiteral(True)` when both branches are `BoolLiteral(True)`.
+    - `Unsupported()` when both branches are trivial (`True` / `Unsupported`) with
+      at least one `Unsupported` (avoiding emitting tautological
+      `p OR NOT COALESCE(p, FALSE)` filters that prune zero rows).
+    - `Or(And(p, t), And(NOT COALESCE(p, False) | Unsupported, f))` when the node
+      contains an `Unsupported` descendant.
+    - `node` unchanged otherwise.
+    """
+    truthy_is_falsy = node.truthy in _FALSY_LITERALS
+    falsy_is_falsy = node.falsy in _FALSY_LITERALS
+    if truthy_is_falsy and falsy_is_falsy:
+        return BoolLiteral(value=False), False
+    if falsy_is_falsy:
+        return And(left=node.predicate, right=node.truthy), False
+    if truthy_is_falsy:
+        return And(left=_make_negated_pred(node.predicate), right=node.falsy), False
+    if node.truthy == BoolLiteral(True) and node.falsy == BoolLiteral(True):
+        return BoolLiteral(value=True), False
+    if has_unsup:
+        if truthy_unconstrained and falsy_unconstrained:
+            return Unsupported(), False
+        negated_pred: Expr = (
+            Unsupported() if pred_unsup else _make_negated_pred(node.predicate)
+        )
+        return (
+            Or(
+                left=And(left=node.predicate, right=node.truthy),
+                right=And(left=negated_pred, right=node.falsy),
+            ),
+            True,
+        )
+    return node, False
+
+
 def rewrite_boolean_when_node(node: Expr) -> Expr:
     """Rewrite a `Ternary` node into boolean conditionals when its output is used as a boolean.
 
@@ -47,81 +131,207 @@ def rewrite_boolean_when_node(node: Expr) -> Expr:
     - If both `truthy` and `falsy` are falsy (`False` or `Null`), rewrites to `False`.
     - If `falsy` is falsy, rewrites `Ternary(p, t, f)` to `p & t`.
     - If `truthy` is falsy, rewrites `Ternary(p, t, f)` to `~COALESCE(p, False) & f`.
+    - If both `truthy` and `falsy` are `True`, rewrites to `True`.
+    - If both `truthy` and `falsy` are trivial (`True` or `Unsupported`) with at least
+      one `Unsupported`, degrades to `Unsupported` (avoiding tautological
+      `p OR ~COALESCE(p, False)` pushdown).
     - If `node` contains an `Unsupported` descendant, rewrites `Ternary(p, t, f)` to
       `(p & t) | (~COALESCE(p, False) & f)` to enable partial pushdown.
     """
     if not isinstance(node, Ternary) or not _is_valid_boolean_ternary(node):
         return node
-    truthy_is_falsy = node.truthy in _FALSY_LITERALS
-    falsy_is_falsy = node.falsy in _FALSY_LITERALS
-    if truthy_is_falsy and falsy_is_falsy:
-        return BoolLiteral(value=False)
-    if falsy_is_falsy:
-        return And(left=node.predicate, right=node.truthy)
-    # In a Ternary (`WHEN p THEN t ELSE f`), a NULL predicate falls through to
-    # the `falsy` (`ELSE`) branch just like FALSE does. Under 3-valued logic,
-    # plain `NOT p` evaluates to NULL (which acts like FALSE in a filter) when
-    # `p` is NULL, failing to activate `f`. Wrapping `p` in `COALESCE(p, FALSE)`
-    # maps NULL -> FALSE before negation so `NOT COALESCE(p, FALSE)` is TRUE
-    # whenever `p` is FALSE or NULL.
-    negated_pred: Expr = Not(
-        expr=Coalesce(operands=(node.predicate, BoolLiteral(value=False)))
+    has_unsup = node.has_descendant(Unsupported)
+    pred_unsup = has_unsup and node.predicate.has_descendant(Unsupported)
+    rewritten, _ = _rewrite_boolean_ternary_step(
+        node,
+        has_unsup=has_unsup,
+        pred_unsup=pred_unsup,
+        truthy_unconstrained=has_unsup and _is_trivial_truthy_or_unsup(node.truthy),
+        falsy_unconstrained=has_unsup and _is_trivial_truthy_or_unsup(node.falsy),
     )
-    if truthy_is_falsy:
-        return And(left=negated_pred, right=node.falsy)
-    if node.has_descendant(Unsupported):
-        if node.predicate.has_descendant(Unsupported):
-            negated_pred = Unsupported()
-        return Or(
-            left=And(left=node.predicate, right=node.truthy),
-            right=And(left=negated_pred, right=node.falsy),
-        )
-    return node
+    return rewritten
 
 
 def rewrite_boolean_when(root: Expr) -> Expr:
-    """Rewrite boolean-valued `Ternary` IR nodes across an IR tree into boolean conditionals.
+    """Rewrite boolean-valued `Ternary` IR nodes across an IR tree in linear $O(N)$ time.
 
-    Propagates boolean context top-down by node index from the filter root
-    through `And`, `Or`, and `Ternary` predicates and branches, then rewrites
-    boolean-context `Ternary` nodes bottom-up.
+    Uses three iterative passes over `flatten_expr_bfs(root)` (zero Python recursion):
+    1. Bottom-up pass over original nodes computing `orig_ok` / `orig_has_leaf` for
+       every `Ternary` chain in $O(1)$ per node (avoiding quadratic re-walks).
+    2. Top-down pass propagating boolean-context flags from the filter root through
+       `And`, `Or`, and `Ternary` predicates/branches.
+    3. Bottom-up reconstruction rewriting validated `Ternary` nodes with shared
+       cumulative AST expansion budget `MAX_BOOLEAN_WHEN_REWRITE_NODES` (accounting
+       for `ListLiteral` fanout weight `1 + len(values)`).
     """
-    nodes: list[Expr] = [root]
-    children_map: list[tuple[int, ...]] = [()]
-    boolean_nodes: set[int] = {0}
-    queue: collections.deque[int] = collections.deque([0])
+    nodes, children_map = flatten_expr_bfs(root)
+    n = len(nodes)
 
-    while queue:
-        curr_idx = queue.popleft()
-        node = nodes[curr_idx]
-        node_children = node.children()
-        if not node_children:
+    # Pass 1: Precompute `_is_valid_boolean_ternary` flags bottom-up in O(N).
+    orig_ok = [True] * n
+    orig_leaf = [False] * n
+    for idx in range(n - 1, -1, -1):
+        node = nodes[idx]
+        if isinstance(node, Ternary):
+            p_idx, t_idx, f_idx = children_map[idx]
+            orig_ok[idx] = (
+                not isinstance(nodes[p_idx], NullLiteral)
+                and orig_ok[t_idx]
+                and orig_ok[f_idx]
+            )
+            orig_leaf[idx] = orig_leaf[t_idx] or orig_leaf[f_idx]
+        else:
+            orig_leaf[idx] = not isinstance(node, NullLiteral)
+
+    # Pass 2: Propagate boolean context top-down in BFS index order (`parent < child`).
+    boolean_nodes = [False] * n
+    boolean_nodes[0] = True
+    for idx in range(n):
+        c_indices = children_map[idx]
+        if not c_indices:
             continue
-
-        child_indices: list[int] = []
-        for child in node_children:
-            c_idx = len(nodes)
-            nodes.append(child)
-            children_map.append(())
-            queue.append(c_idx)
-            child_indices.append(c_idx)
-        children_map[curr_idx] = tuple(child_indices)
-
-        in_boolean_context = curr_idx in boolean_nodes
-        if isinstance(node, (And, Or)) and in_boolean_context:
-            boolean_nodes.update(child_indices)
+        node = nodes[idx]
+        if isinstance(node, (And, Or)) and boolean_nodes[idx]:
+            for c_idx in c_indices:
+                boolean_nodes[c_idx] = True
         elif isinstance(node, Ternary):
-            boolean_nodes.add(child_indices[0])
-            if in_boolean_context and _is_valid_boolean_ternary(node):
-                boolean_nodes.update(child_indices[1:])
+            boolean_nodes[c_indices[0]] = True
+            if boolean_nodes[idx] and orig_ok[idx] and orig_leaf[idx]:
+                boolean_nodes[c_indices[1]] = True
+                boolean_nodes[c_indices[2]] = True
 
-    for idx in range(len(nodes) - 1, -1, -1):
-        child_indices = children_map[idx]
-        if child_indices:
-            child_nodes = tuple(nodes[c_idx] for c_idx in child_indices)
-            nodes[idx] = replace_children(nodes[idx], child_nodes)
-        if idx in boolean_nodes:
-            nodes[idx] = rewrite_boolean_when_node(nodes[idx])
+    # Pass 3: Bottom-up reconstruction with O(1) validity & global expansion budget.
+    total_input_weight = sum(_node_self_weight(node) for node in nodes)
+    remaining_budget = max(0, MAX_BOOLEAN_WHEN_REWRITE_NODES - total_input_weight)
+
+    weights = [_node_self_weight(node) for node in nodes]
+    has_unsup = [isinstance(node, Unsupported) for node in nodes]
+    unconstrained = [
+        isinstance(node, Unsupported) or node == BoolLiteral(True) for node in nodes
+    ]
+    post_ok = [True] * n
+    post_leaf = [not isinstance(node, NullLiteral) for node in nodes]
+
+    for idx in range(n - 1, -1, -1):
+        c_indices = children_map[idx]
+        if c_indices:
+            child_nodes = tuple(nodes[c_idx] for c_idx in c_indices)
+            reconstructed = replace_children(nodes[idx], child_nodes)
+            nodes[idx] = reconstructed
+            weights[idx] = _node_self_weight(reconstructed) + sum(
+                weights[c_idx] for c_idx in c_indices
+            )
+            has_unsup[idx] = isinstance(reconstructed, Unsupported) or any(
+                has_unsup[c_idx] for c_idx in c_indices
+            )
+            if isinstance(reconstructed, And):
+                unconstrained[idx] = (
+                    unconstrained[c_indices[0]] and unconstrained[c_indices[1]]
+                )
+            elif isinstance(reconstructed, Or):
+                unconstrained[idx] = (
+                    unconstrained[c_indices[0]] or unconstrained[c_indices[1]]
+                )
+            else:
+                unconstrained[idx] = isinstance(reconstructed, Unsupported) or (
+                    reconstructed == BoolLiteral(True)
+                )
+            if isinstance(reconstructed, Ternary):
+                p_idx, t_idx, f_idx = c_indices
+                post_ok[idx] = (
+                    not isinstance(nodes[p_idx], NullLiteral)
+                    and post_ok[t_idx]
+                    and post_ok[f_idx]
+                )
+                post_leaf[idx] = post_leaf[t_idx] or post_leaf[f_idx]
+            else:
+                post_ok[idx] = True
+                post_leaf[idx] = not isinstance(reconstructed, NullLiteral)
+
+        if boolean_nodes[idx]:
+            curr = nodes[idx]
+            if isinstance(curr, Ternary) and post_ok[idx] and post_leaf[idx]:
+                p_idx, t_idx, f_idx = c_indices
+                pred_unsup = has_unsup[p_idx]
+                pred_w = weights[p_idx]
+                truthy_w = weights[t_idx]
+                falsy_w = weights[f_idx]
+                orig_w = weights[idx]
+
+                rewritten, duplicates_pred = _rewrite_boolean_ternary_step(
+                    curr,
+                    has_unsup=has_unsup[idx],
+                    pred_unsup=pred_unsup,
+                    truthy_unconstrained=unconstrained[t_idx],
+                    falsy_unconstrained=unconstrained[f_idx],
+                )
+                if rewritten is curr:
+                    continue
+                if isinstance(rewritten, BoolLiteral):
+                    nodes[idx] = rewritten
+                    weights[idx] = 1
+                    has_unsup[idx] = False
+                    unconstrained[idx] = rewritten.value
+                    post_ok[idx] = True
+                    post_leaf[idx] = True
+                    continue
+                if isinstance(rewritten, Unsupported):
+                    nodes[idx] = rewritten
+                    weights[idx] = 1
+                    has_unsup[idx] = True
+                    unconstrained[idx] = True
+                    post_ok[idx] = True
+                    post_leaf[idx] = True
+                    continue
+                if not duplicates_pred:
+                    # `falsy_is_falsy` -> `And(p, t)` or `truthy_is_falsy` -> `And(Not(Coalesce(p, False)), f)`
+                    if curr.falsy in _FALSY_LITERALS:
+                        nodes[idx] = rewritten
+                        weights[idx] = 1 + pred_w + truthy_w
+                        has_unsup[idx] = pred_unsup or has_unsup[t_idx]
+                        unconstrained[idx] = (
+                            unconstrained[p_idx] and unconstrained[t_idx]
+                        )
+                    else:
+                        # Replacing `Ternary(p, falsy_lit, f)` (`2 + p + f` nodes) with
+                        # `And(Not(Coalesce(p, False)), f)` (`4 + p + f` nodes) adds 2 nodes.
+                        extra_cost = 2
+                        if (
+                            4 + pred_w + falsy_w > MAX_BOOLEAN_WHEN_REWRITE_NODES
+                            or extra_cost > remaining_budget
+                        ):
+                            nodes[idx] = Unsupported()
+                            weights[idx] = 1
+                            has_unsup[idx] = True
+                            unconstrained[idx] = True
+                        else:
+                            remaining_budget -= extra_cost
+                            nodes[idx] = rewritten
+                            weights[idx] = 4 + pred_w + falsy_w
+                            has_unsup[idx] = pred_unsup or has_unsup[f_idx]
+                            unconstrained[idx] = pred_unsup and unconstrained[f_idx]
+                    post_ok[idx] = True
+                    post_leaf[idx] = True
+                    continue
+
+                neg_w = 1 if pred_unsup else (pred_w + 3)
+                new_w = 3 + pred_w + truthy_w + neg_w + falsy_w
+                extra_w = max(0, new_w - orig_w)
+                if new_w > MAX_BOOLEAN_WHEN_REWRITE_NODES or extra_w > remaining_budget:
+                    nodes[idx] = Unsupported()
+                    weights[idx] = 1
+                    has_unsup[idx] = True
+                    unconstrained[idx] = True
+                else:
+                    remaining_budget -= extra_w
+                    nodes[idx] = rewritten
+                    weights[idx] = new_w
+                    has_unsup[idx] = True
+                    left_unconstrained = unconstrained[p_idx] and unconstrained[t_idx]
+                    right_unconstrained = pred_unsup and unconstrained[f_idx]
+                    unconstrained[idx] = left_unconstrained or right_unconstrained
+                post_ok[idx] = True
+                post_leaf[idx] = True
 
     return nodes[0]
 
@@ -221,37 +431,3 @@ def rewrite_de_morgan_node(node: Expr) -> Expr:
 def rewrite_de_morgan(root: Expr) -> Expr:
     """Apply De Morgan's law across an IR tree to turn negated `Or` nodes into `And` nodes."""
     return rewrite_tree(root, rewrite_de_morgan_node)
-
-
-def _strip_drop_nulls_node(node: Expr) -> Expr:
-    """Strip a `DropNulls` wrapper by returning its inner expression."""
-    return node.expr if isinstance(node, DropNulls) else node
-
-
-def rewrite_drop_nulls_node(node: Expr, *, not_null_exprs: list[Expr]) -> Expr:
-    """Unwrap a single `DropNulls` node and record its inner expression for `IS NOT NULL`."""
-    if not isinstance(node, DropNulls):
-        return node
-    if node.expr.has_descendant(Unsupported):
-        return Unsupported()
-    not_null_exprs.append(node.expr)
-    return node.expr
-
-
-def rewrite_drop_nulls(root: Expr) -> Expr:
-    """Rewrite `DropNulls(expr)` into `expr` and conjoin `IsNotNull(expr)` at the root.
-
-    If any descendant of a `DropNulls` node is `Unsupported`, the entire
-    `DropNulls` node is rewritten to `Unsupported` without adding a top-level
-    `IsNotNull` check.
-    """
-    not_null_exprs: list[Expr] = []
-    node_rewriter = functools.partial(
-        rewrite_drop_nulls_node,
-        not_null_exprs=not_null_exprs,
-    )
-    result = rewrite_tree(root, node_rewriter)
-    for expr in not_null_exprs:
-        cleaned_expr = rewrite_tree(expr, _strip_drop_nulls_node)
-        result = And(left=result, right=IsNotNull(expr=cleaned_expr))
-    return result

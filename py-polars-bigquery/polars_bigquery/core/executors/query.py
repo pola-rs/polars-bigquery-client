@@ -15,6 +15,7 @@ from polars_bigquery.core import compiler
 from polars_bigquery.core.executors.base import (
     ArrowQueryClient,
     PlanExecutor,
+    close_exporter,
     execute_local_plan_batches,
 )
 from polars_bigquery.core.plan import (
@@ -476,11 +477,21 @@ def compile_query_plan(
     initial_filter_states: dict[int, tuple[tuple[str, ...], bool]] = {}
     for op_idx, op in enumerate(normalized_ops):
         if isinstance(op, Filter):
-            compiled_pred = compiler.compile_predicate(op.predicate)
-            initial_filter_states[op_idx] = (
-                compiled_pred.conjuncts,
-                compiled_pred.is_exact,
-            )
+            if source.schema is None:
+                # Fail closed when no schema is attached to `QueryScan` so
+                # untyped predicates (e.g. FLOAT64 NaN or opaque types) are
+                # evaluated locally instead of risking unsafe BigQuery SQL.
+                initial_filter_states[op_idx] = ((), False)
+            else:
+                compiled_pred = compiler.compile_predicate(
+                    op.predicate,
+                    schema=source.schema,
+                    bq_types=source.bq_types,
+                )
+                initial_filter_states[op_idx] = (
+                    compiled_pred.conjuncts,
+                    compiled_pred.is_exact,
+                )
 
     candidate, emitted_filter_indices = _lower_and_assemble(
         source=source,
@@ -709,12 +720,21 @@ class QueryExecutor(PlanExecutor):
             use_query_cache=source.use_query_cache,
             maximum_bytes_billed=source.maximum_bytes_billed,
         )
-        return execute_local_plan_batches(
-            pl.scan_arrow_c_stream(arrow_stream_exporter),
-            residual_ops,
-            batch_size=batch_size,
-            maintain_order=source.maintain_order,
-        )
+        lazyframe: pl.LazyFrame | None = None
+        try:
+            lazyframe = pl.scan_arrow_c_stream(arrow_stream_exporter)
+            return execute_local_plan_batches(
+                lazyframe,
+                residual_ops,
+                batch_size=batch_size,
+                maintain_order=source.maintain_order,
+            )
+        except BaseException:
+            # Clear `lazyframe` before re-raising so the exception traceback frame
+            # does not retain the exported Arrow C Stream PyCapsule in `f_locals`.
+            lazyframe = None
+            close_exporter(arrow_stream_exporter)
+            raise
 
 
 __all__ = [

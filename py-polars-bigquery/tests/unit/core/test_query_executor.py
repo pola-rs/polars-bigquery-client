@@ -32,11 +32,17 @@ def _scan(
     sql: str = "SELECT a, b FROM t",
     *,
     columns: tuple[str, ...] = ("a", "b"),
+    schema: dict[str, pl.DataType] | pl.Schema | None = None,
     maintain_order: bool = False,
     explicit_schema: bool = False,
     compression: str = "lz4frame",
     use_query_cache: bool | None = None,
 ) -> QueryScan:
+    resolved_schema = (
+        pl.Schema({col: pl.Int64() for col in columns})
+        if schema is None
+        else pl.Schema(schema)
+    )
     return QueryScan(
         raw_query=sql,
         columns=columns,
@@ -44,6 +50,7 @@ def _scan(
         arrow_buffer_compression=compression,  # type: ignore[arg-type]
         use_query_cache=use_query_cache,
         explicit_schema=explicit_schema,
+        schema=resolved_schema,
     )
 
 
@@ -501,7 +508,7 @@ def test_compile_query_plan_whitespace_semicolons_and_user_pipe() -> None:
 
 
 def test_compile_query_plan_trivial_true_preserves_exactness() -> None:
-    scan = _scan("SELECT a FROM t", columns=("a",))
+    scan = _scan("SELECT a FROM t", columns=("a",), schema={"a": pl.Int64()})
     plan = Slice(
         input=Filter(input=scan, predicate=pl.lit(True)),
         offset=0,
@@ -557,20 +564,29 @@ def test_compile_query_plan_length_guard_tiers_and_utf8() -> None:
     assert c_unrewritten.degraded_reason is None
 
     # Tier 1: multi-byte UTF-8 boundary check (é is 2 bytes, 🦀 is 4 bytes)
-    scan = _scan("SELECT a, b, c FROM t", columns=("a", "b", "c"))
+    scan_str = _scan(
+        "SELECT a, b, c FROM t",
+        columns=("a", "b", "c"),
+        schema={"a": pl.String(), "b": pl.String(), "c": pl.Int64()},
+    )
+    scan = _scan(
+        "SELECT a, b, c FROM t",
+        columns=("a", "b", "c"),
+        schema={"a": pl.Int64(), "b": pl.String(), "c": pl.Int64()},
+    )
     pred_utf8 = pl.col("a") == "ééé"
-    c_fit = compile_query_plan(Filter(input=scan, predicate=pred_utf8))
+    c_fit = compile_query_plan(Filter(input=scan_str, predicate=pred_utf8))
     exact_len = len(c_fit.sql.encode("utf-8"))
     assert exact_len > len(c_fit.sql)  # confirm multi-byte UTF-8 inflation
     assert (
         compile_query_plan(
-            Filter(input=scan, predicate=pred_utf8), max_sql_bytes=exact_len
+            Filter(input=scan_str, predicate=pred_utf8), max_sql_bytes=exact_len
         ).degraded_reason
         is None
     )
     # One byte smaller degrades to Tier 4 verbatim fallback (no |> SELECT or |> LIMIT left)
     c_over = compile_query_plan(
-        Filter(input=scan, predicate=pred_utf8), max_sql_bytes=exact_len - 1
+        Filter(input=scan_str, predicate=pred_utf8), max_sql_bytes=exact_len - 1
     )
     assert c_over.degraded_reason == "sql_length_skipped_pushdown"
     assert c_over.sql == "SELECT a, b, c FROM t"
@@ -597,7 +613,7 @@ def test_compile_query_plan_length_guard_tiers_and_utf8() -> None:
     pred_tie = (pl.col("a") == "xx") & (pl.col("b") == "yy")
     keep_left = "SELECT a, b, c FROM t\n|> WHERE (`a` = 'xx')"
     c_tie = compile_query_plan(
-        Filter(input=scan, predicate=pred_tie),
+        Filter(input=scan_str, predicate=pred_tie),
         max_sql_bytes=len(keep_left.encode("utf-8")),
     )
     assert c_tie.degraded_reason == "sql_length_pruned_conjuncts"
@@ -605,7 +621,7 @@ def test_compile_query_plan_length_guard_tiers_and_utf8() -> None:
 
     # Tier 2 cross-filter tie-breaking: drops later Filter stage first
     plan_two_filters = Filter(
-        input=Filter(input=scan, predicate=pl.col("a") == "xx"),
+        input=Filter(input=scan_str, predicate=pl.col("a") == "xx"),
         predicate=pl.col("b") == "yy",
     )
     c_two_tie = compile_query_plan(
@@ -713,6 +729,7 @@ def test_query_executor_execute_logging_and_arguments(caplog) -> None:
     scan = _scan(
         "SELECT a, b, c FROM secret_tbl",
         columns=("a", "b", "c"),
+        schema={"a": pl.Int64(), "b": pl.String(), "c": pl.String()},
         maintain_order=False,
         compression="zstd",
         use_query_cache=False,
@@ -809,7 +826,7 @@ def test_query_executor_forwards_maintain_order_to_collect_batches() -> None:
 
 
 def test_compile_query_plan_validates_max_sql_bytes() -> None:
-    scan = _scan("SELECT a FROM t", columns=("a",))
+    scan = _scan("SELECT a FROM t", columns=("a",), schema={"a": pl.Int64()})
     for bad in (True, False, 1.5, "100"):
         with pytest.raises(TypeError, match="positive int"):
             compile_query_plan(scan, max_sql_bytes=bad)  # type: ignore[arg-type]
@@ -954,7 +971,11 @@ def test_compile_query_plan_inner_query_fast_path_and_large_conjunct_scaling() -
     many_expr = pl.all_horizontal(
         *[pl.col("a") == f"val_{i:04d}_" + "x" * 400 for i in range(2000)]
     )
-    scan = _scan("SELECT a FROM t", columns=("a",))
+    scan = _scan(
+        "SELECT a FROM t",
+        columns=("a",),
+        schema={"a": pl.String()},
+    )
     plan = Filter(input=scan, predicate=many_expr)
     t0 = time.perf_counter()
     compiled = compile_query_plan(plan, max_sql_bytes=100_000)
@@ -1019,3 +1040,85 @@ def test_query_executor_forwards_maximum_bytes_billed(caplog) -> None:
     debug_msgs = [r.message for r in caplog.records if r.levelno == logging.DEBUG]
     assert len(debug_msgs) == 1
     assert "maximum_bytes_billed=10000000" in debug_msgs[0]
+
+
+def test_compile_query_plan_schema_aware_pushdown_and_fail_closed_untyped() -> None:
+    from polars_bigquery.core.types import BQType
+
+    # Untyped QueryScan (schema=None) fails closed instead of pushing unsafe SQL.
+    untyped = QueryScan(
+        raw_query="SELECT a, f FROM t",
+        columns=("a", "f"),
+        maintain_order=False,
+    )
+    compiled_untyped = compile_query_plan(
+        Filter(input=untyped, predicate=pl.col("a") == 1)
+    )
+    assert compiled_untyped.where_clauses == ()
+    assert compiled_untyped.rewritten is False
+
+    # Typed QueryScan uses NaN-safe FLOAT64 lowering and opaque BQType checks.
+    typed = QueryScan(
+        raw_query="SELECT a, f, j FROM t",
+        columns=("a", "f", "j"),
+        maintain_order=False,
+        schema=pl.Schema(
+            {
+                "a": pl.Int64(),
+                "f": pl.Float64(),
+                "j": pl.String(),  # simulating Mode B load_as_storage JSON column
+            }
+        ),
+        bq_types={"a": BQType.INT64, "f": BQType.FLOAT64, "j": BQType.JSON},
+    )
+    compiled_typed = compile_query_plan(
+        Filter(
+            input=typed,
+            predicate=(pl.col("j").str.starts_with("{"))
+            & (pl.col("f") == pl.col("f"))
+            & (pl.col("a") == 1),
+        )
+    )
+    assert len(compiled_typed.where_clauses) == 1
+    assert "STARTS_WITH" not in compiled_typed.sql
+    assert "IS_NAN(`f`)" in compiled_typed.sql
+    assert "(`a` = 1)" in compiled_typed.sql
+
+
+def test_query_executor_closes_exporter_on_post_export_error() -> None:
+    close_calls = 0
+
+    class _Exporter:
+        def __arrow_c_stream__(self, requested_schema=None):
+            return pl.DataFrame({"a": [1]}).__arrow_c_stream__(
+                requested_schema=requested_schema
+            )
+
+        def close(self) -> None:
+            nonlocal close_calls
+            close_calls += 1
+
+    mock_arrow_client = MagicMock()
+    mock_arrow_client.read_query.return_value = _Exporter()
+    executor = QueryExecutor(mock_arrow_client)
+    scan = _scan("SELECT a FROM t", columns=("a",))
+
+    with (
+        patch(
+            "polars_bigquery.core.executors.query.execute_local_plan_batches",
+            side_effect=RuntimeError("boom after stream export"),
+        ),
+        pytest.raises(RuntimeError, match="boom after stream export") as exc_info,
+    ):
+        executor.execute(scan)
+
+    assert close_calls == 1
+    tb = exc_info.tb
+    execute_locals = None
+    while tb is not None:
+        if tb.tb_frame.f_code.co_name == "execute":
+            execute_locals = tb.tb_frame.f_locals
+            break
+        tb = tb.tb_next
+    assert execute_locals is not None
+    assert execute_locals.get("lazyframe") is None

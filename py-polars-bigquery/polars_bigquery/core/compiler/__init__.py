@@ -4,19 +4,26 @@ import dataclasses
 import io
 import json
 import logging
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from typing import Any
 
 import polars as pl
+from polars.datatypes import DataType, DataTypeClass
 
-from polars_bigquery.core.compiler import ir, parser, rewriter, sql
+from polars_bigquery.core.compiler import ir, parser, rewriter, sql, typing
+from polars_bigquery.core.compiler.ir.base import NullLiteral
 from polars_bigquery.core.compiler.parser import json_to_ir
 from polars_bigquery.core.compiler.rewriter import rewrite_ir
 from polars_bigquery.core.compiler.sql import ir_to_sql
+from polars_bigquery.core.compiler.typing import resolve_and_lower_types
+from polars_bigquery.core.types import BQType
 
 logger = logging.getLogger(__name__)
 
+MAX_ROW_RESTRICTION_BYTES = 1_000_000
+
 __all__ = [
+    "MAX_ROW_RESTRICTION_BYTES",
     "CompiledPredicate",
     "compile_predicate",
     "format_conjuncts_sql",
@@ -27,10 +34,17 @@ __all__ = [
     "json_to_ir",
     "parser",
     "predicate_to_row_restriction",
+    "resolve_and_lower_types",
     "rewrite_ir",
     "rewriter",
     "sql",
+    "typing",
 ]
+
+
+def _utf8_byte_length(text: str) -> int:
+    """Return exact UTF-8 byte length, avoiding buffer allocation for ASCII strings."""
+    return len(text) if text.isascii() else len(text.encode("utf-8"))
 
 
 def format_conjuncts_sql(conjuncts: Sequence[str]) -> str:
@@ -85,29 +99,69 @@ class CompiledPredicate:
         return format_conjuncts_sql(self.conjuncts)
 
 
-def _json_expr_to_compiled_predicate(expr_json: dict[str, Any]) -> CompiledPredicate:
+def _json_expr_to_compiled_predicate(
+    expr_json: dict[str, Any],
+    schema: pl.Schema | Mapping[str, DataType | DataTypeClass],
+    bq_types: Mapping[str, BQType] | None = None,
+) -> CompiledPredicate:
     """Compile a Polars expression JSON dict into structured `AND` conjuncts."""
+    normalized_schema = schema if isinstance(schema, pl.Schema) else pl.Schema(schema)
     ir_tree = json_to_ir(expr_json)
+    ir_tree = resolve_and_lower_types(ir_tree, normalized_schema, bq_types=bq_types)
     ir_tree = rewrite_ir(ir_tree)
+    # Guard again after boolean-literal folding (e.g. `TRUE AND NULL` -> `NULL`).
+    if isinstance(ir_tree, NullLiteral):
+        return CompiledPredicate(conjuncts=(), is_exact=False)
     conjuncts, is_exact = sql.compile_ir_conjuncts_to_sql(ir_tree)
     return CompiledPredicate(conjuncts=conjuncts, is_exact=is_exact)
 
 
-def compile_predicate(predicate: pl.Expr) -> CompiledPredicate:
+def compile_predicate(
+    predicate: pl.Expr,
+    *,
+    schema: pl.Schema | Mapping[str, DataType | DataTypeClass],
+    bq_types: Mapping[str, BQType] | None = None,
+) -> CompiledPredicate:
     """Compile a Polars filter expression into structured SQL conjuncts and exactness."""
+    normalized_schema = schema if isinstance(schema, pl.Schema) else pl.Schema(schema)
     predicate_json_file = io.BytesIO()
     try:
         predicate.meta.serialize(predicate_json_file, format="json")
         predicate_json_file.seek(0)
         predicate_json = json.load(predicate_json_file)
-        return _json_expr_to_compiled_predicate(predicate_json)
+        return _json_expr_to_compiled_predicate(
+            predicate_json,
+            normalized_schema,
+            bq_types=bq_types,
+        )
     except (RecursionError, json.JSONDecodeError, pl.exceptions.PolarsError):
         logger.debug(
             "Predicate could not be serialized or parsed; falling back to local filtering.",
+            exc_info=True,
         )
         return CompiledPredicate(conjuncts=(), is_exact=False)
 
 
-def predicate_to_row_restriction(predicate: pl.Expr) -> str:
+def predicate_to_row_restriction(
+    predicate: pl.Expr,
+    *,
+    schema: pl.Schema | Mapping[str, DataType | DataTypeClass],
+    bq_types: Mapping[str, BQType] | None = None,
+) -> str:
     """Orchestrate compilation of a Polars expression to a BigQuery row restriction SQL string."""
-    return compile_predicate(predicate).sql
+    row_restriction = compile_predicate(
+        predicate,
+        schema=schema,
+        bq_types=bq_types,
+    ).sql
+    if row_restriction:
+        byte_len = _utf8_byte_length(row_restriction)
+        if byte_len > MAX_ROW_RESTRICTION_BYTES:
+            logger.debug(
+                "Compiled row_restriction length (%d bytes) exceeds limit (%d bytes); "
+                "falling back to client-side filtering",
+                byte_len,
+                MAX_ROW_RESTRICTION_BYTES,
+            )
+            return ""
+    return row_restriction

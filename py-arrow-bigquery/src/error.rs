@@ -11,8 +11,17 @@ pyo3::create_exception!(
     "Error raised by the BigQuery API."
 );
 
+pyo3::create_exception!(
+    arrow_bigquery.exceptions,
+    UnsupportedTypeError,
+    BigQueryError,
+    "Error raised when a BigQuery table or query returns an Arrow data type that cannot be decoded or exported over FFI."
+);
+
 /// Converts a [`LibBigQueryError`] into a [`PyErr`] while preserving the full causal chain:
 /// - Configuration/validation errors ([`LibBigQueryError::InvalidConfig`]) raise [`PyValueError`].
+/// - Unsupported Arrow/BigQuery schema types ([`LibBigQueryError::UnsupportedType`]) raise
+///   [`UnsupportedTypeError`] (a subclass of [`BigQueryError`]).
 /// - All other BigQuery errors raise [`BigQueryError`] (which subclasses [`PyRuntimeError`]),
 ///   with the top-level message formatted via [`LibBigQueryError::format_causal_chain`].
 /// - If any underlying [`StdError::source`] is an original [`PyErr`] (such as an exception raised
@@ -20,6 +29,9 @@ pyo3::create_exception!(
 pub(crate) fn to_py_err(py: Python<'_>, err: LibBigQueryError) -> PyErr {
     if matches!(err, LibBigQueryError::InvalidConfig(_)) {
         return PyValueError::new_err(err.format_causal_chain());
+    }
+    if matches!(err, LibBigQueryError::UnsupportedType(_)) {
+        return UnsupportedTypeError::new_err(err.format_causal_chain());
     }
 
     let mut current = err.source();
@@ -80,6 +92,19 @@ mod tests {
             let py_err = to_py_err(py, bq_err);
             assert!(py_err.is_instance_of::<PyValueError>(py));
             assert!(py_err.to_string().contains("quota_project_id is required"));
+        });
+    }
+
+    #[test]
+    fn test_to_py_err_unsupported_type_maps_to_unsupported_type_error() {
+        Python::initialize();
+        Python::attach(|py| {
+            let bq_err = LibBigQueryError::UnsupportedType("column `dur` uses INTERVAL".into());
+            let py_err = to_py_err(py, bq_err);
+            assert!(py_err.is_instance_of::<UnsupportedTypeError>(py));
+            assert!(py_err.is_instance_of::<BigQueryError>(py));
+            assert!(py_err.is_instance_of::<PyRuntimeError>(py));
+            assert!(py_err.to_string().contains("INTERVAL"));
         });
     }
 

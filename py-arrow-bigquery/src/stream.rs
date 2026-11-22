@@ -26,19 +26,44 @@ fn record_batch_to_struct_array(
 pub struct ArrowStreamExporter {
     /// The schema of the Arrow stream.
     schema: ArrowSchemaRef,
+    /// Tracks whether `schema` was already validated by `validate_ffi_schema` /
+    /// `parse_arrow_schema_with_options` with `validate_ffi_types = true`.
+    schema_ffi_validated: bool,
     /// The underlying BigQuery record batch source, wrapped in a mutex.
     /// It is an `Option` because the stream can only be consumed once.
     source: std::sync::Mutex<Option<StreamSource>>,
+    /// Thread-safe handle enabling `close()` to abort background Tokio/gRPC stream
+    /// tasks even after `__arrow_c_stream__` hands the receiver to a `PyCapsule`.
+    abort_handle: Option<arrow_bigquery_lib::BigQueryStreamAbortHandle>,
 }
 
 impl ArrowStreamExporter {
+    #[cfg(feature = "testing")]
     pub(crate) fn new(
         schema: ArrowSchemaRef,
         receiver: arrow_bigquery_lib::BigQueryRecordBatchReceiver,
     ) -> Self {
+        Self::new_with_validation(schema, receiver, false)
+    }
+
+    pub(crate) fn new_validated(
+        schema: ArrowSchemaRef,
+        receiver: arrow_bigquery_lib::BigQueryRecordBatchReceiver,
+    ) -> Self {
+        Self::new_with_validation(schema, receiver, true)
+    }
+
+    fn new_with_validation(
+        schema: ArrowSchemaRef,
+        receiver: arrow_bigquery_lib::BigQueryRecordBatchReceiver,
+        schema_ffi_validated: bool,
+    ) -> Self {
+        let abort_handle = Some(receiver.abort_handle());
         Self {
             schema,
+            schema_ffi_validated,
             source: std::sync::Mutex::new(Some(StreamSource::Receiver(receiver))),
+            abort_handle,
         }
     }
 
@@ -46,7 +71,9 @@ impl ArrowStreamExporter {
         let schema = std::sync::Arc::new(batch.schema().clone());
         Self {
             schema,
+            schema_ffi_validated: false,
             source: std::sync::Mutex::new(Some(StreamSource::Batch(batch))),
+            abort_handle: None,
         }
     }
 }
@@ -61,6 +88,9 @@ struct ReceiverIterator {
     /// Held in an `Option` so it can be dropped immediately upon fatal error or interrupt
     /// to abort sibling background stream tasks without waiting for iterator GC.
     rx: Option<arrow_bigquery_lib::BigQueryRecordBatchReceiver>,
+    /// Shared handle checked so external `ArrowStreamExporter::close()` triggers an
+    /// explicit error instead of appearing as a clean EOF (which would truncate rows).
+    abort_handle: arrow_bigquery_lib::BigQueryStreamAbortHandle,
     /// The Arrow datatype (specifically a `Struct` type) matching the schema of the batches.
     dtype: polars_arrow::datatypes::ArrowDataType,
 }
@@ -75,6 +105,14 @@ impl Iterator for ReceiverIterator {
 
         loop {
             let rx = self.rx.as_mut()?;
+            if self.abort_handle.is_aborted() {
+                self.rx = None;
+                return Some(Err(
+                    pyo3_polars::export::polars_error::PolarsError::ComputeError(
+                        "BigQuery Arrow stream was closed before completion".into(),
+                    ),
+                ));
+            }
 
             // True zero-GIL fast path for cached non-main threads (e.g., Polars/Rayon
             // streaming engine threads). `py.check_signals()` is a no-op outside the
@@ -133,24 +171,38 @@ impl Iterator for ReceiverIterator {
 
             match result {
                 Ok(Some(Ok(batch))) => {
+                    if self.abort_handle.is_aborted() {
+                        self.rx = None;
+                        return Some(Err(
+                            pyo3_polars::export::polars_error::PolarsError::ComputeError(
+                                "BigQuery Arrow stream was closed before completion".into(),
+                            ),
+                        ));
+                    }
                     return Some(Ok(record_batch_to_struct_array(batch, self.dtype.clone())));
                 },
                 Ok(Some(Err(err))) => {
                     // Drop the receiver immediately so sibling background streams are aborted now.
                     self.rx = None;
+                    // polars-arrow's Arrow C Stream export callback converts errors with
+                    // `CString::new(...).unwrap()`, which panics across `extern "C"` on interior NUL bytes.
+                    let sanitized_err = err.format_causal_chain().replace('\0', "\\x00");
                     return Some(Err(
                         pyo3_polars::export::polars_error::PolarsError::ComputeError(
-                            format!(
-                                "BigQuery Storage API read error: {}",
-                                err.format_causal_chain()
-                            )
-                            .into(),
+                            format!("BigQuery Storage API read error: {sanitized_err}").into(),
                         ),
                     ));
                 },
                 Ok(None) => {
-                    // Stream finished
+                    // Stream finished (or aborted externally via `ArrowStreamExporter::close`).
                     self.rx = None;
+                    if self.abort_handle.is_aborted() {
+                        return Some(Err(
+                            pyo3_polars::export::polars_error::PolarsError::ComputeError(
+                                "BigQuery Arrow stream was closed before completion".into(),
+                            ),
+                        ));
+                    }
                     return None;
                 },
                 Err(_) => {
@@ -164,6 +216,23 @@ impl Iterator for ReceiverIterator {
 
 #[pymethods]
 impl ArrowStreamExporter {
+    /// Explicitly drop the underlying receiver / batch (if not yet exported) and
+    /// signal cancellation on background Tokio/gRPC stream tasks so they abort
+    /// immediately instead of waiting for garbage collection—even after
+    /// `__arrow_c_stream__` transfers ownership of the receiver to a `PyCapsule`.
+    fn close(&self) {
+        let dropped = {
+            let mut source_guard = self.source.lock().unwrap_or_else(|e| e.into_inner());
+            source_guard.take()
+        };
+        // Drop outside `self.source` lock so `BigQueryRecordBatchReceiver::drop` /
+        // `abort()` never runs under the mutex.
+        drop(dropped);
+        if let Some(abort_handle) = &self.abort_handle {
+            abort_handle.abort();
+        }
+    }
+
     #[pyo3(signature = (requested_schema=None))]
     fn __arrow_c_stream__(
         &self,
@@ -171,12 +240,22 @@ impl ArrowStreamExporter {
         requested_schema: Option<Py<PyAny>>,
     ) -> PyResult<Py<PyAny>> {
         let _ = requested_schema;
-        let mut source_guard = self.source.lock().map_err(|_| {
-            pyo3::exceptions::PyRuntimeError::new_err("Stream receiver lock is poisoned")
-        })?;
-        let source = source_guard
-            .take()
-            .ok_or_else(|| pyo3::exceptions::PyValueError::new_err("Stream already consumed"))?;
+        if !self.schema_ffi_validated {
+            if let Err(err) = arrow_bigquery_lib::validate_ffi_schema(&self.schema) {
+                // Drain the receiver immediately so background Tokio/gRPC stream tasks abort
+                // instead of running until Python garbage-collects this exporter.
+                self.close();
+                return Err(crate::error::to_py_err(py, err));
+            }
+        }
+        let source = {
+            let mut source_guard = self.source.lock().map_err(|_| {
+                pyo3::exceptions::PyRuntimeError::new_err("Stream receiver lock is poisoned")
+            })?;
+            source_guard
+                .take()
+                .ok_or_else(|| pyo3::exceptions::PyValueError::new_err("Stream already consumed"))?
+        };
 
         let fields: Vec<polars_arrow::datatypes::Field> =
             self.schema.iter().map(|(_, field)| field.clone()).collect();
@@ -189,10 +268,17 @@ impl ArrowStreamExporter {
                 >,
             >,
         > = match source {
-            StreamSource::Receiver(rx) => Box::new(ReceiverIterator {
-                rx: Some(rx),
-                dtype: dtype.clone(),
-            }),
+            StreamSource::Receiver(rx) => {
+                let abort_handle = self
+                    .abort_handle
+                    .clone()
+                    .unwrap_or_else(|| rx.abort_handle());
+                Box::new(ReceiverIterator {
+                    rx: Some(rx),
+                    abort_handle,
+                    dtype: dtype.clone(),
+                })
+            },
             StreamSource::Batch(batch) => Box::new(std::iter::once(Ok(
                 record_batch_to_struct_array(batch, dtype.clone()),
             ))),
@@ -255,8 +341,10 @@ mod tests {
         let batch2_done_w = Arc::clone(&batch2_done);
 
         let worker = std::thread::spawn(move || {
+            let abort_handle = receiver.abort_handle();
             let mut iter = ReceiverIterator {
                 rx: Some(receiver),
+                abort_handle,
                 dtype,
             };
             // First batch populates `IS_MAIN_THREAD_CACHE` on this worker thread.
@@ -290,5 +378,72 @@ mod tests {
             }
         });
         worker.join().unwrap();
+    }
+
+    #[test]
+    fn test_exporter_close_after_capsule_export_aborts_task_and_errors_iterator() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        Python::initialize();
+        let rt = pyo3_async_runtimes::tokio::get_runtime();
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        let dropped = Arc::new(AtomicBool::new(false));
+        let dropped_task = Arc::clone(&dropped);
+        struct DropGuard(Arc<AtomicBool>);
+        impl Drop for DropGuard {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+            }
+        }
+        let guard = DropGuard(dropped_task);
+        let handle = rt.spawn(async move {
+            let _keep_tx = tx;
+            let _guard = guard;
+            std::future::pending::<()>().await;
+        });
+
+        let field = Field::new("x".into(), ArrowDataType::Int64, false);
+        let schema = Arc::new(ArrowSchema::from_iter([field.clone()]));
+        let dtype = ArrowDataType::Struct(vec![field]);
+        let receiver =
+            arrow_bigquery_lib::BigQueryRecordBatchReceiver::new_for_testing(rx, vec![handle]);
+        let exporter = ArrowStreamExporter::new(schema, receiver);
+
+        // Hold the exported PyCapsule alive simulating a traceback frame pinning it.
+        let _capsule = Python::attach(|py| exporter.__arrow_c_stream__(py, None).unwrap());
+        assert!(!dropped.load(Ordering::Acquire));
+
+        // Closing the exporter after `__arrow_c_stream__` must still abort the task.
+        exporter.close();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        while !dropped.load(Ordering::Acquire) && std::time::Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        assert!(
+            dropped.load(Ordering::Acquire),
+            "background task must be aborted when close() is called after __arrow_c_stream__"
+        );
+
+        // Also verify `ReceiverIterator::next` fails loudly instead of returning a
+        // silent truncated EOF (`None`) when externally closed.
+        let (_tx2, rx2) = tokio::sync::mpsc::channel(4);
+        let receiver2 =
+            arrow_bigquery_lib::BigQueryRecordBatchReceiver::new_for_testing(rx2, vec![]);
+        let abort_handle = receiver2.abort_handle();
+        let mut iter = ReceiverIterator {
+            rx: Some(receiver2),
+            abort_handle: abort_handle.clone(),
+            dtype,
+        };
+        abort_handle.abort();
+        let err = iter
+            .next()
+            .expect("closed stream must yield Err instead of silent EOF")
+            .expect_err("expected ComputeError on closed stream");
+        assert!(
+            err.to_string().contains("closed before completion"),
+            "unexpected error: {err}"
+        );
+        assert!(iter.next().is_none());
     }
 }
