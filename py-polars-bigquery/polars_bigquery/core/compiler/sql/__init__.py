@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from polars_bigquery.core.compiler._traversal import flatten_expr_bfs
-from polars_bigquery.core.compiler.ir import Expr
+from polars_bigquery.core.compiler.ir import And, Expr, NullLiteral
 from polars_bigquery.core.compiler.sql import (
     base,
     boolean,
@@ -48,6 +48,47 @@ def _compile_ir_to_sql(root: Expr) -> tuple[str | None, bool]:
     return results[0]
 
 
+def compile_ir_to_sql(root: Expr) -> tuple[str | None, bool]:
+    """Compile an Expr IR tree into `(sql, is_exact)`."""
+    return _compile_ir_to_sql(root)
+
+
+def compile_ir_conjuncts_to_sql(root: Expr) -> tuple[tuple[str, ...], bool]:
+    """Flatten top-level `And` nodes left-to-right and compile each conjunct.
+
+    Uses an explicit stack to handle arbitrarily deep `And` trees without
+    hitting Python's recursion limit. Trivial `"TRUE"` conjuncts are omitted
+    while preserving `is_exact=True`. If any top-level branch compiles to
+    `(None, _)` or `(_, False)`, `is_exact` is returned as `False`.
+    """
+    sql_conjuncts: list[str] = []
+    all_exact = True
+    stack: list[Expr] = [root]
+
+    while stack:
+        node = stack.pop()
+        if isinstance(node, And):
+            # Push right first so left is popped and visited first.
+            stack.append(node.right)
+            stack.append(node.left)
+            continue
+
+        if isinstance(node, NullLiteral):
+            all_exact = False
+            continue
+
+        sql_str, is_exact = _compile_ir_to_sql(node)
+        if sql_str is None:
+            all_exact = False
+        else:
+            if not is_exact:
+                all_exact = False
+            if sql_str != "TRUE":
+                sql_conjuncts.append(sql_str)
+
+    return tuple(sql_conjuncts), all_exact
+
+
 def ir_to_sql(root: Expr) -> str | None:
     """Compile an Expr IR tree into a BigQuery SQL row restriction string.
 
@@ -62,6 +103,8 @@ __all__ = [
     "boolean",
     "column_to_sql_identifier",
     "comparison",
+    "compile_ir_conjuncts_to_sql",
+    "compile_ir_to_sql",
     "emit_node_sql",
     "escape_sql_string",
     "format_operator_sql",

@@ -1,8 +1,8 @@
 # Scanning Large Query Results
 
-[`Client.read_query`](../api/index.md#polars_bigquery.Client.read_query) runs a GoogleSQL query and reads the whole result into a Polars `DataFrame`. When the result is larger than memory, or you want to keep processing it with the Polars lazy API and stream it to a sink such as Parquet, write the query result to a table and scan that table with [`Client.scan_table`](../api/index.md#polars_bigquery.Client.scan_table).
+[`Client.read_query`](../api/index.md#polars_bigquery.Client.read_query) runs a GoogleSQL query and reads the whole result into a Polars `DataFrame`. For lazy, out-of-core streaming of query results **up to about 10 GB compressed** (including ordered scans via the default `maintain_order=True`, or projection/filter/`LIMIT` pushdown via `maintain_order=False`), use [`Client.scan_query`](../api/index.md#polars_bigquery.Client.scan_query).
 
-This is also required for large results: the anonymous table that BigQuery writes query results to is [limited to about 10 GB](https://docs.cloud.google.com/bigquery/docs/writing-results#large-results). Larger results need an explicit destination table.
+Because the anonymous table that BigQuery writes `jobs.query` results to is [limited to about 10 GB compressed](https://docs.cloud.google.com/bigquery/docs/writing-results#large-results), queries whose results exceed ~10 GB compressed—or materialized query results you want to scan multiple times without re-running BigQuery—should be written to an explicit destination table and scanned with [`Client.scan_table`](../api/index.md#polars_bigquery.Client.scan_table).
 
 These examples use the [`google-cloud-bigquery`](https://pypi.org/project/google-cloud-bigquery/) client to run the query:
 
@@ -42,7 +42,7 @@ with polars_bigquery.Client(quota_project_id="my-gcp-project") as client:
     lf.filter(pl.col("state") == "WA").sink_parquet("names_wa.parquet")
 ```
 
-Without a destination in the job configuration, BigQuery writes the result to an anonymous table that is kept for about 24 hours and is subject to the 10 GB limit. Use this form for smaller results that you want to process lazily.
+Without a destination in the job configuration, BigQuery writes the result to an anonymous table that is kept for about 24 hours and is subject to the ~10 GB compressed limit. Use this pattern when you want to reuse a materialized result table across multiple scans; for one-off lazy streaming up to ~10 GB compressed without `google-cloud-bigquery`, prefer [`Client.scan_query`](../api/index.md#polars_bigquery.Client.scan_query).
 
 ## Write to an Explicit Destination Table
 
@@ -61,7 +61,7 @@ from google.cloud import bigquery
 
 
 @contextmanager
-def scan_query(
+def scan_large_query(
     sql: str,
     *,
     project: str,
@@ -85,7 +85,7 @@ def scan_query(
         bq_client.delete_dataset(dataset, delete_contents=True, not_found_ok=True)
 
 
-with scan_query(sql, project="my-gcp-project") as lf:
+with scan_large_query(sql, project="my-gcp-project") as lf:
     lf.sink_parquet(pl.PartitionBy("data/", max_rows_per_file=1_000_000))
 ```
 
@@ -99,5 +99,5 @@ The dataset location must match the location of the tables that the query reads.
 
 - **The query runs eagerly.** The query job runs to completion before `scan_table` is called, so you pay for the full query regardless of the Polars operations that follow.
 - **Pushdown applies to the result table.** Column selections and [row filter predicates](../api/predicate-pushdown.md) on the `LazyFrame` are pushed down to the Storage Read API when reading the result table. They reduce data transferred, but not the bytes processed by the query. Put filters that should reduce query cost in the SQL.
-- **Row order is not preserved.** `scan_table` reads from multiple Storage Read API streams in parallel, so an `ORDER BY` in the query does not determine the order of the scanned rows. Sort in Polars, or use [`Client.read_query`](../api/index.md#polars_bigquery.Client.read_query) with `maintain_order=True` for results that fit in memory.
+- **Row order is not preserved.** `scan_table` reads from multiple Storage Read API streams in parallel, so an `ORDER BY` in the query does not determine the order of the scanned rows. Sort in Polars, use [`Client.scan_query`](../api/index.md#polars_bigquery.Client.scan_query) with `maintain_order=True` for ordered out-of-core results up to ~10 GB compressed, or use [`Client.read_query`](../api/index.md#polars_bigquery.Client.read_query) with `maintain_order=True` for results that fit in memory.
 - **Storage Read API billing.** Reading the result table is billed to the `quota_project_id` of the [`Client`](../api/index.md#polars_bigquery.Client), separately from the query job.

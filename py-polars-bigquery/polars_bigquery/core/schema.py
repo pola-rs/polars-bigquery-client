@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import dataclasses
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from typing import Any
 
 import polars as pl
@@ -21,6 +21,7 @@ from polars.datatypes import (
     Time,
 )
 
+import polars_bigquery.exceptions
 from polars_bigquery.core.types import (
     GEOGRAPHY_EXTENSION_METADATA,
     GEOGRAPHY_EXTENSION_NAME,
@@ -63,6 +64,29 @@ class _UnsupportedBigQueryType(Exception):
         self.path = path
 
 
+def has_bignumeric_dtype(dtype: pl.DataType) -> bool:
+    """Return `True` if `dtype` is or nests a `BIGNUMERIC` (`Decimal(precision > 38)`)."""
+    map_cls = getattr(pl, "Map", None)
+    stack: list[pl.DataType] = [dtype]
+    while stack:
+        current = stack.pop()
+        if isinstance(current, pl.Decimal):
+            if current.precision is not None and current.precision > 38:
+                return True
+        elif isinstance(current, (pl.List, pl.Array)):
+            if current.inner is not None:
+                stack.append(current.inner)
+        elif isinstance(current, pl.Struct):
+            for field in current.fields:
+                stack.append(field.dtype)
+        elif map_cls is not None and isinstance(current, map_cls):
+            if current.key is not None:
+                stack.append(current.key)
+            if current.value is not None:
+                stack.append(current.value)
+    return False
+
+
 def _build_extension_dtype_checked(
     builder: ExtensionDtypeBuilder,
     name: str,
@@ -87,6 +111,18 @@ def _build_extension_dtype_checked(
 
 
 _VALID_FIELD_MODES = frozenset({"", "nullable", "required", "repeated"})
+
+
+def _is_supported_timestamp_precision(precision: Any) -> bool:
+    return (
+        precision is None
+        or (
+            isinstance(precision, int)
+            and not isinstance(precision, bool)
+            and precision == 6
+        )
+        or precision == "6"
+    )
 
 
 def _extract_data_type(
@@ -250,19 +286,286 @@ def _extract_data_type(
         return Time(), BQType.TIME
     if type_ == "timestamp":
         precision = field.get("timestampPrecision")
-        if (
-            precision is None
-            or (
-                isinstance(precision, int)
-                and not isinstance(precision, bool)
-                and precision == 6
-            )
-            or precision == "6"
-        ):
+        if _is_supported_timestamp_precision(precision):
             return Datetime(time_unit="us", time_zone="UTC"), BQType.TIMESTAMP
         raise _UnsupportedBigQueryType(f"TIMESTAMP(precision={precision})", path)
 
     raise _UnsupportedBigQueryType(f"unsupported type {type_ or '<missing>'}", path)
+
+
+def _extract_strict_data_type(
+    field: Mapping[str, Any],
+    *,
+    top_col_name: str,
+    depth: int = 0,
+    extension_dtype_builder: ExtensionDtypeBuilder = build_extension_dtype,
+) -> tuple[DataType, BQType]:
+    """Strictly convert a dry-run BigQuery `TableFieldSchema` into `(DataType, BQType)`.
+
+    Unlike `_extract_data_type` (used by `scan_table` to skip unsupported table
+    columns with a warning), query schemas cannot silently omit selected columns
+    when executing verbatim SQL, so malformed fields fail with `BigQueryError`,
+    duplicate `STRUCT` subfields fail with `ValueError`, and unsupported BigQuery
+    types (such as `BIGNUMERIC` / `INTERVAL` / `RANGE` / unknown types) fail
+    with `TypeError`.
+    """
+    if depth > MAX_SCHEMA_NESTING_DEPTH:
+        msg = (
+            "Invalid response from BigQuery: schema nesting depth exceeds "
+            f"maximum supported depth ({MAX_SCHEMA_NESTING_DEPTH})."
+        )
+        raise polars_bigquery.exceptions.BigQueryError(msg)
+
+    if not isinstance(field, Mapping):
+        msg = (
+            "Invalid response from BigQuery: expected schema field object, "
+            f"got {type(field).__name__}."
+        )
+        raise polars_bigquery.exceptions.BigQueryError(msg)
+
+    raw_mode = field.get("mode")
+    if raw_mode is not None and not isinstance(raw_mode, str):
+        msg = (
+            "Invalid response from BigQuery: field 'mode' must be a string, "
+            f"got {type(raw_mode).__name__}."
+        )
+        raise polars_bigquery.exceptions.BigQueryError(msg)
+
+    raw_type = field.get("type")
+    if raw_type is not None and not isinstance(raw_type, str):
+        msg = (
+            "Invalid response from BigQuery: field 'type' must be a string, "
+            f"got {type(raw_type).__name__}."
+        )
+        raise polars_bigquery.exceptions.BigQueryError(msg)
+
+    mode = (raw_mode or "").casefold()
+    if mode not in _VALID_FIELD_MODES:
+        msg = f"Invalid response from BigQuery: unsupported field 'mode' {raw_mode!r}."
+        raise polars_bigquery.exceptions.BigQueryError(msg)
+
+    type_ = (raw_type or "").casefold()
+
+    if mode == "repeated":
+        if type_ == "json":
+            return (
+                extension_dtype_builder(JSON_EXTENSION_NAME, List(String()), None),
+                BQType.ARRAY,
+            )
+        if type_ == "geography":
+            return (
+                extension_dtype_builder(
+                    GEOGRAPHY_EXTENSION_NAME,
+                    List(String()),
+                    GEOGRAPHY_EXTENSION_METADATA,
+                ),
+                BQType.ARRAY,
+            )
+        inner_type, _ = _extract_strict_data_type(
+            {
+                **field,
+                "mode": "NULLABLE",
+            },
+            top_col_name=top_col_name,
+            depth=depth + 1,
+            extension_dtype_builder=extension_dtype_builder,
+        )
+        return List(inner_type), BQType.ARRAY
+
+    if type_ in ("bool", "boolean"):
+        return Boolean(), BQType.BOOL
+    if type_ == "bytes":
+        return Binary(), BQType.BYTES
+    if type_ == "date":
+        return Date(), BQType.DATE
+    if type_ == "datetime":
+        return Datetime(time_unit="us"), BQType.DATETIME
+    if type_ == "geography":
+        return (
+            extension_dtype_builder(
+                GEOGRAPHY_EXTENSION_NAME,
+                String(),
+                GEOGRAPHY_EXTENSION_METADATA,
+            ),
+            BQType.GEOGRAPHY,
+        )
+    if type_ in ("float", "float64"):
+        return Float64(), BQType.FLOAT64
+    if type_ in ("integer", "int64"):
+        return Int64(), BQType.INT64
+    if type_ in ("numeric", "decimal"):
+        return Decimal(precision=38, scale=9), BQType.NUMERIC
+    if type_ in ("bignumeric", "bigdecimal"):
+        msg = (
+            "Polars does not support BigQuery BIGNUMERIC/BIGDECIMAL columns "
+            f"(Decimal precision > 38) in LazyFrame schema for column(s): {top_col_name!r}. "
+            "Cast them to NUMERIC, FLOAT64, or STRING in SQL or exclude them."
+        )
+        raise TypeError(msg)
+    if type_ == "json":
+        return (
+            extension_dtype_builder(JSON_EXTENSION_NAME, String(), None),
+            BQType.JSON,
+        )
+    if type_ == "interval":
+        msg = (
+            f"BigQuery INTERVAL column {top_col_name!r} is not supported over "
+            "Arrow C Data Interface FFI. Cast it in SQL or exclude it."
+        )
+        raise TypeError(msg)
+    if type_ == "range":
+        msg = (
+            f"BigQuery RANGE column {top_col_name!r} is not supported in Polars. "
+            "Cast it in SQL or exclude it."
+        )
+        raise TypeError(msg)
+    if type_ in ("record", "struct"):
+        raw_subfields = field.get("fields")
+        if raw_subfields is None:
+            raw_subfields = []
+        elif not isinstance(raw_subfields, Sequence) or isinstance(
+            raw_subfields, (str, bytes)
+        ):
+            msg = (
+                "Invalid response from BigQuery: STRUCT 'fields' must be a list, "
+                f"got {type(raw_subfields).__name__}."
+            )
+            raise polars_bigquery.exceptions.BigQueryError(msg)
+        polars_fields: list[Field] = []
+        seen_names: set[str] = set()
+        dup_names: list[str] = []
+        dup_seen: set[str] = set()
+        for subfield in raw_subfields:
+            if not isinstance(subfield, Mapping):
+                msg = (
+                    "Invalid response from BigQuery: expected STRUCT subfield object, "
+                    f"got {type(subfield).__name__}."
+                )
+                raise polars_bigquery.exceptions.BigQueryError(msg)
+            raw_sub_name = subfield.get("name", "")
+            sub_name = "" if raw_sub_name is None else raw_sub_name
+            if not isinstance(sub_name, str):
+                msg = (
+                    "Invalid response from BigQuery: STRUCT subfield 'name' must be a string, "
+                    f"got {type(sub_name).__name__}."
+                )
+                raise polars_bigquery.exceptions.BigQueryError(msg)
+            if sub_name in seen_names:
+                if sub_name not in dup_seen:
+                    dup_names.append(sub_name)
+                    dup_seen.add(sub_name)
+                continue
+            seen_names.add(sub_name)
+            sub_dtype, _ = _extract_strict_data_type(
+                subfield,
+                top_col_name=top_col_name,
+                depth=depth + 1,
+                extension_dtype_builder=extension_dtype_builder,
+            )
+            polars_fields.append(Field(sub_name, sub_dtype))
+        if dup_names:
+            dup_list = ", ".join(repr(name) for name in dup_names)
+            struct_name = field.get("name") or "<unnamed>"
+            hint = (
+                " Alias unnamed STRUCT fields explicitly with `AS`."
+                if "" in dup_seen
+                else ""
+            )
+            msg = (
+                f"BigQuery STRUCT field {struct_name!r} contains duplicate "
+                f"subfield name(s): {dup_list}.{hint}"
+            )
+            raise ValueError(msg)
+        return Struct(polars_fields), BQType.STRUCT
+    if type_ == "string":
+        return String(), BQType.STRING
+    if type_ == "time":
+        return Time(), BQType.TIME
+    if type_ == "timestamp":
+        precision = field.get("timestampPrecision")
+        if _is_supported_timestamp_precision(precision):
+            return Datetime(time_unit="us", time_zone="UTC"), BQType.TIMESTAMP
+        msg = (
+            f"BigQuery TIMESTAMP(precision={precision}) column {top_col_name!r} "
+            "is not supported in Polars. Cast to microsecond TIMESTAMP in SQL."
+        )
+        raise TypeError(msg)
+
+    msg = f"got unexpected BigQuery type: {type_}"
+    raise TypeError(msg)
+
+
+def extract_query_schema_from_fields(
+    fields: Sequence[Mapping[str, Any]],
+    *,
+    extension_dtype_builder: ExtensionDtypeBuilder = build_extension_dtype,
+) -> tuple[pl.Schema, dict[str, BQType]]:
+    """Convert BigQuery `TableFieldSchema` entries into `(pl.Schema, bq_types)`.
+
+    Strictly validates every entry (no silent column skipping) for use with
+    `scan_query` dry-run schema discovery.
+
+    See: https://docs.cloud.google.com/bigquery/docs/reference/rest/v2/tables#TableFieldSchema
+    """
+    pl_schema: dict[str, DataType] = {}
+    bq_types: dict[str, BQType] = {}
+    duplicates: list[str] = []
+    seen_duplicates: set[str] = set()
+    for field in fields:
+        if not isinstance(field, Mapping):
+            msg = (
+                "Invalid response from BigQuery: expected schema field object, "
+                f"got {type(field).__name__}."
+            )
+            raise polars_bigquery.exceptions.BigQueryError(msg)
+        raw_name = field.get("name")
+        if not isinstance(raw_name, str):
+            msg = (
+                "Invalid response from BigQuery: schema field 'name' must be a string, "
+                f"got {type(raw_name).__name__}."
+            )
+            raise polars_bigquery.exceptions.BigQueryError(msg)
+        if raw_name == "":
+            msg = (
+                "Invalid response from BigQuery: schema field 'name' must be a "
+                "non-empty string."
+            )
+            raise polars_bigquery.exceptions.BigQueryError(msg)
+        if raw_name in pl_schema:
+            if raw_name not in seen_duplicates:
+                duplicates.append(raw_name)
+                seen_duplicates.add(raw_name)
+            continue
+        dtype, bq_type = _extract_strict_data_type(
+            field,
+            top_col_name=raw_name,
+            extension_dtype_builder=extension_dtype_builder,
+        )
+        pl_schema[raw_name] = dtype
+        bq_types[raw_name] = bq_type
+
+    if duplicates:
+        dup_list = ", ".join(repr(name) for name in duplicates)
+        msg = f"BigQuery schema contains duplicate column name(s): {dup_list}."
+        raise ValueError(msg)
+
+    return pl.Schema(pl_schema), bq_types
+
+
+def extract_polars_schema_from_fields(
+    fields: Sequence[Mapping[str, Any]],
+    *,
+    extension_dtype_builder: ExtensionDtypeBuilder = build_extension_dtype,
+) -> pl.Schema:
+    """Convert BigQuery `TableFieldSchema` entries into a Polars schema.
+
+    See: https://docs.cloud.google.com/bigquery/docs/reference/rest/v2/tables#TableFieldSchema
+    """
+    pl_schema, _ = extract_query_schema_from_fields(
+        fields,
+        extension_dtype_builder=extension_dtype_builder,
+    )
+    return pl_schema
 
 
 _VALID_TIME_PARTITIONING_TYPES = frozenset({"day", "hour", "month", "year"})
@@ -428,12 +731,28 @@ def extract_polars_schema(
     table_metadata: Mapping[str, Any],
     *,
     extension_dtype_builder: ExtensionDtypeBuilder = build_extension_dtype,
+    require_non_empty: bool = False,
 ) -> pl.Schema:
     """Convert a BigQuery table REST response into a Polars schema.
 
+    When `require_non_empty=True`, raises `BigQueryError` if `schema.fields` is
+    missing or empty *before* appending ingestion-time partitioning pseudo-columns.
+
     See: https://docs.cloud.google.com/bigquery/docs/reference/rest/v2/tables#Table
     """
-    return extract_schema_metadata(
+    extracted = extract_schema_metadata(
         table_metadata,
         extension_dtype_builder=extension_dtype_builder,
-    ).polars_schema
+    )
+    if require_non_empty:
+        raw_schema = table_metadata.get("schema")
+        raw_fields = (
+            raw_schema.get("fields") if isinstance(raw_schema, Mapping) else None
+        )
+        if not raw_fields:
+            msg = (
+                "Invalid response from BigQuery: table metadata did not "
+                "contain any schema fields."
+            )
+            raise polars_bigquery.exceptions.BigQueryError(msg)
+    return extracted.polars_schema

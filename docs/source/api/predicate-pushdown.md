@@ -1,6 +1,6 @@
 # Row Predicate Pushdown
 
-When scanning a table with [`Client.scan_table`][polars_bigquery.Client.scan_table], Polars passes `.filter()` predicates to `polars_bigquery`, which compiles supported Polars expressions into a BigQuery Storage Read API `row_restriction` SQL filter using the table's schema (and authoritative BigQuery column types when `schema=None`).
+When scanning a table with [`Client.scan_table`][polars_bigquery.Client.scan_table], Polars passes `.filter()` predicates to `polars_bigquery`, which compiles supported Polars expressions into a BigQuery Storage Read API `row_restriction` SQL filter using the table's schema (and authoritative BigQuery column types when `schema=None`). [`Client.scan_query`][polars_bigquery.Client.scan_query] (with `maintain_order=False`) uses the same schema-aware expression compiler to append GoogleSQL pipe operators (`|> WHERE`, `|> SELECT`, and `|> LIMIT`) directly to the user query.
 
 !!! note "Safe fallback and exact filtering"
     `polars_bigquery` always applies the original `.filter()` predicate in Polars after streaming batches from BigQuery. If an expression (or a branch of a conjunctive `&` filter) uses an unsupported operation, incompatible operand types, or an unrepresentable literal, `polars_bigquery` safely falls back to evaluating the unsupported portion in memory without data loss.
@@ -13,7 +13,7 @@ For the BigQuery-to-Polars table schema mapping (including `TIMESTAMP` `"UTC"`, 
 
 | Polars Expression | BigQuery SQL Translation | Notes |
 | --- | --- | --- |
-| `pl.col("name")` | `` `name` `` | Supports standard and [flexible BigQuery column names](#column-naming-rules-and-limits), as well as `_PARTITIONDATE` (`DAY` partitions) and `_PARTITIONTIME` on ingestion-time partitioned tables. |
+| `pl.col("name")` | `` `name` `` | Supports standard and [flexible BigQuery column names](#column-naming-rules-and-limits), as well as `_PARTITIONDATE` (`DAY` partitions) and `_PARTITIONTIME` on ingestion-time partitioned tables (in `Client.scan_table` only). |
 | `pl.lit(value)` | SQL literal | See [Supported Literal Data Types](#supported-literal-data-types) for literal formatting and bounds. |
 
 ### Comparison Operators
@@ -36,7 +36,7 @@ Logical `&`, `|`, and `~` require `BOOL` operands (integer bitwise `&`, `|`, and
 | Polars Expression | Operator / Method | BigQuery SQL Translation | Notes |
 | --- | --- | --- | --- |
 | `a & b` | `And` (`&`) | `(`a` AND `b`)` | **Supports partial pushdown**: if one branch cannot be pushed down, the supported branch is still pushed down to BigQuery. |
-| `pl.all_horizontal(a, b, ...)` | `all_horizontal` | `((`a` AND `b`) ...)` | Folded into left-associative `AND` expressions; supports partial pushdown. |
+| `pl.all_horizontal(a, b, ...)` | `all_horizontal` | `(`a` AND `b` ...)` | Folded into flat `AND` conjunctions (depth-1 nesting); supports partial pushdown. |
 | `a \| b` | `Or` (`\|`) | `(`a` OR `b`)` | Pushed down when both branches are supported `BOOL` expressions and exact. |
 | `~a` | `Expr.not_` (`~`) | `(NOT `a`)` | Pushed down when the inner `BOOL` expression is exact. Negated disjunctions `~(a \| b)` are automatically rewritten via De Morgan's Law into `(~a) & (~b)` so supported branches can still be pushed down. |
 | `pl.when(p).then(t).otherwise(f)` | `when` / `then` / `otherwise` | Boolean conditionals (`AND` / `OR` / `NOT COALESCE(..., FALSE)`), `IF(`p`, `t`, `f`)`, or `CASE WHEN `p1` THEN `t1` WHEN `p2` THEN `t2` ... [ELSE `f`] END` | Requires `BOOL` predicates (never `NULL`), non-opaque compatible value branches, and at least one non-`NULL` result branch. Supports partial pushdown in boolean filter context and multi-predicate `pl.when(p1, p2, ...)`. |
@@ -133,7 +133,26 @@ The following Polars data types are supported as user-supplied scalar literals i
 
 ---
 
+## `scan_query` Pipe Pushdown Notes (`maintain_order=False`)
+
+With the default `maintain_order=True`, [`Client.scan_query`][polars_bigquery.Client.scan_query] executes your SQL query verbatim without pushing down filters, projections, or limits. When `maintain_order=False`, `polars_bigquery` appends GoogleSQL pipe operators (`|> WHERE`, `|> SELECT`, `|> LIMIT`) to the right-trimmed query (preserving leading newlines and indentation so BigQuery `[line:col]` error coordinates stay unshifted). Keep these caveats in mind:
+
+| Query Pattern / Limitation | Observed Behavior | Guidance / Workaround |
+| --- | --- | --- |
+| Explicit (including partial) `schema` | Unlike dry-run discovery (`schema=None`), which omits `\|> SELECT` when all discovered columns are needed, passing an explicit `schema` always emits `\|> SELECT` for the needed declared columns so **partial** schemas prune unlisted query columns server-side. | Supply a full or partial `schema` only when all referenced columns have explicit aliases; keep `maintain_order=True` for verbatim execution. |
+| Anonymous / unaliased columns (`f0_`, `f1_`) | Dry-run all-column scans omit `\|> SELECT`, so `f0_` flows through unfiltered or filtered/sliced scans. Explicit `\|> SELECT` (including with explicit `schema={"f0_": ...}`) or `\|> WHERE` on `f0_` fails with `Unrecognized name: f0_`. | Alias expressions explicitly with `AS`, use `schema=None` for all-column scans, or use `maintain_order=True`. |
+| Duplicate or case-colliding SQL aliases (`SELECT 1 AS a, 2 AS a` or `2 AS A`) | BigQuery auto-suffixes duplicates in the dry-run schema to `a`/`a_1` and `a`/`A_1`. `\|> LIMIT n` succeeds, ``\|> WHERE (`a` = 1)`` fails (`Column name a is ambiguous`), and selecting `a_1` / `A_1` fails (`Unrecognized name`). | Give every output column a unique, case-insensitive `AS` alias, or use `maintain_order=True`. |
+| Trailing comments after `;` (`SELECT 1; -- note`, `; # note`, `; /* note */`) and multiple `;;` | A single trailing `;` is stripped even when followed by whitespace or well-formed comments (`--`, `#`, `/* */`), preserving those trailing comments (for example, `sqlcommenter`/dbt tracing tags). Unterminated block comments (`; /* ...`) and invalid double semicolons (`;;`) retain `;` and fail in BigQuery. | Pass valid SQL with at most one trailing `;`. |
+| Multi-statement scripts | `CREATE TEMP FUNCTION ...; SELECT ...` works with pipe pushdown. Other scripts are blocked eagerly during dry run (`statementType == "SCRIPT"`), and fail if appended with `\|>` under explicit `schema`. | Use a single `SELECT` statement, [`Client.read_query`][polars_bigquery.Client.read_query], or `maintain_order=True`. |
+| Trailing `ORDER BY` in SQL | Appending `\|>` parses validly with `ORDER BY` (and `ORDER BY ... LIMIT ...`), but row order is **not** preserved under `maintain_order=False`. | Keep the default `maintain_order=True` when ordering must be preserved. |
+| `lf.filter(p).limit(n)` vs. `lf.limit(n)` | `lf.limit(n)` pushes down `\|> LIMIT n`. For `lf.filter(p).limit(n)`, Polars keeps the slice above the scan node, so BigQuery executes `\|> WHERE ...` **without** SQL `LIMIT` (billing the full filtered query and holding the anonymous table cap and initial wait). | Add `LIMIT` inside the SQL query or use `lf.limit(n)` when a server-side cap is needed. |
+| `\|> LIMIT` billing | `\|> LIMIT n` caps transferred rows and anonymous output size, **not** scanned bytes (`totalBytesProcessed`). | Push partition/cluster filters via `lf.filter(...)` or explicit SQL `WHERE`. |
+| Query cache keys | Each distinct pushed `\|> WHERE` / `\|> SELECT` / `\|> LIMIT` combination changes the submitted SQL string and creates a separate BigQuery cache entry. Projected columns are emitted in canonical schema declaration order so column reordering reuses the same cache entry. | Keep `maintain_order=True` for verbatim exact-string query cache reuse, or materialize to a destination table. |
+| Unresolved SQL length (> 1 MB) | Queries approaching BigQuery's ~1 MB unresolved query limit degrade automatically in tiers (pruning the largest top-level `AND` conjuncts first, then dropping `\|> WHERE` while retaining `\|> SELECT` and pre-filter `\|> LIMIT`, then falling back to verbatim SQL) and log one `WARNING`. | Avoid oversized inline `is_in(...)` lists or join against a temporary table. |
+
+---
+
 ## Column Naming Rules and Limits
 
-- **Column identifiers**: Standard and flexible BigQuery column names are quoted with backticks (`` `col` ``). Allowed characters include Unicode letters (`\p{L}`), numbers (`\p{N}`), marks (`\p{M}`), underscores (`\p{Pc}`), hyphens/dashes (`\p{Pd}`), spaces, and the flexible special characters `&`, `%`, `=`, `+`, `:`, `'`, `<`, `>`, `#`, and `|`. Column names containing characters disallowed by BigQuery (such as `` ` ``, `\`, `.`, `$`, or `!`) raise a `ValueError`.
-- **Expression tree and SQL size limits**: Predicate ASTs up to 10,000 nodes (`MAX_AST_NODES = 10_000`) are compiled, duplicated operands in `FLOAT64` `NaN` rewrites are capped at 64 nodes (`MAX_DUPLICATED_OPERAND_NODES = 64`), and compiled `row_restriction` SQL exceeding 1,000,000 UTF-8 bytes (`MAX_ROW_RESTRICTION_BYTES = 1_000_000`) falls back to client-side filtering.
+- **Column identifiers**: Standard and flexible BigQuery column names are quoted with backticks (`` `col` ``). Allowed characters include Unicode letters (`\p{L}`), numbers (`\p{N}`), marks (`\p{M}`), underscores (`\p{Pc}`), hyphens/dashes (`\p{Pd}`), Unicode space separators (`Zs`), and the flexible special characters `&`, `%`, `=`, `+`, `:`, `'`, `<`, `>`, `#`, and `|`. Column names containing disallowed characters (such as `` ` ``, `\`, `.`, `$`, `!`, control characters like `\t`/`\n`/`\r`, or line/paragraph separators) raise a `ValueError`.
+- **Expression tree and SQL size limits**: Predicate ASTs up to 10,000 nodes (`MAX_AST_NODES = 10_000`) are compiled, duplicated operands in `FLOAT64` `NaN` rewrites are capped at 64 nodes (`MAX_DUPLICATED_OPERAND_NODES = 64`), and subtrees exceeding these budgets gracefully degrade to client-side filtering while preserving shallower conjunctive (`&`) filters. Both `Client.scan_table` (`row_restriction`) and `Client.scan_query` (`|> WHERE` / total query) enforce a `1,000,000`-byte UTF-8 ceiling (`MAX_ROW_RESTRICTION_BYTES = 1_000_000` / `MAX_UNRESOLVED_SQL_BYTES = 1_000_000`) by pruning the largest top-level `AND` conjuncts first and logging one `WARNING`.

@@ -59,7 +59,12 @@ def _is_allowed_unicode_category(ch: str) -> bool:
 
 
 def _is_valid_column_character(ch: str) -> bool:
-    """Check if character is permitted in a BigQuery standard or flexible column name."""
+    """Check if character is permitted in a BigQuery standard or flexible column name.
+
+    Permits horizontal Unicode space separators (`Zs`, e.g. ASCII space ` ` and
+    ideographic space) while rejecting control and line/paragraph break characters
+    such as ``\\t``, ``\\n``, ``\\r``, ``\\v``, ``\\f``, ``\\x85``, ``\\u2028``, and ``\\u2029``.
+    """
     if ch in _UNSUPPORTED_COLUMN_CHARS or ch in ("\n", "\r", "\0"):
         return False
     return (
