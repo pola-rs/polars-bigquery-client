@@ -2204,3 +2204,30 @@ def test_scan_table_releases_lazyframe_and_aborts_task_on_post_export_error(
     )
     with pytest.raises(pl.exceptions.ComputeError, match="closed before completion"):
         held_lf.collect()
+
+
+def test_arrow_bigquery_dependency_pin_tracks_polars_bigquery_version():
+    """Guard against releasing polars-bigquery with a stale `arrow-bigquery` floor."""
+    import re
+    from pathlib import Path
+
+    import tomllib
+
+    def _release_tuple(ver: str) -> tuple[int, ...]:
+        m = re.match(r"^([0-9]+(?:\.[0-9]+)*)", ver.strip())
+        assert m is not None, f"Unparseable PEP 440 version {ver!r}"
+        return tuple(int(p) for p in m.group(1).split("."))
+
+    pyproject_path = Path(__file__).resolve().parents[2] / "pyproject.toml"
+    data = tomllib.loads(pyproject_path.read_text(encoding="utf-8"))
+    pkg_version = _release_tuple(data["project"]["version"])
+    deps = data["project"]["dependencies"]
+    arrow_deps = [d for d in deps if d.startswith("arrow-bigquery")]
+    assert len(arrow_deps) == 1
+    match = re.search(r">=\s*([0-9]+(?:\.[0-9]+)*(?:[a-zA-Z0-9._+-]*)?)", arrow_deps[0])
+    assert match is not None, f"Missing '>=' lower pin on {arrow_deps[0]!r}"
+    min_version = _release_tuple(match.group(1))
+    assert min_version >= pkg_version, (
+        f"py-polars-bigquery {data['project']['version']} must pin "
+        f"arrow-bigquery >= {data['project']['version']} (found {arrow_deps[0]!r})"
+    )

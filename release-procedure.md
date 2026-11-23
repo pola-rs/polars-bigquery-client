@@ -3,7 +3,7 @@
 - Update the CHANGELOG.
 - Update the version in `py-arrow-bigquery/pyproject.toml`.
 - Update the version in `py-arrow-bigquery/arrow_bigquery/core/version.py`.
-- Update the version in `py-polars-bigquery/pyproject.toml`.
+- Update the version in `py-polars-bigquery/pyproject.toml`, **and** update its `"arrow-bigquery >= <version>"` minimum dependency pin to match the released `arrow-bigquery` version so users always get matching Rust schema decoding / FFI safety behavior.
 - Update the version in `py-polars-bigquery/polars_bigquery/core/version.py`.
 - Update uv lock files. `uv lock`.
 - Send PR.
