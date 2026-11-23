@@ -12,6 +12,8 @@ classifiers = [
   "Programming Language :: Python :: Implementation :: PyPy",
 ]
 dependencies = [
+    # NOTE(release): Pin to `>= <next-version>` alongside the matching arrow-bigquery
+    # release so consumers get `google:sqlType:datetime` stripping and FFI type guards.
     "arrow-bigquery >= 0.3.2",
     "google-auth >= 2.40.3",
     "polars >= 2.0.0, < 3.0.0",
