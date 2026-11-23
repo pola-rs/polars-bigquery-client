@@ -15,6 +15,7 @@ from polars_bigquery.core import compiler
 from polars_bigquery.core.executors.base import (
     ArrowQueryClient,
     PlanExecutor,
+    close_exporter,
     execute_local_plan_batches,
 )
 from polars_bigquery.core.plan import (
@@ -709,12 +710,21 @@ class QueryExecutor(PlanExecutor):
             use_query_cache=source.use_query_cache,
             maximum_bytes_billed=source.maximum_bytes_billed,
         )
-        return execute_local_plan_batches(
-            pl.scan_arrow_c_stream(arrow_stream_exporter),
-            residual_ops,
-            batch_size=batch_size,
-            maintain_order=source.maintain_order,
-        )
+        lazyframe: pl.LazyFrame | None = None
+        try:
+            lazyframe = pl.scan_arrow_c_stream(arrow_stream_exporter)
+            return execute_local_plan_batches(
+                lazyframe,
+                residual_ops,
+                batch_size=batch_size,
+                maintain_order=source.maintain_order,
+            )
+        except BaseException:
+            # Clear `lazyframe` before re-raising so the exception traceback frame
+            # does not retain the exported Arrow C Stream PyCapsule in `f_locals`.
+            lazyframe = None
+            close_exporter(arrow_stream_exporter)
+            raise
 
 
 __all__ = [

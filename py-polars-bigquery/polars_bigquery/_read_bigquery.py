@@ -22,6 +22,7 @@ from polars_bigquery.core.executors import (
     ReadApiExecutor,
     has_non_comment_sql,
 )
+from polars_bigquery.core.executors.base import close_exporter as _close_exporter
 from polars_bigquery.core.plan import (
     ArrowBufferCompression,
     QueryScan,
@@ -193,7 +194,7 @@ class Client:
         self._quota_project_id = quota_project_id
         self._rest_client_instance: bigquery_rest.BigQueryRestClient | None = None
         self._lifecycle_lock = threading.Lock()
-        self._closed = False
+        self._closed_event = threading.Event()
         self._arrow_client = arrow_bigquery.Client(
             quota_project_id=quota_project_id,
             credentials_provider=credentials_provider,
@@ -204,7 +205,7 @@ class Client:
     def _rest_client(self) -> bigquery_rest.BigQueryRestClient:
         """Lazily initialize the REST client pool only when table metadata is needed."""
         with self._lifecycle_lock:
-            if self._closed:
+            if self._closed_event.is_set():
                 msg = "Cannot use a closed polars_bigquery.Client instance."
                 raise RuntimeError(msg)
             if self._rest_client_instance is None:
@@ -221,17 +222,34 @@ class Client:
             self._rest_client_instance = client
 
     def _ensure_open(self) -> None:
-        with self._lifecycle_lock:
-            if self._closed:
-                msg = "Cannot use a closed polars_bigquery.Client instance."
-                raise RuntimeError(msg)
+        if self._closed_event.is_set():
+            msg = "Cannot use a closed polars_bigquery.Client instance."
+            raise RuntimeError(msg)
+
+    @property
+    def closed(self) -> bool:
+        """Return `True` if [`close`][polars_bigquery.Client.close] has been called."""
+        return self._closed_event.is_set()
 
     def close(self) -> None:
-        """Close underlying REST and native Arrow client resources."""
+        """Close the underlying REST session and native Arrow client.
+
+        Idempotent. Releases pooled REST connections (if allocated), cached
+        native gRPC/HTTP channels, and the Rust-side credentials provider
+        reference.
+
+        Calling `close()` (or exiting a `with Client(...) as client:` block)
+        invalidates this `Client` for subsequent operations: later calls to
+        [`read_table`][polars_bigquery.Client.read_table],
+        [`read_query`][polars_bigquery.Client.read_query],
+        [`scan_table`][polars_bigquery.Client.scan_table], or
+        [`scan_query`][polars_bigquery.Client.scan_query]—including collecting a
+        `LazyFrame` created before closing—raise `RuntimeError`.
+        """
         with self._lifecycle_lock:
-            if self._closed:
+            if self._closed_event.is_set():
                 return
-            self._closed = True
+            self._closed_event.set()
             rest_client = self._rest_client_instance
             self._rest_client_instance = None
             arrow_client = self._arrow_client
@@ -244,6 +262,7 @@ class Client:
                 close_arrow()
 
     def __enter__(self) -> Client:  # noqa: PYI034
+        self._ensure_open()
         return self
 
     def __exit__(self, *exc_info: object) -> None:
@@ -276,7 +295,11 @@ class Client:
             use_query_cache=None,
             maximum_bytes_billed=None,
         )
-        return pl.DataFrame(arrow_stream_exporter)
+        try:
+            return pl.DataFrame(arrow_stream_exporter)
+        except BaseException:
+            _close_exporter(arrow_stream_exporter)
+            raise
 
     def read_table(
         self,
@@ -319,7 +342,11 @@ class Client:
             table_ref,
             maintain_order=maintain_order,
         )
-        return pl.DataFrame(arrow_stream_exporter)
+        try:
+            return pl.DataFrame(arrow_stream_exporter)
+        except BaseException:
+            _close_exporter(arrow_stream_exporter)
+            raise
 
     def read_query(
         self,
@@ -422,7 +449,11 @@ class Client:
             use_query_cache=use_query_cache,
             maximum_bytes_billed=maximum_bytes_billed,
         )
-        return pl.DataFrame(arrow_stream_exporter)
+        try:
+            return pl.DataFrame(arrow_stream_exporter)
+        except BaseException:
+            _close_exporter(arrow_stream_exporter)
+            raise
 
     def scan_table(
         self,
@@ -517,6 +548,7 @@ class Client:
         )
         executor = ReadApiExecutor(self._arrow_client)
         explain_detail = f"table={table_ref}, schema={schema_mode}"
+        closed_event = self._closed_event
 
         def source_generator(
             with_columns: list[str] | None,
@@ -524,6 +556,9 @@ class Client:
             n_rows: int | None,
             batch_size: int | None,
         ) -> Iterator[pl.DataFrame]:
+            if closed_event.is_set():
+                msg = "Cannot use a closed polars_bigquery.Client instance."
+                raise RuntimeError(msg)
             plan = build_io_source_plan(
                 source,
                 with_columns=with_columns,
@@ -846,6 +881,7 @@ class Client:
             maximum_bytes_billed=maximum_bytes_billed,
         )
         executor = QueryExecutor(self._arrow_client)
+        closed_event = self._closed_event
 
         def source_generator(
             with_columns: list[str] | None,
@@ -853,6 +889,9 @@ class Client:
             n_rows: int | None,
             batch_size: int | None,
         ) -> Iterator[pl.DataFrame]:
+            if closed_event.is_set():
+                msg = "Cannot use a closed polars_bigquery.Client instance."
+                raise RuntimeError(msg)
             plan = build_io_source_plan(
                 source,
                 with_columns=with_columns,

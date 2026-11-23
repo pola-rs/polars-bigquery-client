@@ -52,6 +52,13 @@ class ArrowQueryClient(Protocol):
         """Execute a GoogleSQL query (or dry run) and return an Arrow C Stream exporter."""
 
 
+def close_exporter(exporter: Any) -> None:
+    """Close an `ArrowStreamExporter` immediately when supported to abort background streams."""
+    close = getattr(exporter, "close", None)
+    if callable(close):
+        close()
+
+
 class ArrowTableClient(Protocol):
     """Minimal protocol satisfied by `arrow_bigquery.Client` for table scans."""
 
@@ -255,5 +262,6 @@ __all__ = [
     "ArrowTableClient",
     "PlanExecutor",
     "apply_local_plan",
+    "close_exporter",
     "execute_local_plan_batches",
 ]

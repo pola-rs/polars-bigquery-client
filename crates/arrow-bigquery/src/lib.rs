@@ -7,9 +7,11 @@ mod job_cancel;
 mod job_service_retry;
 pub mod query;
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 pub use client_builder::*;
+pub use decode::validate_ffi_schema;
 pub use error::{BigQueryError, JobError, JobFailedError};
 pub use google_cloud_bigquery::model::arrow_serialization_options::CompressionCodec;
 use google_cloud_bigquery::model::{
@@ -358,6 +360,36 @@ pub(crate) fn apply_request_options_parts<B: RequestOptionsBuilder>(
     }
 }
 
+/// Thread-safe handle to cooperatively cancel and abort the background tasks
+/// owned by a [`BigQueryRecordBatchReceiver`], even after ownership of the
+/// receiver has moved elsewhere (e.g. into an Arrow C Stream capsule).
+#[derive(Clone, Debug)]
+pub struct BigQueryStreamAbortHandle {
+    aborted: Arc<AtomicBool>,
+    cancel_tx: Option<Arc<tokio::sync::watch::Sender<bool>>>,
+    abort_handles: Arc<[tokio::task::AbortHandle]>,
+}
+
+impl BigQueryStreamAbortHandle {
+    /// Signals cooperative cancellation and aborts all background stream tasks.
+    ///
+    /// Safe to call multiple times and after the stream has reached clean EOF.
+    pub fn abort(&self) {
+        self.aborted.store(true, Ordering::Release);
+        if let Some(cancel_tx) = &self.cancel_tx {
+            let _ = cancel_tx.send_replace(true);
+        }
+        for handle in self.abort_handles.iter() {
+            handle.abort();
+        }
+    }
+
+    /// Returns `true` if [`Self::abort`] has been called on this handle.
+    pub fn is_aborted(&self) -> bool {
+        self.aborted.load(Ordering::Acquire)
+    }
+}
+
 /// A receiver that yields [`RecordBatch`]es read from BigQuery.
 ///
 /// It manages the background tasks reading from the BigQuery Storage API streams
@@ -365,6 +397,9 @@ pub(crate) fn apply_request_options_parts<B: RequestOptionsBuilder>(
 pub struct BigQueryRecordBatchReceiver {
     /// The channel receiver for receiving [`RecordBatch`]es produced by the background tasks.
     rx: tokio::sync::mpsc::Receiver<Result<RecordBatch, BigQueryError>>,
+    /// Set by [`BigQueryStreamAbortHandle::abort`] when an external caller closes the
+    /// stream before clean EOF so downstream consumers never mistake abort for EOF.
+    aborted: Arc<AtomicBool>,
     /// Cooperative cancellation sender shared across all sibling stream tasks.
     cancel_tx: Option<Arc<tokio::sync::watch::Sender<bool>>>,
     /// Join handles for the background tasks reading from the BigQuery streams.
@@ -378,12 +413,37 @@ pub struct BigQueryRecordBatchReceiver {
 }
 
 impl BigQueryRecordBatchReceiver {
+    /// Returns a cloneable [`BigQueryStreamAbortHandle`] targeting this receiver's
+    /// background stream tasks.
+    pub fn abort_handle(&self) -> BigQueryStreamAbortHandle {
+        BigQueryStreamAbortHandle {
+            aborted: Arc::clone(&self.aborted),
+            cancel_tx: self.cancel_tx.clone(),
+            abort_handles: self
+                .handles
+                .iter()
+                .map(tokio::task::JoinHandle::abort_handle)
+                .collect(),
+        }
+    }
+
     pub async fn recv(&mut self) -> Option<Result<RecordBatch, BigQueryError>> {
         let item = self.rx.recv().await;
         match &item {
-            None | Some(Err(BigQueryError::JobFailed(_))) => {
-                // Clean EOF (or a defensive guard if a stream path emits a confirmed
-                // server-side `JobFailed`, e.g. from cutover `DestinationTableRead::resolve`):
+            None => {
+                if self.aborted.load(Ordering::Acquire) {
+                    // Externally aborted before clean EOF: keep `job_cancel` armed
+                    // so `abort()` triggers best-effort `jobs.cancel` if still running.
+                    self.abort();
+                } else {
+                    // Clean EOF: disarm cancellation to skip issuing a redundant `jobs.cancel`.
+                    self.job_cancel.disarm();
+                    self.abort();
+                }
+            },
+            Some(Err(BigQueryError::JobFailed(_))) => {
+                // Defensive guard if a stream path emits a confirmed server-side
+                // `JobFailed` (e.g. from cutover `DestinationTableRead::resolve`):
                 // disarm cancellation to skip issuing a redundant `jobs.cancel`.
                 self.job_cancel.disarm();
                 self.abort();
@@ -424,6 +484,7 @@ impl BigQueryRecordBatchReceiver {
     ) -> Self {
         Self {
             rx,
+            aborted: Arc::new(AtomicBool::new(false)),
             cancel_tx,
             handles,
             job_cancel: job_cancel::JobCancelSlot::Inactive,
@@ -1885,5 +1946,49 @@ pub(crate) mod tests {
             .expect("expected error item")
             .expect_err("expected Grpc error when ReadRows fails");
         assert!(matches!(err, BigQueryError::Grpc(_)));
+    }
+
+    #[tokio::test]
+    async fn test_stream_abort_handle_aborts_tasks_and_signals_cancel() {
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+        let dropped = Arc::new(AtomicBool::new(false));
+        let dropped_task = Arc::clone(&dropped);
+
+        struct DropGuard(Arc<AtomicBool>);
+        impl Drop for DropGuard {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+            }
+        }
+        let guard = DropGuard(dropped_task);
+        let started = Arc::new(tokio::sync::Notify::new());
+        let started_task = Arc::clone(&started);
+
+        let handle = tokio::spawn(async move {
+            let _keep_tx = tx;
+            let _guard = guard;
+            started_task.notify_one();
+            std::future::pending::<()>().await;
+        });
+        started.notified().await;
+
+        let mut receiver =
+            BigQueryRecordBatchReceiver::new(rx, Some(Arc::new(cancel_tx)), vec![handle]);
+        let abort_handle = receiver.abort_handle();
+        assert!(!abort_handle.is_aborted());
+        assert!(!*cancel_rx.borrow());
+
+        abort_handle.abort();
+        assert!(abort_handle.is_aborted());
+        assert!(*cancel_rx.borrow());
+
+        // `recv()` resolves to `None` once the aborted task drops `tx`.
+        assert!(receiver.recv().await.is_none());
+        assert!(dropped.load(Ordering::Acquire));
+
+        // Calling `abort()` again is an idempotent no-op.
+        abort_handle.abort();
+        assert!(abort_handle.is_aborted());
     }
 }
