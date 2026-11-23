@@ -641,6 +641,7 @@ dependencies = [
     { name = "google-auth" },
     { name = "polars" },
     { name = "requests" },
+    { name = "urllib3" },
 ]
 
 [package.dev-dependencies]
@@ -669,6 +670,7 @@ requires-dist = [
     { name = "google-auth", specifier = ">=2.40.3" },
     { name = "polars", specifier = ">=2.0.0,<3.0.0" },
     { name = "requests", specifier = ">=2.33.0,<3.0.0" },
+    { name = "urllib3", specifier = ">=2.7.0,<3.0.0" },
 ]
 
 [package.metadata.requires-dev]

@@ -22,12 +22,42 @@ def test_bigquery_error_is_unified_with_arrow_bigquery():
 
 
 def test_create_resilient_session_configures_retries_and_pooling():
+    from email.utils import formatdate
+
+    from polars_bigquery.core.bigquery_rest import MAX_RETRY_AFTER_SECONDS
+    from urllib3.exceptions import InvalidHeader
+
     session = create_resilient_session()
-    adapter = session.get_adapter("https://bigquery.googleapis.com")
-    assert adapter.max_retries.total == 5
-    assert adapter.max_retries.backoff_factor == 0.5
-    assert set(adapter.max_retries.status_forcelist) == {429, 500, 502, 503, 504}
-    assert adapter.max_retries.respect_retry_after_header is True
+    try:
+        adapter = session.get_adapter("https://bigquery.googleapis.com")
+        retry = adapter.max_retries
+        assert retry.total == 5
+        assert retry.backoff_factor == 0.5
+        assert retry.backoff_jitter == 0.5
+        assert set(retry.status_forcelist) == {429, 500, 502, 503, 504}
+        assert retry.respect_retry_after_header is True
+        assert retry.retry_after_max == MAX_RETRY_AFTER_SECONDS
+
+        # Retry-After durations are bounded to prevent multi-hour/indefinite sleeps.
+        assert retry.parse_retry_after("5") == 5
+        assert retry.parse_retry_after("0") == 0
+        assert retry.parse_retry_after("86400") == MAX_RETRY_AFTER_SECONDS
+        far_future = formatdate(timeval=4_000_000_000, usegmt=True)
+        assert retry.parse_retry_after(far_future) == MAX_RETRY_AFTER_SECONDS
+        past_date = formatdate(timeval=0, usegmt=True)
+        assert retry.parse_retry_after(past_date) == 0
+        with pytest.raises(InvalidHeader):
+            retry.parse_retry_after("not-a-valid-retry-after")
+
+        # Verify the cap stays enforced across `Retry.increment()` / `Retry.new()`.
+        next_retry = retry.increment(
+            method="GET", url="https://bigquery.googleapis.com"
+        )
+        assert next_retry.retry_after_max == MAX_RETRY_AFTER_SECONDS
+        assert next_retry.backoff_jitter == 0.5
+        assert next_retry.parse_retry_after("86400") == MAX_RETRY_AFTER_SECONDS
+    finally:
+        session.close()
 
 
 def test_raise_for_bigquery_error_extracts_structured_json_message():
@@ -228,7 +258,7 @@ def test_get_table_metadata_rejects_invalid_json_or_non_object():
 
     mock_session = MagicMock()
     mock_session.get.return_value.json.side_effect = ValueError("bad json")
-    with pytest.raises(BigQueryError, match="Invalid JSON response"):
+    with pytest.raises(BigQueryError, match="invalid JSON"):
         get_table_metadata(
             table_ref,
             quota_project_id="q",
@@ -239,7 +269,7 @@ def test_get_table_metadata_rejects_invalid_json_or_non_object():
 
     mock_session.get.return_value.json.side_effect = None
     mock_session.get.return_value.json.return_value = ["unexpected", "list"]
-    with pytest.raises(BigQueryError, match="expected JSON object"):
+    with pytest.raises(BigQueryError, match="unexpected metadata payload type list"):
         get_table_metadata(
             table_ref,
             quota_project_id="q",
@@ -263,7 +293,7 @@ def test_get_table_metadata_wraps_request_exceptions_as_bigquery_error(exc):
     mock_session = MagicMock()
     mock_session.get.side_effect = exc
 
-    with pytest.raises(BigQueryError, match="BigQuery REST request failed") as raised:
+    with pytest.raises(BigQueryError, match="Failed to fetch table metadata") as raised:
         get_table_metadata(
             table_ref,
             quota_project_id="q",
