@@ -735,6 +735,110 @@ def test_client_scan_bigquery_with_polars_schema_pushes_down_projection_and_filt
         assert df.equals(pl.DataFrame({"visible": ["b"]}))
 
 
+def test_client_scan_table_drop_nulls_pushes_down_is_not_null(mock_arrow_client):
+    mock_arrow_client.read_table.return_value = MagicMock()
+
+    with patch("polars.scan_arrow_c_stream") as mock_scan:
+        mock_scan.return_value = pl.LazyFrame(
+            {"id": [1, 2, None], "flag": [None, True, False]}
+        )
+        client = Client(quota_project_id="q")
+        schema = pl.Schema({"id": pl.Int64(), "flag": pl.Boolean()})
+
+        # `lf.drop_nulls()` is lowered by Polars to `is_not_null()` conjuncts.
+        result_all = (
+            client.scan_table(table="p.d.t", schema=schema).drop_nulls().collect()
+        )
+        assert mock_arrow_client.read_table.call_args.kwargs == {
+            "maintain_order": False,
+            "selected_fields": ["id", "flag"],
+            "row_restriction": "((`flag` IS NOT NULL) AND (`id` IS NOT NULL))",
+        }
+        assert result_all.to_dict(as_series=False) == {"id": [2], "flag": [True]}
+
+        mock_arrow_client.read_table.reset_mock()
+        mock_scan.return_value = pl.LazyFrame(
+            {"id": [1, 2, 3], "flag": [None, True, None]}
+        )
+
+        # `lf.drop_nulls(subset=[...])` pushes down only that column's `IS NOT NULL`.
+        result_subset = (
+            client.scan_table(table="p.d.t", schema=schema)
+            .drop_nulls(subset=["flag"])
+            .collect()
+        )
+        assert mock_arrow_client.read_table.call_args.kwargs == {
+            "maintain_order": False,
+            "selected_fields": ["id", "flag"],
+            "row_restriction": "(`flag` IS NOT NULL)",
+        }
+        assert result_subset.to_dict(as_series=False) == {"id": [2], "flag": [True]}
+
+
+def test_client_scan_table_expr_drop_nulls_in_filter_not_pushed_down(mock_arrow_client):
+    mock_arrow_client.read_table.return_value = MagicMock()
+    client = Client(quota_project_id="q")
+    schema = pl.Schema({"id": pl.Int64(), "flag": pl.Boolean()})
+
+    # Single non-null value broadcasts across all rows including nulls.
+    with patch(
+        "polars.scan_arrow_c_stream",
+        return_value=pl.LazyFrame({"id": [1, 2, 3], "flag": [None, True, None]}),
+    ):
+        result = (
+            client.scan_table(table="p.d.t", schema=schema)
+            .filter(pl.col("flag").drop_nulls())
+            .collect()
+        )
+    assert mock_arrow_client.read_table.call_args.kwargs["row_restriction"] == ""
+    assert result.to_dict(as_series=False) == {
+        "id": [1, 2, 3],
+        "flag": [None, True, None],
+    }
+
+    # Multiple non-null values alongside a null raise ShapeError in Polars.
+    mock_arrow_client.read_table.reset_mock()
+    with (
+        patch(
+            "polars.scan_arrow_c_stream",
+            return_value=pl.LazyFrame({"id": [1, 2, 3], "flag": [None, True, False]}),
+        ),
+        pytest.raises(pl.exceptions.ShapeError),
+    ):
+        (
+            client.scan_table(table="p.d.t", schema=schema)
+            .filter(pl.col("flag").drop_nulls())
+            .collect()
+        )
+    assert mock_arrow_client.read_table.call_args.kwargs["row_restriction"] == ""
+
+
+def test_client_scan_query_drop_nulls_pushes_down_is_not_null(mock_arrow_client):
+    mock_arrow_client.read_query.return_value = MagicMock(name="arrow_stream")
+    source_frame = pl.LazyFrame({"id": [1, 2, 3], "flag": [None, True, None]})
+
+    with patch("polars.scan_arrow_c_stream", return_value=source_frame):
+        client = Client(quota_project_id="q")
+        lf = client.scan_query(
+            "SELECT id, flag FROM `p.d.t`",
+            schema={"id": pl.Int64(), "flag": pl.Boolean()},
+            maintain_order=False,
+        )
+        result = lf.drop_nulls(subset=["flag"]).collect()
+
+    mock_arrow_client.read_query.assert_called_once_with(
+        "SELECT id, flag FROM `p.d.t`\n"
+        "|> WHERE (`flag` IS NOT NULL)\n"
+        "|> SELECT `id`, `flag`",
+        arrow_buffer_compression="lz4frame",
+        dry_run=False,
+        maintain_order=False,
+        use_query_cache=None,
+        maximum_bytes_billed=None,
+    )
+    assert result.to_dict(as_series=False) == {"id": [2], "flag": [True]}
+
+
 def test_client_scan_bigquery_handles_bigquery_objects(mock_arrow_client):
     mock_stream = MagicMock()
     mock_arrow_client.read_table.return_value = mock_stream
@@ -1987,6 +2091,159 @@ def test_client_maximum_bytes_billed_wire_serialization():
     assert not captured_bodies[2].get("dryRun")
 
 
+def test_bigquery_rest_retry_has_jitter_and_handles_401_and_errors():
+    import requests
+
+    session = bigquery_rest.create_resilient_session()
+    try:
+        adapter = session.get_adapter("https://bigquery.googleapis.com")
+        assert adapter.max_retries.backoff_jitter > 0
+        assert (
+            adapter.max_retries.retry_after_max == bigquery_rest.MAX_RETRY_AFTER_SECONDS
+        )
+        # Automatic retries are strictly limited to safe, idempotent GET requests.
+        assert adapter.max_retries.allowed_methods == frozenset(["GET"])
+    finally:
+        session.close()
+
+    table_id = arrow_bigquery.BigQueryTableId("p", "d", "t")
+
+    # Simulate a Polars `CachingCredentialProvider` subclass (caches token until cleared
+    # explicitly via `clear_cached_credentials()`, matching real `CredentialProviderGCP`).
+    class _StubCachingCreds:
+        def __init__(self) -> None:
+            self._cached: str | None = "stale-tok"
+            self.clear_calls = 0
+
+        def __call__(self):
+            if self._cached is None:
+                self._cached = "fresh-tok"
+            return ({"bearer_token": self._cached}, 9_999_999_999)
+
+        def clear_cached_credentials(self) -> None:
+            self.clear_calls += 1
+            self._cached = None
+
+    creds = _StubCachingCreds()
+
+    resp_401 = MagicMock()
+    resp_401.status_code = 401
+    resp_200 = MagicMock()
+    resp_200.status_code = 200
+    resp_200.raise_for_status.return_value = None
+    resp_200.json.return_value = {"schema": {"fields": []}}
+
+    mock_session = MagicMock()
+    mock_session.get.side_effect = [resp_401, resp_200]
+    result = bigquery_rest.get_table_metadata(
+        table_id,
+        quota_project_id="q",
+        credentials_provider=creds,
+        user_agent="test-ua",
+        session=mock_session,
+    )
+    assert result == {"schema": {"fields": []}}
+    assert creds.clear_calls == 1
+    assert mock_session.get.call_count == 2
+    assert (
+        mock_session.get.call_args_list[0].kwargs["headers"]["Authorization"]
+        == "Bearer stale-tok"
+    )
+    assert (
+        mock_session.get.call_args_list[1].kwargs["headers"]["Authorization"]
+        == "Bearer fresh-tok"
+    )
+    assert (
+        mock_session.get.call_args_list[0].kwargs["timeout"]
+        == bigquery_rest.METADATA_TIMEOUT
+    )
+    resp_401.close.assert_called_once()
+    resp_200.close.assert_called_once()
+
+    # Persistent 401 is bounded to a single retry and closes both responses.
+    persistent_creds = _StubCachingCreds()
+    persistent_401_first = MagicMock()
+    persistent_401_first.status_code = 401
+    persistent_401_second = MagicMock()
+    persistent_401_second.status_code = 401
+    persistent_401_second.raise_for_status.side_effect = requests.exceptions.HTTPError(
+        "401 Unauthorized"
+    )
+    persistent_401_second.json.return_value = {
+        "error": {"message": "Invalid Credentials"}
+    }
+    mock_session.get.reset_mock()
+    mock_session.get.side_effect = [persistent_401_first, persistent_401_second]
+    with pytest.raises(BigQueryError, match="Invalid Credentials"):
+        bigquery_rest.get_table_metadata(
+            table_id,
+            quota_project_id="q",
+            credentials_provider=persistent_creds,
+            user_agent="test-ua",
+            session=mock_session,
+        )
+    assert persistent_creds.clear_calls == 1
+    assert mock_session.get.call_count == 2
+    persistent_401_first.close.assert_called_once()
+    persistent_401_second.close.assert_called_once()
+
+    # Credentials provider failures wrap as BigQueryError instead of leaking raw errors.
+    def _failing_creds():
+        raise RuntimeError("refresh failed")
+
+    with pytest.raises(BigQueryError, match="Failed to obtain credentials"):
+        bigquery_rest.get_table_metadata(
+            table_id,
+            quota_project_id="q",
+            credentials_provider=_failing_creds,
+            user_agent="test-ua",
+            session=mock_session,
+        )
+
+    # Network exceptions wrap as BigQueryError
+    mock_session.get.side_effect = requests.exceptions.Timeout("timed out")
+    with pytest.raises(BigQueryError, match="Failed to fetch table metadata"):
+        bigquery_rest.get_table_metadata(
+            table_id,
+            quota_project_id="q",
+            credentials_provider=lambda: ({"bearer_token": "tok"}, None),
+            user_agent="test-ua",
+            session=mock_session,
+        )
+
+    # Non-JSON 200 response (e.g. proxy HTML error page) wraps as BigQueryError and closes
+    bad_json_resp = MagicMock()
+    bad_json_resp.status_code = 200
+    bad_json_resp.raise_for_status.return_value = None
+    bad_json_resp.json.side_effect = ValueError("Expecting value")
+    mock_session.get.side_effect = [bad_json_resp]
+    with pytest.raises(BigQueryError, match="invalid JSON"):
+        bigquery_rest.get_table_metadata(
+            table_id,
+            quota_project_id="q",
+            credentials_provider=lambda: ({"bearer_token": "tok"}, None),
+            user_agent="test-ua",
+            session=mock_session,
+        )
+    bad_json_resp.close.assert_called_once()
+
+    # Non-dict JSON payload wraps as BigQueryError and closes
+    list_resp = MagicMock()
+    list_resp.status_code = 200
+    list_resp.raise_for_status.return_value = None
+    list_resp.json.return_value = ["unexpected"]
+    mock_session.get.side_effect = [list_resp]
+    with pytest.raises(BigQueryError, match="unexpected metadata payload type list"):
+        bigquery_rest.get_table_metadata(
+            table_id,
+            quota_project_id="q",
+            credentials_provider=lambda: ({"bearer_token": "tok"}, None),
+            user_agent="test-ua",
+            session=mock_session,
+        )
+    list_resp.close.assert_called_once()
+
+
 def test_unsupported_type_error_export_and_hierarchy():
     from arrow_bigquery import UnsupportedTypeError as TopLevelArrowUnsupported
     from arrow_bigquery import _native
@@ -2100,6 +2357,33 @@ def test_scan_table_releases_lazyframe_and_aborts_task_on_post_export_error(
     )
     with pytest.raises(pl.exceptions.ComputeError, match="closed before completion"):
         held_lf.collect()
+
+
+def test_arrow_bigquery_dependency_pin_tracks_polars_bigquery_version():
+    """Guard against releasing polars-bigquery with a stale `arrow-bigquery` floor."""
+    import re
+    from pathlib import Path
+
+    import tomllib
+
+    def _release_tuple(ver: str) -> tuple[int, ...]:
+        m = re.match(r"^([0-9]+(?:\.[0-9]+)*)", ver.strip())
+        assert m is not None, f"Unparseable PEP 440 version {ver!r}"
+        return tuple(int(p) for p in m.group(1).split("."))
+
+    pyproject_path = Path(__file__).resolve().parents[2] / "pyproject.toml"
+    data = tomllib.loads(pyproject_path.read_text(encoding="utf-8"))
+    pkg_version = _release_tuple(data["project"]["version"])
+    deps = data["project"]["dependencies"]
+    arrow_deps = [d for d in deps if d.startswith("arrow-bigquery")]
+    assert len(arrow_deps) == 1
+    match = re.search(r">=\s*([0-9]+(?:\.[0-9]+)*(?:[a-zA-Z0-9._+-]*)?)", arrow_deps[0])
+    assert match is not None, f"Missing '>=' lower pin on {arrow_deps[0]!r}"
+    min_version = _release_tuple(match.group(1))
+    assert min_version >= pkg_version, (
+        f"py-polars-bigquery {data['project']['version']} must pin "
+        f"arrow-bigquery >= {data['project']['version']} (found {arrow_deps[0]!r})"
+    )
 
 
 class _FakeArrowStreamExporter:

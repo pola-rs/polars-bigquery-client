@@ -42,8 +42,8 @@ All comparison operators require both operands to be exact, supported expression
 | Polars Expression | BigQuery SQL Translation | Notes |
 | --- | --- | --- |
 | `expr.is_null()` | `(`expr` IS NULL)` | — |
-| `expr.is_not_null()` | `(`expr` IS NOT NULL)` | — |
-| `expr.drop_nulls()` | `... AND (`expr` IS NOT NULL)` | Replaces `expr.drop_nulls()` with `expr` and conjoins `(`expr` IS NOT NULL)` to the top-level row restriction when `expr` is supported, exact, and non-`Null`. |
+| `expr.is_not_null()` | `(`expr` IS NOT NULL)` | Also handles `LazyFrame.drop_nulls()` / `LazyFrame.drop_nulls(subset=...)`, which Polars lowers into `is_not_null()` predicates before scan pushdown. |
+| `expr.drop_nulls()` | *(not pushed down)* | Evaluates locally in Polars. `Expr.drop_nulls()` shrinks `Series` length and broadcasts length-1 results across null rows (or raises `ShapeError`), so it cannot be rewritten to a row-level `IS NOT NULL` filter without risking silent data loss. Use `LazyFrame.drop_nulls()` or `expr.is_not_null()` for pushdown. |
 | `pl.coalesce(a, b, ...)` | `COALESCE(`a`, `b`, ...)` | Pushed down when all operands are supported, exact, and non-`Null`. |
 | `expr.fill_null(value)` | `IFNULL(`expr`, `value`)` | Pushed down when both `expr` and `value` are supported, exact, and non-`Null`. |
 | `expr.fill_null(strategy="zero" \| "one")` | `IFNULL(`expr`, 0)` or `IFNULL(`expr`, 1)` | Analytical and aggregate strategies (`"forward"`, `"backward"`, `"min"`, `"max"`, `"mean"`) are not pushed down. |
