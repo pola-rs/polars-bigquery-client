@@ -2,9 +2,8 @@
 
 from __future__ import annotations
 
-import collections
-
-from polars_bigquery.core.compiler.ir import And, Expr
+from polars_bigquery.core.compiler._traversal import flatten_expr_bfs
+from polars_bigquery.core.compiler.ir import And, Expr, NullLiteral
 from polars_bigquery.core.compiler.sql import (
     base,
     boolean,
@@ -38,23 +37,7 @@ def _compile_ir_to_sql(root: Expr) -> tuple[str | None, bool]:
     then evaluates SQL strings bottom-up in reverse BFS order to avoid stack size
     limitations.
     """
-    nodes: list[Expr] = [root]
-    children_map: list[tuple[int, ...]] = [()]
-    queue: collections.deque[int] = collections.deque([0])
-
-    while queue:
-        curr_idx = queue.popleft()
-        node = nodes[curr_idx]
-        node_children = node.children()
-        if node_children:
-            child_indices: list[int] = []
-            for child in node_children:
-                c_idx = len(nodes)
-                nodes.append(child)
-                children_map.append(())
-                queue.append(c_idx)
-                child_indices.append(c_idx)
-            children_map[curr_idx] = tuple(child_indices)
+    nodes, children_map = flatten_expr_bfs(root)
 
     results: list[tuple[str | None, bool]] = [(None, False)] * len(nodes)
     for idx in range(len(nodes) - 1, -1, -1):
@@ -75,8 +58,9 @@ def compile_ir_conjuncts_to_sql(root: Expr) -> tuple[tuple[str, ...], bool]:
 
     Uses an explicit stack to handle arbitrarily deep `And` trees without
     hitting Python's recursion limit. Trivial `"TRUE"` conjuncts are omitted
-    while preserving `is_exact=True`. If any top-level branch compiles to
-    `(None, _)` or `(_, False)`, `is_exact` is returned as `False`.
+    while preserving `is_exact=True`. Bare `NullLiteral` conjuncts are omitted
+    with `is_exact=False`. If any top-level branch compiles to `(None, _)` or
+    `(_, False)`, `is_exact` is returned as `False`.
     """
     sql_conjuncts: list[str] = []
     all_exact = True
@@ -88,6 +72,10 @@ def compile_ir_conjuncts_to_sql(root: Expr) -> tuple[tuple[str, ...], bool]:
             # Push right first so left is popped and visited first.
             stack.append(node.right)
             stack.append(node.left)
+            continue
+
+        if isinstance(node, NullLiteral):
+            all_exact = False
             continue
 
         sql_str, is_exact = _compile_ir_to_sql(node)

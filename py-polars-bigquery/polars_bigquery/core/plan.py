@@ -4,11 +4,14 @@ from __future__ import annotations
 
 import abc
 import dataclasses
-from collections.abc import Sequence
+import types
+from collections.abc import Mapping, Sequence
 from typing import Literal
 
 import arrow_bigquery
 import polars as pl
+
+from polars_bigquery.core.types import BQType
 
 ArrowBufferCompression = Literal["lz4frame", "zstd", "unspecified"]
 MAX_BIGQUERY_INT64 = (1 << 63) - 1
@@ -61,6 +64,8 @@ class QueryScan(PlanNode):
     use_query_cache: bool | None = None
     explicit_schema: bool = False
     maximum_bytes_billed: int | None = None
+    schema: pl.Schema | None = None
+    bq_types: Mapping[str, BQType] | None = None
 
     def __post_init__(self) -> None:
         if len(self.columns) == 0:
@@ -70,6 +75,16 @@ class QueryScan(PlanNode):
             msg = "QueryScan columns must be unique."
             raise ValueError(msg)
         validate_maximum_bytes_billed(self.maximum_bytes_billed)
+        if self.schema is not None:
+            copied_schema = pl.Schema(self.schema)
+            if tuple(copied_schema.keys()) != self.columns:
+                msg = "QueryScan schema columns must match QueryScan.columns."
+                raise ValueError(msg)
+            object.__setattr__(self, "schema", copied_schema)
+        if self.bq_types is not None:
+            object.__setattr__(
+                self, "bq_types", types.MappingProxyType(dict(self.bq_types))
+            )
 
     def children(self) -> tuple[PlanNode, ...]:
         return ()
@@ -85,6 +100,7 @@ class TableScan(PlanNode):
     table_ref: arrow_bigquery.BigQueryTableId
     schema: pl.Schema
     maintain_order: bool = False
+    bq_types: Mapping[str, BQType] | None = None
 
     def __post_init__(self) -> None:
         # Copy the caller-provided schema via pl.Schema(...) so external
@@ -95,6 +111,10 @@ class TableScan(PlanNode):
             msg = "TableScan requires a non-empty schema."
             raise ValueError(msg)
         object.__setattr__(self, "schema", copied_schema)
+        if self.bq_types is not None:
+            object.__setattr__(
+                self, "bq_types", types.MappingProxyType(dict(self.bq_types))
+            )
 
     @property
     def columns(self) -> tuple[str, ...]:

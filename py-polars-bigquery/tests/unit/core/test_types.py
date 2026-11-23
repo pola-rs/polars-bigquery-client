@@ -14,6 +14,7 @@ from polars_bigquery.core.types import (
     polars_datetime_time_unit,
     polars_dtype_to_bq_type,
 )
+from polars_bigquery.exceptions import UnsupportedTypeWarning
 
 
 class _CustomJsonExtension(pl.BaseExtension):
@@ -27,6 +28,8 @@ class _CustomGeographyExtension(pl.BaseExtension):
 def test_public_dtypes_and_warning_exports():
     assert "dtypes" in polars_bigquery.__all__
     assert polars_bigquery.dtypes.__all__ == ["GEOGRAPHY", "JSON"]
+    assert "UnsupportedTypeWarning" in polars_bigquery.exceptions.__all__
+    assert issubclass(UnsupportedTypeWarning, UserWarning)
 
     json_dtype = polars_bigquery.dtypes.JSON
     assert isinstance(json_dtype, pl.Extension)

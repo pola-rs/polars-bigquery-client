@@ -2136,7 +2136,7 @@ def test_emit_coalesce_sql_rejects_invalid_inputs(
         ),
         pytest.param(
             pl.when(pl.col("a") == 1).then(True).otherwise(True),
-            "IF((`a` = 1), TRUE, TRUE)",
+            "",
             id="boolean_when_both_branches_true",
         ),
         pytest.param(
@@ -2233,7 +2233,7 @@ def test_emit_coalesce_sql_rejects_invalid_inputs(
             pl.when(pl.col("a") == 1)
             .then(pl.when(pl.col("b") == 2).then(True).otherwise(True))
             .otherwise(pl.col("c") == 3),
-            "IF((`a` = 1), IF((`b` = 2), TRUE, TRUE), (`c` = 3))",
+            "IF((`a` = 1), TRUE, (`c` = 3))",
             id="nested_truthy_when_in_truthy_branch",
         ),
         pytest.param(
@@ -3732,6 +3732,7 @@ def test_column_to_sql_identifier_rejects_control_and_line_break_whitespace(
 
 def test_column_to_sql_identifier_allows_unicode_space_separators() -> None:
     assert compiler.sql.column_to_sql_identifier("first name") == "`first name`"
+    assert compiler.sql.column_to_sql_identifier("a\u00a0b") == "`a\u00a0b`"
     assert compiler.sql.column_to_sql_identifier("a\u3000b") == "`a\u3000b`"
 
 
@@ -3776,6 +3777,209 @@ def test_drop_nulls_broadcast_superset_differential_regression() -> None:
         compiler.predicate_to_row_restriction(pl.col("flag").is_not_null())
         == "(`flag` IS NOT NULL)"
     )
+
+
+def test_flatten_expr_bfs_maintains_parent_before_child_invariant() -> None:
+    """`flatten_expr_bfs` returns nodes/edges with `parent < child` without recursion."""
+    from polars_bigquery.core.compiler._traversal import flatten_expr_bfs
+
+    deep: compiler.ir.Expr = compiler.ir.Column("z")
+    for _ in range(1_200):
+        deep = compiler.ir.And(left=compiler.ir.Column("a"), right=deep)
+
+    nodes, children_map = flatten_expr_bfs(deep)
+    assert len(nodes) == 2_401
+    assert len(children_map) == len(nodes)
+    for parent_idx, child_indices in enumerate(children_map):
+        for child_idx in child_indices:
+            assert parent_idx < child_idx
+
+
+def test_rewrite_boolean_when_expansion_cap_degrades_to_unsupported(
+    monkeypatch,
+) -> None:
+    """Bounding `MAX_BOOLEAN_WHEN_REWRITE_NODES` degrades huge `Ternary` rewrites."""
+    from polars_bigquery.core.compiler.rewriter import boolean as boolean_rewriter
+
+    nested = compiler.ir.Ternary(
+        predicate=compiler.ir.Eq(compiler.ir.Column("a"), compiler.ir.IntLiteral(1)),
+        truthy=compiler.ir.Eq(compiler.ir.Column("b"), compiler.ir.IntLiteral(2)),
+        falsy=compiler.ir.Unsupported(),
+    )
+    monkeypatch.setattr(boolean_rewriter, "MAX_BOOLEAN_WHEN_REWRITE_NODES", 5)
+    assert boolean_rewriter.rewrite_boolean_when(nested) == compiler.ir.Unsupported()
+
+    # `truthy` falsy (`Ternary(p, False, f)` -> `And(Not(Coalesce(p, False)), f)`)
+    # adds 2 nodes (`extra_cost = 2`); degrade when budget is insufficient.
+    truthy_false = compiler.ir.Ternary(
+        predicate=compiler.ir.Column("a"),
+        truthy=compiler.ir.BoolLiteral(False),
+        falsy=compiler.ir.Column("b"),
+    )
+    monkeypatch.setattr(boolean_rewriter, "MAX_BOOLEAN_WHEN_REWRITE_NODES", 5)
+    assert (
+        boolean_rewriter.rewrite_boolean_when(truthy_false) == compiler.ir.Unsupported()
+    )
+    monkeypatch.setattr(boolean_rewriter, "MAX_BOOLEAN_WHEN_REWRITE_NODES", 6)
+    assert boolean_rewriter.rewrite_boolean_when(truthy_false) == compiler.ir.And(
+        left=compiler.ir.Not(
+            expr=compiler.ir.Coalesce(
+                operands=(compiler.ir.Column("a"), compiler.ir.BoolLiteral(False))
+            )
+        ),
+        right=compiler.ir.Column("b"),
+    )
+
+
+def test_rewrite_boolean_when_suppresses_tautology_and_scales_linearly() -> None:
+    """Boolean `when` chains with only trivial branches omit tautological SQL and stay O(N)."""
+    import time
+
+    from polars_bigquery.core.compiler.rewriter import boolean as boolean_rewriter
+
+    # Two-branch chain where the fallback branch becomes Unsupported must NOT emit
+    # `((`good` = 1) OR (NOT COALESCE((`good` = 1), FALSE)))`.
+    taut_chain = (
+        pl.when(pl.col("good") == 1)
+        .then(True)
+        .when(pl.col("i") * 2 == 4)
+        .then(True)
+        .otherwise(False)
+    )
+    assert compiler.predicate_to_row_restriction(taut_chain) == ""
+    assert compiler.compile_predicate(taut_chain) == compiler.CompiledPredicate(
+        conjuncts=(), is_exact=False
+    )
+
+    # Both branches Unsupported (e.g. non-boolean expressions) degrades immediately.
+    unsup_both = (
+        pl.when(pl.col("good") == 1).then(pl.col("i") * 2).otherwise(pl.col("i") * 3)
+    )
+    assert compiler.predicate_to_row_restriction(unsup_both) == ""
+
+    # When both branches are `True`, an exact predicate simplifies to `TRUE` (`is_exact=True`),
+    # whereas an `Unsupported` predicate degrades to `Unsupported()` (`is_exact=False`).
+    assert compiler.compile_predicate(
+        pl.when(pl.col("good") == 1).then(True).otherwise(True)
+    ) == compiler.CompiledPredicate(conjuncts=(), is_exact=True)
+    assert compiler.compile_predicate(
+        pl.when(pl.col("i") * 2 == 4).then(True).otherwise(True)
+    ) == compiler.CompiledPredicate(conjuncts=(), is_exact=False)
+
+    # `Not(Or(...))` and negated `when(Or(...)).then(False).otherwise(True)` branches split
+    # via De Morgan's law must NOT be dropped as unconstrained tautologies.
+    de_morgan_chain = (
+        pl.when(pl.col("good") == 1)
+        .then(True)
+        .otherwise(~((pl.col("a") == 2) | (pl.col("i") * 2 == 4)))
+    )
+    assert (
+        compiler.predicate_to_row_restriction(de_morgan_chain)
+        == "((`good` = 1) OR ((NOT COALESCE((`good` = 1), FALSE)) AND (NOT (`a` = 2))))"
+    )
+    de_morgan_when_chain = (
+        pl.when(pl.col("good") == 1)
+        .then(True)
+        .when((pl.col("a") == 2) | (pl.col("i") * 2 == 4))
+        .then(False)
+        .otherwise(True)
+    )
+    assert (
+        compiler.predicate_to_row_restriction(de_morgan_when_chain)
+        == "((`good` = 1) OR ((NOT COALESCE((`good` = 1), FALSE)) AND (NOT COALESCE((`a` = 2), FALSE))))"
+    )
+
+    # `rewrite_boolean_when_node` and `rewrite_boolean_when` share the same tautology rule.
+    ir_taut = compiler.ir.Ternary(
+        predicate=compiler.ir.Eq(compiler.ir.Column("good"), compiler.ir.IntLiteral(1)),
+        truthy=compiler.ir.BoolLiteral(True),
+        falsy=compiler.ir.Unsupported(),
+    )
+    assert (
+        boolean_rewriter.rewrite_boolean_when_node(ir_taut) == compiler.ir.Unsupported()
+    )
+    assert boolean_rewriter.rewrite_boolean_when(ir_taut) == compiler.ir.Unsupported()
+
+    ir_taut_eq_unsup = compiler.ir.Ternary(
+        predicate=compiler.ir.Eq(compiler.ir.Column("good"), compiler.ir.IntLiteral(1)),
+        truthy=compiler.ir.BoolLiteral(True),
+        falsy=compiler.ir.Eq(compiler.ir.Unsupported(), compiler.ir.IntLiteral(4)),
+    )
+    assert (
+        boolean_rewriter.rewrite_boolean_when_node(ir_taut_eq_unsup)
+        == compiler.ir.Unsupported()
+    )
+    assert (
+        boolean_rewriter.rewrite_boolean_when(ir_taut_eq_unsup)
+        == compiler.ir.Unsupported()
+    )
+
+    ir_pred_unsup_true = compiler.ir.Ternary(
+        predicate=compiler.ir.Unsupported(),
+        truthy=compiler.ir.BoolLiteral(True),
+        falsy=compiler.ir.BoolLiteral(True),
+    )
+    assert (
+        boolean_rewriter.rewrite_boolean_when_node(ir_pred_unsup_true)
+        == compiler.ir.Unsupported()
+    )
+    assert (
+        boolean_rewriter.rewrite_boolean_when(ir_pred_unsup_true)
+        == compiler.ir.Unsupported()
+    )
+
+    # Verify linear O(N) runtime on a 1,600-deep chained Ternary (was ~1.45s quadratic).
+    deep_chain: compiler.ir.Expr = compiler.ir.Column("z")
+    for _ in range(1_600):
+        deep_chain = compiler.ir.Ternary(
+            predicate=compiler.ir.Column("p"),
+            truthy=compiler.ir.Column("t"),
+            falsy=deep_chain,
+        )
+    t0 = time.perf_counter()
+    rewritten = boolean_rewriter.rewrite_boolean_when(deep_chain)
+    elapsed = time.perf_counter() - t0
+    assert isinstance(rewritten, compiler.ir.Ternary)
+    assert elapsed < 0.5, f"expected linear rewrite, took {elapsed:.3f}s"
+
+
+def test_rewrite_boolean_when_weights_list_literals_against_budget(monkeypatch) -> None:
+    """Large `ListLiteral` predicates must count toward the expansion budget."""
+    from polars_bigquery.core.compiler.rewriter import boolean as boolean_rewriter
+
+    big_list = compiler.ir.ListLiteral(
+        values=tuple(compiler.ir.IntLiteral(i) for i in range(50))
+    )
+    nested = compiler.ir.Ternary(
+        predicate=compiler.ir.IsIn(compiler.ir.Column("a"), big_list),
+        truthy=compiler.ir.Eq(compiler.ir.Column("b"), compiler.ir.IntLiteral(2)),
+        falsy=compiler.ir.And(compiler.ir.Column("c"), compiler.ir.Unsupported()),
+    )
+    monkeypatch.setattr(boolean_rewriter, "MAX_BOOLEAN_WHEN_REWRITE_NODES", 80)
+    assert boolean_rewriter.rewrite_boolean_when(nested) == compiler.ir.Unsupported()
+
+
+def test_compile_ir_conjuncts_to_sql_skips_null_literal() -> None:
+    """Bare top-level `NullLiteral` conjuncts are omitted with `is_exact=False`."""
+    assert compiler.sql.compile_ir_conjuncts_to_sql(compiler.ir.NullLiteral()) == (
+        (),
+        False,
+    )
+    assert compiler.sql.compile_ir_conjuncts_to_sql(
+        compiler.ir.And(
+            left=compiler.ir.Eq(compiler.ir.Column("a"), compiler.ir.IntLiteral(1)),
+            right=compiler.ir.NullLiteral(),
+        )
+    ) == (("(`a` = 1)",), False)
+    assert compiler.compile_predicate(pl.lit(None)) == compiler.CompiledPredicate(
+        conjuncts=(), is_exact=False
+    )
+    assert compiler.compile_predicate(
+        pl.lit(True) & pl.lit(None)
+    ) == compiler.CompiledPredicate(conjuncts=(), is_exact=False)
+    assert compiler.compile_predicate(
+        (pl.col("a") == 1) & pl.lit(None)
+    ) == compiler.CompiledPredicate(conjuncts=("(`a` = 1)",), is_exact=False)
 
 
 def test_float32_literal_widens_through_ieee754_binary32() -> None:
