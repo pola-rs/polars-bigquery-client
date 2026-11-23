@@ -11,6 +11,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 pub use client_builder::*;
+pub use decode::validate_ffi_schema;
 pub use error::{BigQueryError, JobError, JobFailedError};
 pub use google_cloud_bigquery::model::arrow_serialization_options::CompressionCodec;
 use google_cloud_bigquery::model::{
