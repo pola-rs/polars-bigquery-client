@@ -2046,3 +2046,16 @@ def test_bigquery_rest_retry_has_jitter_and_handles_401_and_errors(monkeypatch):
             session=mock_session,
         )
     list_resp.close.assert_called_once()
+
+
+def test_unsupported_type_error_export_and_hierarchy():
+    from arrow_bigquery import UnsupportedTypeError as TopLevelArrowUnsupported
+    from arrow_bigquery import _native
+    from arrow_bigquery.exceptions import UnsupportedTypeError as ArrowUnsupported
+    from polars_bigquery.exceptions import UnsupportedTypeError
+
+    assert UnsupportedTypeError is ArrowUnsupported
+    assert UnsupportedTypeError is TopLevelArrowUnsupported
+    assert UnsupportedTypeError is _native.UnsupportedTypeError
+    assert issubclass(UnsupportedTypeError, BigQueryError)
+    assert issubclass(UnsupportedTypeError, RuntimeError)

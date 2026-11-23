@@ -26,18 +26,38 @@ fn record_batch_to_struct_array(
 pub struct ArrowStreamExporter {
     /// The schema of the Arrow stream.
     schema: ArrowSchemaRef,
+    /// Tracks whether `schema` was already validated by `validate_ffi_schema` /
+    /// `parse_arrow_schema`.
+    schema_ffi_validated: bool,
     /// The underlying BigQuery record batch source, wrapped in a mutex.
     /// It is an `Option` because the stream can only be consumed once.
     source: std::sync::Mutex<Option<StreamSource>>,
 }
 
 impl ArrowStreamExporter {
+    #[cfg(feature = "testing")]
     pub(crate) fn new(
         schema: ArrowSchemaRef,
         receiver: arrow_bigquery_lib::BigQueryRecordBatchReceiver,
     ) -> Self {
+        Self::new_with_validation(schema, receiver, false)
+    }
+
+    pub(crate) fn new_validated(
+        schema: ArrowSchemaRef,
+        receiver: arrow_bigquery_lib::BigQueryRecordBatchReceiver,
+    ) -> Self {
+        Self::new_with_validation(schema, receiver, true)
+    }
+
+    fn new_with_validation(
+        schema: ArrowSchemaRef,
+        receiver: arrow_bigquery_lib::BigQueryRecordBatchReceiver,
+        schema_ffi_validated: bool,
+    ) -> Self {
         Self {
             schema,
+            schema_ffi_validated,
             source: std::sync::Mutex::new(Some(StreamSource::Receiver(receiver))),
         }
     }
@@ -46,6 +66,7 @@ impl ArrowStreamExporter {
         let schema = std::sync::Arc::new(batch.schema().clone());
         Self {
             schema,
+            schema_ffi_validated: false,
             source: std::sync::Mutex::new(Some(StreamSource::Batch(batch))),
         }
     }
@@ -138,13 +159,12 @@ impl Iterator for ReceiverIterator {
                 Ok(Some(Err(err))) => {
                     // Drop the receiver immediately so sibling background streams are aborted now.
                     self.rx = None;
+                    // polars-arrow's Arrow C Stream export callback converts errors with
+                    // `CString::new(...).unwrap()`, which panics across `extern "C"` on interior NUL bytes.
+                    let sanitized_err = err.format_causal_chain().replace('\0', "\\x00");
                     return Some(Err(
                         pyo3_polars::export::polars_error::PolarsError::ComputeError(
-                            format!(
-                                "BigQuery Storage API read error: {}",
-                                err.format_causal_chain()
-                            )
-                            .into(),
+                            format!("BigQuery Storage API read error: {sanitized_err}").into(),
                         ),
                     ));
                 },
@@ -171,12 +191,26 @@ impl ArrowStreamExporter {
         requested_schema: Option<Py<PyAny>>,
     ) -> PyResult<Py<PyAny>> {
         let _ = requested_schema;
-        let mut source_guard = self.source.lock().map_err(|_| {
-            pyo3::exceptions::PyRuntimeError::new_err("Stream receiver lock is poisoned")
-        })?;
-        let source = source_guard
-            .take()
-            .ok_or_else(|| pyo3::exceptions::PyValueError::new_err("Stream already consumed"))?;
+        if !self.schema_ffi_validated {
+            if let Err(err) = arrow_bigquery_lib::validate_ffi_schema(&self.schema) {
+                // Release the receiver immediately outside `self.source` lock so background
+                // Tokio/gRPC stream tasks abort instead of running until GC.
+                let dropped = {
+                    let mut source_guard = self.source.lock().unwrap_or_else(|e| e.into_inner());
+                    source_guard.take()
+                };
+                drop(dropped);
+                return Err(crate::error::to_py_err(py, err));
+            }
+        }
+        let source = {
+            let mut source_guard = self.source.lock().map_err(|_| {
+                pyo3::exceptions::PyRuntimeError::new_err("Stream receiver lock is poisoned")
+            })?;
+            source_guard
+                .take()
+                .ok_or_else(|| pyo3::exceptions::PyValueError::new_err("Stream already consumed"))?
+        };
 
         let fields: Vec<polars_arrow::datatypes::Field> =
             self.schema.iter().map(|(_, field)| field.clone()).collect();
@@ -290,5 +324,82 @@ mod tests {
             }
         });
         worker.join().unwrap();
+    }
+
+    #[test]
+    fn test_exporter_rejects_unvalidated_ffi_schema_and_aborts_background_task() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        use polars_arrow::datatypes::IntervalUnit;
+
+        Python::initialize();
+        let rt = pyo3_async_runtimes::tokio::get_runtime();
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        let dropped = Arc::new(AtomicBool::new(false));
+        let dropped_task = Arc::clone(&dropped);
+        struct DropGuard(Arc<AtomicBool>);
+        impl Drop for DropGuard {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+            }
+        }
+        let guard = DropGuard(dropped_task);
+        let handle = rt.spawn(async move {
+            let _keep_tx = tx;
+            let _guard = guard;
+            std::future::pending::<()>().await;
+        });
+
+        let schema = Arc::new(ArrowSchema::from_iter([Field::new(
+            "dur".into(),
+            ArrowDataType::Interval(IntervalUnit::MonthDayNano),
+            true,
+        )]));
+        let receiver =
+            arrow_bigquery_lib::BigQueryRecordBatchReceiver::new_for_testing(rx, vec![handle]);
+        let exporter = ArrowStreamExporter::new(schema, receiver);
+
+        Python::attach(|py| {
+            let err = exporter.__arrow_c_stream__(py, None).unwrap_err();
+            assert!(err.is_instance_of::<crate::error::UnsupportedTypeError>(py));
+            assert!(err.is_instance_of::<crate::error::BigQueryError>(py));
+        });
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        while !dropped.load(Ordering::Acquire) && std::time::Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        assert!(
+            dropped.load(Ordering::Acquire),
+            "background task must be aborted when validate_ffi_schema fails in __arrow_c_stream__"
+        );
+    }
+
+    #[test]
+    fn test_receiver_iterator_sanitizes_interior_nul_bytes_in_errors() {
+        Python::initialize();
+        let rt = pyo3_async_runtimes::tokio::get_runtime();
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        rt.block_on(async {
+            tx.send(Err(arrow_bigquery_lib::BigQueryError::Protocol(
+                "bad\0msg".into(),
+            )))
+            .await
+            .unwrap();
+        });
+        let receiver = arrow_bigquery_lib::BigQueryRecordBatchReceiver::new_for_testing(rx, vec![]);
+        let dtype =
+            ArrowDataType::Struct(vec![Field::new("x".into(), ArrowDataType::Int64, false)]);
+        let mut iter = ReceiverIterator {
+            rx: Some(receiver),
+            dtype,
+        };
+        let err = iter.next().unwrap().unwrap_err();
+        let msg = err.to_string();
+        assert!(!msg.contains('\0'), "interior NUL was not sanitized: {msg}");
+        assert!(
+            msg.contains("bad\\x00msg"),
+            "unexpected sanitized error message: {msg}"
+        );
     }
 }

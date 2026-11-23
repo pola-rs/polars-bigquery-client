@@ -36,6 +36,7 @@ pub enum BigQueryError {
     JobFailed(Box<JobFailedError>),
     Protocol(String),
     InvalidConfig(String),
+    UnsupportedType(String),
     Other(Box<dyn std::error::Error + Send + Sync>),
 }
 
@@ -129,6 +130,7 @@ impl std::fmt::Display for BigQueryError {
             Self::JobFailed(err) => std::fmt::Display::fmt(err, f),
             Self::Protocol(msg) => write!(f, "BigQuery protocol error: {}", msg),
             Self::InvalidConfig(msg) => write!(f, "BigQuery configuration error: {}", msg),
+            Self::UnsupportedType(msg) => write!(f, "Unsupported BigQuery data type: {}", msg),
             Self::Other(e) => write!(f, "BigQuery client error: {}", e),
         }
     }
@@ -140,7 +142,10 @@ impl std::error::Error for BigQueryError {
             Self::Grpc(e) => Some(e),
             Self::ClientBuilder(e) => Some(e),
             Self::Arrow(e) => Some(e),
-            Self::JobFailed(_) | Self::Protocol(_) | Self::InvalidConfig(_) => None,
+            Self::JobFailed(_)
+            | Self::Protocol(_)
+            | Self::InvalidConfig(_)
+            | Self::UnsupportedType(_) => None,
             Self::Other(e) => Some(e.as_ref()),
         }
     }
@@ -250,6 +255,13 @@ mod tests {
         assert_eq!(
             err.format_causal_chain(),
             "BigQuery configuration error: quota_project_id is required"
+        );
+
+        let unsupported_err = BigQueryError::UnsupportedType("column `dur` uses INTERVAL".into());
+        assert!(unsupported_err.source().is_none());
+        assert_eq!(
+            unsupported_err.format_causal_chain(),
+            "Unsupported BigQuery data type: column `dur` uses INTERVAL"
         );
     }
 
