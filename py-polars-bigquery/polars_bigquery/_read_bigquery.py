@@ -22,6 +22,7 @@ from polars_bigquery.core.executors import (
     ReadApiExecutor,
     has_non_comment_sql,
 )
+from polars_bigquery.core.executors.base import close_exporter as _close_exporter
 from polars_bigquery.core.plan import (
     ArrowBufferCompression,
     QueryScan,
@@ -276,7 +277,11 @@ class Client:
             use_query_cache=None,
             maximum_bytes_billed=None,
         )
-        return pl.DataFrame(arrow_stream_exporter)
+        try:
+            return pl.DataFrame(arrow_stream_exporter)
+        except BaseException:
+            _close_exporter(arrow_stream_exporter)
+            raise
 
     def read_table(
         self,
@@ -319,7 +324,11 @@ class Client:
             table_ref,
             maintain_order=maintain_order,
         )
-        return pl.DataFrame(arrow_stream_exporter)
+        try:
+            return pl.DataFrame(arrow_stream_exporter)
+        except BaseException:
+            _close_exporter(arrow_stream_exporter)
+            raise
 
     def read_query(
         self,
@@ -422,7 +431,11 @@ class Client:
             use_query_cache=use_query_cache,
             maximum_bytes_billed=maximum_bytes_billed,
         )
-        return pl.DataFrame(arrow_stream_exporter)
+        try:
+            return pl.DataFrame(arrow_stream_exporter)
+        except BaseException:
+            _close_exporter(arrow_stream_exporter)
+            raise
 
     def scan_table(
         self,

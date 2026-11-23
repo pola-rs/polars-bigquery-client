@@ -1865,3 +1865,105 @@ def test_client_maximum_bytes_billed_wire_serialization():
     assert captured_bodies[1].get("dryRun") is True
     assert captured_bodies[2].get("maximumBytesBilled") == "500000"
     assert not captured_bodies[2].get("dryRun")
+
+
+def test_client_closes_exporter_when_stream_consumption_fails(mock_arrow_client):
+    close_calls = 0
+
+    class _ExplodingExporter:
+        def __arrow_c_stream__(self, requested_schema=None):
+            raise RuntimeError("boom during stream import")
+
+        def close(self) -> None:
+            nonlocal close_calls
+            close_calls += 1
+
+    client = Client(quota_project_id="test-proj")
+
+    mock_arrow_client.read_table.return_value = _ExplodingExporter()
+    with pytest.raises(RuntimeError, match="boom during stream import"):
+        client.read_table("my-project.my_dataset.tbl")
+    assert close_calls == 1
+
+    mock_arrow_client.read_query.return_value = _ExplodingExporter()
+    with pytest.raises(RuntimeError, match="boom during stream import"):
+        client.read_query("SELECT 1")
+    assert close_calls == 2
+
+    mock_arrow_client.read_table.return_value = _ExplodingExporter()
+    lf = client.scan_table("my-project.my_dataset.tbl", schema={"id": pl.Int64()})
+    with pytest.raises(RuntimeError, match="boom during stream import"):
+        lf.collect()
+    assert close_calls == 3
+
+
+def test_scan_table_releases_lazyframe_and_aborts_task_on_post_export_error(
+    mock_arrow_client, monkeypatch
+):
+    """Post-`scan_arrow_c_stream` errors must drop `lazyframe` and abort the stream."""
+    import time
+
+    from arrow_bigquery import _native
+
+    captured_io_source = {}
+    orig_register = pl.io.plugins.register_io_source
+
+    def _capture(io_source, schema, **kwargs):
+        captured_io_source["fn"] = io_source
+        return orig_register(io_source=io_source, schema=schema, **kwargs)
+
+    monkeypatch.setattr(pl.io.plugins, "register_io_source", _capture)
+
+    exporter, drop_flag = _native._test_create_exporter_with_drop_flag()
+    mock_arrow_client.read_table.return_value = exporter
+
+    client = Client(quota_project_id="test-proj")
+    client.scan_table("my-project.my_dataset.tbl", schema={"placeholder": pl.Int32()})
+
+    with (
+        patch(
+            "polars_bigquery.core.executors.read_api.execute_local_plan_batches",
+            side_effect=RuntimeError("boom after arrow stream export"),
+        ),
+        pytest.raises(RuntimeError, match="boom after arrow stream export") as exc_info,
+    ):
+        captured_io_source["fn"](
+            with_columns=["placeholder"],
+            predicate=None,
+            n_rows=None,
+            batch_size=None,
+        )
+
+    # Walk traceback while exception (and its `f_locals`) is still alive.
+    tb = exc_info.tb
+    execute_locals = None
+    while tb is not None:
+        if tb.tb_frame.f_code.co_name == "execute":
+            execute_locals = tb.tb_frame.f_locals
+            break
+        tb = tb.tb_next
+    assert execute_locals is not None
+    assert execute_locals.get("lazyframe") is None
+
+    deadline = time.monotonic() + 1.0
+    while not drop_flag.is_set() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert drop_flag.is_set(), (
+        "background Tokio task was not aborted on post-export error"
+    )
+
+    # Also verify `ArrowStreamExporter.close()` aborts a background task even when
+    # a consumed `LazyFrame` stays alive holding the exported PyCapsule, and that
+    # reading from the closed stream raises instead of returning a silent empty EOF.
+    exporter2, drop_flag2 = _native._test_create_exporter_with_drop_flag()
+    held_lf = pl.scan_arrow_c_stream(exporter2)
+    assert not drop_flag2.is_set()
+    exporter2.close()
+    deadline = time.monotonic() + 1.0
+    while not drop_flag2.is_set() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert drop_flag2.is_set(), (
+        "exporter.close() must abort background task while LazyFrame holds capsule"
+    )
+    with pytest.raises(pl.exceptions.ComputeError, match="closed before completion"):
+        held_lf.collect()
