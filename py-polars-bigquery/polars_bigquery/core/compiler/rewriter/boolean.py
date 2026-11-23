@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import dataclasses
+
 from polars_bigquery.core.compiler._traversal import flatten_expr_bfs
 from polars_bigquery.core.compiler.ir.base import (
     Expr,
@@ -41,6 +43,23 @@ def _is_de_morgan_not(node: Not) -> bool:
     )
 
 
+def _is_node_unconstrained(
+    node: Expr,
+    child_indices: tuple[int, ...],
+    unconstrained: list[bool],
+    *,
+    has_unsup: bool,
+) -> bool:
+    """Return True if `node` imposes no SQL row restriction given child flags."""
+    if isinstance(node, And):
+        return unconstrained[child_indices[0]] and unconstrained[child_indices[1]]
+    if isinstance(node, Or):
+        return unconstrained[child_indices[0]] or unconstrained[child_indices[1]]
+    if isinstance(node, Not):
+        return has_unsup and not _is_de_morgan_not(node)
+    return has_unsup or node == BoolLiteral(True)
+
+
 def _is_trivial_truthy_or_unsup(node: Expr) -> bool:
     """Return True if evaluating `node` in a filter imposes no SQL row restriction.
 
@@ -64,18 +83,9 @@ def _is_trivial_truthy_or_unsup(node: Expr) -> bool:
             has_unsup[c_idx] for c_idx in c_indices
         )
         has_unsup[idx] = node_unsup
-        if isinstance(curr, Unsupported) or curr == BoolLiteral(True):
-            flags[idx] = True
-        elif isinstance(curr, And):
-            left_idx, right_idx = c_indices
-            flags[idx] = flags[left_idx] and flags[right_idx]
-        elif isinstance(curr, Or):
-            left_idx, right_idx = c_indices
-            flags[idx] = flags[left_idx] or flags[right_idx]
-        elif isinstance(curr, Not):
-            flags[idx] = node_unsup and not _is_de_morgan_not(curr)
-        else:
-            flags[idx] = node_unsup
+        flags[idx] = _is_node_unconstrained(
+            curr, c_indices, flags, has_unsup=node_unsup
+        )
     return flags[0]
 
 
@@ -183,11 +193,241 @@ def rewrite_boolean_when_node(node: Expr) -> Expr:
     return rewritten
 
 
+def _ternary_validity_flags(
+    node: Expr,
+    child_indices: tuple[int, ...],
+    nodes: list[Expr],
+    ok: list[bool],
+    has_leaf: list[bool],
+) -> tuple[bool, bool]:
+    """Return `(is_ok, has_non_null_leaf)` for `node` from already-computed child flags."""
+    if not isinstance(node, Ternary):
+        return True, not isinstance(node, NullLiteral)
+    p_idx, t_idx, f_idx = child_indices
+    node_ok = not isinstance(nodes[p_idx], NullLiteral) and ok[t_idx] and ok[f_idx]
+    return node_ok, has_leaf[t_idx] or has_leaf[f_idx]
+
+
+def _compute_valid_ternary_flags(
+    nodes: list[Expr], children_map: list[tuple[int, ...]]
+) -> list[bool]:
+    """Precompute `_is_valid_boolean_ternary` bottom-up in O(N) over a BFS node array."""
+    n = len(nodes)
+    ok = [True] * n
+    has_leaf = [False] * n
+    for idx in range(n - 1, -1, -1):
+        ok[idx], has_leaf[idx] = _ternary_validity_flags(
+            nodes[idx], children_map[idx], nodes, ok, has_leaf
+        )
+    return [ok[idx] and has_leaf[idx] for idx in range(n)]
+
+
+def _propagate_boolean_context(
+    nodes: list[Expr],
+    children_map: list[tuple[int, ...]],
+    valid_ternary: list[bool],
+) -> list[bool]:
+    """Propagate boolean context flags top-down in BFS order (`parent < child`)."""
+    boolean_nodes = [False] * len(nodes)
+    boolean_nodes[0] = True
+    for idx, node in enumerate(nodes):
+        c_indices = children_map[idx]
+        if not c_indices:
+            continue
+        if isinstance(node, (And, Or)) and boolean_nodes[idx]:
+            for c_idx in c_indices:
+                boolean_nodes[c_idx] = True
+        elif isinstance(node, Ternary):
+            boolean_nodes[c_indices[0]] = True
+            if boolean_nodes[idx] and valid_ternary[idx]:
+                boolean_nodes[c_indices[1]] = True
+                boolean_nodes[c_indices[2]] = True
+    return boolean_nodes
+
+
+@dataclasses.dataclass(slots=True)
+class _BooleanWhenRewriteState:
+    """Mutable bottom-up state for `rewrite_boolean_when` with shared AST weight budget."""
+
+    nodes: list[Expr]
+    weights: list[int]
+    has_unsup: list[bool]
+    unconstrained: list[bool]
+    post_ok: list[bool]
+    post_leaf: list[bool]
+    remaining_budget: int
+
+    @classmethod
+    def from_nodes(cls, nodes: list[Expr]) -> _BooleanWhenRewriteState:
+        weights = [_node_self_weight(node) for node in nodes]
+        remaining_budget = max(0, MAX_BOOLEAN_WHEN_REWRITE_NODES - sum(weights))
+        return cls(
+            nodes=nodes,
+            weights=weights,
+            has_unsup=[isinstance(node, Unsupported) for node in nodes],
+            unconstrained=[
+                isinstance(node, Unsupported) or node == BoolLiteral(True)
+                for node in nodes
+            ],
+            post_ok=[True] * len(nodes),
+            post_leaf=[not isinstance(node, NullLiteral) for node in nodes],
+            remaining_budget=remaining_budget,
+        )
+
+    def _set_slot(
+        self,
+        idx: int,
+        expr: Expr,
+        *,
+        weight: int,
+        node_unsup: bool,
+        is_unconstrained: bool,
+    ) -> None:
+        self.nodes[idx] = expr
+        self.weights[idx] = weight
+        self.has_unsup[idx] = node_unsup
+        self.unconstrained[idx] = is_unconstrained
+        self.post_ok[idx] = True
+        self.post_leaf[idx] = True
+
+    def _degrade_to_unsupported(self, idx: int) -> None:
+        self._set_slot(
+            idx,
+            Unsupported(),
+            weight=1,
+            node_unsup=True,
+            is_unconstrained=True,
+        )
+
+    def _try_consume_budget(self, new_weight: int, extra_weight: int) -> bool:
+        if (
+            new_weight > MAX_BOOLEAN_WHEN_REWRITE_NODES
+            or extra_weight > self.remaining_budget
+        ):
+            return False
+        self.remaining_budget -= extra_weight
+        return True
+
+    def reconstruct(self, idx: int, child_indices: tuple[int, ...]) -> None:
+        """Rebuild `nodes[idx]` from its already-rewritten children and refresh metadata."""
+        child_nodes = tuple(self.nodes[c_idx] for c_idx in child_indices)
+        reconstructed = replace_children(self.nodes[idx], child_nodes)
+        self.nodes[idx] = reconstructed
+        self.weights[idx] = _node_self_weight(reconstructed) + sum(
+            self.weights[c_idx] for c_idx in child_indices
+        )
+        node_unsup = isinstance(reconstructed, Unsupported) or any(
+            self.has_unsup[c_idx] for c_idx in child_indices
+        )
+        self.has_unsup[idx] = node_unsup
+        self.unconstrained[idx] = _is_node_unconstrained(
+            reconstructed, child_indices, self.unconstrained, has_unsup=node_unsup
+        )
+        self.post_ok[idx], self.post_leaf[idx] = _ternary_validity_flags(
+            reconstructed, child_indices, self.nodes, self.post_ok, self.post_leaf
+        )
+
+    def _apply_falsy_truthy_rewrite(
+        self,
+        idx: int,
+        curr: Ternary,
+        rewritten: Expr,
+        pred_idx: int,
+        falsy_idx: int,
+    ) -> None:
+        # Replacing `Ternary(p, falsy_lit, f)` (`2 + p + f` nodes) with
+        # `And(Not(Coalesce(p, False)), f)` (`4 + p + f` nodes) adds 2 nodes.
+        new_w = 4 + self.weights[pred_idx] + self.weights[falsy_idx]
+        if not self._try_consume_budget(new_w, extra_weight=2):
+            self._degrade_to_unsupported(idx)
+            return
+        pred_unsup = self.has_unsup[pred_idx]
+        neg_unconstrained = pred_unsup and not isinstance(curr.predicate, Or)
+        self._set_slot(
+            idx,
+            rewritten,
+            weight=new_w,
+            node_unsup=pred_unsup or self.has_unsup[falsy_idx],
+            is_unconstrained=neg_unconstrained and self.unconstrained[falsy_idx],
+        )
+
+    def _apply_duplicated_pred_rewrite(
+        self,
+        idx: int,
+        rewritten: Expr,
+        child_indices: tuple[int, ...],
+    ) -> None:
+        p_idx, t_idx, f_idx = child_indices
+        pred_unsup = self.has_unsup[p_idx]
+        pred_w = self.weights[p_idx]
+        neg_w = 1 if pred_unsup else (pred_w + 3)
+        new_w = 3 + pred_w + self.weights[t_idx] + neg_w + self.weights[f_idx]
+        extra_w = max(0, new_w - self.weights[idx])
+        if not self._try_consume_budget(new_w, extra_w):
+            self._degrade_to_unsupported(idx)
+            return
+        left_unconstrained = self.unconstrained[p_idx] and self.unconstrained[t_idx]
+        right_unconstrained = pred_unsup and self.unconstrained[f_idx]
+        self._set_slot(
+            idx,
+            rewritten,
+            weight=new_w,
+            node_unsup=True,
+            is_unconstrained=left_unconstrained or right_unconstrained,
+        )
+
+    def try_rewrite_ternary(self, idx: int, child_indices: tuple[int, ...]) -> None:
+        """Rewrite a validated boolean-context `Ternary` at `idx`, enforcing the AST budget."""
+        curr = self.nodes[idx]
+        if not (
+            isinstance(curr, Ternary) and self.post_ok[idx] and self.post_leaf[idx]
+        ):
+            return
+
+        p_idx, t_idx, f_idx = child_indices
+        pred_unsup = self.has_unsup[p_idx]
+        rewritten, duplicates_pred = _rewrite_boolean_ternary_step(
+            curr,
+            has_unsup=self.has_unsup[idx],
+            pred_unsup=pred_unsup,
+            truthy_unconstrained=self.unconstrained[t_idx],
+            falsy_unconstrained=self.unconstrained[f_idx],
+        )
+        if rewritten is curr:
+            return
+        if isinstance(rewritten, BoolLiteral):
+            self._set_slot(
+                idx,
+                rewritten,
+                weight=1,
+                node_unsup=False,
+                is_unconstrained=rewritten.value,
+            )
+            return
+        if isinstance(rewritten, Unsupported):
+            self._degrade_to_unsupported(idx)
+            return
+        if duplicates_pred:
+            self._apply_duplicated_pred_rewrite(idx, rewritten, child_indices)
+            return
+        if curr.falsy in _FALSY_LITERALS:
+            self._set_slot(
+                idx,
+                rewritten,
+                weight=1 + self.weights[p_idx] + self.weights[t_idx],
+                node_unsup=pred_unsup or self.has_unsup[t_idx],
+                is_unconstrained=self.unconstrained[p_idx]
+                and self.unconstrained[t_idx],
+            )
+            return
+        self._apply_falsy_truthy_rewrite(idx, curr, rewritten, p_idx, f_idx)
+
+
 def rewrite_boolean_when(root: Expr) -> Expr:
     """Rewrite boolean-valued `Ternary` IR nodes across an IR tree in linear $O(N)$ time.
 
     Uses three iterative passes over `flatten_expr_bfs(root)` (zero Python recursion):
-    1. Bottom-up pass over original nodes computing `orig_ok` / `orig_has_leaf` for
+    1. Bottom-up pass over original nodes computing `_is_valid_boolean_ternary` for
        every `Ternary` chain in $O(1)$ per node (avoiding quadratic re-walks).
     2. Top-down pass propagating boolean-context flags from the filter root through
        `And`, `Or`, and `Ternary` predicates/branches.
@@ -196,184 +436,18 @@ def rewrite_boolean_when(root: Expr) -> Expr:
        for `ListLiteral` fanout weight `1 + len(values)`).
     """
     nodes, children_map = flatten_expr_bfs(root)
-    n = len(nodes)
+    valid_ternary = _compute_valid_ternary_flags(nodes, children_map)
+    boolean_nodes = _propagate_boolean_context(nodes, children_map, valid_ternary)
 
-    # Pass 1: Precompute `_is_valid_boolean_ternary` flags bottom-up in O(N).
-    orig_ok = [True] * n
-    orig_leaf = [False] * n
-    for idx in range(n - 1, -1, -1):
-        node = nodes[idx]
-        if isinstance(node, Ternary):
-            p_idx, t_idx, f_idx = children_map[idx]
-            orig_ok[idx] = (
-                not isinstance(nodes[p_idx], NullLiteral)
-                and orig_ok[t_idx]
-                and orig_ok[f_idx]
-            )
-            orig_leaf[idx] = orig_leaf[t_idx] or orig_leaf[f_idx]
-        else:
-            orig_leaf[idx] = not isinstance(node, NullLiteral)
-
-    # Pass 2: Propagate boolean context top-down in BFS index order (`parent < child`).
-    boolean_nodes = [False] * n
-    boolean_nodes[0] = True
-    for idx in range(n):
-        c_indices = children_map[idx]
-        if not c_indices:
-            continue
-        node = nodes[idx]
-        if isinstance(node, (And, Or)) and boolean_nodes[idx]:
-            for c_idx in c_indices:
-                boolean_nodes[c_idx] = True
-        elif isinstance(node, Ternary):
-            boolean_nodes[c_indices[0]] = True
-            if boolean_nodes[idx] and orig_ok[idx] and orig_leaf[idx]:
-                boolean_nodes[c_indices[1]] = True
-                boolean_nodes[c_indices[2]] = True
-
-    # Pass 3: Bottom-up reconstruction with O(1) validity & global expansion budget.
-    total_input_weight = sum(_node_self_weight(node) for node in nodes)
-    remaining_budget = max(0, MAX_BOOLEAN_WHEN_REWRITE_NODES - total_input_weight)
-
-    weights = [_node_self_weight(node) for node in nodes]
-    has_unsup = [isinstance(node, Unsupported) for node in nodes]
-    unconstrained = [
-        isinstance(node, Unsupported) or node == BoolLiteral(True) for node in nodes
-    ]
-    post_ok = [True] * n
-    post_leaf = [not isinstance(node, NullLiteral) for node in nodes]
-
-    for idx in range(n - 1, -1, -1):
+    state = _BooleanWhenRewriteState.from_nodes(nodes)
+    for idx in range(len(nodes) - 1, -1, -1):
         c_indices = children_map[idx]
         if c_indices:
-            child_nodes = tuple(nodes[c_idx] for c_idx in c_indices)
-            reconstructed = replace_children(nodes[idx], child_nodes)
-            nodes[idx] = reconstructed
-            weights[idx] = _node_self_weight(reconstructed) + sum(
-                weights[c_idx] for c_idx in c_indices
-            )
-            has_unsup[idx] = isinstance(reconstructed, Unsupported) or any(
-                has_unsup[c_idx] for c_idx in c_indices
-            )
-            if isinstance(reconstructed, And):
-                unconstrained[idx] = (
-                    unconstrained[c_indices[0]] and unconstrained[c_indices[1]]
-                )
-            elif isinstance(reconstructed, Or):
-                unconstrained[idx] = (
-                    unconstrained[c_indices[0]] or unconstrained[c_indices[1]]
-                )
-            elif isinstance(reconstructed, Not):
-                unconstrained[idx] = has_unsup[idx] and not _is_de_morgan_not(
-                    reconstructed
-                )
-            else:
-                unconstrained[idx] = has_unsup[idx] or (
-                    reconstructed == BoolLiteral(True)
-                )
-            if isinstance(reconstructed, Ternary):
-                p_idx, t_idx, f_idx = c_indices
-                post_ok[idx] = (
-                    not isinstance(nodes[p_idx], NullLiteral)
-                    and post_ok[t_idx]
-                    and post_ok[f_idx]
-                )
-                post_leaf[idx] = post_leaf[t_idx] or post_leaf[f_idx]
-            else:
-                post_ok[idx] = True
-                post_leaf[idx] = not isinstance(reconstructed, NullLiteral)
-
+            state.reconstruct(idx, c_indices)
         if boolean_nodes[idx]:
-            curr = nodes[idx]
-            if isinstance(curr, Ternary) and post_ok[idx] and post_leaf[idx]:
-                p_idx, t_idx, f_idx = c_indices
-                pred_unsup = has_unsup[p_idx]
-                pred_w = weights[p_idx]
-                truthy_w = weights[t_idx]
-                falsy_w = weights[f_idx]
-                orig_w = weights[idx]
+            state.try_rewrite_ternary(idx, c_indices)
 
-                rewritten, duplicates_pred = _rewrite_boolean_ternary_step(
-                    curr,
-                    has_unsup=has_unsup[idx],
-                    pred_unsup=pred_unsup,
-                    truthy_unconstrained=unconstrained[t_idx],
-                    falsy_unconstrained=unconstrained[f_idx],
-                )
-                if rewritten is curr:
-                    continue
-                if isinstance(rewritten, BoolLiteral):
-                    nodes[idx] = rewritten
-                    weights[idx] = 1
-                    has_unsup[idx] = False
-                    unconstrained[idx] = rewritten.value
-                    post_ok[idx] = True
-                    post_leaf[idx] = True
-                    continue
-                if isinstance(rewritten, Unsupported):
-                    nodes[idx] = rewritten
-                    weights[idx] = 1
-                    has_unsup[idx] = True
-                    unconstrained[idx] = True
-                    post_ok[idx] = True
-                    post_leaf[idx] = True
-                    continue
-                if not duplicates_pred:
-                    # `falsy_is_falsy` -> `And(p, t)` or `truthy_is_falsy` -> `And(Not(Coalesce(p, False)), f)`
-                    if curr.falsy in _FALSY_LITERALS:
-                        nodes[idx] = rewritten
-                        weights[idx] = 1 + pred_w + truthy_w
-                        has_unsup[idx] = pred_unsup or has_unsup[t_idx]
-                        unconstrained[idx] = (
-                            unconstrained[p_idx] and unconstrained[t_idx]
-                        )
-                    else:
-                        # Replacing `Ternary(p, falsy_lit, f)` (`2 + p + f` nodes) with
-                        # `And(Not(Coalesce(p, False)), f)` (`4 + p + f` nodes) adds 2 nodes.
-                        extra_cost = 2
-                        if (
-                            4 + pred_w + falsy_w > MAX_BOOLEAN_WHEN_REWRITE_NODES
-                            or extra_cost > remaining_budget
-                        ):
-                            nodes[idx] = Unsupported()
-                            weights[idx] = 1
-                            has_unsup[idx] = True
-                            unconstrained[idx] = True
-                        else:
-                            remaining_budget -= extra_cost
-                            nodes[idx] = rewritten
-                            weights[idx] = 4 + pred_w + falsy_w
-                            has_unsup[idx] = pred_unsup or has_unsup[f_idx]
-                            neg_unconstrained = pred_unsup and not isinstance(
-                                curr.predicate, Or
-                            )
-                            unconstrained[idx] = (
-                                neg_unconstrained and unconstrained[f_idx]
-                            )
-                    post_ok[idx] = True
-                    post_leaf[idx] = True
-                    continue
-
-                neg_w = 1 if pred_unsup else (pred_w + 3)
-                new_w = 3 + pred_w + truthy_w + neg_w + falsy_w
-                extra_w = max(0, new_w - orig_w)
-                if new_w > MAX_BOOLEAN_WHEN_REWRITE_NODES or extra_w > remaining_budget:
-                    nodes[idx] = Unsupported()
-                    weights[idx] = 1
-                    has_unsup[idx] = True
-                    unconstrained[idx] = True
-                else:
-                    remaining_budget -= extra_w
-                    nodes[idx] = rewritten
-                    weights[idx] = new_w
-                    has_unsup[idx] = True
-                    left_unconstrained = unconstrained[p_idx] and unconstrained[t_idx]
-                    right_unconstrained = pred_unsup and unconstrained[f_idx]
-                    unconstrained[idx] = left_unconstrained or right_unconstrained
-                post_ok[idx] = True
-                post_leaf[idx] = True
-
-    return nodes[0]
+    return state.nodes[0]
 
 
 def rewrite_boolean_literals_node(node: Expr) -> Expr:
