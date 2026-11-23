@@ -232,8 +232,10 @@ def execute_local_plan_batches(
     """
     # Fall back to incremental Python-side batch streaming at the first
     # operator that hits a Polars runtime limitation: either a `Slice` whose
-    # bounds exceed native `i64`/`IdxSize`, or an empty `Project(())` where
-    # Polars 2.0–2.1 `lazyframe.drop(pl.all()).collect_batches()` loses row height.
+    # bounds exceed native `i64`/`IdxSize`, or an empty `Project(())` because
+    # Polars `scan_arrow_c_stream` projection pushdown passes `with_columns=[]`
+    # to `PyArrowCStreamReader.next_batch([])`, which collapses row height to 0
+    # in Polars 2.0–2.1.
     split_at = next(
         (
             idx
