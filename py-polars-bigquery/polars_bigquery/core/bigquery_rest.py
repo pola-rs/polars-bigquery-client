@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import contextlib
-import inspect
 import urllib.parse
 from typing import Any
 
@@ -25,42 +24,25 @@ DEFAULT_TIMEOUT: tuple[float, float] = (_CONNECT_TIMEOUT, _READ_TIMEOUT)
 # endpoint fails fast rather than blocking for 30+ minutes across retries.
 METADATA_TIMEOUT: tuple[float, float] = (10.0, 30.0)
 # Upper bound (in seconds) on a single `Retry-After` sleep so a `429`/`503` response
-# (or clock-skewed proxy) cannot hang callers for hours (`urllib3` 2.7+ defaults
-# `retry_after_max` to 6 hours; older versions impose no cap at all).
+# (or clock-skewed proxy) cannot hang callers for hours (`urllib3` defaults
+# `retry_after_max` to 6 hours).
 MAX_RETRY_AFTER_SECONDS: int = 60
-_RETRY_SUPPORTS_BACKOFF_JITTER = "backoff_jitter" in inspect.signature(Retry).parameters
-_RETRY_SUPPORTS_RETRY_AFTER_MAX = (
-    "retry_after_max" in inspect.signature(Retry).parameters
-)
-
-
-class _BoundedRetry(Retry):
-    """`urllib3.util.retry.Retry` that caps parsed `Retry-After` sleeps."""
-
-    def parse_retry_after(self, retry_after: str) -> float:
-        return min(
-            float(super().parse_retry_after(retry_after)),
-            float(MAX_RETRY_AFTER_SECONDS),
-        )
 
 
 def create_resilient_session() -> requests.Session:
     """Create a requests.Session with connection pooling and jittered exponential backoff."""
     session = requests.Session()
-    retry_kwargs: dict[str, Any] = {
-        "total": 5,
-        "backoff_factor": 0.5,
-        "status_forcelist": (429, 500, 502, 503, 504),
+    retry_strategy = Retry(
+        total=5,
+        backoff_factor=0.5,
+        backoff_jitter=0.5,
+        status_forcelist=(429, 500, 502, 503, 504),
         # Restrict automatic retries to safe, idempotent GET requests so non-idempotent
         # mutations (e.g. POST datasets.insert / tables.insert) are never duplicated.
-        "allowed_methods": frozenset(["GET"]),
-        "respect_retry_after_header": True,
-    }
-    if _RETRY_SUPPORTS_BACKOFF_JITTER:
-        retry_kwargs["backoff_jitter"] = 0.5
-    if _RETRY_SUPPORTS_RETRY_AFTER_MAX:
-        retry_kwargs["retry_after_max"] = MAX_RETRY_AFTER_SECONDS
-    retry_strategy = _BoundedRetry(**retry_kwargs)
+        allowed_methods=frozenset(["GET"]),
+        respect_retry_after_header=True,
+        retry_after_max=MAX_RETRY_AFTER_SECONDS,
+    )
     adapter = HTTPAdapter(
         max_retries=retry_strategy,
         pool_connections=10,

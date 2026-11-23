@@ -33,17 +33,19 @@ def test_create_resilient_session_configures_retries_and_pooling():
         retry = adapter.max_retries
         assert retry.total == 5
         assert retry.backoff_factor == 0.5
+        assert retry.backoff_jitter == 0.5
         assert set(retry.status_forcelist) == {429, 500, 502, 503, 504}
         assert retry.respect_retry_after_header is True
+        assert retry.retry_after_max == MAX_RETRY_AFTER_SECONDS
 
         # Retry-After durations are bounded to prevent multi-hour/indefinite sleeps.
-        assert retry.parse_retry_after("5") == 5.0
-        assert retry.parse_retry_after("0") == 0.0
-        assert retry.parse_retry_after("86400") == float(MAX_RETRY_AFTER_SECONDS)
+        assert retry.parse_retry_after("5") == 5
+        assert retry.parse_retry_after("0") == 0
+        assert retry.parse_retry_after("86400") == MAX_RETRY_AFTER_SECONDS
         far_future = formatdate(timeval=4_000_000_000, usegmt=True)
-        assert retry.parse_retry_after(far_future) == float(MAX_RETRY_AFTER_SECONDS)
+        assert retry.parse_retry_after(far_future) == MAX_RETRY_AFTER_SECONDS
         past_date = formatdate(timeval=0, usegmt=True)
-        assert retry.parse_retry_after(past_date) == 0.0
+        assert retry.parse_retry_after(past_date) == 0
         with pytest.raises(InvalidHeader):
             retry.parse_retry_after("not-a-valid-retry-after")
 
@@ -51,8 +53,9 @@ def test_create_resilient_session_configures_retries_and_pooling():
         next_retry = retry.increment(
             method="GET", url="https://bigquery.googleapis.com"
         )
-        assert type(next_retry) is type(retry)
-        assert next_retry.parse_retry_after("86400") == float(MAX_RETRY_AFTER_SECONDS)
+        assert next_retry.retry_after_max == MAX_RETRY_AFTER_SECONDS
+        assert next_retry.backoff_jitter == 0.5
+        assert next_retry.parse_retry_after("86400") == MAX_RETRY_AFTER_SECONDS
     finally:
         session.close()
 

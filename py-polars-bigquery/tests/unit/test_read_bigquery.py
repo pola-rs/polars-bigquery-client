@@ -1867,48 +1867,20 @@ def test_client_maximum_bytes_billed_wire_serialization():
     assert not captured_bodies[2].get("dryRun")
 
 
-def test_bigquery_rest_retry_has_jitter_and_handles_401_and_errors(monkeypatch):
+def test_bigquery_rest_retry_has_jitter_and_handles_401_and_errors():
     import requests
 
     session = bigquery_rest.create_resilient_session()
     try:
         adapter = session.get_adapter("https://bigquery.googleapis.com")
-        if bigquery_rest._RETRY_SUPPORTS_BACKOFF_JITTER:
-            assert adapter.max_retries.backoff_jitter > 0
-        if bigquery_rest._RETRY_SUPPORTS_RETRY_AFTER_MAX:
-            assert (
-                adapter.max_retries.retry_after_max
-                == bigquery_rest.MAX_RETRY_AFTER_SECONDS
-            )
+        assert adapter.max_retries.backoff_jitter > 0
+        assert (
+            adapter.max_retries.retry_after_max == bigquery_rest.MAX_RETRY_AFTER_SECONDS
+        )
         # Automatic retries are strictly limited to safe, idempotent GET requests.
         assert adapter.max_retries.allowed_methods == frozenset(["GET"])
     finally:
         session.close()
-
-    # Verify compatibility with older urllib3 where Retry lacks `backoff_jitter`
-    # and `retry_after_max`, while still bounding `Retry-After` sleeps.
-    monkeypatch.setattr(bigquery_rest, "_RETRY_SUPPORTS_BACKOFF_JITTER", False)
-    monkeypatch.setattr(bigquery_rest, "_RETRY_SUPPORTS_RETRY_AFTER_MAX", False)
-    seen_retry_kwargs: list[dict[str, object]] = []
-    orig_retry = bigquery_rest._BoundedRetry
-
-    def _recording_retry(**kwargs):
-        seen_retry_kwargs.append(kwargs)
-        return orig_retry(**kwargs)
-
-    monkeypatch.setattr(bigquery_rest, "_BoundedRetry", _recording_retry)
-    fallback_session = bigquery_rest.create_resilient_session()
-    try:
-        adapter = fallback_session.get_adapter("https://bigquery.googleapis.com")
-        assert adapter.max_retries.parse_retry_after("999999") == float(
-            bigquery_rest.MAX_RETRY_AFTER_SECONDS
-        )
-    finally:
-        fallback_session.close()
-    assert len(seen_retry_kwargs) == 1
-    assert "backoff_jitter" not in seen_retry_kwargs[0]
-    assert "retry_after_max" not in seen_retry_kwargs[0]
-    monkeypatch.undo()
 
     table_id = arrow_bigquery.BigQueryTableId("p", "d", "t")
 
