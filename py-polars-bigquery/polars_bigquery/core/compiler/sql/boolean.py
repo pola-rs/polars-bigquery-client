@@ -39,6 +39,11 @@ def format_is_null(_node: IsNull, operand: str) -> str:
 
 @format_operator_sql.register
 def format_is_not_null(_node: IsNotNull, operand: str) -> str:
+    """Format an `IsNotNull` node as BigQuery SQL `(<operand> IS NOT NULL)`.
+
+    Also handles `LazyFrame.drop_nulls()` / `LazyFrame.drop_nulls(subset=...)`,
+    which Polars lowers into `is_not_null()` predicates before scan pushdown.
+    """
     return f"({operand} IS NOT NULL)"
 
 

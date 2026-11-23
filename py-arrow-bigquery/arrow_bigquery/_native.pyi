@@ -10,6 +10,7 @@ class UnsupportedTypeError(BigQueryError):
 class ArrowStreamExporter:
     """Bridge exporting BigQuery Arrow record batches via the Arrow C Stream interface."""
 
+    def close(self) -> None: ...
     def __arrow_c_stream__(self, requested_schema: Any = None) -> Any: ...
 
 class BigQueryTableId:

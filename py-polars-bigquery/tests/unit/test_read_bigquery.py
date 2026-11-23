@@ -735,6 +735,110 @@ def test_client_scan_bigquery_with_polars_schema_pushes_down_projection_and_filt
         assert df.equals(pl.DataFrame({"visible": ["b"]}))
 
 
+def test_client_scan_table_drop_nulls_pushes_down_is_not_null(mock_arrow_client):
+    mock_arrow_client.read_table.return_value = MagicMock()
+
+    with patch("polars.scan_arrow_c_stream") as mock_scan:
+        mock_scan.return_value = pl.LazyFrame(
+            {"id": [1, 2, None], "flag": [None, True, False]}
+        )
+        client = Client(quota_project_id="q")
+        schema = pl.Schema({"id": pl.Int64(), "flag": pl.Boolean()})
+
+        # `lf.drop_nulls()` is lowered by Polars to `is_not_null()` conjuncts.
+        result_all = (
+            client.scan_table(table="p.d.t", schema=schema).drop_nulls().collect()
+        )
+        assert mock_arrow_client.read_table.call_args.kwargs == {
+            "maintain_order": False,
+            "selected_fields": ["id", "flag"],
+            "row_restriction": "((`flag` IS NOT NULL) AND (`id` IS NOT NULL))",
+        }
+        assert result_all.to_dict(as_series=False) == {"id": [2], "flag": [True]}
+
+        mock_arrow_client.read_table.reset_mock()
+        mock_scan.return_value = pl.LazyFrame(
+            {"id": [1, 2, 3], "flag": [None, True, None]}
+        )
+
+        # `lf.drop_nulls(subset=[...])` pushes down only that column's `IS NOT NULL`.
+        result_subset = (
+            client.scan_table(table="p.d.t", schema=schema)
+            .drop_nulls(subset=["flag"])
+            .collect()
+        )
+        assert mock_arrow_client.read_table.call_args.kwargs == {
+            "maintain_order": False,
+            "selected_fields": ["id", "flag"],
+            "row_restriction": "(`flag` IS NOT NULL)",
+        }
+        assert result_subset.to_dict(as_series=False) == {"id": [2], "flag": [True]}
+
+
+def test_client_scan_table_expr_drop_nulls_in_filter_not_pushed_down(mock_arrow_client):
+    mock_arrow_client.read_table.return_value = MagicMock()
+    client = Client(quota_project_id="q")
+    schema = pl.Schema({"id": pl.Int64(), "flag": pl.Boolean()})
+
+    # Single non-null value broadcasts across all rows including nulls.
+    with patch(
+        "polars.scan_arrow_c_stream",
+        return_value=pl.LazyFrame({"id": [1, 2, 3], "flag": [None, True, None]}),
+    ):
+        result = (
+            client.scan_table(table="p.d.t", schema=schema)
+            .filter(pl.col("flag").drop_nulls())
+            .collect()
+        )
+    assert mock_arrow_client.read_table.call_args.kwargs["row_restriction"] == ""
+    assert result.to_dict(as_series=False) == {
+        "id": [1, 2, 3],
+        "flag": [None, True, None],
+    }
+
+    # Multiple non-null values alongside a null raise ShapeError in Polars.
+    mock_arrow_client.read_table.reset_mock()
+    with (
+        patch(
+            "polars.scan_arrow_c_stream",
+            return_value=pl.LazyFrame({"id": [1, 2, 3], "flag": [None, True, False]}),
+        ),
+        pytest.raises(pl.exceptions.ShapeError),
+    ):
+        (
+            client.scan_table(table="p.d.t", schema=schema)
+            .filter(pl.col("flag").drop_nulls())
+            .collect()
+        )
+    assert mock_arrow_client.read_table.call_args.kwargs["row_restriction"] == ""
+
+
+def test_client_scan_query_drop_nulls_pushes_down_is_not_null(mock_arrow_client):
+    mock_arrow_client.read_query.return_value = MagicMock(name="arrow_stream")
+    source_frame = pl.LazyFrame({"id": [1, 2, 3], "flag": [None, True, None]})
+
+    with patch("polars.scan_arrow_c_stream", return_value=source_frame):
+        client = Client(quota_project_id="q")
+        lf = client.scan_query(
+            "SELECT id, flag FROM `p.d.t`",
+            schema={"id": pl.Int64(), "flag": pl.Boolean()},
+            maintain_order=False,
+        )
+        result = lf.drop_nulls(subset=["flag"]).collect()
+
+    mock_arrow_client.read_query.assert_called_once_with(
+        "SELECT id, flag FROM `p.d.t`\n"
+        "|> WHERE (`flag` IS NOT NULL)\n"
+        "|> SELECT `id`, `flag`",
+        arrow_buffer_compression="lz4frame",
+        dry_run=False,
+        maintain_order=False,
+        use_query_cache=None,
+        maximum_bytes_billed=None,
+    )
+    assert result.to_dict(as_series=False) == {"id": [2], "flag": [True]}
+
+
 def test_client_scan_bigquery_handles_bigquery_objects(mock_arrow_client):
     mock_stream = MagicMock()
     mock_arrow_client.read_table.return_value = mock_stream
@@ -888,13 +992,63 @@ def test_client_scan_ingestion_time_partitioned_table(mock_arrow_client):
         assert df_compound["val"].to_list() == [20]
 
 
-def test_client_context_manager_closes_rest_session(mock_arrow_client):
+def test_client_context_manager_closes_rest_and_arrow_clients(mock_arrow_client):
+    client = Client(quota_project_id="q")
+    assert not client.closed
     with patch.object(
-        Client, "close", wraps=Client(quota_project_id="q").close
-    ) as mock_close:
-        with Client(quota_project_id="q") as client:
+        client._rest_client, "close", wraps=client._rest_client.close
+    ) as mock_rest_close:
+        with client as ctx_client:
+            assert ctx_client is client
             assert client.quota_project_id == "q"
-        mock_close.assert_called_once()
+            assert not client.closed
+        mock_rest_close.assert_called_once_with()
+    mock_arrow_client.close.assert_called_once_with()
+    assert client.closed
+
+    # Calling close() repeatedly is idempotent and leaves client closed.
+    client.close()
+    assert client.closed
+    mock_arrow_client.close.assert_called_once_with()
+
+    # Any use after closing raises RuntimeError.
+    with pytest.raises(RuntimeError, match="closed"), client:
+        pass
+    with pytest.raises(RuntimeError, match="closed"):
+        client.read_table("p.d.t")
+    with pytest.raises(RuntimeError, match="closed"):
+        client.read_query("SELECT 1")
+    with pytest.raises(RuntimeError, match="closed"):
+        client.scan_table("p.d.t", schema={"id": pl.Int64()})
+    with pytest.raises(RuntimeError, match="closed"):
+        client.scan_query("SELECT 1", schema={"id": pl.Int64()})
+
+
+def test_client_close_closes_arrow_client_even_if_rest_close_fails(mock_arrow_client):
+    client = Client(quota_project_id="q")
+    with (
+        patch.object(
+            client._rest_client, "close", side_effect=OSError("socket close failed")
+        ),
+        pytest.raises(OSError, match="socket close failed"),
+    ):
+        client.close()
+    assert client.closed
+    mock_arrow_client.close.assert_called_once_with()
+
+
+def test_client_close_invalidates_pending_lazy_scan(mock_arrow_client):
+    client = Client(quota_project_id="q")
+    lf_table = client.scan_table("my-project.my_dataset.tbl", schema={"id": pl.Int64()})
+    lf_query = client.scan_query("SELECT 1 AS id", schema={"id": pl.Int64()})
+    client.close()
+
+    with pytest.raises(RuntimeError, match="closed"):
+        lf_table.collect()
+    with pytest.raises(RuntimeError, match="closed"):
+        lf_query.collect()
+    mock_arrow_client.read_table.assert_not_called()
+    mock_arrow_client.read_query.assert_not_called()
 
 
 def test_client_read_query_dry_run_returns_polars_dataframe():
@@ -967,6 +1121,76 @@ def test_client_read_query_dry_run_returns_polars_dataframe():
     assert df["totalBytesProcessed"].to_list() == [128]
     assert df["cacheHit"].to_list() == [True]
     assert df["statementType"].to_list() == ["SELECT"]
+
+
+@pytest.mark.parametrize("dry_run", [False, True])
+def test_client_read_query_invalid_sql_raises_polars_bigquery_error(dry_run):
+    import json
+    import threading
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self):
+            length = int(self.headers.get("Content-Length", "0"))
+            _ = self.rfile.read(length)
+            payload = json.dumps(
+                {
+                    "error": {
+                        "code": 400,
+                        "message": 'Syntax error: Unexpected identifier "BROKEN"',
+                        "status": "INVALID_ARGUMENT",
+                    }
+                }
+            ).encode("utf-8")
+            self.send_response(400)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+        def log_message(self, format, *args):
+            pass
+
+    server = HTTPServer(("127.0.0.1", 0), Handler)
+    server.timeout = 2.0
+    port = server.server_port
+    server_thread = threading.Thread(target=server.handle_request, daemon=True)
+    server_thread.start()
+
+    try:
+
+        def creds():
+            return ({"bearer_token": "fake-tok"}, None)
+
+        with Client(quota_project_id="test-proj", credentials_provider=creds) as client:
+            client._arrow_client = arrow_bigquery.Client(
+                quota_project_id="test-proj",
+                credentials_provider=creds,
+                bq_endpoint=f"http://127.0.0.1:{port}",
+            )
+            with pytest.raises(BigQueryError, match="Syntax error"):
+                client.read_query("SELECT BROKEN", dry_run=dry_run)
+    finally:
+        server_thread.join(timeout=2.0)
+        server.server_close()
+
+
+def test_client_init_closes_rest_session_when_arrow_client_fails():
+    with (
+        patch(
+            "polars_bigquery.core.bigquery_rest.BigQueryRestClient",
+        ) as mock_rest_cls,
+        patch(
+            "arrow_bigquery.Client",
+            side_effect=ValueError("quota_project_id is required"),
+        ),
+        pytest.raises(ValueError, match="quota_project_id"),
+    ):
+        Client(quota_project_id="")
+
+    # Because the REST client session is lazily allocated on first `scan_table`
+    # metadata fetch, a failed `arrow_bigquery.Client()` leaves no session open.
+    mock_rest_cls.assert_not_called()
 
 
 @pytest.mark.parametrize("bad_codec", ["snappy", "gzip", 123, ["lz4frame"], None])
@@ -2031,3 +2255,105 @@ def test_unsupported_type_error_export_and_hierarchy():
     assert UnsupportedTypeError is _native.UnsupportedTypeError
     assert issubclass(UnsupportedTypeError, BigQueryError)
     assert issubclass(UnsupportedTypeError, RuntimeError)
+
+
+def test_client_closes_exporter_when_stream_consumption_fails(mock_arrow_client):
+    close_calls = 0
+
+    class _ExplodingExporter:
+        def __arrow_c_stream__(self, requested_schema=None):
+            raise RuntimeError("boom during stream import")
+
+        def close(self) -> None:
+            nonlocal close_calls
+            close_calls += 1
+
+    client = Client(quota_project_id="test-proj")
+
+    mock_arrow_client.read_table.return_value = _ExplodingExporter()
+    with pytest.raises(RuntimeError, match="boom during stream import"):
+        client.read_table("my-project.my_dataset.tbl")
+    assert close_calls == 1
+
+    mock_arrow_client.read_query.return_value = _ExplodingExporter()
+    with pytest.raises(RuntimeError, match="boom during stream import"):
+        client.read_query("SELECT 1")
+    assert close_calls == 2
+
+    mock_arrow_client.read_table.return_value = _ExplodingExporter()
+    lf = client.scan_table("my-project.my_dataset.tbl", schema={"id": pl.Int64()})
+    with pytest.raises(RuntimeError, match="boom during stream import"):
+        lf.collect()
+    assert close_calls == 3
+
+
+def test_scan_table_releases_lazyframe_and_aborts_task_on_post_export_error(
+    mock_arrow_client, monkeypatch
+):
+    """Post-`scan_arrow_c_stream` errors must drop `lazyframe` and abort the stream."""
+    import time
+
+    from arrow_bigquery import _native
+
+    captured_io_source = {}
+    orig_register = pl.io.plugins.register_io_source
+
+    def _capture(io_source, schema, **kwargs):
+        captured_io_source["fn"] = io_source
+        return orig_register(io_source=io_source, schema=schema, **kwargs)
+
+    monkeypatch.setattr(pl.io.plugins, "register_io_source", _capture)
+
+    exporter, drop_flag = _native._test_create_exporter_with_drop_flag()
+    mock_arrow_client.read_table.return_value = exporter
+
+    client = Client(quota_project_id="test-proj")
+    client.scan_table("my-project.my_dataset.tbl", schema={"placeholder": pl.Int32()})
+
+    with (
+        patch(
+            "polars_bigquery.core.executors.read_api.execute_local_plan_batches",
+            side_effect=RuntimeError("boom after arrow stream export"),
+        ),
+        pytest.raises(RuntimeError, match="boom after arrow stream export") as exc_info,
+    ):
+        captured_io_source["fn"](
+            with_columns=["placeholder"],
+            predicate=None,
+            n_rows=None,
+            batch_size=None,
+        )
+
+    # Walk traceback while exception (and its `f_locals`) is still alive.
+    tb = exc_info.tb
+    execute_locals = None
+    while tb is not None:
+        if tb.tb_frame.f_code.co_name == "execute":
+            execute_locals = tb.tb_frame.f_locals
+            break
+        tb = tb.tb_next
+    assert execute_locals is not None
+    assert execute_locals.get("lazyframe") is None
+
+    deadline = time.monotonic() + 1.0
+    while not drop_flag.is_set() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert drop_flag.is_set(), (
+        "background Tokio task was not aborted on post-export error"
+    )
+
+    # Also verify `ArrowStreamExporter.close()` aborts a background task even when
+    # a consumed `LazyFrame` stays alive holding the exported PyCapsule, and that
+    # reading from the closed stream raises instead of returning a silent empty EOF.
+    exporter2, drop_flag2 = _native._test_create_exporter_with_drop_flag()
+    held_lf = pl.scan_arrow_c_stream(exporter2)
+    assert not drop_flag2.is_set()
+    exporter2.close()
+    deadline = time.monotonic() + 1.0
+    while not drop_flag2.is_set() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert drop_flag2.is_set(), (
+        "exporter.close() must abort background task while LazyFrame holds capsule"
+    )
+    with pytest.raises(pl.exceptions.ComputeError, match="closed before completion"):
+        held_lf.collect()

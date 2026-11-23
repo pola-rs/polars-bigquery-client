@@ -53,15 +53,20 @@ pub fn _test_create_exporter_with_drop_flag() -> (ArrowStreamExporter, DropFlag)
     let flag_clone = flag.clone();
     let (tx, rx) = tokio::sync::mpsc::channel(10);
 
+    // Construct `SetOnDrop` *before* entering `async move` so it is captured in
+    // the future's initial state and runs on drop even if the task is aborted
+    // before its first poll.
+    struct SetOnDrop(std::sync::Arc<std::sync::atomic::AtomicBool>);
+    impl Drop for SetOnDrop {
+        fn drop(&mut self) {
+            self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+    let cleanup = SetOnDrop(flag_clone);
+
     // Spawn a placeholder task that holds `tx` and runs until aborted, setting `flag` on drop.
     let handle = rt.spawn(async move {
-        struct SetOnDrop(std::sync::Arc<std::sync::atomic::AtomicBool>);
-        impl Drop for SetOnDrop {
-            fn drop(&mut self) {
-                self.0.store(true, std::sync::atomic::Ordering::SeqCst);
-            }
-        }
-        let _cleanup = SetOnDrop(flag_clone);
+        let _cleanup = cleanup;
         let _keep_tx_alive = tx;
 
         std::future::pending::<()>().await;

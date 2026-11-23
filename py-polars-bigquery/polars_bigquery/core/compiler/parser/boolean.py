@@ -9,7 +9,6 @@ from polars_bigquery.core.compiler.ir.boolean import (
     And,
     BoolLiteral,
     Coalesce,
-    DropNulls,
     FillNull,
     IsNotNull,
     IsNull,
@@ -87,14 +86,20 @@ def parse_is_null(spec: Any, expr_json: Any) -> ParseRecord:
 
 @register_parser("$.Function.function.Boolean.IsNotNull")
 def parse_is_not_null(spec: Any, expr_json: Any) -> ParseRecord:
-    """Parse a Polars `IsNotNull` BooleanFunction node into an IR `IsNotNull` record."""
+    """Parse a Polars `IsNotNull` BooleanFunction node into an IR `IsNotNull` record.
+
+    Polars also rewrites `LazyFrame.drop_nulls()` / `LazyFrame.drop_nulls(subset=...)`
+    (called outside of `.filter()`) into `is_not_null()` predicates before handing
+    them to IO scan plugins, so row-level null dropping pushes down through this
+    parser.
+
+    Note: `$.Function.function.DropNulls` (`Expr.drop_nulls()`) is intentionally NOT
+    registered so it parses as `Unsupported()`. Inside `.filter()`, `Expr.drop_nulls()`
+    shrinks the `Series` length rather than producing a row-aligned mask, broadcasting
+    length-1 results across null rows and raising `ShapeError` otherwise; rewriting it
+    to `IS NOT NULL` would violate the pushdown superset invariant.
+    """
     return parse_unary_function(expr_json, IsNotNull, func_spec=spec)
-
-
-@register_parser("$.Function.function.DropNulls")
-def parse_drop_nulls(spec: Any, expr_json: Any) -> ParseRecord:
-    """Parse a Polars `DropNulls` Function node into an IR `DropNulls` record."""
-    return parse_unary_function(expr_json, DropNulls, func_spec=spec)
 
 
 @register_parser("$.Function.function.Coalesce")
