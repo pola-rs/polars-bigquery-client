@@ -1878,11 +1878,3 @@ def test_unsupported_type_error_export_and_hierarchy():
     assert UnsupportedTypeError is _native.UnsupportedTypeError
     assert issubclass(UnsupportedTypeError, BigQueryError)
     assert issubclass(UnsupportedTypeError, RuntimeError)
-
-    # The Rust-only `validate_ffi_types` knob must not be exposed on the Python FFI surface.
-    with pytest.raises(TypeError):
-        arrow_bigquery.Client(
-            quota_project_id="test-proj",
-            credentials_provider=lambda: ({"bearer_token": "tok"}, None),
-            validate_ffi_types=False,  # type: ignore[call-arg]
-        )

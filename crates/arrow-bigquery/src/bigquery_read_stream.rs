@@ -45,10 +45,7 @@ use polars_arrow::record_batch::RecordBatch;
 use tokio::time::Instant;
 
 use super::bigquery_read_retry::StreamRetryConfig;
-use crate::decode::{
-    parse_arrow_schema_with_options, validate_non_empty_arrow_bytes, DecodeJob, DecodeQueue,
-    SchemaDecodeOptions,
-};
+use crate::decode::{parse_arrow_schema, validate_non_empty_arrow_bytes, DecodeJob, DecodeQueue};
 use crate::BigQueryError;
 
 pub(crate) type SchemaSender =
@@ -113,7 +110,7 @@ fn read_rows_response_to_record_batch(
     let Some((serialized_record_batch, row_count)) = extract_response_arrow_bytes(response)? else {
         return Ok(None);
     };
-    let metadata = crate::decode::parse_arrow_schema(schema)?;
+    let metadata = parse_arrow_schema(schema)?;
     let mut batches =
         crate::decode::decode_arrow_record_batches(serialized_record_batch, row_count, metadata)?;
     if batches.is_empty() {
@@ -204,7 +201,6 @@ pub(crate) struct ReadStreamOptions {
     pub(crate) maintain_order: bool,
     pub(crate) cancel_tx: Arc<tokio::sync::watch::Sender<bool>>,
     pub(crate) cancel_rx: tokio::sync::watch::Receiver<bool>,
-    pub(crate) schema_decode_options: SchemaDecodeOptions,
 }
 
 pub(crate) struct ReadQueryStreamOptions {
@@ -217,7 +213,6 @@ pub(crate) struct ReadQueryStreamOptions {
     pub(crate) maintain_order: bool,
     pub(crate) cancel_tx: Arc<tokio::sync::watch::Sender<bool>>,
     pub(crate) cancel_rx: tokio::sync::watch::Receiver<bool>,
-    pub(crate) schema_decode_options: SchemaDecodeOptions,
 }
 
 pub(crate) struct ReadStream {
@@ -230,7 +225,6 @@ pub(crate) struct ReadStream {
     decode_queue: DecodeQueue,
     cancel_tx: Arc<tokio::sync::watch::Sender<bool>>,
     cancel_rx: tokio::sync::watch::Receiver<bool>,
-    schema_decode_options: SchemaDecodeOptions,
     /// Encapsulates mutable connection and retry state for the stream reader.
     pub(crate) state: ReadStreamState,
 }
@@ -248,7 +242,6 @@ impl ReadStream {
             maintain_order: _,
             cancel_tx,
             cancel_rx,
-            schema_decode_options,
         } = options;
         Self {
             read_rows,
@@ -260,7 +253,6 @@ impl ReadStream {
             decode_queue,
             cancel_tx,
             cancel_rx,
-            schema_decode_options,
             state: ReadStreamState::Connecting {
                 offset: current_offset,
                 retry_state: RetryState::new(true),
@@ -448,10 +440,7 @@ impl ReadStream {
                                         return;
                                     },
                                 };
-                                let parsed = match parse_arrow_schema_with_options(
-                                    &serialized_schema,
-                                    self.schema_decode_options,
-                                ) {
+                                let parsed = match parse_arrow_schema(&serialized_schema) {
                                     Ok(parsed) => Arc::new(parsed),
                                     Err(err) => {
                                         self.send_fatal_error(err).await;
@@ -603,7 +592,6 @@ pub(crate) async fn read_query_stream(options: ReadQueryStreamOptions) {
         maintain_order,
         cancel_tx,
         mut cancel_rx,
-        schema_decode_options,
     } = options;
     let decode_queue = DecodeQueue::new(maintain_order);
 
@@ -634,7 +622,6 @@ pub(crate) async fn read_query_stream(options: ReadQueryStreamOptions) {
                 maintain_order,
                 cancel_tx,
                 cancel_rx,
-                schema_decode_options,
             },
             decode_queue,
         );
@@ -659,7 +646,6 @@ pub(crate) mod tests {
 
     use super::*;
     use crate::bigquery_read_retry::RetryableErrors;
-    use crate::decode::parse_arrow_schema;
 
     #[derive(Debug, Default)]
     pub(crate) struct RecordedReadRows {
@@ -917,7 +903,6 @@ pub(crate) mod tests {
             maintain_order: true,
             cancel_tx: Arc::new(cancel_tx),
             cancel_rx,
-            schema_decode_options: SchemaDecodeOptions::default(),
         })
         .await;
 
@@ -967,7 +952,6 @@ pub(crate) mod tests {
             maintain_order: false,
             cancel_tx: Arc::new(cancel_tx),
             cancel_rx,
-            schema_decode_options: SchemaDecodeOptions::default(),
         })
         .await;
 
@@ -1010,7 +994,6 @@ pub(crate) mod tests {
             maintain_order: false,
             cancel_tx: Arc::clone(&cancel_tx),
             cancel_rx,
-            schema_decode_options: SchemaDecodeOptions::default(),
         })
         .await;
 
@@ -1065,7 +1048,6 @@ pub(crate) mod tests {
             maintain_order: false,
             cancel_tx: Arc::clone(&cancel_tx),
             cancel_rx,
-            schema_decode_options: SchemaDecodeOptions::default(),
         })
         .await;
 
@@ -1123,7 +1105,6 @@ pub(crate) mod tests {
             maintain_order: false,
             cancel_tx: Arc::clone(&cancel_tx),
             cancel_rx,
-            schema_decode_options: SchemaDecodeOptions::default(),
         }));
 
         // Signal cancellation as a sibling stream would upon fatal error.
@@ -1184,7 +1165,6 @@ pub(crate) mod tests {
                 maintain_order: false,
                 cancel_tx: Arc::new(cancel_tx),
                 cancel_rx,
-                schema_decode_options: SchemaDecodeOptions::default(),
             },
             decode_queue,
         );

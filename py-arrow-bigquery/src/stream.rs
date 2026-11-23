@@ -27,7 +27,7 @@ pub struct ArrowStreamExporter {
     /// The schema of the Arrow stream.
     schema: ArrowSchemaRef,
     /// Tracks whether `schema` was already validated by `validate_ffi_schema` /
-    /// `parse_arrow_schema_with_options` with `validate_ffi_types = true`.
+    /// `parse_arrow_schema`.
     schema_ffi_validated: bool,
     /// The underlying BigQuery record batch source, wrapped in a mutex.
     /// It is an `Option` because the stream can only be consumed once.
