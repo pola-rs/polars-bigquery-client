@@ -355,7 +355,7 @@ impl Client {
             )?;
 
         let (schema, receiver) = result.map_err(|err| error::to_py_err(py, err))?;
-        Ok(ArrowStreamExporter::new(schema, receiver))
+        Ok(ArrowStreamExporter::new_validated(schema, receiver))
     }
 
     /// Executes a BigQuery SQL query (or dry run) and returns an [`ArrowStreamExporter`]
@@ -409,7 +409,7 @@ impl Client {
                     .await
             })?;
             let (schema, receiver) = result.map_err(|err| error::to_py_err(py, err))?;
-            Ok(ArrowStreamExporter::new(schema, receiver))
+            Ok(ArrowStreamExporter::new_validated(schema, receiver))
         }
     }
 }
@@ -459,6 +459,10 @@ fn parse_read_options(
 #[pyo3(name = "_native")]
 fn polars_bigquery(m: &Bound<PyModule>) -> PyResult<()> {
     m.add("BigQueryError", m.py().get_type::<error::BigQueryError>())?;
+    m.add(
+        "UnsupportedTypeError",
+        m.py().get_type::<error::UnsupportedTypeError>(),
+    )?;
     m.add_class::<Client>()?;
     m.add_class::<BigQueryTableId>()?;
     #[cfg(feature = "testing")]
