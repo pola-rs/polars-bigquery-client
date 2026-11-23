@@ -1019,3 +1019,42 @@ def test_query_executor_forwards_maximum_bytes_billed(caplog) -> None:
     debug_msgs = [r.message for r in caplog.records if r.levelno == logging.DEBUG]
     assert len(debug_msgs) == 1
     assert "maximum_bytes_billed=10000000" in debug_msgs[0]
+
+
+def test_query_executor_closes_exporter_on_post_export_error() -> None:
+    close_calls = 0
+
+    class _Exporter:
+        def __arrow_c_stream__(self, requested_schema=None):
+            return pl.DataFrame({"a": [1]}).__arrow_c_stream__(
+                requested_schema=requested_schema
+            )
+
+        def close(self) -> None:
+            nonlocal close_calls
+            close_calls += 1
+
+    mock_arrow_client = MagicMock()
+    mock_arrow_client.read_query.return_value = _Exporter()
+    executor = QueryExecutor(mock_arrow_client)
+    scan = _scan("SELECT a FROM t", columns=("a",))
+
+    with (
+        patch(
+            "polars_bigquery.core.executors.query.execute_local_plan_batches",
+            side_effect=RuntimeError("boom after stream export"),
+        ),
+        pytest.raises(RuntimeError, match="boom after stream export") as exc_info,
+    ):
+        executor.execute(scan)
+
+    assert close_calls == 1
+    tb = exc_info.tb
+    execute_locals = None
+    while tb is not None:
+        if tb.tb_frame.f_code.co_name == "execute":
+            execute_locals = tb.tb_frame.f_locals
+            break
+        tb = tb.tb_next
+    assert execute_locals is not None
+    assert execute_locals.get("lazyframe") is None
