@@ -13,6 +13,7 @@ from polars_bigquery.core.executors import (
 )
 from polars_bigquery.core.plan import (
     Filter,
+    PlanNode,
     Project,
     QueryScan,
     Slice,
@@ -321,3 +322,69 @@ def test_zero_column_fallback_deprioritizes_nested_bignumeric() -> None:
     )
     compiled = compile_read_api_plan(Project(input=scan, columns=()))
     assert compiled.selected_fields == ("nested_ok",)
+
+
+def test_zero_column_fallback_handles_decimal_none_precision() -> None:
+    from polars_bigquery.core.executors.read_api import _dtype_fallback_rank
+
+    dec_unspec = pl.Decimal(38, 2)
+    dec_unspec.precision = None
+    assert _dtype_fallback_rank(dec_unspec) == 8
+    assert _dtype_fallback_rank(pl.Decimal(38, 9)) == 5
+    assert _dtype_fallback_rank(pl.Decimal(76, 38)) == 8
+
+
+def test_read_api_executor_max_stream_count_boundaries() -> None:
+    from polars_bigquery.core.executors.read_api import _SINGLE_STREAM_ROW_LIMIT
+
+    scan = _tscan({"id": pl.Int64()})
+    cases: list[tuple[str, PlanNode, int | None]] = [
+        ("zero_limit", Slice(input=scan, offset=0, length=0), 1),
+        (
+            "at_threshold",
+            Slice(input=scan, offset=0, length=_SINGLE_STREAM_ROW_LIMIT),
+            1,
+        ),
+        (
+            "above_threshold",
+            Slice(input=scan, offset=0, length=_SINGLE_STREAM_ROW_LIMIT + 1),
+            None,
+        ),
+        ("nonzero_offset", Slice(input=scan, offset=100_000, length=10), None),
+        (
+            "nonzero_offset_then_small_slice",
+            Slice(
+                input=Slice(input=scan, offset=100_000, length=50_000),
+                offset=0,
+                length=10,
+            ),
+            None,
+        ),
+        (
+            "large_leading_slice_then_small_slice",
+            Slice(
+                input=Slice(
+                    input=scan, offset=0, length=_SINGLE_STREAM_ROW_LIMIT + 100
+                ),
+                offset=0,
+                length=10,
+            ),
+            1,
+        ),
+    ]
+    for label, plan, expected_max_streams in cases:
+        mock_arrow_client = MagicMock()
+        mock_arrow_client.read_table.return_value = MagicMock(name="exporter")
+        executor = ReadApiExecutor(mock_arrow_client)
+        with patch(
+            "polars.scan_arrow_c_stream",
+            return_value=pl.LazyFrame({"id": [1, 2, 3]}),
+        ):
+            list(executor.execute(plan))
+        kwargs = mock_arrow_client.read_table.call_args.kwargs
+        if expected_max_streams is None:
+            assert "max_stream_count" not in kwargs, f"unexpected cap for {label}"
+        else:
+            assert kwargs.get("max_stream_count") == expected_max_streams, (
+                f"wrong cap for {label}"
+            )

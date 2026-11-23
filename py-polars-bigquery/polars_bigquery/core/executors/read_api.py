@@ -30,6 +30,10 @@ from polars_bigquery.core.schema import has_bignumeric_dtype
 logger = logging.getLogger(__name__)
 
 MAX_ROW_RESTRICTION_BYTES = 1_000_000
+# Cap `read_table` fanout to a single stream when Polars pushes a small row
+# limit (`n_rows`), avoiding spinning up `available_parallelism()` parallel gRPC
+# streams and prefetch buffers only to discard nearly all rows.
+_SINGLE_STREAM_ROW_LIMIT = 10_000
 
 _INGESTION_TIME_PSEUDO_COLUMNS_CASEFOLD = frozenset(
     {"_partitiondate", "_partitiontime"}
@@ -79,7 +83,7 @@ def _dtype_fallback_rank(dtype: pl.DataType) -> int:
     if isinstance(dtype, (pl.Int128, pl.UInt128)):
         return 5
     if isinstance(dtype, pl.Decimal):
-        return 5 if dtype.precision <= 38 else 8
+        return 5 if (dtype.precision is not None and dtype.precision <= 38) else 8
     if isinstance(dtype, (pl.Duration, pl.Null, pl.Unknown, pl.Object)):
         return 8
     if dtype.is_nested():
@@ -246,11 +250,27 @@ class ReadApiExecutor(PlanExecutor):
                     compiled.degraded_reason,
                 )
 
+        read_kwargs: dict[str, Any] = {
+            "maintain_order": source.maintain_order,
+            "selected_fields": list(compiled.selected_fields),
+            "row_restriction": compiled.row_restriction,
+        }
+        has_filter = any(isinstance(op, Filter) for op in residual_ops)
+        has_leading_small_slice = False
+        if not has_filter:
+            for op in residual_ops:
+                if isinstance(op, Slice):
+                    if op.offset > 0:
+                        break
+                    if op.length <= _SINGLE_STREAM_ROW_LIMIT:
+                        has_leading_small_slice = True
+                        break
+        if has_leading_small_slice:
+            read_kwargs["max_stream_count"] = 1
+
         arrow_stream_exporter = self._arrow_client.read_table(
             source.table_ref,
-            maintain_order=source.maintain_order,
-            selected_fields=list(compiled.selected_fields),
-            row_restriction=compiled.row_restriction,
+            **read_kwargs,
         )
         return execute_local_plan_batches(
             pl.scan_arrow_c_stream(arrow_stream_exporter),
