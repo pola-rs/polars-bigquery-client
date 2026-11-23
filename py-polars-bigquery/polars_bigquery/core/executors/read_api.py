@@ -5,7 +5,7 @@ from __future__ import annotations
 import dataclasses
 import heapq
 import logging
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from typing import Any, Literal, cast
 
 import polars as pl
@@ -27,6 +27,7 @@ from polars_bigquery.core.plan import (
     validate_and_normalize_linear_plan,
 )
 from polars_bigquery.core.schema import has_bignumeric_dtype
+from polars_bigquery.core.types import BQType
 
 logger = logging.getLogger(__name__)
 
@@ -65,8 +66,30 @@ def _validate_max_row_restriction_bytes(max_bytes: Any) -> int:
     return max_bytes
 
 
-def _dtype_fallback_rank(dtype: pl.DataType) -> int:
+_BQ_TYPE_FALLBACK_RANK: dict[BQType, int] = {
+    BQType.BOOL: 0,
+    BQType.DATE: 3,
+    BQType.INT64: 4,
+    BQType.FLOAT64: 4,
+    BQType.TIME: 4,
+    BQType.DATETIME: 4,
+    BQType.TIMESTAMP: 4,
+    BQType.NUMERIC: 5,
+    BQType.STRING: 6,
+    BQType.BYTES: 6,
+    BQType.JSON: 6,
+    BQType.GEOGRAPHY: 6,
+    BQType.ARRAY: 7,
+    BQType.STRUCT: 7,
+}
+
+
+def _dtype_fallback_rank(dtype: pl.DataType, bq_type: BQType | None = None) -> int:
     """Return a cost/safety priority rank (lower is preferred) for a 0-column fallback."""
+    if bq_type is not None:
+        return _BQ_TYPE_FALLBACK_RANK[bq_type]
+    if isinstance(dtype, pl.BaseExtension):
+        return _dtype_fallback_rank(dtype.ext_storage())
     if isinstance(dtype, pl.Boolean):
         return 0
     if isinstance(dtype, (pl.Int8, pl.UInt8)):
@@ -80,7 +103,7 @@ def _dtype_fallback_rank(dtype: pl.DataType) -> int:
     if isinstance(dtype, (pl.Int128, pl.UInt128)):
         return 5
     if isinstance(dtype, pl.Decimal):
-        return 5 if dtype.precision <= 38 else 8
+        return 5 if (dtype.precision is not None and dtype.precision <= 38) else 8
     if isinstance(dtype, (pl.Duration, pl.Null, pl.Unknown, pl.Object)):
         return 8
     if dtype.is_nested():
@@ -88,7 +111,10 @@ def _dtype_fallback_rank(dtype: pl.DataType) -> int:
     return 6
 
 
-def _select_zero_column_fallback(schema: pl.Schema) -> str:
+def _select_zero_column_fallback(
+    schema: pl.Schema,
+    bq_types: Mapping[str, BQType] | None = None,
+) -> str:
     """Select the single narrowest safe column to request for a 0-column read."""
     physical_columns = [
         (idx, name, dtype)
@@ -98,7 +124,13 @@ def _select_zero_column_fallback(schema: pl.Schema) -> str:
     if physical_columns:
         _, best_name, _ = min(
             physical_columns,
-            key=lambda item: (_dtype_fallback_rank(item[2]), item[0]),
+            key=lambda item: (
+                _dtype_fallback_rank(
+                    item[2],
+                    bq_type=bq_types.get(item[1]) if bq_types is not None else None,
+                ),
+                item[0],
+            ),
         )
         return best_name
     for name in schema:
@@ -174,7 +206,9 @@ def compile_read_api_plan(
     ]
     selected_fields = tuple(dict.fromkeys([*output_cols, *filter_cols]))
     if not selected_fields:
-        selected_fields = (_select_zero_column_fallback(source.schema),)
+        selected_fields = (
+            _select_zero_column_fallback(source.schema, source.bq_types),
+        )
 
     conjuncts: list[str] = []
     for op in normalized_ops:
