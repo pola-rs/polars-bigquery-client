@@ -40,12 +40,16 @@ class IsNull(UnaryExpr):
 
 @dataclasses.dataclass(frozen=True)
 class IsNotNull(UnaryExpr):
-    """IR node representing an IS NOT NULL check."""
+    """IR node representing an IS NOT NULL check.
 
+    In addition to `Expr.is_not_null()`, Polars lowers `LazyFrame.drop_nulls()`
+    (outside of a `.filter()`) into `is_not_null()` predicate checks, which are
+    pushed down to BigQuery using this IR node.
 
-@dataclasses.dataclass(frozen=True)
-class DropNulls(UnaryExpr):
-    """IR node representing a Polars `Expr.drop_nulls()` operation."""
+    By contrast, `Expr.drop_nulls()` (`pl.col(...).drop_nulls()`) shrinks a
+    `Series` length and broadcasts length-1 results across null rows, so it
+    intentionally has no IR node and degrades to `Unsupported`.
+    """
 
 
 @dataclasses.dataclass(frozen=True)

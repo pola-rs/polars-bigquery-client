@@ -788,7 +788,6 @@ def test_json_path_parser_registration_and_dispatch() -> None:
         "$.Function.function.Boolean.IsFinite",
         "$.Function.function.Boolean.IsIn",
         "$.Function.function.Coalesce",
-        "$.Function.function.DropNulls",
         "$.Function.function.FillNull",
         "$.Function.function.FillNullWithStrategy",
         "$.Function.function.StringExpr.Uppercase",
@@ -805,6 +804,8 @@ def test_json_path_parser_registration_and_dispatch() -> None:
         "$.Ternary",
     }
     assert expected_paths.issubset(compiler.parser.PARSERS.keys())
+    # `Expr.drop_nulls()` is intentionally unregistered so it parses as `Unsupported`.
+    assert "$.Function.function.DropNulls" not in compiler.parser.PARSERS
 
     # Unmatched JSON paths dispatch to an Unsupported IR leaf record
     assert compiler.parser.dispatch_parser({"UnknownNode": 123}) == (
@@ -3361,59 +3362,68 @@ def test_is_null_and_is_not_null_unsupported_and_degraded_cases(
 @pytest.mark.parametrize(
     ("expr", "expected_sql"),
     [
+        # `drop_nulls()` changes series length and can broadcast length-1 arrays
+        # or raise ShapeError inside Polars `.filter()`, so hoisting `IS NOT NULL`
+        # violates the row-restriction superset invariant. Standalone clauses fall
+        # back to Polars (`""`), while valid `&` siblings are still pushed down.
         pytest.param(
             pl.col("flag").drop_nulls(),
-            "(`flag` AND (`flag` IS NOT NULL))",
+            "",
             id="top_level_boolean_drop_nulls",
         ),
         pytest.param(
             pl.col("a").drop_nulls() == 1,
-            "((`a` = 1) AND (`a` IS NOT NULL))",
+            "",
             id="drop_nulls_in_equality_comparison",
         ),
         pytest.param(
             pl.col("a").str.to_lowercase().drop_nulls() == "abc",
-            "((LOWER(`a`) = 'abc') AND (LOWER(`a`) IS NOT NULL))",
+            "",
             id="drop_nulls_on_string_function",
         ),
         pytest.param(
             pl.col("a").drop_nulls().str.to_lowercase() == "abc",
-            "((LOWER(`a`) = 'abc') AND (`a` IS NOT NULL))",
+            "",
             id="string_function_on_drop_nulls",
         ),
         pytest.param(
             pl.col("a").drop_nulls().str.to_lowercase().drop_nulls() == "abc",
-            "((LOWER(`a`) = 'abc') AND (LOWER(`a`) IS NOT NULL) AND (`a` IS NOT NULL))",
+            "",
             id="nested_drop_nulls_chain",
         ),
         pytest.param(
             (pl.col("a").drop_nulls() == 1) & (pl.col("b").drop_nulls() == 2),
-            "((`a` = 1) AND (`b` = 2) AND (`a` IS NOT NULL) AND (`b` IS NOT NULL))",
+            "",
             id="multiple_drop_nulls_in_conjunction",
         ),
         pytest.param(
+            (pl.col("a").drop_nulls() > 5) & (pl.col("c") == 1),
+            "(`c` = 1)",
+            id="drop_nulls_in_conjunction_preserves_valid_sibling",
+        ),
+        pytest.param(
             (pl.col("a").drop_nulls() > 5) & (unsupported(pl.col("c")) == 1),
-            "((`a` > 5) AND (`a` IS NOT NULL))",
+            "",
             id="drop_nulls_in_conjunction_with_unsupported_sibling",
         ),
         pytest.param(
             pl.col("a").drop_nulls() == unsupported(pl.col("b")),
-            "(`a` IS NOT NULL)",
-            id="drop_nulls_with_unsupported_comparison_sibling_pushes_down_is_not_null",
+            "",
+            id="drop_nulls_with_unsupported_comparison_sibling_falls_back",
         ),
         pytest.param(
-            ~((pl.col("a").drop_nulls() == 1) | (unsupported(pl.col("b")) == 2)),
-            "((NOT (`a` = 1)) AND (`a` IS NOT NULL))",
-            id="drop_nulls_in_de_morgan_with_unsupported_sibling",
+            ~((pl.col("a").drop_nulls() == 1) | (pl.col("b") == 2)),
+            "(NOT (`b` = 2))",
+            id="drop_nulls_in_de_morgan_preserves_valid_sibling",
         ),
         pytest.param(
             (~((pl.col("a") == 1) | (pl.col("b") == 2))).drop_nulls(),
-            "((NOT (`a` = 1)) AND (NOT (`b` = 2)) AND (((NOT (`a` = 1)) AND (NOT (`b` = 2))) IS NOT NULL))",
+            "",
             id="de_morgan_rewrite_inside_drop_nulls",
         ),
         pytest.param(
             pl.when(pl.col("a") == 1).then(pl.col("b") == 2).drop_nulls(),
-            "((`a` = 1) AND (`b` = 2) AND (IF((`a` = 1), (`b` = 2), NULL) IS NOT NULL))",
+            "",
             id="when_without_otherwise_inside_drop_nulls",
         ),
     ],
@@ -3487,24 +3497,6 @@ def test_drop_nulls_unsupported_and_degraded_cases(
     ("parser_fn", "spec", "expr_json"),
     [
         pytest.param(
-            compiler.parser.boolean.parse_drop_nulls,
-            {"unexpected": True},
-            {"input": [{"Column": "a"}]},
-            id="drop_nulls_parameterized_spec",
-        ),
-        pytest.param(
-            compiler.parser.boolean.parse_drop_nulls,
-            "DropNulls",
-            {"input": []},
-            id="drop_nulls_empty_inputs",
-        ),
-        pytest.param(
-            compiler.parser.boolean.parse_drop_nulls,
-            "DropNulls",
-            {"input": [{"Column": "a"}, {"Column": "b"}]},
-            id="drop_nulls_too_many_inputs",
-        ),
-        pytest.param(
             compiler.parser.boolean.parse_is_null,
             {"unexpected": True},
             {"input": [{"Column": "a"}]},
@@ -3518,7 +3510,7 @@ def test_drop_nulls_unsupported_and_degraded_cases(
         ),
     ],
 )
-def test_parse_drop_nulls_and_null_checks_reject_invalid_inputs(
+def test_parse_null_checks_reject_invalid_inputs(
     parser_fn: Any,
     spec: Any,
     expr_json: Any,
@@ -3528,51 +3520,6 @@ def test_parse_drop_nulls_and_null_checks_reject_invalid_inputs(
 
     # Assert
     assert actual == compiler.parser.base.UNSUPPORTED_RECORD
-
-
-@pytest.mark.parametrize(
-    ("root", "expected"),
-    [
-        pytest.param(
-            compiler.ir.Column("a"),
-            compiler.ir.Column("a"),
-            id="no_drop_nulls_returns_unchanged_root",
-        ),
-        pytest.param(
-            compiler.ir.Eq(
-                left=compiler.ir.DropNulls(expr=compiler.ir.Column("a")),
-                right=compiler.ir.IntLiteral(1),
-            ),
-            compiler.ir.And(
-                left=compiler.ir.Eq(
-                    left=compiler.ir.Column("a"),
-                    right=compiler.ir.IntLiteral(1),
-                ),
-                right=compiler.ir.IsNotNull(expr=compiler.ir.Column("a")),
-            ),
-            id="single_drop_nulls_conjoins_is_not_null_at_root",
-        ),
-        pytest.param(
-            compiler.ir.DropNulls(
-                expr=compiler.ir.And(
-                    left=compiler.ir.Column("a"),
-                    right=compiler.ir.Unsupported(),
-                )
-            ),
-            compiler.ir.Unsupported(),
-            id="drop_nulls_with_unsupported_descendant_rewrites_to_unsupported",
-        ),
-    ],
-)
-def test_rewrite_drop_nulls(
-    root: compiler.ir.Expr,
-    expected: compiler.ir.Expr,
-) -> None:
-    # Arrange & Act
-    actual = compiler.rewriter.boolean.rewrite_drop_nulls(root)
-
-    # Assert
-    assert actual == expected
 
 
 @pytest.mark.parametrize(
@@ -3689,10 +3636,9 @@ def test_compile_predicate_structured_conjuncts_and_exactness() -> None:
     assert res_dm.conjuncts == ("(NOT (`a` = 1))", "(NOT (`b` = 2))")
     assert res_dm.is_exact is True
 
-    # Conjuncts introduced by rewrite_drop_nulls
+    # DropNulls is unregistered and parses directly to Unsupported (length-1 broadcast safety)
     res_dn = compiler.compile_predicate((pl.col("a") > 1).drop_nulls())
-    assert res_dn.is_exact is True
-    assert len(res_dn.conjuncts) == 2
+    assert res_dn == compiler.CompiledPredicate(conjuncts=(), is_exact=False)
 
     # Trivial TRUE conjunct omitted while keeping is_exact=True
     res_true = compiler.compile_predicate(pl.lit(True))
@@ -3792,3 +3738,46 @@ def test_column_to_sql_identifier_rejects_control_and_line_break_whitespace(
 def test_column_to_sql_identifier_allows_unicode_space_separators() -> None:
     assert compiler.sql.column_to_sql_identifier("first name") == "`first name`"
     assert compiler.sql.column_to_sql_identifier("a\u3000b") == "`a\u3000b`"
+
+
+def test_drop_nulls_broadcast_superset_differential_regression() -> None:
+    """Verify drop_nulls() broadcasts length-1 arrays in Polars and falls back safely."""
+    df_bool = pl.DataFrame({"flag": [None, True, None]})
+    expr_bool_drop_nulls = pl.col("flag").drop_nulls()
+    assert df_bool.filter(expr_bool_drop_nulls).height == 3
+    assert compiler.predicate_to_row_restriction(expr_bool_drop_nulls) == ""
+
+    # 0 or >= 2 non-null values alongside nulls raise ShapeError in Polars.
+    df_all_null = pl.DataFrame({"flag": [None, None]}, schema={"flag": pl.Boolean()})
+    with pytest.raises(pl.exceptions.ShapeError):
+        df_all_null.filter(expr_bool_drop_nulls)
+
+    df_two_non_null = pl.DataFrame({"flag": [None, True, False]})
+    with pytest.raises(pl.exceptions.ShapeError):
+        df_two_non_null.filter(expr_bool_drop_nulls)
+
+    df = pl.DataFrame({"flag": [True, False], "s": [None, "a"]})
+    # When `s` has 1 non-null value, `s.drop_nulls()` has length 1 and Polars broadcasts
+    # it across ALL rows, keeping the row where `s` IS NULL!
+    expr_broadcast_eq = pl.col("s").drop_nulls() == "a"
+    assert df.filter(expr_broadcast_eq).height == 2
+    assert compiler.predicate_to_row_restriction(expr_broadcast_eq) == ""
+
+    expr_broadcast_or = pl.col("flag") | (pl.col("s").drop_nulls() == "b")
+    kept = df.filter(expr_broadcast_or)
+    assert kept["flag"].to_list() == [True]
+    assert kept["s"].to_list() == [None]
+    assert compiler.predicate_to_row_restriction(expr_broadcast_or) == ""
+
+    # Conjunction preserves valid sibling while dropping drop_nulls branch.
+    expr_compound = (pl.col("s").drop_nulls() == "a") & pl.col("flag")
+    assert compiler.predicate_to_row_restriction(expr_compound) == "`flag`"
+
+    # Contrast: `LazyFrame.drop_nulls()` / `is_not_null()` checks rows individually
+    # and pushes down as `IS NOT NULL`.
+    assert df_bool.drop_nulls(subset=["flag"]).height == 1
+    assert df_bool.filter(pl.col("flag").is_not_null()).height == 1
+    assert (
+        compiler.predicate_to_row_restriction(pl.col("flag").is_not_null())
+        == "(`flag` IS NOT NULL)"
+    )

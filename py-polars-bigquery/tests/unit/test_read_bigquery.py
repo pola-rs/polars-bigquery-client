@@ -735,6 +735,110 @@ def test_client_scan_bigquery_with_polars_schema_pushes_down_projection_and_filt
         assert df.equals(pl.DataFrame({"visible": ["b"]}))
 
 
+def test_client_scan_table_drop_nulls_pushes_down_is_not_null(mock_arrow_client):
+    mock_arrow_client.read_table.return_value = MagicMock()
+
+    with patch("polars.scan_arrow_c_stream") as mock_scan:
+        mock_scan.return_value = pl.LazyFrame(
+            {"id": [1, 2, None], "flag": [None, True, False]}
+        )
+        client = Client(quota_project_id="q")
+        schema = pl.Schema({"id": pl.Int64(), "flag": pl.Boolean()})
+
+        # `lf.drop_nulls()` is lowered by Polars to `is_not_null()` conjuncts.
+        result_all = (
+            client.scan_table(table="p.d.t", schema=schema).drop_nulls().collect()
+        )
+        assert mock_arrow_client.read_table.call_args.kwargs == {
+            "maintain_order": False,
+            "selected_fields": ["id", "flag"],
+            "row_restriction": "((`flag` IS NOT NULL) AND (`id` IS NOT NULL))",
+        }
+        assert result_all.to_dict(as_series=False) == {"id": [2], "flag": [True]}
+
+        mock_arrow_client.read_table.reset_mock()
+        mock_scan.return_value = pl.LazyFrame(
+            {"id": [1, 2, 3], "flag": [None, True, None]}
+        )
+
+        # `lf.drop_nulls(subset=[...])` pushes down only that column's `IS NOT NULL`.
+        result_subset = (
+            client.scan_table(table="p.d.t", schema=schema)
+            .drop_nulls(subset=["flag"])
+            .collect()
+        )
+        assert mock_arrow_client.read_table.call_args.kwargs == {
+            "maintain_order": False,
+            "selected_fields": ["id", "flag"],
+            "row_restriction": "(`flag` IS NOT NULL)",
+        }
+        assert result_subset.to_dict(as_series=False) == {"id": [2], "flag": [True]}
+
+
+def test_client_scan_table_expr_drop_nulls_in_filter_not_pushed_down(mock_arrow_client):
+    mock_arrow_client.read_table.return_value = MagicMock()
+    client = Client(quota_project_id="q")
+    schema = pl.Schema({"id": pl.Int64(), "flag": pl.Boolean()})
+
+    # Single non-null value broadcasts across all rows including nulls.
+    with patch(
+        "polars.scan_arrow_c_stream",
+        return_value=pl.LazyFrame({"id": [1, 2, 3], "flag": [None, True, None]}),
+    ):
+        result = (
+            client.scan_table(table="p.d.t", schema=schema)
+            .filter(pl.col("flag").drop_nulls())
+            .collect()
+        )
+    assert mock_arrow_client.read_table.call_args.kwargs["row_restriction"] == ""
+    assert result.to_dict(as_series=False) == {
+        "id": [1, 2, 3],
+        "flag": [None, True, None],
+    }
+
+    # Multiple non-null values alongside a null raise ShapeError in Polars.
+    mock_arrow_client.read_table.reset_mock()
+    with (
+        patch(
+            "polars.scan_arrow_c_stream",
+            return_value=pl.LazyFrame({"id": [1, 2, 3], "flag": [None, True, False]}),
+        ),
+        pytest.raises(pl.exceptions.ShapeError),
+    ):
+        (
+            client.scan_table(table="p.d.t", schema=schema)
+            .filter(pl.col("flag").drop_nulls())
+            .collect()
+        )
+    assert mock_arrow_client.read_table.call_args.kwargs["row_restriction"] == ""
+
+
+def test_client_scan_query_drop_nulls_pushes_down_is_not_null(mock_arrow_client):
+    mock_arrow_client.read_query.return_value = MagicMock(name="arrow_stream")
+    source_frame = pl.LazyFrame({"id": [1, 2, 3], "flag": [None, True, None]})
+
+    with patch("polars.scan_arrow_c_stream", return_value=source_frame):
+        client = Client(quota_project_id="q")
+        lf = client.scan_query(
+            "SELECT id, flag FROM `p.d.t`",
+            schema={"id": pl.Int64(), "flag": pl.Boolean()},
+            maintain_order=False,
+        )
+        result = lf.drop_nulls(subset=["flag"]).collect()
+
+    mock_arrow_client.read_query.assert_called_once_with(
+        "SELECT id, flag FROM `p.d.t`\n"
+        "|> WHERE (`flag` IS NOT NULL)\n"
+        "|> SELECT `id`, `flag`",
+        arrow_buffer_compression="lz4frame",
+        dry_run=False,
+        maintain_order=False,
+        use_query_cache=None,
+        maximum_bytes_billed=None,
+    )
+    assert result.to_dict(as_series=False) == {"id": [2], "flag": [True]}
+
+
 def test_client_scan_bigquery_handles_bigquery_objects(mock_arrow_client):
     mock_stream = MagicMock()
     mock_arrow_client.read_table.return_value = mock_stream
