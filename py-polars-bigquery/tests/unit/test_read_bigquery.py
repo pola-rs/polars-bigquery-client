@@ -1865,3 +1865,24 @@ def test_client_maximum_bytes_billed_wire_serialization():
     assert captured_bodies[1].get("dryRun") is True
     assert captured_bodies[2].get("maximumBytesBilled") == "500000"
     assert not captured_bodies[2].get("dryRun")
+
+
+def test_unsupported_type_error_export_and_hierarchy():
+    from arrow_bigquery import UnsupportedTypeError as TopLevelArrowUnsupported
+    from arrow_bigquery import _native
+    from arrow_bigquery.exceptions import UnsupportedTypeError as ArrowUnsupported
+    from polars_bigquery.exceptions import UnsupportedTypeError
+
+    assert UnsupportedTypeError is ArrowUnsupported
+    assert UnsupportedTypeError is TopLevelArrowUnsupported
+    assert UnsupportedTypeError is _native.UnsupportedTypeError
+    assert issubclass(UnsupportedTypeError, BigQueryError)
+    assert issubclass(UnsupportedTypeError, RuntimeError)
+
+    # The Rust-only `validate_ffi_types` knob must not be exposed on the Python FFI surface.
+    with pytest.raises(TypeError):
+        arrow_bigquery.Client(
+            quota_project_id="test-proj",
+            credentials_provider=lambda: ({"bearer_token": "tok"}, None),
+            validate_ffi_types=False,  # type: ignore[call-arg]
+        )

@@ -4,6 +4,7 @@ use google_cloud_gax::retry_throttler::{
     AdaptiveThrottler, RetryThrottlerArg, SharedRetryThrottler,
 };
 
+use crate::decode::SchemaDecodeOptions;
 use crate::{BigQueryError, BigQueryJobService, Client};
 
 static INIT_CRYPTO: std::sync::Once = std::sync::Once::new();
@@ -26,6 +27,7 @@ pub struct ServiceConfigBuilder {
     bqstorage_endpoint: Option<String>,
     user_agent: Option<String>,
     quota_project_id: Option<String>,
+    schema_decode_options: SchemaDecodeOptions,
 }
 
 impl ServiceConfigBuilder {
@@ -55,6 +57,21 @@ impl ServiceConfigBuilder {
 
     pub fn with_quota_project_id(mut self, quota_project_id: Option<String>) -> Self {
         self.quota_project_id = quota_project_id;
+        self
+    }
+
+    /// Configures whether decoded Arrow schemas reject types unsupported by the
+    /// `polars-arrow` C Data Interface FFI layer (`Interval(MonthDayNano)`,
+    /// mismatched `Time32`/`Time64` units, empty `Union`, and interior NUL bytes
+    /// in field names or timestamp timezones).
+    ///
+    /// Defaults to `true`. Pure-Rust consumers that decode `RecordBatch` values
+    /// directly without exporting over the Arrow C Data Interface may disable this.
+    /// Note that types `polars-arrow`'s IPC decoder cannot read at all
+    /// (`Decimal256`, `Interval(DayTime)`, `Interval(MonthDayMillis)`, and
+    /// `Unknown`) are still rejected unconditionally.
+    pub fn with_validate_ffi_types(mut self, validate: bool) -> Self {
+        self.schema_decode_options.validate_ffi_types = validate;
         self
     }
 
@@ -96,12 +113,13 @@ impl ServiceConfigBuilder {
         let bq_client = bq_builder.build().await?;
         let read_client = read_builder.build().await?;
 
-        Ok(Client::from_parts(
+        Ok(Client::from_parts_with_options(
             bq_client,
             read_client,
             quota_project_id,
             self.user_agent,
             read_retry_throttler,
+            self.schema_decode_options,
         ))
     }
 }
@@ -118,6 +136,7 @@ mod tests {
         assert!(builder.bqstorage_endpoint.is_none());
         assert!(builder.user_agent.is_none());
         assert!(builder.quota_project_id.is_none());
+        assert!(builder.schema_decode_options.validate_ffi_types);
     }
 
     #[test]
@@ -128,7 +147,8 @@ mod tests {
             .with_bq_endpoint("https://custom.bq.endpoint.com")
             .with_bqstorage_endpoint("https://custom.bqstorage.endpoint.com")
             .with_user_agent(Some("custom-agent/1.0".to_string()))
-            .with_quota_project_id(Some("custom-project".to_string()));
+            .with_quota_project_id(Some("custom-project".to_string()))
+            .with_validate_ffi_types(false);
 
         assert!(builder.cred.is_some());
         assert_eq!(
@@ -141,6 +161,26 @@ mod tests {
         );
         assert_eq!(builder.user_agent.as_deref(), Some("custom-agent/1.0"));
         assert_eq!(builder.quota_project_id.as_deref(), Some("custom-project"));
+        assert!(!builder.schema_decode_options.validate_ffi_types);
+    }
+
+    #[tokio::test]
+    async fn test_service_config_builder_build_preserves_decode_options() {
+        let cred = google_cloud_auth::credentials::anonymous::Builder::new().build();
+        let client = ServiceConfigBuilder::new()
+            .with_cred(cred)
+            .with_quota_project_id(Some("custom-project".to_string()))
+            .with_validate_ffi_types(false)
+            .build()
+            .await
+            .expect("should build client");
+
+        assert_eq!(
+            client.schema_decode_options(),
+            SchemaDecodeOptions {
+                validate_ffi_types: false,
+            }
+        );
     }
 
     #[tokio::test]
