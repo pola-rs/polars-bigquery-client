@@ -888,13 +888,63 @@ def test_client_scan_ingestion_time_partitioned_table(mock_arrow_client):
         assert df_compound["val"].to_list() == [20]
 
 
-def test_client_context_manager_closes_rest_session(mock_arrow_client):
+def test_client_context_manager_closes_rest_and_arrow_clients(mock_arrow_client):
+    client = Client(quota_project_id="q")
+    assert not client.closed
     with patch.object(
-        Client, "close", wraps=Client(quota_project_id="q").close
-    ) as mock_close:
-        with Client(quota_project_id="q") as client:
+        client._rest_client, "close", wraps=client._rest_client.close
+    ) as mock_rest_close:
+        with client as ctx_client:
+            assert ctx_client is client
             assert client.quota_project_id == "q"
-        mock_close.assert_called_once()
+            assert not client.closed
+        mock_rest_close.assert_called_once_with()
+    mock_arrow_client.close.assert_called_once_with()
+    assert client.closed
+
+    # Calling close() repeatedly is idempotent and leaves client closed.
+    client.close()
+    assert client.closed
+    mock_arrow_client.close.assert_called_once_with()
+
+    # Any use after closing raises RuntimeError.
+    with pytest.raises(RuntimeError, match="closed"), client:
+        pass
+    with pytest.raises(RuntimeError, match="closed"):
+        client.read_table("p.d.t")
+    with pytest.raises(RuntimeError, match="closed"):
+        client.read_query("SELECT 1")
+    with pytest.raises(RuntimeError, match="closed"):
+        client.scan_table("p.d.t", schema={"id": pl.Int64()})
+    with pytest.raises(RuntimeError, match="closed"):
+        client.scan_query("SELECT 1", schema={"id": pl.Int64()})
+
+
+def test_client_close_closes_arrow_client_even_if_rest_close_fails(mock_arrow_client):
+    client = Client(quota_project_id="q")
+    with (
+        patch.object(
+            client._rest_client, "close", side_effect=OSError("socket close failed")
+        ),
+        pytest.raises(OSError, match="socket close failed"),
+    ):
+        client.close()
+    assert client.closed
+    mock_arrow_client.close.assert_called_once_with()
+
+
+def test_client_close_invalidates_pending_lazy_scan(mock_arrow_client):
+    client = Client(quota_project_id="q")
+    lf_table = client.scan_table("my-project.my_dataset.tbl", schema={"id": pl.Int64()})
+    lf_query = client.scan_query("SELECT 1 AS id", schema={"id": pl.Int64()})
+    client.close()
+
+    with pytest.raises(RuntimeError, match="closed"):
+        lf_table.collect()
+    with pytest.raises(RuntimeError, match="closed"):
+        lf_query.collect()
+    mock_arrow_client.read_table.assert_not_called()
+    mock_arrow_client.read_query.assert_not_called()
 
 
 def test_client_read_query_dry_run_returns_polars_dataframe():
@@ -967,6 +1017,76 @@ def test_client_read_query_dry_run_returns_polars_dataframe():
     assert df["totalBytesProcessed"].to_list() == [128]
     assert df["cacheHit"].to_list() == [True]
     assert df["statementType"].to_list() == ["SELECT"]
+
+
+@pytest.mark.parametrize("dry_run", [False, True])
+def test_client_read_query_invalid_sql_raises_polars_bigquery_error(dry_run):
+    import json
+    import threading
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self):
+            length = int(self.headers.get("Content-Length", "0"))
+            _ = self.rfile.read(length)
+            payload = json.dumps(
+                {
+                    "error": {
+                        "code": 400,
+                        "message": 'Syntax error: Unexpected identifier "BROKEN"',
+                        "status": "INVALID_ARGUMENT",
+                    }
+                }
+            ).encode("utf-8")
+            self.send_response(400)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+        def log_message(self, format, *args):
+            pass
+
+    server = HTTPServer(("127.0.0.1", 0), Handler)
+    server.timeout = 2.0
+    port = server.server_port
+    server_thread = threading.Thread(target=server.handle_request, daemon=True)
+    server_thread.start()
+
+    try:
+
+        def creds():
+            return ({"bearer_token": "fake-tok"}, None)
+
+        with Client(quota_project_id="test-proj", credentials_provider=creds) as client:
+            client._arrow_client = arrow_bigquery.Client(
+                quota_project_id="test-proj",
+                credentials_provider=creds,
+                bq_endpoint=f"http://127.0.0.1:{port}",
+            )
+            with pytest.raises(BigQueryError, match="Syntax error"):
+                client.read_query("SELECT BROKEN", dry_run=dry_run)
+    finally:
+        server_thread.join(timeout=2.0)
+        server.server_close()
+
+
+def test_client_init_closes_rest_session_when_arrow_client_fails():
+    with (
+        patch(
+            "polars_bigquery.core.bigquery_rest.BigQueryRestClient",
+        ) as mock_rest_cls,
+        patch(
+            "arrow_bigquery.Client",
+            side_effect=ValueError("quota_project_id is required"),
+        ),
+        pytest.raises(ValueError, match="quota_project_id"),
+    ):
+        Client(quota_project_id="")
+
+    # Because the REST client session is lazily allocated on first `scan_table`
+    # metadata fetch, a failed `arrow_bigquery.Client()` leaves no session open.
+    mock_rest_cls.assert_not_called()
 
 
 @pytest.mark.parametrize("bad_codec", ["snappy", "gzip", 123, ["lz4frame"], None])
