@@ -98,29 +98,30 @@ The following Polars data types are supported as scalar literals in comparisons 
 
 When [`Client.scan_table`][polars_bigquery.Client.scan_table] inspects a BigQuery table's REST metadata, or when [`Client.scan_query`][polars_bigquery.Client.scan_query] runs a dry-run query for schema discovery (and when passing an explicit `schema` to either method), BigQuery column types correspond to the following Polars data types:
 
-| BigQuery Type | Polars Data Type |
-| --- | --- |
-| `BOOL` / `BOOLEAN` | `pl.Boolean` |
-| `INT64` / `INTEGER` | `pl.Int64` |
-| `FLOAT64` / `FLOAT` | `pl.Float64` |
-| `NUMERIC` / `DECIMAL` | `pl.Decimal(precision=38, scale=9)` |
-| `BIGNUMERIC` / `BIGDECIMAL` | `pl.Decimal(precision=76, scale=38)` |
-| `STRING` | `pl.String` |
-| `BYTES` | `pl.Binary` |
-| `DATE` | `pl.Date` |
-| `DATETIME` | `pl.Datetime(time_unit="us", time_zone=None)` |
-| `TIME` | `pl.Time` |
-| `TIMESTAMP` | `pl.Datetime(time_unit="us", time_zone="utc")` |
-| `INTERVAL` | `pl.Duration(time_unit="us")` |
-| `JSON` | `pl.String` |
-| `GEOGRAPHY` | `pl.String` |
-| `STRUCT` / `RECORD` | `pl.Struct(...)` |
-| `ARRAY` (`mode="REPEATED"`) | `pl.List(...)` |
+| BigQuery Type | Polars Data Type | Notes |
+| --- | --- | --- |
+| `BOOL` / `BOOLEAN` | `pl.Boolean` | |
+| `INT64` / `INTEGER` | `pl.Int64` | |
+| `FLOAT64` / `FLOAT` | `pl.Float64` | |
+| `NUMERIC` / `DECIMAL` | `pl.Decimal(precision=38, scale=9)` | Parameterized `NUMERIC(P, S)` tracked in [#128](https://github.com/pola-rs/polars-bigquery-client/issues/128). |
+| `STRING` | `pl.String` | |
+| `BYTES` | `pl.Binary` | |
+| `DATE` | `pl.Date` | |
+| `DATETIME` | `pl.Datetime(time_unit="us", time_zone=None)` | |
+| `TIME` | `pl.Time` | |
+| `TIMESTAMP` | `pl.Datetime(time_unit="us", time_zone="UTC")` | Microsecond precision (`timestampPrecision` `6`, `"6"`, or unset). Non-microsecond `TIMESTAMP` is unsupported. |
+| `JSON` | `polars_bigquery.dtypes.JSON` (`pl.Extension("google:sqlType:json", pl.String())`) | Resolves to a registered `BaseExtension` or `pl.String` when loaded as storage. |
+| `GEOGRAPHY` | `polars_bigquery.dtypes.GEOGRAPHY` (`pl.Extension("google:sqlType:geography", pl.String(), '{"encoding": "WKT"}')`) | Resolves to a registered `BaseExtension` or `pl.String` when loaded as storage. |
+| `ARRAY<JSON>` | `pl.Extension("google:sqlType:json", pl.List(pl.String()))` | Extension tag wraps the outer `List` field (not `pl.List(dtypes.JSON)`). |
+| `ARRAY<GEOGRAPHY>` | `pl.Extension("google:sqlType:geography", pl.List(pl.String()), '{"encoding": "WKT"}')` | Extension tag wraps the outer `List` field. |
+| `ARRAY` (`mode="REPEATED"`) | `pl.List(...)` | Preserves field parameters across element recursion. |
+| `STRUCT` / `RECORD` | `pl.Struct(...)` | |
+| `BIGNUMERIC` / `BIGDECIMAL`, `INTERVAL`, `RANGE<T>`, non-microsecond `TIMESTAMP` | *(unsupported)* | Omitted with `UnsupportedTypeWarning` in `scan_table` (`UnsupportedTypeError` if no columns remain); raises `UnsupportedTypeError` in `scan_query`. |
 
-For **ingestion-time partitioned tables**, [`Client.scan_table`][polars_bigquery.Client.scan_table] (only — not `scan_query`) also exposes two pseudo-columns in the `LazyFrame` schema that can be used in `.filter()` predicates for partition pruning:
+For **ingestion-time partitioned tables** with at least one physical column, [`Client.scan_table`][polars_bigquery.Client.scan_table] (only — not `scan_query`) also exposes pseudo-columns in the `LazyFrame` schema that can be used in `.filter()` predicates for partition pruning:
 
-- `_PARTITIONDATE`: `pl.Date`
-- `_PARTITIONTIME`: `pl.Datetime(time_unit="us", time_zone="utc")`
+- `_PARTITIONDATE`: `pl.Date` (daily `DAY` ingestion-time partitioned tables only)
+- `_PARTITIONTIME`: `pl.Datetime(time_unit="us", time_zone="UTC")` (all ingestion-time partitioned tables)
 
 ---
 

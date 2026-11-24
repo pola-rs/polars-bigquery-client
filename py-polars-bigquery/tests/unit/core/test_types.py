@@ -11,6 +11,7 @@ from polars_bigquery.core.types import (
     BQType,
     build_extension_dtype,
     column_width_rank,
+    has_bignumeric_dtype,
     polars_datetime_time_unit,
     polars_dtype_to_bq_type,
 )
@@ -279,12 +280,50 @@ def test_build_extension_dtype_explicit_load_as_storage_and_env_warning(
     import polars_bigquery.core.types as types_mod
 
     monkeypatch.setattr(types_mod, "_INITIAL_UNKNOWN_EXTENSION_BEHAVIOR", None)
+    monkeypatch.setattr(types_mod, "_last_warned_env_drift", None)
     monkeypatch.setenv("POLARS_UNKNOWN_EXTENSION_TYPE_BEHAVIOR", "load_as_storage")
     with caplog.at_level("WARNING", logger=types_mod.__name__):
         assert build_extension_dtype(JSON_EXTENSION_NAME, pl.String()) == pl.Extension(
             JSON_EXTENSION_NAME, pl.String()
         )
+        # Subsequent calls with identical drift must be throttled (1 warning total).
+        assert build_extension_dtype(
+            GEOGRAPHY_EXTENSION_NAME, pl.String(), GEOGRAPHY_EXTENSION_METADATA
+        ) == pl.Extension(
+            GEOGRAPHY_EXTENSION_NAME, pl.String(), GEOGRAPHY_EXTENSION_METADATA
+        )
+    assert len(caplog.records) == 1
     assert "POLARS_UNKNOWN_EXTENSION_TYPE_BEHAVIOR" in caplog.text
+    assert JSON_EXTENSION_NAME in caplog.text
+    assert GEOGRAPHY_EXTENSION_NAME in caplog.text
+
+    # Restoring the initial value clears the latch; drifting again warns once.
+    caplog.clear()
+    monkeypatch.delenv("POLARS_UNKNOWN_EXTENSION_TYPE_BEHAVIOR", raising=False)
+    with caplog.at_level("WARNING", logger=types_mod.__name__):
+        assert build_extension_dtype(JSON_EXTENSION_NAME, pl.String()) == pl.Extension(
+            JSON_EXTENSION_NAME, pl.String()
+        )
+    assert caplog.records == []
+    assert types_mod._last_warned_env_drift is None
+
+    # Hot-path un-drifted calls must not acquire _WARNED_ENV_DRIFT_LOCK.
+    class _FailIfAcquiredLock:
+        def __enter__(self):
+            raise AssertionError("lock must not be acquired on un-drifted fast path")
+
+        def __exit__(self, *exc_info):
+            return None
+
+    with monkeypatch.context() as lock_mp:
+        lock_mp.setattr(types_mod, "_WARNED_ENV_DRIFT_LOCK", _FailIfAcquiredLock())
+        assert build_extension_dtype(JSON_EXTENSION_NAME, pl.String()) == pl.Extension(
+            JSON_EXTENSION_NAME, pl.String()
+        )
+    monkeypatch.setenv("POLARS_UNKNOWN_EXTENSION_TYPE_BEHAVIOR", "load_as_storage")
+    with caplog.at_level("WARNING", logger=types_mod.__name__):
+        build_extension_dtype(JSON_EXTENSION_NAME, pl.String())
+    assert len(caplog.records) == 1
 
     caplog.clear()
     monkeypatch.setattr(
@@ -293,6 +332,7 @@ def test_build_extension_dtype_explicit_load_as_storage_and_env_warning(
     monkeypatch.delenv("POLARS_UNKNOWN_EXTENSION_TYPE_BEHAVIOR", raising=False)
     with caplog.at_level("WARNING", logger=types_mod.__name__):
         assert build_extension_dtype(JSON_EXTENSION_NAME, pl.String()) == pl.String()
+    assert len(caplog.records) == 1
     assert "POLARS_UNKNOWN_EXTENSION_TYPE_BEHAVIOR" in caplog.text
 
 
@@ -430,18 +470,249 @@ def test_polars_datetime_time_unit(dtype, expected):
             ),
             6,
         ),
-        (pl.Duration("us"), 6),
-        (pl.Float16(), 6),
-        (pl.Decimal(76, 38), 6),
+        (pl.Duration("us"), 7),
+        (pl.Float16(), 7),
+        (pl.Decimal(76, 38), 7),
+        (pl.List(pl.Decimal(76, 38)), 7),
+        (pl.Struct({"x": pl.Decimal(76, 38)}), 7),
+        (pl.List(pl.Duration("us")), 7),
+        (pl.Struct({"x": pl.Duration("us")}), 7),
+        (pl.Extension(JSON_EXTENSION_NAME, pl.Decimal(76, 38)), 7),
+        (pl.Extension(JSON_EXTENSION_NAME, pl.List(pl.Decimal(76, 38))), 7),
+        # Invalid storage on BigQuery extension names MUST rank 7 (never unwrapped).
+        (pl.Extension(JSON_EXTENSION_NAME, pl.Boolean()), 7),
+        (pl.Extension(JSON_EXTENSION_NAME, pl.Int64()), 7),
+        (pl.Extension(JSON_EXTENSION_NAME, pl.List(pl.Int64())), 7),
+        (pl.Extension(GEOGRAPHY_EXTENSION_NAME, pl.Boolean()), 7),
+        (pl.Extension(GEOGRAPHY_EXTENSION_NAME, pl.Int64()), 7),
+        (pl.Extension(GEOGRAPHY_EXTENSION_NAME, pl.List(pl.Int64())), 7),
+        (pl.List(pl.Extension(JSON_EXTENSION_NAME, pl.Int64())), 7),
+        (pl.Struct({"x": pl.Extension(JSON_EXTENSION_NAME, pl.Boolean())}), 7),
+        (
+            pl.Extension(
+                "custom:outer",
+                pl.Extension(JSON_EXTENSION_NAME, pl.Boolean()),
+            ),
+            7,
+        ),
+        (
+            pl.Struct(
+                {
+                    "x": pl.Extension(
+                        "custom:outer",
+                        pl.Extension(GEOGRAPHY_EXTENSION_NAME, pl.Int64()),
+                    )
+                }
+            ),
+            7,
+        ),
+        # Valid BigQuery extensions wrapped by a custom outer extension keep BQ rank.
+        (
+            pl.Extension(
+                "custom:outer",
+                pl.Extension(JSON_EXTENSION_NAME, pl.String()),
+            ),
+            5,
+        ),
+        (
+            pl.Extension(
+                "custom:outer",
+                pl.Extension(JSON_EXTENSION_NAME, pl.List(pl.String())),
+            ),
+            6,
+        ),
+        (pl.Extension("custom:bn", pl.Decimal(76, 38)), 7),
+        (pl.Extension("custom:bool", pl.Boolean()), 1),
+        (pl.Extension("custom:bool_cls", pl.Boolean), 1),
+        (pl.Extension("custom:bin", pl.Binary()), 5),
+        # Uninstantiated DataTypeClass storage inside BigQuery/custom extensions.
+        (pl.Extension(JSON_EXTENSION_NAME, pl.String), 5),
+        (
+            pl.Extension(
+                GEOGRAPHY_EXTENSION_NAME, pl.String, GEOGRAPHY_EXTENSION_METADATA
+            ),
+            5,
+        ),
+        (pl.Extension(JSON_EXTENSION_NAME, pl.List(pl.String)), 6),
+        (
+            pl.Extension(
+                GEOGRAPHY_EXTENSION_NAME,
+                pl.List(pl.String),
+                GEOGRAPHY_EXTENSION_METADATA,
+            ),
+            6,
+        ),
+        (pl.Extension(JSON_EXTENSION_NAME, pl.Int64), 7),
+        (pl.Extension(JSON_EXTENSION_NAME, pl.List(pl.Int64)), 7),
+        (pl.Extension(JSON_EXTENSION_NAME, pl.List), 7),
+        (pl.List(pl.Extension(JSON_EXTENSION_NAME, pl.String)), 6),
+        (pl.Struct({"a": pl.Extension("custom:bool_cls", pl.Boolean)}), 6),
+        (pl.Struct({"a": pl.Extension("custom:dur_cls", pl.Duration)}), 7),
+        (
+            pl.Extension(
+                "custom:outer",
+                pl.Extension("custom:inner", pl.Boolean()),
+            ),
+            1,
+        ),
     ],
 )
 def test_column_width_rank(dtype, expected_rank):
     assert column_width_rank(dtype) == expected_rank
 
 
-def test_column_width_rank_prefers_authoritative_bq_type():
-    # Under Mode B storage loading, dtype alone might be pl.String(), while
-    # authoritative BQType controls the true rank.
+def test_column_width_rank_shared_struct_field_dtype_and_invalid_bq_extensions():
+    shared_int = pl.Int64()
+    shared_struct = pl.Struct([pl.Field("a", shared_int), pl.Field("b", shared_int)])
+    assert column_width_rank(shared_struct) == 6
+    assert column_width_rank(pl.Struct([])) == 6
+
+    assert (
+        polars_dtype_to_bq_type(pl.Extension(JSON_EXTENSION_NAME, pl.Decimal(76, 38)))
+        is None
+    )
+    assert (
+        polars_dtype_to_bq_type(pl.Extension(JSON_EXTENSION_NAME, pl.List(pl.Int64())))
+        is None
+    )
+    assert (
+        polars_dtype_to_bq_type(pl.Extension(GEOGRAPHY_EXTENSION_NAME, pl.Int64()))
+        is None
+    )
+    # Uninstantiated DataTypeClass storage/inner types match instantiated forms.
+    assert (
+        polars_dtype_to_bq_type(pl.Extension(JSON_EXTENSION_NAME, pl.String))
+        is BQType.JSON
+    )
+    assert (
+        polars_dtype_to_bq_type(
+            pl.Extension(
+                GEOGRAPHY_EXTENSION_NAME, pl.String, GEOGRAPHY_EXTENSION_METADATA
+            )
+        )
+        is BQType.GEOGRAPHY
+    )
+    assert (
+        polars_dtype_to_bq_type(pl.Extension(JSON_EXTENSION_NAME, pl.List(pl.String)))
+        is BQType.ARRAY
+    )
+    assert (
+        polars_dtype_to_bq_type(
+            pl.Extension(
+                GEOGRAPHY_EXTENSION_NAME,
+                pl.List(pl.String),
+                GEOGRAPHY_EXTENSION_METADATA,
+            )
+        )
+        is BQType.ARRAY
+    )
+    assert (
+        polars_dtype_to_bq_type(pl.Extension(JSON_EXTENSION_NAME, pl.List(pl.Int64)))
+        is None
+    )
+    assert polars_dtype_to_bq_type(pl.Extension(JSON_EXTENSION_NAME, pl.List)) is None
+
+
+def test_recursive_extension_cycles_raise_recursion_error():
+    class _SelfCycleExt(pl.BaseExtension):
+        def ext_storage(self):
+            return self
+
+    class _FreshWrapperCycleExt(pl.BaseExtension):
+        def ext_storage(self):
+            return _FreshWrapperCycleExt("custom:fresh", pl.String())
+
+    class _NonDtypeExt(pl.BaseExtension):
+        def ext_storage(self):
+            return "not-a-dtype"
+
+    self_cycle = _SelfCycleExt("custom:self", pl.String())
+    with pytest.raises(RecursionError):
+        has_bignumeric_dtype(self_cycle)
+    with pytest.raises(RecursionError):
+        column_width_rank(self_cycle)
+    with pytest.raises(RecursionError):
+        column_width_rank(pl.List(self_cycle))
+
+    fresh_cycle = _FreshWrapperCycleExt("custom:fresh", pl.String())
+    with pytest.raises(RecursionError):
+        has_bignumeric_dtype(fresh_cycle)
+    with pytest.raises(RecursionError):
+        column_width_rank(fresh_cycle)
+    with pytest.raises(RecursionError):
+        column_width_rank(pl.Struct({"x": fresh_cycle}))
+
+    mutated_cycle = pl.Extension("custom:mut", pl.String())
+    mutated_cycle._storage = mutated_cycle
+    with pytest.raises(RecursionError):
+        has_bignumeric_dtype(mutated_cycle)
+    with pytest.raises(RecursionError):
+        column_width_rank(mutated_cycle)
+
+    bad_ext = _NonDtypeExt("custom:bad", pl.String())
+    assert has_bignumeric_dtype(bad_ext) is False
+    assert column_width_rank(bad_ext) == 7
+    assert column_width_rank(pl.Struct({"x": bad_ext})) == 7
+
+
+def test_dtype_traversals_deep_and_chained_extensions():
+    class _ChainExt(pl.BaseExtension):
+        def __init__(self, remaining: int, target: pl.DataType | type[pl.DataType]):
+            self._rem = remaining
+            self._target = target
+            super().__init__("custom:chain", pl.Int64())
+
+        def ext_storage(self):
+            if self._rem > 0:
+                return _ChainExt(self._rem - 1, self._target)
+            return self._target
+
+    assert column_width_rank(_ChainExt(5, pl.Boolean)) == 1
+    assert column_width_rank(_ChainExt(5, pl.List(pl.String()))) == 6
+    assert column_width_rank(_ChainExt(5, pl.List(pl.Decimal(76, 38)))) == 7
+    assert has_bignumeric_dtype(_ChainExt(5, pl.Decimal(76, 38))) is True
+    assert has_bignumeric_dtype(_ChainExt(5, pl.Int64())) is False
+
+    # BigQuery maximum STRUCT nesting depth is 15; verify depth-15+ chains work.
+    deep_bn: pl.DataType = pl.Decimal(precision=76, scale=38)
+    deep_ok: pl.DataType = pl.Int64()
+    for _ in range(15):
+        deep_bn = pl.Struct([pl.Field("nested", deep_bn)])
+        deep_ok = pl.Struct([pl.Field("nested", deep_ok)])
+    assert has_bignumeric_dtype(deep_bn) is True
+    assert has_bignumeric_dtype(deep_ok) is False
+    assert column_width_rank(deep_bn) == 7
+    assert column_width_rank(deep_ok) == 6
+
+
+def test_has_bignumeric_dtype_nested():
+    bn = pl.Decimal(precision=76, scale=38)
+    num = pl.Decimal(precision=38, scale=9)
+    unparam = pl.Decimal(precision=38, scale=9)
+    unparam.precision = None  # type: ignore[misc]
+
+    assert has_bignumeric_dtype(bn) is True
+    assert has_bignumeric_dtype(pl.List(bn)) is True
+    assert has_bignumeric_dtype(pl.Array(bn, 2)) is True
+    assert has_bignumeric_dtype(pl.Struct([pl.Field("x", pl.List(bn))])) is True
+    assert has_bignumeric_dtype(pl.Extension("custom:bn", bn)) is True
+    assert has_bignumeric_dtype(pl.Extension(JSON_EXTENSION_NAME, bn)) is True
+    assert has_bignumeric_dtype(num) is False
+    assert has_bignumeric_dtype(unparam) is False
+    assert has_bignumeric_dtype(pl.Extension("custom:num", num)) is False
+    assert has_bignumeric_dtype(pl.List(num)) is False
+    assert has_bignumeric_dtype(pl.Struct([pl.Field("x", pl.Int64())])) is False
+    if hasattr(pl, "Map"):
+        assert has_bignumeric_dtype(pl.Map(pl.String(), bn)) is True
+        assert has_bignumeric_dtype(pl.Map(pl.String(), pl.Int64())) is False
+
+
+def test_column_width_rank_unparameterized_decimal_and_bq_type_override():
+    unparam_decimal = pl.Decimal(38, 9)
+    unparam_decimal.precision = None  # type: ignore[misc]
+    assert column_width_rank(unparam_decimal) == 7
+
+    # When authoritative bq_type is passed, it overrides dtype inference.
     assert column_width_rank(pl.String(), bq_type=BQType.ARRAY) == 6
     assert column_width_rank(pl.String(), bq_type=BQType.BOOL) == 1
     assert column_width_rank(pl.Int64(), bq_type=BQType.STRUCT) == 6

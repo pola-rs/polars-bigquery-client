@@ -5,6 +5,7 @@ from __future__ import annotations
 import enum
 import logging
 import os
+import threading
 from typing import Literal
 
 import polars as pl
@@ -15,6 +16,7 @@ logger = logging.getLogger(__name__)
 JSON_EXTENSION_NAME = "google:sqlType:json"
 GEOGRAPHY_EXTENSION_NAME = "google:sqlType:geography"
 GEOGRAPHY_EXTENSION_METADATA = '{"encoding": "WKT"}'
+_BIGQUERY_EXTENSION_NAMES = frozenset({JSON_EXTENSION_NAME, GEOGRAPHY_EXTENSION_NAME})
 
 # BigQuery NUMERIC supports up to 38 total digits, up to 9 fractional digits,
 # and at most 29 integer digits (precision - scale <= 29).
@@ -30,6 +32,8 @@ _UNKNOWN_EXTENSION_ENV_VAR = "POLARS_UNKNOWN_EXTENSION_TYPE_BEHAVIOR"
 _INITIAL_UNKNOWN_EXTENSION_BEHAVIOR: str | None = os.environ.get(
     _UNKNOWN_EXTENSION_ENV_VAR
 )
+_WARNED_ENV_DRIFT_LOCK = threading.Lock()
+_last_warned_env_drift: tuple[str | None, str | None] | None = None
 
 
 class BQType(enum.Enum):
@@ -129,10 +133,10 @@ def build_extension_dtype(
     Note: In Polars 2.x, the Rust Arrow C Stream importer latches
     ``POLARS_UNKNOWN_EXTENSION_TYPE_BEHAVIOR`` once per process on import
     (``pl.Config.reload_env_vars()`` does not refresh it). This helper follows
-    the value latched at module import time and logs a warning if the
-    environment variable is mutated mid-process; pass ``load_as_storage``
-    explicitly when deterministic resolution independent of process environment
-    is needed.
+    the value latched at module import time and logs one warning per
+    ``(initial, current)`` drift transition if the environment variable is
+    mutated mid-process; pass ``load_as_storage`` explicitly when deterministic
+    resolution independent of process environment is needed.
     """
     registered = pl.get_extension_type(name)
     if isinstance(registered, type) and issubclass(registered, pl.BaseExtension):
@@ -141,23 +145,112 @@ def build_extension_dtype(
         return storage
     if load_as_storage is not None:
         return storage if load_as_storage else pl.Extension(name, storage, metadata)
+    global _last_warned_env_drift
     current_behavior = os.environ.get(_UNKNOWN_EXTENSION_ENV_VAR)
     if current_behavior != _INITIAL_UNKNOWN_EXTENSION_BEHAVIOR:
-        logger.warning(
-            "%s changed from %r to %r after module import; Polars 2.x latches "
-            "this setting once per process, so keeping the initial value %r to "
-            "stay aligned with Arrow stream decoding. Prefer "
-            "polars.register_extension_type(%r, as_storage=True) or setting the "
-            "environment variable before launching Python.",
-            _UNKNOWN_EXTENSION_ENV_VAR,
-            _INITIAL_UNKNOWN_EXTENSION_BEHAVIOR,
-            current_behavior,
-            _INITIAL_UNKNOWN_EXTENSION_BEHAVIOR,
-            name,
-        )
+        should_warn = False
+        drift = (_INITIAL_UNKNOWN_EXTENSION_BEHAVIOR, current_behavior)
+        with _WARNED_ENV_DRIFT_LOCK:
+            if _last_warned_env_drift != drift:
+                _last_warned_env_drift = drift
+                should_warn = True
+        if should_warn:
+            logger.warning(
+                "%s changed from %r to %r after module import; Polars 2.x latches "
+                "this setting once per process, so keeping the initial value %r to "
+                "stay aligned with Arrow stream decoding. Prefer "
+                "polars.register_extension_type(..., as_storage=True) "
+                "(e.g. %r and %r) or setting the environment variable before "
+                "launching Python.",
+                _UNKNOWN_EXTENSION_ENV_VAR,
+                _INITIAL_UNKNOWN_EXTENSION_BEHAVIOR,
+                current_behavior,
+                _INITIAL_UNKNOWN_EXTENSION_BEHAVIOR,
+                JSON_EXTENSION_NAME,
+                GEOGRAPHY_EXTENSION_NAME,
+            )
+    elif _last_warned_env_drift is not None:
+        with _WARNED_ENV_DRIFT_LOCK:
+            if (
+                os.environ.get(_UNKNOWN_EXTENSION_ENV_VAR)
+                == _INITIAL_UNKNOWN_EXTENSION_BEHAVIOR
+            ):
+                _last_warned_env_drift = None
     if _INITIAL_UNKNOWN_EXTENSION_BEHAVIOR == "load_as_storage":
         return storage
     return pl.Extension(name, storage, metadata)
+
+
+def _is_dtype_or_class(value: object, cls: type[DataType] = DataType) -> bool:
+    """Return `True` if `value` is an instance or `DataTypeClass` subclass of `cls`."""
+    return isinstance(value, cls) or (
+        isinstance(value, type) and issubclass(value, cls)
+    )
+
+
+def _unwrap_extension_storage(
+    dtype: pl.BaseExtension,
+) -> DataType | DataTypeClass | None:
+    """Recursively unwrap custom `pl.BaseExtension` storage types.
+
+    Stops at BigQuery Arrow extension types (`google:sqlType:json` and
+    `google:sqlType:geography`): returns them intact when valid and returns
+    `None` when their storage dtype is invalid so they cannot fall through to a
+    narrower storage width rank. Also returns `None` if a custom extension
+    returns a non-`DataType`/`DataTypeClass`. Self-referential extensions
+    terminate with `RecursionError`.
+    """
+    if dtype.ext_name() in _BIGQUERY_EXTENSION_NAMES:
+        return dtype if polars_dtype_to_bq_type(dtype) is not None else None
+    storage = dtype.ext_storage()
+    if not _is_dtype_or_class(storage):
+        return None
+    if isinstance(storage, pl.BaseExtension):
+        return _unwrap_extension_storage(storage)
+    return storage
+
+
+def has_bignumeric_dtype(dtype: DataType | DataTypeClass) -> bool:
+    """Return `True` if `dtype` is or nests a `BIGNUMERIC` (`Decimal(precision > 38)`).
+
+    Uses a simple recursive depth-first walk (BigQuery caps schema nesting at
+    15 levels). Self-referential extensions terminate with `RecursionError`.
+    """
+    if isinstance(dtype, pl.Decimal):
+        return (
+            dtype.precision is not None and dtype.precision > BQ_NUMERIC_MAX_PRECISION
+        )
+    if isinstance(dtype, pl.BaseExtension):
+        storage = dtype.ext_storage()
+        return isinstance(storage, DataType) and has_bignumeric_dtype(storage)
+    if isinstance(dtype, (pl.List, pl.Array)):
+        return isinstance(dtype.inner, DataType) and has_bignumeric_dtype(dtype.inner)
+    if isinstance(dtype, pl.Struct):
+        return any(has_bignumeric_dtype(field.dtype) for field in dtype.fields)
+    map_cls = getattr(pl, "Map", None)
+    if map_cls is not None and isinstance(dtype, map_cls):
+        return (
+            isinstance(dtype.key, DataType) and has_bignumeric_dtype(dtype.key)
+        ) or (isinstance(dtype.value, DataType) and has_bignumeric_dtype(dtype.value))
+    return False
+
+
+def _has_unsupported_nested_dtype(dtype: DataType | DataTypeClass) -> bool:
+    """Return `True` if a container/extension nests any dtype outside BigQuery's 14 `BQType`s."""
+    if isinstance(dtype, type):
+        return polars_dtype_to_bq_type(dtype) is None
+    if isinstance(dtype, pl.BaseExtension):
+        if dtype.ext_name() in _BIGQUERY_EXTENSION_NAMES:
+            return polars_dtype_to_bq_type(dtype) is None
+        storage = dtype.ext_storage()
+        if not _is_dtype_or_class(storage):
+            return True
+        return _has_unsupported_nested_dtype(storage)
+    if isinstance(dtype, pl.List):
+        return dtype.inner is None or _has_unsupported_nested_dtype(dtype.inner)
+    if isinstance(dtype, pl.Struct):
+        return any(_has_unsupported_nested_dtype(field.dtype) for field in dtype.fields)
+    return polars_dtype_to_bq_type(dtype) is None
 
 
 def polars_dtype_to_bq_type(dtype: DataType | DataTypeClass) -> BQType | None:
@@ -172,18 +265,16 @@ def polars_dtype_to_bq_type(dtype: DataType | DataTypeClass) -> BQType | None:
 
     if isinstance(dtype, pl.BaseExtension):
         ext_name = dtype.ext_name()
-        if ext_name == JSON_EXTENSION_NAME:
-            return (
-                BQType.ARRAY
-                if isinstance(dtype.ext_storage(), pl.List)
-                else BQType.JSON
-            )
-        if ext_name == GEOGRAPHY_EXTENSION_NAME:
-            return (
-                BQType.ARRAY
-                if isinstance(dtype.ext_storage(), pl.List)
-                else BQType.GEOGRAPHY
-            )
+        if ext_name in (JSON_EXTENSION_NAME, GEOGRAPHY_EXTENSION_NAME):
+            storage = dtype.ext_storage()
+            if _is_dtype_or_class(storage, pl.String):
+                return (
+                    BQType.JSON if ext_name == JSON_EXTENSION_NAME else BQType.GEOGRAPHY
+                )
+            if isinstance(storage, pl.List) and _is_dtype_or_class(
+                storage.inner, pl.String
+            ):
+                return BQType.ARRAY
         return None
 
     if isinstance(dtype, pl.Datetime):
@@ -231,13 +322,41 @@ def column_width_rank(
     *,
     bq_type: BQType | None = None,
 ) -> int:
-    """Return a deterministic storage-width rank (1=narrowest, 6=widest/unknown).
+    """Return a deterministic storage-width rank (1=narrowest, 6=nested, 7=unknown).
+
+    Ranks follow BigQuery wire widths across the 14 supported `BQType` values
+    (`1` BOOL, `2` DATE, `3` 8-byte scalars, `4` NUMERIC, `5` variable-length
+    STRING/BYTES/JSON/GEOGRAPHY, `6` ARRAY/STRUCT), leaving `7` for unknown or
+    unsupported dtypes (including nested `BIGNUMERIC` / `Duration` / `Float16`
+    inside `List`/`Struct`/`BaseExtension`) so zero-column fallback prioritizes
+    every valid BigQuery type first.
 
     When `bq_type` is supplied (e.g. from authoritative BigQuery REST metadata),
     it takes precedence over inferring the BigQuery type from `dtype`.
     """
-    resolved = bq_type if bq_type is not None else polars_dtype_to_bq_type(dtype)
-    return _BQ_TYPE_WIDTH_RANK.get(resolved, 6)
+    if bq_type is not None:
+        return _BQ_TYPE_WIDTH_RANK.get(bq_type, 7)
+    if isinstance(dtype, type):
+        resolved = polars_dtype_to_bq_type(dtype)
+        return _BQ_TYPE_WIDTH_RANK[resolved] if resolved is not None else 7
+    resolved = polars_dtype_to_bq_type(dtype)
+    if resolved is None:
+        if isinstance(dtype, pl.BaseExtension):
+            unwrapped = _unwrap_extension_storage(dtype)
+            if unwrapped is None:
+                return 7
+            unwrapped_bq = polars_dtype_to_bq_type(unwrapped)
+            if unwrapped_bq is None:
+                return 7
+            if isinstance(
+                unwrapped, (pl.List, pl.Struct)
+            ) and _has_unsupported_nested_dtype(unwrapped):
+                return 7
+            return _BQ_TYPE_WIDTH_RANK[unwrapped_bq]
+        return 7
+    if isinstance(dtype, (pl.List, pl.Struct)) and _has_unsupported_nested_dtype(dtype):
+        return 7
+    return _BQ_TYPE_WIDTH_RANK[resolved]
 
 
 __all__ = [
@@ -253,6 +372,7 @@ __all__ = [
     "BQType",
     "build_extension_dtype",
     "column_width_rank",
+    "has_bignumeric_dtype",
     "polars_datetime_time_unit",
     "polars_decimal_supports_one",
     "polars_dtype_to_bq_type",
