@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import collections
 import enum
 import logging
 import os
@@ -10,6 +11,8 @@ from typing import Literal
 
 import polars as pl
 from polars.datatypes import DataType, DataTypeClass
+
+import polars_bigquery.exceptions
 
 logger = logging.getLogger(__name__)
 
@@ -163,71 +166,108 @@ def build_extension_dtype(
                 "%s changed from %r to %r after module import; Polars 2.x latches "
                 "this setting once per process, so keeping the initial value %r to "
                 "stay aligned with Arrow stream decoding. Prefer "
-                "polars.register_extension_type(%r, as_storage=True) or setting the "
-                "environment variable before launching Python.",
+                "polars.register_extension_type(..., as_storage=True) "
+                "(e.g. %r and %r) or setting the environment variable before "
+                "launching Python.",
                 _UNKNOWN_EXTENSION_ENV_VAR,
                 _INITIAL_UNKNOWN_EXTENSION_BEHAVIOR,
                 current_behavior,
                 _INITIAL_UNKNOWN_EXTENSION_BEHAVIOR,
-                name,
+                JSON_EXTENSION_NAME,
+                GEOGRAPHY_EXTENSION_NAME,
             )
-    else:
+    elif _last_warned_env_drift is not None:
         with _WARNED_ENV_DRIFT_LOCK:
-            _last_warned_env_drift = None
+            if (
+                os.environ.get(_UNKNOWN_EXTENSION_ENV_VAR)
+                == _INITIAL_UNKNOWN_EXTENSION_BEHAVIOR
+            ):
+                _last_warned_env_drift = None
     if _INITIAL_UNKNOWN_EXTENSION_BEHAVIOR == "load_as_storage":
         return storage
     return pl.Extension(name, storage, metadata)
 
 
-def _unwrap_extension_storage(dtype: pl.BaseExtension) -> DataType | None:
+def _is_dtype_or_class(value: object, cls: type[DataType] = DataType) -> bool:
+    """Return `True` if `value` is an instance or `DataTypeClass` subclass of `cls`."""
+    return isinstance(value, cls) or (
+        isinstance(value, type) and issubclass(value, cls)
+    )
+
+
+def _uses_default_ext_storage(dtype: pl.BaseExtension) -> bool:
+    """Return `True` if `dtype.ext_storage()` just reads an already-stored `_storage`."""
+    dtype_cls = type(dtype)
+    if dtype_cls is pl.Extension:
+        return "ext_storage" not in dtype.__dict__
+    return (
+        dtype_cls.ext_storage is pl.BaseExtension.ext_storage
+        and not hasattr(dtype_cls, "_storage")
+        and "ext_storage" not in getattr(dtype, "__dict__", ())
+    )
+
+
+def _unwrap_extension_storage(
+    dtype: pl.BaseExtension,
+) -> tuple[DataType | DataTypeClass, int] | None:
     """Iteratively unwrap chained `pl.BaseExtension` storage types with cycle/depth guards.
 
-    Stops at BigQuery Arrow extension types (`google:sqlType:json` and
-    `google:sqlType:geography`): returns them intact when valid and returns
+    Returns ``(unwrapped_dtype, depth)`` where ``depth`` is the number of
+    extension wrappers traversed so callers can preserve the total nesting
+    depth budget. Stops at BigQuery Arrow extension types (`google:sqlType:json`
+    and `google:sqlType:geography`): returns them intact when valid and returns
     `None` when their storage dtype is invalid so they cannot fall through to a
     narrower storage width rank. Also returns `None` if a custom extension
     creates a cycle (e.g. `ext_storage()` returning `self`), returns a
-    non-`DataType`, or nests deeper than `_MAX_TYPE_DEPTH`.
+    non-`DataType`/`DataTypeClass`, or nests deeper than `_MAX_TYPE_DEPTH`.
     """
     # Retain strong references keyed by `id()` so CPython cannot collect and
     # reuse addresses of freshly allocated `ext_storage()` wrappers mid-walk.
     seen: dict[int, DataType] = {}
-    current: DataType = dtype
+    current: DataType | DataTypeClass = dtype
     depth = 0
     while isinstance(current, pl.BaseExtension):
         if current.ext_name() in _BIGQUERY_EXTENSION_NAMES:
-            return current if polars_dtype_to_bq_type(current) is not None else None
+            if polars_dtype_to_bq_type(current) is None:
+                return None
+            return current, depth
         obj_id = id(current)
         if obj_id in seen or depth >= _MAX_TYPE_DEPTH:
             return None
         seen[obj_id] = current
         storage = current.ext_storage()
-        if not isinstance(storage, DataType):
+        if not _is_dtype_or_class(storage):
             return None
         current = storage
         depth += 1
-    return current
+    return current, depth
 
 
 def has_bignumeric_dtype(dtype: pl.DataType) -> bool:
-    """Return `True` if `dtype` is or nests a `BIGNUMERIC` (`Decimal(precision > 38)`)."""
+    """Return `True` if `dtype` is or nests a `BIGNUMERIC` (`Decimal(precision > 38)`).
+
+    Fails closed by raising `UnsupportedTypeError` if a custom `pl.BaseExtension`
+    subclass overrides `ext_storage()` with a chain exceeding `_MAX_TYPE_DEPTH`
+    and no `BIGNUMERIC` is found along shallower paths. Finite materialized
+    containers (`List`/`Array`/`Struct`/`Map`) and built-in/default
+    `BaseExtension` wrappers are walked in full without depth truncation.
+    """
     map_cls = getattr(pl, "Map", None)
-    # Map `id(node) -> (min_ext_depth, node)`: retaining `node` prevents CPython
-    # address reuse for temporary `ext_storage()` objects, and tracking minimum
-    # extension depth allows shared DAG nodes first reached at deep extension
-    # depth to re-expand when later reached via a shallower path. Only
-    # `BaseExtension.ext_storage()` edges increment `ext_depth`, because finite
-    # Polars container trees (`List`/`Array`/`Struct`/`Map`) already live in
-    # memory and can safely walk iteratively without failing open at depth 64.
-    seen: dict[int, tuple[int, pl.DataType]] = {}
-    stack: list[tuple[pl.DataType, int]] = [(dtype, 0)]
-    while stack:
-        current, ext_depth = stack.pop()
+    # 0-1 BFS keyed by `id(node)`: retaining strong references in `seen`
+    # prevents CPython address reuse for temporary `ext_storage()` objects.
+    # Pushing weight-0 edges (materialized containers and default `_storage`
+    # extensions) on the left and weight-1 edges (overridden `ext_storage()`)
+    # on the right visits every reachable node at its minimum dynamic
+    # `ext_depth` in strictly non-decreasing order.
+    seen: dict[int, pl.DataType] = {}
+    queue: collections.deque[tuple[pl.DataType, int]] = collections.deque([(dtype, 0)])
+    depth_exceeded = False
+    while queue:
+        current, ext_depth = queue.popleft()
         obj_id = id(current)
-        prev = seen.get(obj_id)
-        if prev is not None and ext_depth >= prev[0]:
+        if obj_id in seen:
             continue
-        seen[obj_id] = (ext_depth, current)
+        seen[obj_id] = current
         if isinstance(current, pl.Decimal):
             if (
                 current.precision is not None
@@ -235,41 +275,76 @@ def has_bignumeric_dtype(dtype: pl.DataType) -> bool:
             ):
                 return True
         elif isinstance(current, pl.BaseExtension):
-            if ext_depth >= _MAX_TYPE_DEPTH:
-                continue
-            storage = current.ext_storage()
-            if isinstance(storage, DataType):
-                stack.append((storage, ext_depth + 1))
+            if _uses_default_ext_storage(current):
+                storage = current.ext_storage()
+                if isinstance(storage, DataType):
+                    queue.appendleft((storage, ext_depth))
+            elif ext_depth >= _MAX_TYPE_DEPTH:
+                depth_exceeded = True
+            else:
+                storage = current.ext_storage()
+                if isinstance(storage, DataType):
+                    queue.append((storage, ext_depth + 1))
         elif isinstance(current, (pl.List, pl.Array)):
-            if current.inner is not None:
-                stack.append((current.inner, ext_depth))
+            if isinstance(current.inner, DataType):
+                queue.appendleft((current.inner, ext_depth))
         elif isinstance(current, pl.Struct):
             for field in current.fields:
-                stack.append((field.dtype, ext_depth))
+                if isinstance(field.dtype, DataType):
+                    queue.appendleft((field.dtype, ext_depth))
         elif map_cls is not None and isinstance(current, map_cls):
-            if current.key is not None:
-                stack.append((current.key, ext_depth))
-            if current.value is not None:
-                stack.append((current.value, ext_depth))
+            if isinstance(current.key, DataType):
+                queue.appendleft((current.key, ext_depth))
+            if isinstance(current.value, DataType):
+                queue.appendleft((current.value, ext_depth))
+    if depth_exceeded:
+        msg = (
+            "Extension type nesting depth exceeds maximum supported depth "
+            f"({_MAX_TYPE_DEPTH}); cannot verify whether a BIGNUMERIC "
+            "(Decimal precision > 38) column is nested deeper inside a custom "
+            "`ext_storage()` chain."
+        )
+        raise polars_bigquery.exceptions.UnsupportedTypeError(msg)
     return False
 
 
-def _has_unsupported_nested_dtype(dtype: DataType) -> bool:
+def _has_unsupported_nested_dtype(dtype: DataType, *, initial_depth: int = 0) -> bool:
     """Return `True` if a container/extension nests any dtype outside BigQuery's 14 `BQType`s."""
-    # Iterative DFS distinguishing true cycles (`visiting`) from shared DAG nodes (`safe`).
-    # `safe` retains strong references to visited nodes so CPython cannot free a temporary
-    # `ext_storage()` object and recycle its `id()` for a later unsupported `DataType`.
-    safe: dict[int, DataType] = {}
+    # Iterative post-order DFS distinguishing true cycles (`visiting`) from shared DAG
+    # nodes (`safe_height`). Storing the exact subtree height `h(node)` in `safe_height`
+    # keeps the `_MAX_TYPE_DEPTH` check order-independent across diamond DAGs: a node
+    # cached via a shallow branch still triggers `True` when later revisited at a depth
+    # where `depth + h(node) > _MAX_TYPE_DEPTH`. Strong references in `safe_height` (and
+    # pending post-order frames in `stack`) prevent CPython address reuse for temporary
+    # `ext_storage()` wrapper objects.
+    safe_height: dict[int, tuple[int, DataType | DataTypeClass]] = {}
     visiting: set[int] = set()
-    stack: list[tuple[DataType, int, bool]] = [(dtype, 0, True)]
+    max_child_height: dict[int, int] = {}
+    stack: list[tuple[DataType | DataTypeClass, int, bool, int | None]] = [
+        (dtype, initial_depth, True, None)
+    ]
+
+    def _record_child_height(parent_id: int | None, child_height: int) -> None:
+        if parent_id is not None:
+            candidate = child_height + 1
+            if candidate > max_child_height.get(parent_id, 0):
+                max_child_height[parent_id] = candidate
+
     while stack:
-        current, depth, entering = stack.pop()
+        current, depth, entering, parent_id = stack.pop()
         obj_id = id(current)
         if not entering:
             visiting.discard(obj_id)
-            safe[obj_id] = current
+            height = max_child_height.pop(obj_id, 0)
+            safe_height[obj_id] = (height, current)
+            _record_child_height(parent_id, height)
             continue
-        if obj_id in safe:
+        cached = safe_height.get(obj_id)
+        if cached is not None:
+            cached_height = cached[0]
+            if depth + cached_height > _MAX_TYPE_DEPTH:
+                return True
+            _record_child_height(parent_id, cached_height)
             continue
         if obj_id in visiting or depth > _MAX_TYPE_DEPTH:
             return True
@@ -278,29 +353,34 @@ def _has_unsupported_nested_dtype(dtype: DataType) -> bool:
             if current.ext_name() in _BIGQUERY_EXTENSION_NAMES:
                 if polars_dtype_to_bq_type(current) is None:
                     return True
-                safe[obj_id] = current
+                safe_height[obj_id] = (0, current)
+                _record_child_height(parent_id, 0)
                 continue
             storage = current.ext_storage()
-            if not isinstance(storage, DataType):
+            if not _is_dtype_or_class(storage):
                 return True
             visiting.add(obj_id)
-            stack.append((current, depth, False))
-            stack.append((storage, depth + 1, True))
+            max_child_height[obj_id] = 0
+            stack.append((current, depth, False, parent_id))
+            stack.append((storage, depth + 1, True, obj_id))
         elif isinstance(current, pl.List):
             if current.inner is None:
                 return True
             visiting.add(obj_id)
-            stack.append((current, depth, False))
-            stack.append((current.inner, depth + 1, True))
+            max_child_height[obj_id] = 0
+            stack.append((current, depth, False, parent_id))
+            stack.append((current.inner, depth + 1, True, obj_id))
         elif isinstance(current, pl.Struct):
             visiting.add(obj_id)
-            stack.append((current, depth, False))
+            max_child_height[obj_id] = 0
+            stack.append((current, depth, False, parent_id))
             for field in current.fields:
-                stack.append((field.dtype, depth + 1, True))
+                stack.append((field.dtype, depth + 1, True, obj_id))
         elif polars_dtype_to_bq_type(current) is None:
             return True
         else:
-            safe[obj_id] = current
+            safe_height[obj_id] = (0, current)
+            _record_child_height(parent_id, 0)
     return False
 
 
@@ -318,11 +398,13 @@ def polars_dtype_to_bq_type(dtype: DataType | DataTypeClass) -> BQType | None:
         ext_name = dtype.ext_name()
         if ext_name in (JSON_EXTENSION_NAME, GEOGRAPHY_EXTENSION_NAME):
             storage = dtype.ext_storage()
-            if isinstance(storage, pl.String):
+            if _is_dtype_or_class(storage, pl.String):
                 return (
                     BQType.JSON if ext_name == JSON_EXTENSION_NAME else BQType.GEOGRAPHY
                 )
-            if isinstance(storage, pl.List) and isinstance(storage.inner, pl.String):
+            if isinstance(storage, pl.List) and _is_dtype_or_class(
+                storage.inner, pl.String
+            ):
                 return BQType.ARRAY
         return None
 
@@ -391,10 +473,18 @@ def column_width_rank(
     resolved = polars_dtype_to_bq_type(dtype)
     if resolved is None:
         if isinstance(dtype, pl.BaseExtension):
-            unwrapped = _unwrap_extension_storage(dtype)
-            if unwrapped is None:
+            result = _unwrap_extension_storage(dtype)
+            if result is None:
                 return 7
-            return column_width_rank(unwrapped)
+            unwrapped, depth = result
+            unwrapped_bq = polars_dtype_to_bq_type(unwrapped)
+            if unwrapped_bq is None:
+                return 7
+            if isinstance(unwrapped, (pl.List, pl.Struct)) and (
+                _has_unsupported_nested_dtype(unwrapped, initial_depth=depth)
+            ):
+                return 7
+            return _BQ_TYPE_WIDTH_RANK[unwrapped_bq]
         return 7
     if isinstance(dtype, (pl.List, pl.Struct)) and _has_unsupported_nested_dtype(dtype):
         return 7

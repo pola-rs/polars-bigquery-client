@@ -197,6 +197,27 @@ def test_compile_read_api_plan_zero_column_fallback_priority_tiers() -> None:
         Project(input=ext_scan, columns=())
     ).selected_fields == ("flag_ext",)
 
+    # Uninstantiated DataTypeClass storage in BigQuery/custom extensions ranks properly.
+    ext_cls_scan = _tscan(
+        {
+            "arr_json": pl.Extension("google:sqlType:json", pl.List(pl.String)),
+            "scalar_json": pl.Extension("google:sqlType:json", pl.String),
+            "_PARTITIONDATE": pl.Date,
+        }
+    )
+    assert compile_read_api_plan(
+        Project(input=ext_cls_scan, columns=())
+    ).selected_fields == ("scalar_json",)
+    ext_arr_only_scan = _tscan(
+        {
+            "arr_json": pl.Extension("google:sqlType:json", pl.List(pl.String)),
+            "_PARTITIONDATE": pl.Date,
+        }
+    )
+    assert compile_read_api_plan(
+        Project(input=ext_arr_only_scan, columns=())
+    ).selected_fields == ("arr_json",)
+
     # Tie breaking within the same tier picks earliest schema index.
     tie_scan = _tscan({"second_tier3": pl.Float64(), "first_i64": pl.Int64()})
     assert compile_read_api_plan(

@@ -294,6 +294,8 @@ def test_build_extension_dtype_explicit_load_as_storage_and_env_warning(
         )
     assert len(caplog.records) == 1
     assert "POLARS_UNKNOWN_EXTENSION_TYPE_BEHAVIOR" in caplog.text
+    assert JSON_EXTENSION_NAME in caplog.text
+    assert GEOGRAPHY_EXTENSION_NAME in caplog.text
 
     # Restoring the initial value clears the latch; drifting again warns once.
     caplog.clear()
@@ -303,6 +305,21 @@ def test_build_extension_dtype_explicit_load_as_storage_and_env_warning(
             JSON_EXTENSION_NAME, pl.String()
         )
     assert caplog.records == []
+    assert types_mod._last_warned_env_drift is None
+
+    # Hot-path un-drifted calls must not acquire _WARNED_ENV_DRIFT_LOCK.
+    class _FailIfAcquiredLock:
+        def __enter__(self):
+            raise AssertionError("lock must not be acquired on un-drifted fast path")
+
+        def __exit__(self, *exc_info):
+            return None
+
+    with monkeypatch.context() as lock_mp:
+        lock_mp.setattr(types_mod, "_WARNED_ENV_DRIFT_LOCK", _FailIfAcquiredLock())
+        assert build_extension_dtype(JSON_EXTENSION_NAME, pl.String()) == pl.Extension(
+            JSON_EXTENSION_NAME, pl.String()
+        )
     monkeypatch.setenv("POLARS_UNKNOWN_EXTENSION_TYPE_BEHAVIOR", "load_as_storage")
     with caplog.at_level("WARNING", logger=types_mod.__name__):
         build_extension_dtype(JSON_EXTENSION_NAME, pl.String())
@@ -506,7 +523,31 @@ def test_polars_datetime_time_unit(dtype, expected):
         ),
         (pl.Extension("custom:bn", pl.Decimal(76, 38)), 7),
         (pl.Extension("custom:bool", pl.Boolean()), 1),
+        (pl.Extension("custom:bool_cls", pl.Boolean), 1),
         (pl.Extension("custom:bin", pl.Binary()), 5),
+        # Uninstantiated DataTypeClass storage inside BigQuery/custom extensions.
+        (pl.Extension(JSON_EXTENSION_NAME, pl.String), 5),
+        (
+            pl.Extension(
+                GEOGRAPHY_EXTENSION_NAME, pl.String, GEOGRAPHY_EXTENSION_METADATA
+            ),
+            5,
+        ),
+        (pl.Extension(JSON_EXTENSION_NAME, pl.List(pl.String)), 6),
+        (
+            pl.Extension(
+                GEOGRAPHY_EXTENSION_NAME,
+                pl.List(pl.String),
+                GEOGRAPHY_EXTENSION_METADATA,
+            ),
+            6,
+        ),
+        (pl.Extension(JSON_EXTENSION_NAME, pl.Int64), 7),
+        (pl.Extension(JSON_EXTENSION_NAME, pl.List(pl.Int64)), 7),
+        (pl.Extension(JSON_EXTENSION_NAME, pl.List), 7),
+        (pl.List(pl.Extension(JSON_EXTENSION_NAME, pl.String)), 6),
+        (pl.Struct({"a": pl.Extension("custom:bool_cls", pl.Boolean)}), 6),
+        (pl.Struct({"a": pl.Extension("custom:dur_cls", pl.Duration)}), 7),
         (
             pl.Extension(
                 "custom:outer",
@@ -538,9 +579,43 @@ def test_column_width_rank_shared_struct_field_dtype_and_invalid_bq_extensions()
         polars_dtype_to_bq_type(pl.Extension(GEOGRAPHY_EXTENSION_NAME, pl.Int64()))
         is None
     )
+    # Uninstantiated DataTypeClass storage/inner types match instantiated forms.
+    assert (
+        polars_dtype_to_bq_type(pl.Extension(JSON_EXTENSION_NAME, pl.String))
+        is BQType.JSON
+    )
+    assert (
+        polars_dtype_to_bq_type(
+            pl.Extension(
+                GEOGRAPHY_EXTENSION_NAME, pl.String, GEOGRAPHY_EXTENSION_METADATA
+            )
+        )
+        is BQType.GEOGRAPHY
+    )
+    assert (
+        polars_dtype_to_bq_type(pl.Extension(JSON_EXTENSION_NAME, pl.List(pl.String)))
+        is BQType.ARRAY
+    )
+    assert (
+        polars_dtype_to_bq_type(
+            pl.Extension(
+                GEOGRAPHY_EXTENSION_NAME,
+                pl.List(pl.String),
+                GEOGRAPHY_EXTENSION_METADATA,
+            )
+        )
+        is BQType.ARRAY
+    )
+    assert (
+        polars_dtype_to_bq_type(pl.Extension(JSON_EXTENSION_NAME, pl.List(pl.Int64)))
+        is None
+    )
+    assert polars_dtype_to_bq_type(pl.Extension(JSON_EXTENSION_NAME, pl.List)) is None
 
 
 def test_extension_cycle_and_depth_guards():
+    from polars_bigquery.exceptions import UnsupportedTypeError
+
     class _SelfCycleExt(pl.BaseExtension):
         def ext_storage(self):
             return self
@@ -555,9 +630,17 @@ def test_extension_cycle_and_depth_guards():
     assert column_width_rank(pl.List(self_cycle)) == 7
 
     fresh_cycle = _FreshWrapperCycleExt("custom:fresh", pl.String())
-    assert has_bignumeric_dtype(fresh_cycle) is False
+    # Dynamic/unbounded ext_storage() fails closed instead of returning False.
+    with pytest.raises(UnsupportedTypeError, match="nesting depth exceeds maximum"):
+        has_bignumeric_dtype(fresh_cycle)
     assert column_width_rank(fresh_cycle) == 7
     assert column_width_rank(pl.Struct({"x": fresh_cycle})) == 7
+
+    # Materialized cyclic pl.Extension._storage terminates safely via id() tracking.
+    mutated_cycle = pl.Extension("custom:mut", pl.String())
+    mutated_cycle._storage = mutated_cycle
+    assert has_bignumeric_dtype(mutated_cycle) is False
+    assert column_width_rank(mutated_cycle) == 7
 
 
 def test_dtype_traversals_prevent_id_reuse_on_fresh_ext_storage():
@@ -593,6 +676,7 @@ def test_dtype_traversals_prevent_id_reuse_on_fresh_ext_storage():
 
 def test_has_bignumeric_dtype_deep_containers_and_extension_diamond_dag():
     from polars_bigquery.core.types import _MAX_TYPE_DEPTH
+    from polars_bigquery.exceptions import UnsupportedTypeError
 
     # Finite Polars List containers deeper than _MAX_TYPE_DEPTH still detect BIGNUMERIC.
     deep_bn: pl.DataType = pl.Decimal(precision=76, scale=38)
@@ -600,12 +684,34 @@ def test_has_bignumeric_dtype_deep_containers_and_extension_diamond_dag():
         deep_bn = pl.List(deep_bn)
     assert has_bignumeric_dtype(deep_bn) is True
 
-    # Shared extension DAG reached at depth _MAX_TYPE_DEPTH AND depth 0 must detect
-    # BIGNUMERIC regardless of field order (minimum ext_depth tracking).
+    # Finite built-in pl.Extension chains deeper than _MAX_TYPE_DEPTH do not fail open.
+    deep_ext_bn: pl.DataType = pl.Decimal(precision=76, scale=38)
+    deep_ext_ok: pl.DataType = pl.Int64()
+    for idx in range(_MAX_TYPE_DEPTH + 5):
+        deep_ext_bn = pl.Extension(f"custom:bn_{idx}", deep_ext_bn)
+        deep_ext_ok = pl.Extension(f"custom:ok_{idx}", deep_ext_ok)
+    assert has_bignumeric_dtype(deep_ext_bn) is True
+    assert has_bignumeric_dtype(deep_ext_ok) is False
+
+    # Dynamic custom ext_storage() chain exceeding _MAX_TYPE_DEPTH fails closed.
+    class _DynChainExt(pl.BaseExtension):
+        def __init__(self, remaining: int, target: pl.DataType):
+            self._rem = remaining
+            self._target = target
+            super().__init__("custom:dyn", pl.String())
+
+        def ext_storage(self):
+            if self._rem > 0:
+                return _DynChainExt(self._rem - 1, self._target)
+            return self._target
+
+    with pytest.raises(UnsupportedTypeError, match="nesting depth exceeds maximum"):
+        has_bignumeric_dtype(_DynChainExt(_MAX_TYPE_DEPTH + 1, pl.Decimal(76, 38)))
+
+    # Shared extension DAG reached at dynamic depth _MAX_TYPE_DEPTH AND depth 0
+    # must detect BIGNUMERIC regardless of field order (0-1 BFS).
     shared_ext = pl.Extension("custom:shared", pl.Decimal(precision=76, scale=38))
-    deep_chain: pl.DataType = shared_ext
-    for idx in range(_MAX_TYPE_DEPTH):
-        deep_chain = pl.Extension(f"custom:w{idx}", deep_chain)
+    deep_chain = _DynChainExt(_MAX_TYPE_DEPTH, shared_ext)
 
     dag_deep_last = pl.Struct(
         [pl.Field("shallow", shared_ext), pl.Field("deep", deep_chain)]
@@ -615,6 +721,58 @@ def test_has_bignumeric_dtype_deep_containers_and_extension_diamond_dag():
     )
     assert has_bignumeric_dtype(dag_deep_last) is True
     assert has_bignumeric_dtype(dag_deep_first) is True
+
+
+def test_column_width_rank_diamond_dag_and_extension_depth_budget():
+    from polars_bigquery.core.types import _MAX_TYPE_DEPTH
+
+    # Shared List chain of height 40 reached at both depth 1 (41 <= 64) and
+    # depth 30 (70 > 64) must return rank 7 in BOTH field declaration orders.
+    shared_chain: pl.DataType = pl.Int64()
+    for _ in range(40):
+        shared_chain = pl.List(shared_chain)
+    deep_branch: pl.DataType = shared_chain
+    for _ in range(29):
+        deep_branch = pl.List(deep_branch)
+
+    shallow_first = pl.Struct(
+        [pl.Field("shallow", shared_chain), pl.Field("deep", deep_branch)]
+    )
+    deep_first = pl.Struct(
+        [pl.Field("deep", deep_branch), pl.Field("shallow", shared_chain)]
+    )
+    assert column_width_rank(shallow_first) == 7
+    assert column_width_rank(deep_first) == 7
+
+    # Shared chain within total budget (depth 20 + height 40 = 60 <= 64) stays rank 6.
+    safe_branch: pl.DataType = shared_chain
+    for _ in range(19):
+        safe_branch = pl.List(safe_branch)
+    assert (
+        column_width_rank(
+            pl.Struct(
+                [pl.Field("shallow", shared_chain), pl.Field("deep", safe_branch)]
+            )
+        )
+        == 6
+    )
+    assert (
+        column_width_rank(
+            pl.Struct(
+                [pl.Field("deep", safe_branch), pl.Field("shallow", shared_chain)]
+            )
+        )
+        == 6
+    )
+
+    # Custom BaseExtension wrapping List carries its depth budget instead of resetting to 0.
+    ext_boundary_ok: pl.DataType = pl.List(pl.Int64())
+    for idx in range(_MAX_TYPE_DEPTH - 1):
+        ext_boundary_ok = pl.Extension(f"custom:ok{idx}", ext_boundary_ok)
+    assert column_width_rank(ext_boundary_ok) == 6
+
+    ext_boundary_over = pl.Extension("custom:extra", ext_boundary_ok)
+    assert column_width_rank(ext_boundary_over) == 7
 
 
 def test_has_bignumeric_dtype_nested():

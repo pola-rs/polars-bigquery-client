@@ -2274,13 +2274,19 @@ def test_client_scan_bignumeric_raises_clear_unsupported_type_error(mock_arrow_c
         ):
             client.scan_query("SELECT col FROM t")
 
-    # Explicit schema with deeply nested BIGNUMERIC (>64 List levels) also raises
-    # UnsupportedTypeError rather than leaking Polars InvalidOperationError.
+    # Explicit schema with deeply nested BIGNUMERIC (>64 List / Extension levels) also
+    # raises UnsupportedTypeError rather than leaking Polars InvalidOperationError.
     deep_bn: pl.DataType = pl.Decimal(76, 38)
     for _ in range(70):
         deep_bn = pl.List(deep_bn)
     with pytest.raises(UnsupportedTypeError, match="BIGNUMERIC/BIGDECIMAL.*'deep'"):
         client.scan_table("p.d.t", schema={"deep": deep_bn})
+
+    deep_ext_bn: pl.DataType = pl.Decimal(76, 38)
+    for idx in range(70):
+        deep_ext_bn = pl.Extension(f"custom:e{idx}", deep_ext_bn)
+    with pytest.raises(UnsupportedTypeError, match="BIGNUMERIC/BIGDECIMAL.*'deep_ext'"):
+        client.scan_table("p.d.t", schema={"deep_ext": deep_ext_bn})
 
     # Explicit schema with nested BIGNUMERIC also raises UnsupportedTypeError without calling Polars.
     with pytest.raises(UnsupportedTypeError, match="BIGNUMERIC/BIGDECIMAL.*'s'"):
