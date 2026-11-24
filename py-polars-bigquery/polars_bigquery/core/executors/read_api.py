@@ -32,6 +32,10 @@ from polars_bigquery.core.types import BQType
 logger = logging.getLogger(__name__)
 
 MAX_ROW_RESTRICTION_BYTES = 1_000_000
+# Cap `read_table` fanout to a single stream when Polars pushes a small row
+# limit (`n_rows`), avoiding spinning up `available_parallelism()` parallel gRPC
+# streams and prefetch buffers only to discard nearly all rows.
+_SINGLE_STREAM_ROW_LIMIT = 10_000
 
 _INGESTION_TIME_PSEUDO_COLUMNS_CASEFOLD = frozenset(
     {"_partitiondate", "_partitiontime"}
@@ -281,11 +285,27 @@ class ReadApiExecutor(PlanExecutor):
                     compiled.degraded_reason,
                 )
 
+        read_kwargs: dict[str, Any] = {
+            "maintain_order": source.maintain_order,
+            "selected_fields": list(compiled.selected_fields),
+            "row_restriction": compiled.row_restriction,
+        }
+        has_filter = any(isinstance(op, Filter) for op in residual_ops)
+        has_leading_small_slice = False
+        if not has_filter:
+            for op in residual_ops:
+                if isinstance(op, Slice):
+                    if op.offset > 0:
+                        break
+                    if op.length <= _SINGLE_STREAM_ROW_LIMIT:
+                        has_leading_small_slice = True
+                        break
+        if has_leading_small_slice:
+            read_kwargs["max_stream_count"] = 1
+
         arrow_stream_exporter = self._arrow_client.read_table(
             source.table_ref,
-            maintain_order=source.maintain_order,
-            selected_fields=list(compiled.selected_fields),
-            row_restriction=compiled.row_restriction,
+            **read_kwargs,
         )
         lazyframe: pl.LazyFrame | None = None
         try:

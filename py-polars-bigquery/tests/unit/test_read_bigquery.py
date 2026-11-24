@@ -2746,3 +2746,130 @@ def test_arrow_bigquery_dependency_pin_tracks_polars_bigquery_version():
         f"py-polars-bigquery {data['project']['version']} must pin "
         f"arrow-bigquery >= {data['project']['version']} (found {arrow_deps[0]!r})"
     )
+
+
+class _FakeArrowStreamExporter:
+    """Single-use Arrow C Stream exporter backed by a real Polars DataFrame."""
+
+    def __init__(self, df: pl.DataFrame) -> None:
+        self._df = df
+
+    def __arrow_c_stream__(self, requested_schema=None):
+        return self._df.__arrow_c_stream__(requested_schema=requested_schema)
+
+
+def test_drop_columns_iter_closes_underlying_batch_iterator():
+    from polars_bigquery.core.executors.base import _iter_project_batches
+
+    closed = False
+
+    def batch_gen():
+        nonlocal closed
+        try:
+            yield pl.DataFrame({"a": [1, 2]})
+            yield pl.DataFrame({"a": [3, 4]})
+        finally:
+            closed = True
+
+    it = _iter_project_batches(batch_gen(), ())
+    first = next(it)
+    assert first.shape == (2, 0)
+    assert not closed
+    it.close()
+    assert closed
+
+
+def test_scan_table_caps_stream_count_on_small_limit(mock_arrow_client):
+    from polars_bigquery.core.executors.read_api import _SINGLE_STREAM_ROW_LIMIT
+
+    df_source = pl.DataFrame({"id": [1, 2, 3, 4, 5]})
+    mock_arrow_client.read_table.side_effect = [
+        _FakeArrowStreamExporter(df_source),
+        _FakeArrowStreamExporter(df_source),
+    ]
+    client = Client(quota_project_id="test-proj")
+    lf = client.scan_table("my-project.my_dataset.tbl", schema={"id": pl.Int64()})
+
+    small = lf.limit(3).collect()
+    assert small.height == 3
+    assert (
+        mock_arrow_client.read_table.call_args_list[0].kwargs["max_stream_count"] == 1
+    )
+
+    large = lf.limit(_SINGLE_STREAM_ROW_LIMIT + 1).collect()
+    assert large.height == 5
+    assert (
+        "max_stream_count" not in mock_arrow_client.read_table.call_args_list[1].kwargs
+    )
+
+
+def test_scan_table_keeps_parallel_streams_when_predicate_and_n_rows_combined(
+    mock_arrow_client, monkeypatch
+):
+    """Do not force `max_stream_count=1` if a caller passes both predicate and small n_rows."""
+    captured_io_source = {}
+    orig_register = pl.io.plugins.register_io_source
+
+    def _capture(io_source, schema, **kwargs):
+        captured_io_source["fn"] = io_source
+        return orig_register(io_source=io_source, schema=schema, **kwargs)
+
+    monkeypatch.setattr(pl.io.plugins, "register_io_source", _capture)
+    df_source = pl.DataFrame({"id": [1, 2, 3]})
+    mock_arrow_client.read_table.return_value = _FakeArrowStreamExporter(df_source)
+
+    client = Client(quota_project_id="test-proj")
+    client.scan_table("my-project.my_dataset.tbl", schema={"id": pl.Int64()})
+
+    batches = list(
+        captured_io_source["fn"](
+            with_columns=["id"],
+            predicate=pl.col("id") > 1,
+            n_rows=5,
+            batch_size=None,
+        )
+    )
+    assert sum(b.height for b in batches) == 2
+    assert "max_stream_count" not in mock_arrow_client.read_table.call_args.kwargs
+
+
+def test_scan_table_zero_column_preserves_height_across_batches(
+    mock_arrow_client, monkeypatch
+):
+    """Zero-column projections via real Arrow C stream preserve exact row height."""
+    captured_io_source = {}
+    orig_register = pl.io.plugins.register_io_source
+
+    def _capture(io_source, schema, **kwargs):
+        captured_io_source["fn"] = io_source
+        return orig_register(io_source=io_source, schema=schema, **kwargs)
+
+    monkeypatch.setattr(pl.io.plugins, "register_io_source", _capture)
+    full_df = pl.DataFrame(
+        {
+            "flag": [True, False, True, True, False],
+            "num": [1, 20, 30, 4, 50],
+        }
+    )
+
+    def _fake_read_table(table_ref, *, selected_fields, **kwargs):
+        return _FakeArrowStreamExporter(full_df.select(selected_fields))
+
+    mock_arrow_client.read_table.side_effect = _fake_read_table
+
+    client = Client(quota_project_id="test-proj")
+    lf = client.scan_table(
+        "my-project.my_dataset.tbl",
+        schema={"flag": pl.Boolean(), "num": pl.Int64()},
+    )
+
+    # Chunked zero-column batch streaming preserves total height and zero width.
+    batches = list(captured_io_source["fn"]([], None, None, 2))
+    assert len(batches) > 1
+    assert sum(b.height for b in batches) == 5
+    assert all(b.width == 0 for b in batches)
+
+    # End-to-end LazyFrame row counts with unfiltered scan, limit, and filter.
+    assert lf.select(pl.len()).collect().item() == 5
+    assert lf.limit(2).select(pl.len()).collect().item() == 2
+    assert lf.filter(pl.col("num") > 10).select(pl.len()).collect().item() == 3

@@ -13,6 +13,7 @@ import polars as pl
 from polars_bigquery.core.plan import (
     Filter,
     PlanNode,
+    Project,
     Slice,
     UnaryPlanOp,
     decompose_linear_plan,
@@ -66,6 +67,7 @@ class ArrowTableClient(Protocol):
         table: arrow_bigquery.BigQueryTableId,
         *,
         maintain_order: bool = ...,
+        max_stream_count: int | None = ...,
         selected_fields: list[str] | None = ...,
         row_restriction: str = ...,
     ) -> Any:
@@ -165,7 +167,7 @@ def _iter_slice_batches(
 
 
 def _apply_project_batch(batch: pl.DataFrame, columns: tuple[str, ...]) -> pl.DataFrame:
-    return batch.select(list(columns)) if columns else batch.drop(pl.all())
+    return batch.select(list(columns)) if columns else batch.drop(batch.columns)
 
 
 def _iter_filter_batches(
@@ -228,26 +230,33 @@ def execute_local_plan_batches(
     `Slice` stage and subsequent operators incrementally with arbitrary-precision
     Python integers so `OverflowError` cannot occur.
     """
-    first_oversized = next(
+    # Fall back to incremental Python-side batch streaming at the first
+    # operator that hits a Polars runtime limitation: either a `Slice` whose
+    # bounds exceed native `i64`/`IdxSize`, or an empty `Project(())` because
+    # Polars `scan_arrow_c_stream` projection pushdown passes `with_columns=[]`
+    # to `PyArrowCStreamReader.next_batch([])`, which collapses row height to 0
+    # in Polars 2.0–2.1.
+    split_at = next(
         (
             idx
             for idx, op in enumerate(ops)
-            if isinstance(op, Slice) and not _slice_fits_polars(op)
+            if (isinstance(op, Slice) and not _slice_fits_polars(op))
+            or (isinstance(op, Project) and len(op.columns) == 0)
         ),
         None,
     )
-    if first_oversized is None:
+    if split_at is None:
         return _apply_ops_to_frame(lazyframe, ops).collect_batches(
             chunk_size=batch_size,
             maintain_order=maintain_order,
         )
 
-    prefix_lf = _apply_ops_to_frame(lazyframe, ops[:first_oversized])
+    prefix_lf = _apply_ops_to_frame(lazyframe, ops[:split_at])
     base_iter = prefix_lf.collect_batches(
         chunk_size=batch_size,
         maintain_order=maintain_order,
     )
-    return _iter_apply_ops(base_iter, ops[first_oversized:])
+    return _iter_apply_ops(base_iter, ops[split_at:])
 
 
 __all__ = [
