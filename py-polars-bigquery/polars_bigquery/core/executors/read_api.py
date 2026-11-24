@@ -5,7 +5,7 @@ from __future__ import annotations
 import dataclasses
 import heapq
 import logging
-from collections.abc import Iterator, Mapping
+from collections.abc import Iterator
 from typing import Any, Literal, cast
 
 import polars as pl
@@ -27,7 +27,7 @@ from polars_bigquery.core.plan import (
     validate_and_normalize_linear_plan,
 )
 from polars_bigquery.core.schema import has_bignumeric_dtype
-from polars_bigquery.core.types import BQType
+from polars_bigquery.core.types import column_width_rank
 
 logger = logging.getLogger(__name__)
 
@@ -66,77 +66,36 @@ def _validate_max_row_restriction_bytes(max_bytes: Any) -> int:
     return max_bytes
 
 
-_BQ_TYPE_FALLBACK_RANK: dict[BQType, int] = {
-    BQType.BOOL: 0,
-    BQType.DATE: 3,
-    BQType.INT64: 4,
-    BQType.FLOAT64: 4,
-    BQType.TIME: 4,
-    BQType.DATETIME: 4,
-    BQType.TIMESTAMP: 4,
-    BQType.NUMERIC: 5,
-    BQType.STRING: 6,
-    BQType.BYTES: 6,
-    BQType.JSON: 6,
-    BQType.GEOGRAPHY: 6,
-    BQType.ARRAY: 7,
-    BQType.STRUCT: 7,
-}
+def _zero_column_rank(dtype: pl.DataType) -> int:
+    """Return a width/safety priority rank (lower is preferred) for 0-column fallback."""
+    if has_bignumeric_dtype(dtype):
+        return 7
+    return column_width_rank(dtype)
 
 
-def _dtype_fallback_rank(dtype: pl.DataType, bq_type: BQType | None = None) -> int:
-    """Return a cost/safety priority rank (lower is preferred) for a 0-column fallback."""
-    if bq_type is not None:
-        return _BQ_TYPE_FALLBACK_RANK[bq_type]
-    if isinstance(dtype, pl.BaseExtension):
-        return _dtype_fallback_rank(dtype.ext_storage())
-    if isinstance(dtype, pl.Boolean):
-        return 0
-    if isinstance(dtype, (pl.Int8, pl.UInt8)):
-        return 1
-    if isinstance(dtype, (pl.Int16, pl.UInt16, pl.Float16)):
-        return 2
-    if isinstance(dtype, (pl.Date, pl.Int32, pl.UInt32, pl.Float32)):
-        return 3
-    if isinstance(dtype, (pl.Int64, pl.UInt64, pl.Float64, pl.Time, pl.Datetime)):
-        return 4
-    if isinstance(dtype, (pl.Int128, pl.UInt128)):
-        return 5
-    if isinstance(dtype, pl.Decimal):
-        return 5 if (dtype.precision is not None and dtype.precision <= 38) else 8
-    if isinstance(dtype, (pl.Duration, pl.Null, pl.Unknown, pl.Object)):
-        return 8
-    if dtype.is_nested():
-        return 8 if has_bignumeric_dtype(dtype) else 7
-    return 6
+def _select_zero_column_fallback(schema: pl.Schema) -> str:
+    """Select the single narrowest safe column to request for a 0-column read.
 
-
-def _select_zero_column_fallback(
-    schema: pl.Schema,
-    bq_types: Mapping[str, BQType] | None = None,
-) -> str:
-    """Select the single narrowest safe column to request for a 0-column read."""
+    Prefers physical columns ahead of ingestion-time pseudo-columns so explicit
+    schemas (or mixed tables where pseudo-columns remain optional) always read
+    a real column first. When only pseudo-columns remain (all physical columns
+    were skipped), applies the same width-then-order tie breaker so
+    `_PARTITIONDATE` (`DATE`, rank 2) is chosen before `_PARTITIONTIME`
+    (`TIMESTAMP`, rank 3).
+    """
     physical_columns = [
         (idx, name, dtype)
         for idx, (name, dtype) in enumerate(schema.items())
         if name.casefold() not in _INGESTION_TIME_PSEUDO_COLUMNS_CASEFOLD
     ]
-    if physical_columns:
-        _, best_name, _ = min(
-            physical_columns,
-            key=lambda item: (
-                _dtype_fallback_rank(
-                    item[2],
-                    bq_type=bq_types.get(item[1]) if bq_types is not None else None,
-                ),
-                item[0],
-            ),
-        )
-        return best_name
-    for name in schema:
-        if name.casefold() == "_partitiontime":
-            return name
-    return next(iter(schema))
+    candidates = physical_columns or [
+        (idx, name, dtype) for idx, (name, dtype) in enumerate(schema.items())
+    ]
+    _, best_name, _ = min(
+        candidates,
+        key=lambda item: (_zero_column_rank(item[2]), item[0]),
+    )
+    return best_name
 
 
 def _prune_conjuncts_to_budget(
@@ -206,9 +165,7 @@ def compile_read_api_plan(
     ]
     selected_fields = tuple(dict.fromkeys([*output_cols, *filter_cols]))
     if not selected_fields:
-        selected_fields = (
-            _select_zero_column_fallback(source.schema, source.bq_types),
-        )
+        selected_fields = (_select_zero_column_fallback(source.schema),)
 
     conjuncts: list[str] = []
     for op in normalized_ops:

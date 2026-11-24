@@ -518,15 +518,16 @@ class Client:
 
         When `schema` is `None`, top-level columns whose type (or any nested
         `STRUCT`/`ARRAY` subfield) is unsupported (`BIGNUMERIC`, `INTERVAL`,
-        `RANGE<T>`, picosecond `TIMESTAMP`, or empty/unnamed/duplicate `STRUCT`)
-        are omitted with an `UnsupportedTypeWarning` warning, rather than
-        failing the entire scan as
+        `RANGE<T>`, non-microsecond `TIMESTAMP`, or unrecognized future types
+        or field modes) are omitted with an `UnsupportedTypeWarning` warning,
+        rather than failing the entire scan as
         [`Client.read_table`][polars_bigquery.Client.read_table] can.
 
-        For ingestion-time partitioned tables, `_PARTITIONTIME`
-        (`pl.Datetime("us", "UTC")`) is always added to the `LazyFrame` schema
-        when `schema` is `None`; `_PARTITIONDATE` (`pl.Date`) is additionally
-        added when the table uses daily (`DAY`) partitioning.
+        For ingestion-time partitioned tables (with at least one physical
+        column), `_PARTITIONTIME` (`pl.Datetime("us", "UTC")`) is added to the
+        `LazyFrame` schema when `schema` is `None`; `_PARTITIONDATE`
+        (`pl.Date`) is additionally added when the table uses daily (`DAY`)
+        partitioning.
 
         Parameters
         ----------
@@ -536,22 +537,23 @@ class Client:
             `project` (or `project_id`), `dataset_id`, and `table_id` attributes
             (such as `google.cloud.bigquery.TableReference`).
         schema
-            Optional Polars schema (`polars.Schema` or a mapping of column names
-            to Polars data types) for the table. When provided, `scan_table`
-            avoids calling the BigQuery `tables.get` REST API to fetch table
-            metadata. For ingestion-time partitioned tables, include
-            `"_PARTITIONTIME": pl.Datetime("us", "UTC")` and (for `DAY`
+            Optional non-empty Polars schema (`polars.Schema` or a mapping of
+            column names to Polars data types) for the table. When provided,
+            `scan_table` skips calling the BigQuery `tables.get` REST API to
+            fetch table metadata. For ingestion-time partitioned tables,
+            include `"_PARTITIONTIME": pl.Datetime("us", "UTC")` and (for `DAY`
             partitions) `"_PARTITIONDATE": pl.Date` in `schema` if you want to
             filter or select those pseudo-columns. For `JSON` and `GEOGRAPHY`
-            columns, use `polars_bigquery.dtypes.JSON` and
-            `polars_bigquery.dtypes.GEOGRAPHY` (or a registered
-            `polars.BaseExtension` subclass). Loading extension types as plain
+            columns, the dtype must match the active Polars Arrow extension
+            mode: `polars_bigquery.dtypes.JSON` /
+            `polars_bigquery.dtypes.GEOGRAPHY` by default, your registered
+            `polars.BaseExtension` subclass, or `pl.String()` when loaded as
             storage (`as_storage=True` or
-            `POLARS_UNKNOWN_EXTENSION_TYPE_BEHAVIOR=load_as_storage`) is not
-            supported with an explicit `schema` because `pl.String` cannot be
-            distinguished from BigQuery `STRING` without table metadata.
-            Passing an empty mapping (`schema={}`) skips both `tables.get` and
-            `CreateReadSession`, yielding an empty 0-row, 0-column `DataFrame`.
+            `POLARS_UNKNOWN_EXTENSION_TYPE_BEHAVIOR=load_as_storage`). For
+            `ARRAY<JSON>` and `ARRAY<GEOGRAPHY>` under default extension mode,
+            BigQuery wraps the outer `List` field rather than the element (for
+            example, `pl.Extension("google:sqlType:json", pl.List(pl.String()))`
+            instead of `pl.List(polars_bigquery.dtypes.JSON)`).
 
         Returns
         -------
@@ -567,13 +569,16 @@ class Client:
 
         Raises
         ------
+        polars_bigquery.exceptions.UnsupportedTypeError
+            If `schema` is `None` and a table with one or more defined columns
+            has zero supported columns (and zero ingestion-time partition
+            pseudo-columns) remaining after omitting unsupported columns.
         polars_bigquery.exceptions.BigQueryError
             If `schema` is `None` and fetching table metadata from the BigQuery
-            REST API fails or returns malformed schema/partition metadata, or if
+            REST API fails or returns a malformed metadata envelope, or if
             reading from the Storage Read API fails during collection.
         ValueError
-            If `schema` is `None` and a non-empty table has zero supported
-            columns remaining after omitting unsupported columns.
+            If an explicit `schema` is empty (contains zero columns).
         TypeError
             If an explicit `schema` contains an unspecified Polars data type
             class (such as bare `pl.Datetime`) or an unsupported `BIGNUMERIC`
@@ -607,18 +612,12 @@ class Client:
         """
         self._ensure_open()
         table_ref = arrow_bigquery.api.resources.parse_table_id(table)
-        bq_types: Mapping[str, polars_bigquery.core.types.BQType] | None
         if schema is None:
             table_metadata = self._rest_client.get_table_metadata(table_ref)
-            try:
-                extracted = polars_bigquery.core.schema.extract_schema_metadata(
-                    table_metadata
-                )
-            except (TypeError, ValueError) as exc:
-                msg = f"Invalid BigQuery table metadata for '{table_ref}': {exc}"
-                raise polars_bigquery.exceptions.BigQueryError(msg) from exc
+            extracted = polars_bigquery.core.schema.extract_schema_metadata(
+                table_metadata
+            )
             polars_schema = extracted.polars_schema
-            bq_types = extracted.bq_types
             if extracted.skipped_columns:
                 skipped_summary = _format_skipped_columns(extracted.skipped_columns)
                 if len(polars_schema) == 0:
@@ -626,10 +625,10 @@ class Client:
                         f"Table '{table_ref}' has no supported columns to scan. "
                         f"Skipped {len(extracted.skipped_columns)} unsupported "
                         f"column(s): {skipped_summary}. "
-                        "Use client.read_query() to cast or exclude unsupported "
-                        "columns in SQL."
+                        "Use client.scan_query() or client.read_query() to cast or "
+                        "exclude unsupported columns in SQL."
                     )
-                    raise ValueError(msg)
+                    raise polars_bigquery.exceptions.UnsupportedTypeError(msg)
                 logger.debug(
                     "Omitting %d unsupported column(s) from table '%s': %s",
                     len(extracted.skipped_columns),
@@ -639,14 +638,14 @@ class Client:
                 warnings.warn(
                     f"Skipping {len(extracted.skipped_columns)} unsupported column(s) "
                     f"in table '{table_ref}': {skipped_summary}. "
-                    "Use client.read_query() to cast or select these columns in SQL.",
+                    "Use client.scan_query() or client.read_query() to cast or "
+                    "exclude these columns in SQL.",
                     polars_bigquery.exceptions.UnsupportedTypeWarning,
                     stacklevel=2,
                 )
             schema_mode = "metadata"
         else:
-            polars_schema = _normalize_schema(schema, require_non_empty=False)
-            bq_types = None
+            polars_schema = _normalize_schema(schema, require_non_empty=True)
             schema_mode = "explicit"
 
         explain_detail = f"table={table_ref}, schema={schema_mode}"
@@ -657,7 +656,6 @@ class Client:
                 table_ref=table_ref,
                 schema=polars_schema,
                 maintain_order=False,
-                bq_types=bq_types,
             )
             executor = ReadApiExecutor(self._arrow_client)
 
@@ -672,9 +670,9 @@ class Client:
             if closed_event.is_set():
                 msg = "Cannot use a closed polars_bigquery.Client instance."
                 raise RuntimeError(msg)
-            # Explicit empty `schema={}` is treated identically to a 0-column table:
-            # short-circuit without calling `CreateReadSession` (BigQuery rejects empty
-            # schemas with FAILED_PRECONDITION).
+            # Short-circuit discovered 0-column tables without calling
+            # `CreateReadSession` (BigQuery rejects empty schemas with
+            # FAILED_PRECONDITION).
             if source is None or executor is None:
                 logger.debug(
                     "Short-circuiting empty schema scan for table '%s' without "
@@ -852,9 +850,10 @@ class Client:
         TypeError
             If `query`, `maintain_order`, `use_query_cache`, or
             `maximum_bytes_billed` have invalid types, if the dry-run result
-            schema contains an unsupported BigQuery field type (including
-            `BIGNUMERIC` / `BIGDECIMAL`), or if an explicit `schema` contains an
-            unspecified Polars data type class (such as bare `pl.Datetime`).
+            schema contains an unsupported BigQuery field type (`BIGNUMERIC` /
+            `BIGDECIMAL`, `INTERVAL`, `RANGE`, non-microsecond `TIMESTAMP`, or
+            an unrecognized type or mode), or if an explicit `schema` contains
+            an unspecified Polars data type class (such as bare `pl.Datetime`).
         RuntimeError
             If called on a closed `Client` instance.
 

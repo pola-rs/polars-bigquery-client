@@ -10,11 +10,11 @@ class UnsupportedTypeWarning(UserWarning):
 
     BigQuery tables may contain columns whose types (or nested subfield types)
     are not supported by `polars_bigquery`, such as `BIGNUMERIC`, `INTERVAL`,
-    `RANGE<T>`, picosecond `TIMESTAMP`, or unnamed/duplicate/empty `STRUCT`
-    fields. When `Client.scan_table` inspects table metadata and at least one
-    supported column (or ingestion-time partition pseudo-column) remains, the
-    unsupported top-level columns are omitted from the `LazyFrame` schema and
-    this warning is emitted.
+    `RANGE<T>`, non-microsecond `TIMESTAMP`, or unrecognized future BigQuery
+    types or field modes. When `Client.scan_table` inspects table metadata and
+    at least one supported column (or ingestion-time partition pseudo-column)
+    remains, the unsupported top-level columns are omitted from the `LazyFrame`
+    schema and this warning is emitted.
 
     You can filter or turn this warning into an error with the standard
     `warnings` module:

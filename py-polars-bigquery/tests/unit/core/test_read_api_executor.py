@@ -80,51 +80,50 @@ def test_compile_read_api_plan_visibility_and_multi_project_collapse() -> None:
 
 
 def test_compile_read_api_plan_zero_column_fallback_priority_tiers() -> None:
-    # Check each rank tier strictly preferred over all higher-rank tiers.
-    nested_map = (
-        pl.Map(pl.String(), pl.Int64())
-        if hasattr(pl, "Map")
-        else pl.Struct({"k": pl.String()})
-    )
+    # Check each BigQuery width tier (via core.types.column_width_rank) is strictly
+    # preferred over all higher-rank tiers: 1=BOOL, 2=DATE, 3=8-byte scalars,
+    # 4=NUMERIC, 5=STRING/BYTES/JSON/GEOGRAPHY, 6=ARRAY/STRUCT, 7=unknown/unsupported.
+    unparam_decimal = pl.Decimal(precision=38, scale=9)
+    unparam_decimal.precision = None  # type: ignore[misc]
     ordered_candidates: list[tuple[str, pl.DataType]] = [
-        ("tier0_bool", pl.Boolean()),
-        ("tier1_i8", pl.Int8()),
-        ("tier1_u8", pl.UInt8()),
-        ("tier2_i16", pl.Int16()),
-        ("tier2_u16", pl.UInt16()),
-        ("tier2_f16", pl.Float16()),
-        ("tier3_date", pl.Date()),
+        ("tier1_bool", pl.Boolean()),
+        ("tier2_date", pl.Date()),
+        ("tier3_i64", pl.Int64()),
         ("tier3_i32", pl.Int32()),
-        ("tier3_u32", pl.UInt32()),
-        ("tier3_f32", pl.Float32()),
-        ("tier4_i64", pl.Int64()),
-        ("tier4_u64", pl.UInt64()),
-        ("tier4_f64", pl.Float64()),
-        ("tier4_time", pl.Time()),
-        ("tier4_dt", pl.Datetime("us")),
-        ("tier5_i128", pl.Int128()),
-        ("tier5_u128", pl.UInt128()),
-        ("tier5_dec38", pl.Decimal(precision=38, scale=9)),
-        ("tier6_str", pl.String()),
-        ("tier6_bin", pl.Binary()),
-        ("tier6_cat", pl.Categorical()),
-        ("tier6_enum", pl.Enum(["x"])),
-        ("tier7_list", pl.List(pl.Int64())),
-        ("tier7_arr", pl.Array(pl.Int64(), 2)),
-        ("tier7_struct", pl.Struct({"x": pl.Int64()})),
-        ("tier7_map", nested_map),
-        ("tier8_dur", pl.Duration("us")),
-        ("tier8_bignum", pl.Decimal(precision=76, scale=38)),
-        ("tier8_null", pl.Null()),
-        ("tier8_unknown", pl.Unknown()),
-        ("tier8_obj", pl.Object()),
+        ("tier3_f64", pl.Float64()),
+        ("tier3_time", pl.Time()),
+        ("tier3_dt", pl.Datetime("us")),
+        ("tier3_ts", pl.Datetime("us", "UTC")),
+        ("tier4_dec38", pl.Decimal(precision=38, scale=9)),
+        ("tier5_str", pl.String()),
+        ("tier5_bin", pl.Binary()),
+        ("tier5_json", pl.Extension("google:sqlType:json", pl.String())),
+        (
+            "tier5_geo",
+            pl.Extension(
+                "google:sqlType:geography", pl.String(), '{"encoding": "WKT"}'
+            ),
+        ),
+        ("tier6_list", pl.List(pl.Int64())),
+        ("tier6_struct", pl.Struct({"x": pl.Int64()})),
+        (
+            "tier6_json_arr",
+            pl.Extension("google:sqlType:json", pl.List(pl.String())),
+        ),
+        ("tier7_dur", pl.Duration("us")),
+        ("tier7_f16", pl.Float16()),
+        ("tier7_bignum", pl.Decimal(precision=76, scale=38)),
+        ("tier7_dec_none", unparam_decimal),
+        ("tier7_null", pl.Null()),
+        ("tier7_unknown", pl.Unknown()),
+        ("tier7_obj", pl.Object()),
     ]
     # Add in reverse order so the narrowest type wins by rank, not position.
     for i in range(len(ordered_candidates)):
         slice_map = dict(reversed(ordered_candidates[i:]))
         # Include ingestion-time pseudo-columns to confirm physical column wins.
         slice_map["_PARTITIONDATE"] = pl.Date()
-        slice_map["_PARTITIONTIME"] = pl.Datetime("us", "utc")
+        slice_map["_PARTITIONTIME"] = pl.Datetime("us", "UTC")
         scan = _tscan(slice_map)
         compiled = compile_read_api_plan(Project(input=scan, columns=()))
         assert len(compiled.selected_fields) == 1
@@ -137,21 +136,46 @@ def test_compile_read_api_plan_zero_column_fallback_priority_tiers() -> None:
             f"For slice starting at {expected_name}, got {winner}"
         )
 
+    # Custom non-BigQuery BaseExtension unwraps its storage dtype for ranking.
+    ext_scan = _tscan(
+        {
+            "note": pl.String(),
+            "flag_ext": pl.Extension("custom:flag", pl.Boolean()),
+        }
+    )
+    assert compile_read_api_plan(
+        Project(input=ext_scan, columns=())
+    ).selected_fields == ("flag_ext",)
+
     # Tie breaking within the same tier picks earliest schema index.
-    tie_scan = _tscan({"second_tier4": pl.Float64(), "first_i64": pl.Int64()})
+    tie_scan = _tscan({"second_tier3": pl.Float64(), "first_i64": pl.Int64()})
     assert compile_read_api_plan(
         Project(input=tie_scan, columns=())
-    ).selected_fields == ("second_tier4",)
+    ).selected_fields == ("second_tier3",)
 
-    # Pseudo-columns only: prefer _PARTITIONTIME over _PARTITIONDATE
+    # Pseudo-columns only: _PARTITIONDATE (DATE, rank 2) wins over _PARTITIONTIME
+    # (TIMESTAMP, rank 3) regardless of declaration order.
     pseudo_both = _tscan(
-        {"_PARTITIONDATE": pl.Date(), "_PARTITIONTIME": pl.Datetime("us", "utc")}
+        {"_PARTITIONDATE": pl.Date(), "_PARTITIONTIME": pl.Datetime("us", "UTC")}
     )
     assert compile_read_api_plan(
         Project(input=pseudo_both, columns=())
+    ).selected_fields == ("_PARTITIONDATE",)
+
+    pseudo_reversed = _tscan(
+        {"_PARTITIONTIME": pl.Datetime("us", "UTC"), "_PARTITIONDATE": pl.Date()}
+    )
+    assert compile_read_api_plan(
+        Project(input=pseudo_reversed, columns=())
+    ).selected_fields == ("_PARTITIONDATE",)
+
+    # Non-DAY ingestion-time table: only _PARTITIONTIME present.
+    pseudo_time_only = _tscan({"_PARTITIONTIME": pl.Datetime("us", "UTC")})
+    assert compile_read_api_plan(
+        Project(input=pseudo_time_only, columns=())
     ).selected_fields == ("_PARTITIONTIME",)
 
-    # Only _PARTITIONDATE present
+    # Only _PARTITIONDATE present.
     pseudo_date_only = _tscan({"_PARTITIONDATE": pl.Date()})
     assert compile_read_api_plan(
         Project(input=pseudo_date_only, columns=())
@@ -257,10 +281,10 @@ def test_compile_read_api_plan_case_insensitive_pseudo_column_fallback() -> None
     assert compiled.selected_fields == ("note",)
 
     pseudo_lower = _tscan(
-        {"_partitiondate": pl.Date(), "_PartitionTime": pl.Datetime("us", "utc")}
+        {"_PartitionTime": pl.Datetime("us", "UTC"), "_partitiondate": pl.Date()}
     )
     compiled_pseudo = compile_read_api_plan(Project(input=pseudo_lower, columns=()))
-    assert compiled_pseudo.selected_fields == ("_PartitionTime",)
+    assert compiled_pseudo.selected_fields == ("_partitiondate",)
 
 
 def test_compile_read_api_plan_row_restriction_length_guard(caplog) -> None:
@@ -316,6 +340,7 @@ def test_zero_column_fallback_deprioritizes_nested_bignumeric() -> None:
         {
             "arr_bn": pl.List(pl.Decimal(precision=76, scale=38)),
             "struct_bn": pl.Struct([pl.Field("x", pl.Decimal(precision=76, scale=38))]),
+            "ext_bn": pl.Extension("custom:bn", pl.Decimal(precision=76, scale=38)),
             "nested_ok": pl.List(pl.String()),
         }
     )

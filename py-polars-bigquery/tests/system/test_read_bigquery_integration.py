@@ -505,3 +505,184 @@ def test_scan_table_zero_column_hour_ingestion_time_partitioned(client):
         assert df.width == 0
     finally:
         client.read_query(f"DROP SCHEMA IF EXISTS `{project}.{dataset}` CASCADE")
+
+
+def _rest_bigquery_post(client, project: str, path: str, payload: dict) -> dict:
+    import requests
+
+    token_data, _ = client.credentials_provider()
+    resp = requests.post(
+        f"https://bigquery.googleapis.com/bigquery/v2/projects/{project}/{path}",
+        headers={
+            "Authorization": f"Bearer {token_data['bearer_token']}",
+            "Content-Type": "application/json",
+            "x-goog-user-project": project,
+        },
+        json=payload,
+        timeout=60,
+    )
+    resp.raise_for_status()
+    return resp.json()
+
+
+def test_scan_query_extension_and_struct_wire_parity(client):
+    sql = """
+    SELECT
+        PARSE_JSON('{"a": 1}') AS j,
+        ST_GEOGPOINT(0, 0) AS g,
+        [PARSE_JSON('{"a": 1}')] AS aj,
+        [ST_GEOGPOINT(0, 0)] AS ag,
+        STRUCT(
+            PARSE_JSON('{"a": 1}') AS j,
+            ST_GEOGPOINT(0, 0) AS g,
+            [PARSE_JSON('{"a": 1}')] AS aj,
+            [ST_GEOGPOINT(0, 0)] AS ag
+        ) AS st,
+        [STRUCT(PARSE_JSON('{"a": 1}') AS j, ST_GEOGPOINT(0, 0) AS g)] AS ast
+    """
+    eager = client.read_query(sql)
+    lazy = client.scan_query(sql)
+    assert lazy.collect_schema() == eager.schema
+    collected = lazy.collect()
+    assert collected.schema == eager.schema
+    assert collected.shape == (1, 6)
+
+    # BigQuery synthesizes `_field_1` / `_field_2` for unnamed/case-colliding subfields.
+    s1 = client.scan_query("SELECT STRUCT(1) AS s").collect()
+    assert s1.schema == pl.Schema({"s": pl.Struct({"_field_1": pl.Int64()})})
+    s2 = client.scan_query("SELECT STRUCT(1, 2) AS s").collect()
+    assert s2.schema == pl.Schema(
+        {"s": pl.Struct({"_field_1": pl.Int64(), "_field_2": pl.Int64()})}
+    )
+    s_case = client.scan_query("SELECT STRUCT(1 AS a, 'x' AS A) AS s").collect()
+    assert s_case.schema == pl.Schema(
+        {"s": pl.Struct({"a": pl.Int64(), "_field_2": pl.String()})}
+    )
+
+
+def test_scan_table_extension_partition_skipping_and_empty_tables(client):
+    import warnings
+
+    from polars_bigquery.exceptions import UnsupportedTypeError, UnsupportedTypeWarning
+
+    project = os.environ["GOOGLE_CLOUD_PROJECT"]
+    dataset = f"_polars_bq_test_{uuid.uuid4().hex[:12]}"
+    fq_ds = f"{project}.{dataset}"
+    client.read_query(
+        f"CREATE SCHEMA `{fq_ds}` OPTIONS(default_table_expiration_days=1)"
+    )
+    try:
+        # 1. JSON / GEOGRAPHY / ARRAY / STRUCT parity between read_table and scan_table
+        ext_tbl = f"{fq_ds}.ext_types"
+        client.read_query(
+            f"""
+            CREATE TABLE `{ext_tbl}` AS
+            SELECT
+                PARSE_JSON('{{"a": 1}}') AS j,
+                ST_GEOGPOINT(0, 0) AS g,
+                [PARSE_JSON('{{"a": 1}}')] AS aj,
+                [ST_GEOGPOINT(0, 0)] AS ag,
+                STRUCT(
+                    PARSE_JSON('{{"a": 1}}') AS j,
+                    ST_GEOGPOINT(0, 0) AS g,
+                    [PARSE_JSON('{{"a": 1}}')] AS aj,
+                    [ST_GEOGPOINT(0, 0)] AS ag
+                ) AS st,
+                [STRUCT(PARSE_JSON('{{"a": 1}}') AS j, ST_GEOGPOINT(0, 0) AS g)] AS ast
+            """
+        )
+        eager = client.read_table(ext_tbl)
+        lazy = client.scan_table(ext_tbl)
+        assert lazy.collect_schema() == eager.schema
+        assert lazy.collect().shape == (1, 6)
+
+        # 2. All-unsupported physical column on DAY ingestion-time partitioned table
+        day_tbl = f"{fq_ds}.day_interval"
+        _rest_bigquery_post(
+            client,
+            project,
+            "queries",
+            {
+                "query": f"CREATE TABLE `{day_tbl}` (dur INTERVAL) PARTITION BY _PARTITIONDATE",
+                "useLegacySql": False,
+            },
+        )
+        _rest_bigquery_post(
+            client,
+            project,
+            "queries",
+            {
+                "query": f"INSERT INTO `{day_tbl}` (dur) VALUES (INTERVAL 1 DAY), (INTERVAL 2 HOUR)",
+                "useLegacySql": False,
+            },
+        )
+        with pytest.warns(UnsupportedTypeWarning, match=r"dur \(INTERVAL\)"):
+            day_df = client.scan_table(day_tbl).collect()
+        assert day_df.schema == pl.Schema(
+            {
+                "_PARTITIONDATE": pl.Date(),
+                "_PARTITIONTIME": pl.Datetime("us", "UTC"),
+            }
+        )
+        assert day_df.shape == (2, 2)
+
+        # 3. All-unsupported physical column on HOUR ingestion-time partitioned table
+        hour_tbl = f"{fq_ds}.hour_interval"
+        _rest_bigquery_post(
+            client,
+            project,
+            "queries",
+            {
+                "query": f"CREATE TABLE `{hour_tbl}` (dur INTERVAL) PARTITION BY TIMESTAMP_TRUNC(_PARTITIONTIME, HOUR)",
+                "useLegacySql": False,
+            },
+        )
+        _rest_bigquery_post(
+            client,
+            project,
+            "queries",
+            {
+                "query": f"INSERT INTO `{hour_tbl}` (dur) VALUES (INTERVAL 1 DAY)",
+                "useLegacySql": False,
+            },
+        )
+        with pytest.warns(UnsupportedTypeWarning, match=r"dur \(INTERVAL\)"):
+            hour_df = client.scan_table(hour_tbl).collect()
+        assert hour_df.schema == pl.Schema({"_PARTITIONTIME": pl.Datetime("us", "UTC")})
+        assert hour_df.shape == (1, 1)
+
+        # 4. Non-partitioned all-unsupported table raises UnsupportedTypeError without warning
+        bad_tbl = f"{fq_ds}.bad_only"
+        _rest_bigquery_post(
+            client,
+            project,
+            "queries",
+            {
+                "query": f"CREATE TABLE `{bad_tbl}` (dur INTERVAL)",
+                "useLegacySql": False,
+            },
+        )
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            with pytest.raises(UnsupportedTypeError, match="no supported columns"):
+                client.scan_table(bad_tbl)
+        assert caught == []
+
+        # 5. Schemaless (0-column) DAY ingestion-time partitioned table short-circuits to (0, 0)
+        _rest_bigquery_post(
+            client,
+            project,
+            f"datasets/{dataset}/tables",
+            {
+                "tableReference": {
+                    "projectId": project,
+                    "datasetId": dataset,
+                    "tableId": "empty_day",
+                },
+                "timePartitioning": {"type": "DAY"},
+            },
+        )
+        empty_day_df = client.scan_table(f"{fq_ds}.empty_day").collect()
+        assert empty_day_df.shape == (0, 0)
+    finally:
+        client.read_query(f"DROP SCHEMA IF EXISTS `{fq_ds}` CASCADE")

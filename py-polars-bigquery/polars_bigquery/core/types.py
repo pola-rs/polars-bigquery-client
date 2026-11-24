@@ -231,13 +231,25 @@ def column_width_rank(
     *,
     bq_type: BQType | None = None,
 ) -> int:
-    """Return a deterministic storage-width rank (1=narrowest, 6=widest/unknown).
+    """Return a deterministic storage-width rank (1=narrowest, 6=nested, 7=unknown).
+
+    Ranks follow BigQuery wire widths across the 14 supported `BQType` values
+    (`1` BOOL, `2` DATE, `3` 8-byte scalars, `4` NUMERIC, `5` variable-length
+    STRING/BYTES/JSON/GEOGRAPHY, `6` ARRAY/STRUCT), leaving `7` for unknown or
+    unsupported dtypes (e.g. `Duration`, `Float16`, `BIGNUMERIC` decimals) so
+    zero-column fallback prioritizes every valid BigQuery type first.
 
     When `bq_type` is supplied (e.g. from authoritative BigQuery REST metadata),
     it takes precedence over inferring the BigQuery type from `dtype`.
     """
-    resolved = bq_type if bq_type is not None else polars_dtype_to_bq_type(dtype)
-    return _BQ_TYPE_WIDTH_RANK.get(resolved, 6)
+    if bq_type is not None:
+        return _BQ_TYPE_WIDTH_RANK.get(bq_type, 7)
+    resolved = polars_dtype_to_bq_type(dtype)
+    if resolved is not None:
+        return _BQ_TYPE_WIDTH_RANK[resolved]
+    if isinstance(dtype, pl.BaseExtension):
+        return column_width_rank(dtype.ext_storage())
+    return 7
 
 
 __all__ = [

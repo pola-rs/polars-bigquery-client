@@ -1,78 +1,79 @@
-# BigQuery Schema Mapping, Column Skipping, and Plan Type Propagation for Polars 2.0+
+# BigQuery Schema Mapping and Column Skipping for Polars 2.0+
 
 *   **Author:** @tswast
 *   **Status:** Proposed
-*   **Date:** 2026-11-24
+*   **Created:** 2026-11-24
+*   **Last updated:** 2026-11-24
 *   **Related design docs:** [Row Predicate Pushdown](./polars_bigquery_scan_table_row_predicate_pushdown.md), [`Client.scan_query()`](./polars_bigquery_scan_query.md)
 
 --------------------------------------------------------------------------------
 
 ## Overview
 
-When calling `Client.scan_table()`, Polars requires the full output schema up front, before reading rows over the BigQuery Storage Read API. Unlike eager `Client.read_table()` (which infers the schema directly from BigQuery's Arrow IPC stream), `Client.scan_table()` builds a `polars.Schema` from the JSON response returned by the BigQuery `tables.get` REST API (unless the caller supplies an explicit `schema=`). Similarly, `Client.scan_query()` discovers its initial schema from the JSON `bigquerySchema` payload returned by a `jobs.query` dry run.
+Before reading rows over the BigQuery Storage Read API, `Client.scan_table()` must supply Polars with the full output schema. Unlike eager `Client.read_table()` (which infers the schema from BigQuery's Arrow IPC stream), `Client.scan_table()` builds a `pl.Schema` from the JSON response returned by the BigQuery `tables.get` REST API (unless the caller passes an explicit `schema=`). Similarly, `Client.scan_query()` discovers its initial schema from the JSON `bigquerySchema` payload returned by a `jobs.query` dry run.
 
-In Polars 2.0+, Arrow C Stream validation rejects collection when the registered schema disagrees with the Arrow IPC stream returned at execution time. This design covers the schema-mapping layer in `polars_bigquery`:
+In Polars 2.0+, Arrow C Stream validation fails `.collect()` when the declared schema differs from the Arrow IPC stream returned at execution time. Note that all baseline statements in `The Problem` describe the `main` branch prior to this change (commit `32fdc1f`). This design updates the schema-mapping layer in `polars_bigquery`:
 
-1.  Aligning extracted Polars dtypes with BigQuery's Arrow IPC output (uppercase `"UTC"` timezone, Arrow extension types for `JSON` and `GEOGRAPHY`, and outer-wrapped `List(String())` extensions for `ARRAY<JSON>` and `ARRAY<GEOGRAPHY>`).
-2.  Distinguishing table-scan extraction (which skips unsupported top-level columns with a warning so mixed tables remain readable) from query-scan extraction (which rejects unsupported columns immediately so verbatim `SELECT` outputs are never silently dropped).
-3.  Preserving REST field parameters across `REPEATED` (`ARRAY`) recursion and validating `timestampPrecision`.
-4.  Restricting the `_PARTITIONDATE` pseudo-column to daily (`DAY`) ingestion-time partitioned tables.
-5.  Short-circuiting empty tables (`0` columns) and explicit `schema={}` without opening a Storage Read API session.
-6.  Carrying an immutable column-name-to-`BQType` mapping on `TableScan` plan nodes so `ReadApiExecutor` retains authoritative BigQuery types even when Polars loads extension columns as plain storage (`pl.String` / `pl.List(pl.String)`).
+1.  Aligning extracted Polars dtypes with BigQuery's Arrow IPC output (uppercase `"UTC"` timezone, Arrow extension types for `JSON` and `GEOGRAPHY`, and outer-wrapped `pl.List(pl.String())` extensions for `ARRAY<JSON>` and `ARRAY<GEOGRAPHY>`).
+2.  Distinguishing table-scan extraction (which skips unsupported top-level columns with `UnsupportedTypeWarning` so mixed tables remain readable, and raises `UnsupportedTypeError` if zero supported columns or pseudo-columns remain) from query-scan extraction (which rejects unsupported columns immediately with `TypeError` so verbatim `SELECT` outputs are never omitted).
+3.  Preserving REST field attributes across `REPEATED` (`ARRAY`) recursion and validating `timestampPrecision`.
+4.  Restricting the `_PARTITIONDATE` pseudo-column to daily (`DAY`) ingestion-time partitioned tables with at least one physical column.
+5.  Short-circuiting discovered zero-column tables (including schemaless ingestion-time partitioned tables) without opening a Storage Read API session, while rejecting explicit empty `schema={}` (`ValueError`, matching `Client.scan_query()`).
+6.  Consolidating zero-column fallback column ranking inside `ReadApiExecutor` onto the existing `core/types.py::column_width_rank` utility (`1`–`6` across the 14 supported `BQType` values, `7` for unsupported/unknown types), choosing `_PARTITIONDATE` (`DATE`, rank `2`) over `_PARTITIONTIME` (`TIMESTAMP`, rank `3`) on daily tables when only pseudo-columns remain.
 
 ## The Problem
 
-This repository contains three layers: `crates/arrow-bigquery` (Rust Storage Read API and `jobs.query` Arrow IPC client), `py-arrow-bigquery` (PyO3 bindings exposing Arrow C Stream export), and `py-polars-bigquery` (Python Polars connector). Prior PRs introduced `UnsupportedTypeError` (`#116`), stripped `google:sqlType:datetime` extension metadata during Arrow decoding so `DATETIME` matches `pl.Datetime("us")` (`#123`), and added `BQType`, `build_extension_dtype`, and `polars_bigquery.dtypes.{JSON,GEOGRAPHY}` (`#121`).
+This repository spans three layers: `crates/arrow-bigquery` (Rust Storage Read API and `jobs.query` Arrow IPC client), `py-arrow-bigquery` (PyO3 bindings exposing Arrow C Stream export), and `py-polars-bigquery` (Python Polars connector). Prior PRs added [`UnsupportedTypeError` (`#116`)](https://github.com/pola-rs/polars-bigquery-client/pull/116) (a `BigQueryError` subclass guarding against Arrow C Data Interface FFI failures inside `arrow-bigquery`), introduced `BQType`, `build_extension_dtype`, `column_width_rank`, and scalar constants `polars_bigquery.dtypes.JSON` and `GEOGRAPHY` ([`#121`](https://github.com/pola-rs/polars-bigquery-client/pull/121)), and stripped `google:sqlType:datetime` extension metadata during Arrow decoding so `DATETIME` decodes as `pl.Datetime("us")` ([`#123`](https://github.com/pola-rs/polars-bigquery-client/pull/123)).
 
-Even with those prerequisites merged, `core/schema.py` broke on real-world BigQuery tables under Polars 2.0+ for five separate reasons:
+Prior to this change (`main` at commit `32fdc1f`), `py-polars-bigquery/polars_bigquery/core/schema.py` fails on BigQuery tables under Polars 2.0+ for five reasons:
 
-1.  **`TIMESTAMP` timezone casing mismatch.** BigQuery's Arrow IPC stream marks `TIMESTAMP` columns and `_PARTITIONTIME` with uppercase `"UTC"`. The previous schema extractor emitted lowercase `time_zone="utc"`, causing `scan_table().collect_schema()` to disagree with `read_table().schema`.
-2.  **`JSON` and `GEOGRAPHY` extension mismatch.** BigQuery tags `JSON` with Arrow extension name `google:sqlType:json` and `GEOGRAPHY` with `google:sqlType:geography` and metadata `'{"encoding": "WKT"}'`. For `ARRAY<JSON>` and `ARRAY<GEOGRAPHY>`, BigQuery places the extension metadata on the outer Arrow `List` field rather than the inner `String` element. Polars 2.0+ loads unregistered Arrow extension types as `pl.Extension(...)` by default. Because `core/schema.py` previously mapped `JSON` and `GEOGRAPHY` to plain `pl.String`, collecting a `scan_table()` call on any table with those columns failed Polars schema validation (`SchemaError`).
-3.  **Unscannable mixed tables.** A single unsupported column anywhere in a BigQuery table crashed the entire `scan_table()` call instead of allowing users to scan the remaining supported columns:
-    *   `BIGNUMERIC` / `BIGDECIMAL` maps to precision 76 (exceeding Polars' maximum `Decimal` precision of 38).
-    *   `INTERVAL` requires Arrow `Interval(MonthDayNano)`, which causes FFI failure (`UnsupportedTypeError`).
+1.  **`TIMESTAMP` timezone casing mismatch.** BigQuery's Arrow IPC stream marks `TIMESTAMP` columns and `_PARTITIONTIME` with uppercase `"UTC"`. The schema extractor emitted lowercase `time_zone="utc"`, causing `scan_table().collect_schema()` to disagree with `read_table().schema`.
+2.  **`JSON` and `GEOGRAPHY` extension mismatch.** BigQuery tags `JSON` with Arrow extension name `google:sqlType:json` (`metadata=None`) and `GEOGRAPHY` with `google:sqlType:geography` and Well-Known Text (WKT) metadata `'{"encoding": "WKT"}'`. For `ARRAY<JSON>` and `ARRAY<GEOGRAPHY>`, BigQuery places the extension metadata on the outer Arrow `List` field rather than the inner `String` element. Polars 2.0+ loads unregistered Arrow extension types as `pl.Extension(...)` by default (`POLARS_UNKNOWN_EXTENSION_TYPE_BEHAVIOR=load_as_extension`). Mapping `JSON` and `GEOGRAPHY` to plain `pl.String` causes collecting `scan_table()` or `scan_query()` to fail Polars schema validation (`SchemaError`).
+3.  **Unscannable mixed tables and stale `INTERVAL`/`BIGNUMERIC` mappings.** A single unsupported column fails the entire `scan_table()` call instead of allowing users to read the remaining supported columns, and `scan_query()` maps unsupported types inaccurately:
+    *   `BIGNUMERIC` / `BIGDECIMAL` maps to `pl.Decimal(76, 38)`, exceeding Polars' maximum `Decimal` precision of `38` (raising `pl.exceptions.InvalidOperationError` when building a `LazyFrame`).
+    *   `INTERVAL` previously mapped to `pl.Duration("us")`, but requires Arrow `Interval(MonthDayNano)`, which `arrow-bigquery` rejects with `UnsupportedTypeError` to avoid FFI failure.
     *   `RANGE<T>` has no Polars representation.
-    *   Picosecond / non-microsecond `TIMESTAMP` (`timestampPrecision` other than `6` / `"6"` / unset) exceeds microsecond precision assumptions.
-    *   Future BigQuery data types that have no mapping yet would fail the entire scan unless omitted individually.
-4.  **Dropped REST field parameters and incorrect partition pseudo-columns.**
-    *   When recursing into `mode="REPEATED"` (`ARRAY`), the previous extractor rebuilt a synthetic dict containing only `name`, `type`, `fields`, and `mode`. That dropped `timestampPrecision` and any other field properties, letting `ARRAY<TIMESTAMP>` with non-microsecond precision slip through as microsecond `List(Datetime("us", "UTC"))`.
-    *   The extractor unconditionally attached `_PARTITIONDATE` to every ingestion-time partitioned table. BigQuery only exposes `_PARTITIONDATE` on `DAY`-partitioned tables; `HOUR`, `MONTH`, and `YEAR` ingestion-time partitioned tables expose only `_PARTITIONTIME`.
-5.  **Zero-column tables failing session creation.** BigQuery's `CreateReadSession` RPC rejects empty (`0`-column) tables with `FAILED_PRECONDITION`. Passing explicit `schema={}` raised `ValueError` eagerly, and scanning a discovered `0`-column table threw `BigQueryError` when `require_non_empty=True`.
-
-A sixth structural hazard existed in downstream metadata handling: when a user configures Polars to load Arrow extension columns as plain storage (`register_extension_type(..., as_storage=True)` or `POLARS_UNKNOWN_EXTENSION_TYPE_BEHAVIOR=load_as_storage`), `JSON` and `GEOGRAPHY` appear in `pl.Schema` as `pl.String()`, and `ARRAY<JSON>`/`ARRAY<GEOGRAPHY>` appear as `pl.List(pl.String())`. Inspecting `pl.Schema` alone loses the distinction between a real `STRING` column and an extension column loaded as storage, affecting zero-column fallback column ranking now and future SQL predicate compilation later.
+    *   Non-microsecond `TIMESTAMP` (`timestampPrecision` other than `6`, `"6"`, or unset — coarser or finer) does not match the connector's fixed microsecond `pl.Datetime("us", "UTC")` schema.
+    *   Unrecognized future BigQuery data types or field modes would fail the entire scan unless omitted individually.
+4.  **Dropped REST field attributes and inaccurate partition pseudo-columns.**
+    *   When recursing into `mode="REPEATED"` (`ARRAY`), the extractor rebuilt a synthetic dict with only `name`, `type`, `fields`, and `mode`. Rebuilding the dictionary dropped `timestampPrecision` and other attributes, letting `ARRAY<TIMESTAMP>` with non-microsecond precision pass through unvalidated as `pl.List(pl.Datetime("us", "UTC"))`.
+    *   The extractor unconditionally attached `_PARTITIONDATE` to every ingestion-time partitioned table (even when empty or non-daily). BigQuery exposes `_PARTITIONDATE` only on `DAY`-partitioned tables; `HOUR`, `MONTH`, and `YEAR` tables expose only `_PARTITIONTIME`.
+5.  **Zero-column tables failing session creation.** BigQuery's `CreateReadSession` RPC rejects empty zero-column tables — **including** schemaless ingestion-time partitioned tables (`{"timePartitioning": {"type": "DAY"}}` with no `schema.fields`) — with `FAILED_PRECONDITION`. Previously, `scan_table()` raised `BigQueryError` or passed non-empty pseudo-columns into `CreateReadSession`.
 
 ## Goals
 
-*   **Schema parity with Polars 2.0+ Arrow C Streams:** For all 14 supported `BQType` values (`BOOL`, `INT64`, `FLOAT64`, `NUMERIC`, `STRING`, `BYTES`, `DATE`, `DATETIME`, `TIME`, `TIMESTAMP`, `JSON`, `GEOGRAPHY`, `ARRAY`, `STRUCT`), ensure `scan_table().collect_schema()` matches the schema imported from BigQuery's Arrow IPC stream, including uppercase `"UTC"` and default/registered extension handling for scalar and `REPEATED` `JSON` and `GEOGRAPHY`.
-*   **Graceful omission on mixed tables (`scan_table`):** Skip top-level columns whose own type or nested subfield is unsupported (`BIGNUMERIC`, `INTERVAL`, `RANGE`, non-microsecond `TIMESTAMP`, or unrecognized future BigQuery types), emitting one `UnsupportedTypeWarning` listing up to five omitted columns with their nested field paths (`col.sub.leaf`).
-*   **Fail-fast on unusable table schemas (`scan_table`):** Raise `ValueError` without emitting a warning when a non-empty table has zero supported columns (and zero retained partition pseudo-columns) left after skipping.
-*   **Avoid speculative client-side REST validation:** Trust the structural invariants enforced by BigQuery's REST API rather than guarding against impossible payloads (such as non-dict table metadata, integer `mode`/`type` values, or deeply nested `STRUCT`s beyond BigQuery's limit of 15) and avoid closed allowlists (`timePartitioning.type`, `field.mode`) that would break scanning if BigQuery introduces a new feature or granularity. Gate `_PARTITIONDATE` on `timePartitioning.type` being `"DAY"` (or omitted/`""`/`None`), and retain `_PARTITIONTIME` for any other `timePartitioning.type` without rejecting unknown granularities. *(Note: the existing `schema.py` code carries over-defensive checks and closed allowlists for `timePartitioning.type` and `field.mode` that require cleanup to match this design.)*
-*   **Strict extraction for valid queries (`scan_query`):** Keep `extract_polars_schema_from_fields` strict so query outputs are never silently dropped when running verbatim SQL, while accepting valid query results that cannot occur in stored tables—including a single unnamed `STRUCT` subfield (`""`), empty `STRUCT([])`, and case-differing subfield names (`a` vs `A`). Raise `ValueError` on exact duplicate column or subfield names (including multiple unnamed subfields `""`, which Polars `Struct` cannot represent), and `TypeError` on unsupported BigQuery types (`BIGNUMERIC`, `INTERVAL`, `RANGE`, non-microsecond `TIMESTAMP`, unknown types).
-*   **Single source of truth for type mapping:** Share declarative BigQuery-to-Polars type mapping tables (`_SCALAR_TYPE_MAP`, `_EXTENSION_TYPE_MAP`, `_UNSUPPORTED_TYPE_MAP`) and one recursive field extractor across table-scan and query-scan modes so supported types and aliases cannot drift out of sync.
-*   **Fail-loudly on custom extension builder hooks:** Call `extension_dtype_builder` directly in both `scan_table` and `scan_query` without catching exceptions from user-registered `pl.BaseExtension.ext_from_params(...)` hooks, so defects in third-party extension implementations surface directly instead of being masked as skipped columns. *(Note: the existing `schema.py` code contains `_build_extension_dtype_checked` catching five exception types and requires a follow-up update to remove that wrapper.)*
-*   **Preserve column parameters and accurate partition metadata:** Preserve extra REST keys across `REPEATED` recursion (`{**field, "mode": "NULLABLE"}`), guard `timestampPrecision`, avoid overwriting existing columns when appending pseudo-columns, and expose `_PARTITIONDATE` only on `DAY` ingestion-time partitioned tables (`_PARTITIONTIME` on all ingestion-time partitioned tables).
-*   **Empty-schema short-circuit:** Support `0`-column tables and explicit `schema={}` in `scan_table` by returning a 0-row, 0-column `pl.DataFrame` without invoking `CreateReadSession`, while still enforcing `Client.close()` checks at collection time.
-*   **Immutable `BQType` propagation on `TableScan` and narrowest-column fallback:** Store `bq_types` inside a read-only `MappingProxyType` wrapper on `TableScan` so `ReadApiExecutor`'s zero-column fallback ranks candidates using authoritative `BQType` sizes and unwraps `pl.BaseExtension`. On rank ties, pick the first column in schema order. When only ingestion-time pseudo-columns remain, apply the same size-then-order rule so `_PARTITIONDATE` (`DATE`, 4 bytes) beats `_PARTITIONTIME` (`TIMESTAMP`, 8 bytes) on daily tables. *(Note: the existing `read_api.py` code still hardcodes `_PARTITIONTIME` preference and requires a follow-up update to match this design.)*
+*   **Schema parity with Polars 2.0+ Arrow C Streams:** For supported BigQuery table and query columns matching the 14 `BQType` values (`BOOL`, `INT64`, `FLOAT64`, `NUMERIC`, `STRING`, `BYTES`, `DATE`, `DATETIME`, `TIME`, `TIMESTAMP`, `JSON`, `GEOGRAPHY`, `ARRAY`, `STRUCT`), ensure `scan_table().collect_schema()` and `scan_query().collect_schema()` match BigQuery's Arrow IPC stream — subject to three intentional differences: (1) ingestion-time partition pseudo-columns are exposed by `scan_table()` but omitted by `read_table()`, (2) unsupported columns are skipped with a warning by `scan_table()` while `read_table()` raises `UnsupportedTypeError`, and (3) parameterized `NUMERIC(P, S)` on stored tables returns `Decimal(P, S)` in `read_table()` and is deferred under [issue #128](https://github.com/pola-rs/polars-bigquery-client/issues/128).
+*   **Skip unsupported columns on mixed tables (`scan_table()`):** Omit top-level columns whose own type, mode, or nested subfield is unsupported (`BIGNUMERIC`, `INTERVAL`, `RANGE`, non-microsecond `TIMESTAMP`, or unrecognized future BigQuery types/modes), emitting one `UnsupportedTypeWarning` listing up to five omitted columns with dotted field paths (`col.sub.leaf`).
+*   **Fail fast on unusable table schemas (`scan_table()`):** Raise `UnsupportedTypeError` without emitting a warning when a table with one or more defined columns has zero supported columns (and zero retained partition pseudo-columns) remaining after skipping.
+*   **Forward-compatible REST parsing without defensive bloat:** Keep malformed top-level metadata envelope checks and the recursion depth cap (`64`, matching `crates/arrow-bigquery/src/decode.rs`) raising `BigQueryError`, without adding closed allowlists for `timePartitioning.type` or redundant type guards for payloads BigQuery does not emit. Gate `_PARTITIONDATE` on `timePartitioning.type` being `"DAY"` (or omitted/`""`/`None`), and retain `_PARTITIONTIME` for any other granularity without rejecting unknown future granularities.
+*   **Strict extraction for queries (`scan_query()`):** Reject unsupported types/modes eagerly with `TypeError` (naming the top-level column) so verbatim SQL outputs are never omitted. Reject exact duplicate top-level columns and `STRUCT` subfields with `ValueError`, while still accepting empty `STRUCT([])`, single unnamed subfield `""`, and case-differing subfield names (`a` vs. `A`).
+*   **Shared mapping tables and rank helper:** Share declarative BigQuery-to-Polars type-mapping tables and a single recursive dispatcher across table-scan and query-scan modes. Reuse `polars_bigquery.core.types.column_width_rank` inside `ReadApiExecutor` instead of maintaining a parallel width-rank table.
+*   **Fail loudly on custom extension hooks:** Invoke extension dtype resolution directly in both `scan_table()` and `scan_query()` without catching exceptions from user-registered `pl.BaseExtension.ext_from_params(...)` hooks, so errors propagate with their original exception type and traceback.
+*   **Preserve column attributes and accurate partition metadata:** Preserve extra REST keys across `REPEATED` recursion, validate `timestampPrecision`, prevent pseudo-columns from overwriting existing (including skipped) columns, skip appending pseudo-columns when `schema.fields` is empty, and expose `_PARTITIONDATE` only on daily ingestion-time partitioned tables.
+*   **Zero-column table short-circuit (`schema=None`):** For discovered tables with zero defined physical columns (unpartitioned or ingestion-time partitioned), return a `(0, 0)` `pl.DataFrame` without invoking `CreateReadSession`, while enforcing `Client.close()` checks at collection time. Reject explicit empty `schema={}` eagerly with `ValueError` (matching `Client.scan_query()`).
+*   **Consistent zero-column fallback ranking:** Select the narrowest physical column first using `column_width_rank`, breaking ties by schema order. When only ingestion-time pseudo-columns remain, apply the same width-then-order selector so `_PARTITIONDATE` (`DATE`, rank `2`) is selected before `_PARTITIONTIME` (`TIMESTAMP`, rank `3`) on daily tables.
 
 ## Non-Goals
 
-*   **Schema-aware predicate pushdown (`core/compiler/`):** Wiring `source.schema` and `source.bq_types` into `compiler.compile_predicate(...)` is deferred to a separate PR.
-*   **`QueryScan.schema` and `QueryScan.bq_types` plan fields:** Unconsumed metadata fields on `QueryScan` are in the process of being removed and are out of scope for this design.
-*   **Zero-column batch height workaround in Polars 2.0–2.1:** Avoiding `lazyframe.drop(pl.all()).collect_batches()` row-height collapse in `core/executors/base.py` and capping `max_stream_count=1` on small `n_rows` limits belong to a separate PR.
-*   **Full support for deferred BigQuery types:** Adding Arrow/Polars decoding for `BIGNUMERIC`, `INTERVAL`, `RANGE<T>`, picosecond `TIMESTAMP`, or parameterized `NUMERIC(P, S)` precision preservation is out of scope.
-*   **Partial `STRUCT` pruning:** Extracting only the supported subfields of a `STRUCT` that contains an unsupported nested field is deferred; the entire top-level column is omitted.
-*   **End-user documentation pages (`docs/source/api/data-types.md`):** Adding the MkDocs data-types reference page and registering extension docstrings in `docs/source/api/index.md` are deferred to a separate docs PR.
-*   **Mode B (`load_as_storage`) with explicit `schema=`:** When callers supply explicit `schema=`, `tables.get` is bypassed and `pl.String` is indistinguishable from BigQuery `STRING`. Callers providing explicit `schema=` for `JSON`/`GEOGRAPHY` columns must use `polars_bigquery.dtypes.{JSON,GEOGRAPHY}` or a registered `BaseExtension` subclass.
-*   **Backward compatibility for prior wrong mappings:** Retaining lowercase `"utc"`, plain `pl.String` for unregistered `JSON`/`GEOGRAPHY`, raising `TypeError` for one unsupported column in a mixed table, or raising `ValueError` for explicit `schema={}` is explicitly not preserved.
+*   **Plan-node `BQType` propagation (`TableScan.bq_types`, `QueryScan.bq_types`, `ExtractedSchema.bq_types`):** Zero-column fallback ranking yields identical ranks with or without `bq_types` for all 14 `BQType` values (`STRING`/`JSON`/`GEOGRAPHY` share rank `5`; `List(String)`/`ARRAY` share rank `6`). Defer adding `bq_types` propagation to `TableScan`/`QueryScan` until the schema-aware predicate pushdown PR (`core/compiler/`) actually consumes it.
+*   **Public `ARRAY<JSON>` / `ARRAY<GEOGRAPHY>` `dtypes` constants:** Defer exporting array extension constants in `polars_bigquery.dtypes` (YAGNI); document explicit outer-wrapped `pl.Extension(...)` syntax in `scan_table()` docstrings and [predicate-pushdown.md](../../docs/source/api/predicate-pushdown.md).
+*   **Zero-column batch height workaround in Polars 2.0–2.1:** Keeping row height exact under `drop(pl.all()).collect_batches()` in `core/executors/base.py` and capping `max_stream_count=1` on small `n_rows` limits belong to a separate PR.
+*   **Full support for deferred BigQuery types:** Arrow/Polars decoding for `BIGNUMERIC`, `INTERVAL`, `RANGE<T>`, non-microsecond `TIMESTAMP`, and parameterized `NUMERIC(P, S)` precision preservation ([issue #128](https://github.com/pola-rs/polars-bigquery-client/issues/128)) are out of scope.
+*   **Partial `STRUCT` pruning:** Extracting only supported subfields of a `STRUCT` containing an unsupported nested field is deferred; the entire enclosing top-level column is omitted.
+*   **Dedicated API data-types page (`docs/source/api/data-types.md`):** Adding the new data-types reference page and updating `docs/source/api/index.md` are deferred to a separate docs PR. (Existing `docs/source/api/predicate-pushdown.md` *is* updated in this change so its mapping table stays accurate.)
+*   **Backward compatibility for prior behavior:** Lowercase `"utc"`, plain `pl.String` for unregistered `JSON`/`GEOGRAPHY`, `pl.Duration("us")` for `INTERVAL`, `TypeError` for a single unsupported column in a mixed table, and unconditional `_PARTITIONDATE` on non-daily ingestion-time tables are not preserved.
 
 ## Open Questions
 
-None. All initial questions have been resolved by the owner:
+None. All decisions from multi-stage review have been resolved:
 
-*   Strict query extraction retains support for unnamed `STRUCT` subfields (single `""`), empty `STRUCT([])`, and case-differing subfield names (`a` vs `A`).
-*   `QueryScan.schema` and `QueryScan.bq_types` are moved out of scope (`Non-Goals`).
-*   Custom `BaseExtension.ext_from_params` exceptions propagate directly in both `scan_table` and `scan_query` (no `_build_extension_dtype_checked` catch boundary).
-*   Zero-column pseudo-column fallback uses the same size-then-order rule as physical columns, selecting `_PARTITIONDATE` (`DATE`, 4 bytes) over `_PARTITIONTIME` (`TIMESTAMP`, 8 bytes) on `DAY`-partitioned tables.
+*   All-unsupported non-partitioned `scan_table()` raises **`UnsupportedTypeError`** (subclass of `BigQueryError`), aligning unsupported-type handling with `read_table()` and `read_query()`.
+*   Explicit empty `schema={}` raises **`ValueError`** (matching `scan_query()`); `(0, 0)` short-circuiting applies only to discovered zero-column tables (`schema=None`).
+*   `ReadApiExecutor` reuses **`core/types.py::column_width_rank`** (with unknown/unsupported dtypes and nested `BIGNUMERIC` moved to rank `7`, behind `ARRAY`/`STRUCT` at `6`).
+*   `bq_types` propagation is **omitted** from `ExtractedSchema`, `TableScan`, and `QueryScan` until `core/compiler/` consumes it.
+*   Public `ARRAY<JSON>` / `ARRAY<GEOGRAPHY>` constants are **omitted** from `polars_bigquery.dtypes`.
+*   Custom `BaseExtension.ext_from_params` exceptions and non-`DataType` return values propagate directly in both `scan_table()` and `scan_query()` (verified offline in Polars `2.1.0`: `pl.Schema` / `pl.Field` fail fast with `TypeError: cannot parse input of type '<type>' into Polars data type`).
+*   Pseudo-column fallback applies the same `(rank, schema_index)` rule as physical columns, selecting `_PARTITIONDATE` over `_PARTITIONTIME` on daily tables.
 
 ## Critical User Journeys (CUJs)
 
@@ -80,39 +81,39 @@ None. All initial questions have been resolved by the owner:
 
 *   **Given:** A BigQuery table containing `TIMESTAMP`, `JSON`, `GEOGRAPHY`, `ARRAY<JSON>`, and `ARRAY<GEOGRAPHY>` columns and default Polars 2.0+ extension settings (`POLARS_UNKNOWN_EXTENSION_TYPE_BEHAVIOR` unset).
 *   **When:** A user runs `lf = client.scan_table("project.dataset.tbl")` and collects with `lf.collect()`.
-*   **Then:** `lf.collect_schema()` reports `pl.Datetime("us", "UTC")` for `TIMESTAMP`, `polars_bigquery.dtypes.JSON` / `GEOGRAPHY` for scalar extensions, and outer-wrapped `pl.Extension(..., pl.List(pl.String()))` for `ARRAY<JSON>` / `ARRAY<GEOGRAPHY>`. Collection over an Arrow C Stream succeeds without `SchemaError`, matching `read_table().schema`.
+*   **Then:** `lf.collect_schema()` reports `pl.Datetime("us", "UTC")` for `TIMESTAMP`, `polars_bigquery.dtypes.JSON` / `GEOGRAPHY` for scalar extensions, and outer-wrapped `pl.Extension(..., pl.List(pl.String()))` for `ARRAY<JSON>` / `ARRAY<GEOGRAPHY>`. Collecting the Arrow C Stream succeeds without `SchemaError`, and the resulting `DataFrame` schema matches `read_table().schema`.
 
 ### CUJ 2: Scanning a mixed table containing an unsupported column
 
 *   **Given:** A BigQuery table with supported column `id INT64`, top-level `dur INTERVAL`, and nested `meta STRUCT<ok INT64, bad BIGNUMERIC>`.
 *   **When:** A user runs `client.scan_table("project.dataset.mixed")`.
-*   **Then:** The client omits `dur` and `meta` from the returned `LazyFrame` schema (retaining `id`), and emits one `UnsupportedTypeWarning` naming up to five skipped columns with nested paths (`dur (INTERVAL)`, `meta (BIGNUMERIC at meta.bad)`), directing the user to `client.read_query()` and formatting warnings at the caller's stack level.
+*   **Then:** The client omits `dur` and `meta` from the returned `LazyFrame` schema (retaining `id`), and emits one `UnsupportedTypeWarning` (at the caller's stack frame) naming up to five skipped columns with nested paths (`dur (INTERVAL)`, `meta (BIGNUMERIC at meta.bad)`), directing the user to cast or exclude those columns in SQL using `client.scan_query()` or `client.read_query()`.
 
 ### CUJ 3: Scanning a table with zero supported physical columns
 
-*   **Given:** A non-empty BigQuery table whose physical columns are all unsupported (e.g., `INTERVAL` and `BIGNUMERIC`).
+*   **Given:** A BigQuery table with one or more defined columns whose physical columns are all unsupported (for example, `INTERVAL` and `BIGNUMERIC`).
 *   **When:** A user runs `client.scan_table("project.dataset.all_bad")`.
 *   **Then:**
-    *   If the table is **not** ingestion-time partitioned, `scan_table` raises `ValueError` listing the skipped columns and does **not** emit `UnsupportedTypeWarning`.
-    *   If the table **is** ingestion-time partitioned, `scan_table` emits `UnsupportedTypeWarning` and returns a `LazyFrame` exposing only the valid pseudo-columns (`_PARTITIONDATE` + `_PARTITIONTIME` for `DAY`, or `_PARTITIONTIME` only for `HOUR`/`MONTH`/`YEAR`).
+    *   If the table is **not** ingestion-time partitioned, `scan_table()` raises `UnsupportedTypeError` listing the skipped columns and does **not** emit `UnsupportedTypeWarning`.
+    *   If the table **is** ingestion-time partitioned, `scan_table()` emits `UnsupportedTypeWarning` and returns a `LazyFrame` exposing only the valid pseudo-columns (`_PARTITIONDATE` and `_PARTITIONTIME` for `DAY`, or `_PARTITIONTIME` only for `HOUR`, `MONTH`, and `YEAR`).
 
-### CUJ 4: Scanning an empty (0-column) table or passing explicit `schema={}`
+### CUJ 4: Scanning a discovered zero-column table
 
-*   **Given:** A BigQuery table whose REST metadata defines no columns (`schema` absent/empty/`None`) or a caller passing `schema={}` to `scan_table`.
-*   **When:** A user builds `lf = client.scan_table(...)` and calls `lf.collect()` (before or after `client.close()`).
-*   **Then:** Before `client.close()`, `lf.collect()` returns a `(0, 0)` `pl.DataFrame` without issuing a `CreateReadSession` call (and with `schema={}`, without issuing a `tables.get` REST call). After `client.close()`, `lf.collect()` raises `RuntimeError`.
+*   **Given:** A BigQuery table whose REST metadata defines zero physical columns (`schema` absent, `None`, or `fields: []` — whether unpartitioned or ingestion-time partitioned).
+*   **When:** A user builds `lf = client.scan_table("project.dataset.empty")` and calls `lf.collect()` (before or after `client.close()`).
+*   **Then:** Before `client.close()`, `lf.collect()` returns a `(0, 0)` `pl.DataFrame` without issuing a `CreateReadSession` call. After `client.close()`, `lf.collect()` raises `RuntimeError`. Passing an explicit empty `schema={}` raises `ValueError` eagerly (matching `client.scan_query()`).
 
-### CUJ 5: Providing an explicit schema for `JSON` / `GEOGRAPHY` / `TIMESTAMP`
+### CUJ 5: Providing an explicit `schema=` for `JSON`, `GEOGRAPHY`, or `TIMESTAMP`
 
-*   **Given:** A user wants to skip the `tables.get` REST call and supplies `schema={"ts": pl.Datetime("us", "UTC"), "j": dtypes.JSON, "g": dtypes.GEOGRAPHY}` to `scan_table`.
+*   **Given:** A user wants to skip the `tables.get` REST call and supplies an explicit non-empty `schema=` matching their active Polars Arrow extension mode (`dtypes.JSON` / `dtypes.GEOGRAPHY` by default, their registered `BaseExtension` subclass, or `pl.String()` when loaded as storage). For `ARRAY<JSON>`, callers pass the outer-wrapped `pl.Extension("google:sqlType:json", pl.List(pl.String()))` (not `pl.List(dtypes.JSON)`).
 *   **When:** The user collects `lf.collect()`.
-*   **Then:** Matching extension schemas succeed through Arrow C Stream import without calling `tables.get`. Supplying plain `pl.String()` for an unregistered `JSON` column fails with Polars' `SchemaError` naming `google:sqlType:json`.
+*   **Then:** Matching extension schemas succeed through Arrow C Stream import without calling `tables.get`. Supplying plain `pl.String()` for an unregistered `JSON` column under default mode fails with Polars' `SchemaError` naming `google:sqlType:json`.
 
 ### CUJ 6: Running `scan_query()` against a query selecting an unsupported type
 
-*   **Given:** A SQL query whose dry-run schema contains `BIGNUMERIC`, `INTERVAL`, `RANGE`, or picosecond `TIMESTAMP` (including inside `ARRAY` or `STRUCT`).
+*   **Given:** A SQL query whose dry-run schema contains `BIGNUMERIC`, `INTERVAL`, `RANGE`, non-microsecond `TIMESTAMP`, or an unrecognized type/mode (including inside `ARRAY` or `STRUCT`).
 *   **When:** A user runs `client.scan_query(sql)`.
-*   **Then:** `scan_query` fails immediately with `TypeError` referencing the top-level column name, without executing the query or silently omitting columns.
+*   **Then:** `scan_query()` fails immediately with `TypeError` naming the top-level column, without executing the query or silently dropping columns.
 
 --------------------------------------------------------------------------------
 
@@ -122,198 +123,148 @@ None. All initial questions have been resolved by the owner:
 
 ```text
 Client.scan_table(table, schema=None)
+  |-- schema is not None (explicit)
+  |     -> pl.Schema(schema), require non-empty (empty -> ValueError)
+  |     -> TableScan -> ReadApiExecutor -> Arrow C Stream import
   |
-  +--> BigQuery REST tables.get (JSON Table metadata)
-  |      |
-  |      v
-  |    extract_schema_metadata(table_metadata)     [pure, no warnings]
-  |      |-- for each field: _extract_field_dtype(strict=False)
-  |      |-- appends _PARTITIONDATE (DAY/default only) & _PARTITIONTIME
-  |      v
-  |    ExtractedSchema(polars_schema, bq_types, skipped_columns)
-  |      |-- if skipped_columns and len(polars_schema) == 0 -> raise ValueError
-  |      |-- if skipped_columns and len(polars_schema) > 0  -> warn UnsupportedTypeWarning
-  |      |
-  +--> if len(polars_schema) == 0 (or explicit schema={}):
-  |      register_io_source -> check Client.closed -> yield 0x0 DataFrame
-  |      (no CreateReadSession RPC)
-  |
-  +--> if len(polars_schema) > 0:
-         TableScan(table_ref, schema=polars_schema, bq_types=MappingProxyType)
-           -> ReadApiExecutor
-                -> zero-col fallback: _select_zero_column_fallback(schema, bq_types)
-                -> arrow_client.read_table(selected_fields=...)
-                -> Polars Arrow C Stream import
+  +-- schema is None (REST discovery)
+        -> BigQuery REST tables.get (JSON metadata)
+        -> extract_schema_metadata(table_metadata)
+             |-- per field: recursive dispatcher (strict=False)
+             |-- if fields non-empty & ingestion-time partitioned:
+             |     append _PARTITIONDATE (DAY/default only) & _PARTITIONTIME
+             v
+           ExtractedSchema(polars_schema, skipped_columns)
+             |-- skipped_columns & len == 0 -> raise UnsupportedTypeError
+             |-- skipped_columns & len > 0  -> warn UnsupportedTypeWarning
+             |-- no skipped & len == 0      -> yield (0, 0) DataFrame
+             |                                 (no CreateReadSession RPC)
+             +-- len > 0 -> TableScan -> ReadApiExecutor
+                              -> 0-col fallback: column_width_rank(dtype)
+                              -> arrow_client.read_table(selected_fields=...)
 
 Client.scan_query(query, schema=None)
+  |-- schema is not None (explicit)
+  |     -> pl.Schema(schema), require non-empty (empty -> ValueError)
+  |     -> QueryScan -> QueryExecutor
   |
-  +--> jobs.query(dryRun=True) -> JSON bigquerySchema.fields
-         |
-         v
-       extract_polars_schema_from_fields(fields)   [strict, raises on bad type/dup]
-         |-- for each field: _extract_field_dtype(strict=True)
-         v
-       pl.Schema -> register_io_source -> QueryExecutor
+  +-- schema is None (dry run)
+        -> jobs.query(dryRun=True) -> JSON bigquerySchema.fields
+        -> extract_polars_schema_from_fields(fields) [strict=True]
+        -> QueryScan -> QueryExecutor
 ```
 
-### Component Design
+### Schema Mapping Contract
 
-#### 1. Shared Type Mapping & Dispatcher (`polars_bigquery/core/schema.py`)
-
-Schema extraction is a pure transformation with no warning or logging side effects. To stop table-scan and query-scan paths from drifting out of sync, all type-name-to-Polars logic lives in module-level declarative tables consumed by one recursive function, `_extract_field_dtype`.
-
-**Public/internal dataclasses:**
-
-*   `SkippedColumn(name: str, reason: str, path: str)` (frozen) — records an omitted top-level column from `tables.get`, the human-readable reason (e.g., `"BIGNUMERIC"`, `"INTERVAL"`, `"TIMESTAMP(precision=12)"`), and the dotted path to the failing element (`"dur"` for top-level, `"meta.inner.bad"` for nested `STRUCT` fields).
-*   `ExtractedSchema(polars_schema: pl.Schema, bq_types: dict[str, BQType], skipped_columns: tuple[SkippedColumn, ...])` (frozen) — output of `extract_schema_metadata()`.
-*   `_UnsupportedBigQueryType(reason, path)` — internal exception raised inside skip mode (`strict=False`) and caught at the top-level field loop in `extract_schema_metadata()` so nested `STRUCT`/`ARRAY` failures unwind directly to omit the enclosing top-level column.
-*   `_ExtensionTypeSpec(extension_name: str, metadata: str | None, bq_type: BQType)` (frozen, slotted) — pairs Arrow extension parameters with the canonical `BQType`.
-
-**Declarative mapping tables:**
-
-| BigQuery REST `type` (casefolded) | `mode` | Polars `DataType` | Canonical `BQType` | Source table |
-| --- | --- | --- | --- | --- |
-| `bool`, `boolean` | scalar | `Boolean()` | `BOOL` | `_SCALAR_TYPE_MAP` |
-| `bytes` | scalar | `Binary()` | `BYTES` | `_SCALAR_TYPE_MAP` |
-| `date` | scalar | `Date()` | `DATE` | `_SCALAR_TYPE_MAP` |
-| `datetime` | scalar | `Datetime(time_unit="us")` | `DATETIME` | `_SCALAR_TYPE_MAP` |
-| `float`, `float64` | scalar | `Float64()` | `FLOAT64` | `_SCALAR_TYPE_MAP` |
-| `integer`, `int64` | scalar | `Int64()` | `INT64` | `_SCALAR_TYPE_MAP` |
-| `numeric`, `decimal` | scalar | `Decimal(precision=38, scale=9)` | `NUMERIC` | `_SCALAR_TYPE_MAP` |
-| `string` | scalar | `String()` | `STRING` | `_SCALAR_TYPE_MAP` |
-| `time` | scalar | `Time()` | `TIME` | `_SCALAR_TYPE_MAP` |
-| `json` | scalar | `builder("google:sqlType:json", String(), None)` | `JSON` | `_EXTENSION_TYPE_MAP` |
-| `json` | `REPEATED` | `builder("google:sqlType:json", List(String()), None)` | `ARRAY` | `_EXTENSION_TYPE_MAP` |
-| `geography` | scalar | `builder("google:sqlType:geography", String(), '{"encoding": "WKT"}')` | `GEOGRAPHY` | `_EXTENSION_TYPE_MAP` |
-| `geography` | `REPEATED` | `builder("google:sqlType:geography", List(String()), '{"encoding": "WKT"}')` | `ARRAY` | `_EXTENSION_TYPE_MAP` |
-| `timestamp` (`precision` in `None, 6, "6"`) | scalar | `Datetime(time_unit="us", time_zone="UTC")` | `TIMESTAMP` | timestamp branch |
-| `record`, `struct` | scalar | `Struct([...])` | `STRUCT` | struct helper |
-| Any other supported type | `REPEATED` | `List(inner_dtype)` | `ARRAY` | recursive branch |
-| `bignumeric`, `bigdecimal` | any | Unsupported (`BIGNUMERIC`) | — | `_UNSUPPORTED_TYPE_MAP` |
-| `interval` | any | Unsupported (`INTERVAL`) | — | `_UNSUPPORTED_TYPE_MAP` |
-| `range` | any | Unsupported (`RANGE`) | — | `_UNSUPPORTED_TYPE_MAP` |
-| `timestamp` (`precision` not in `None, 6, "6"`) | any | Unsupported (`TIMESTAMP(precision=...)`) | — | timestamp branch |
-| Any unrecognized type | any | Unsupported (`unsupported type ...`) | — | fallback |
-
-Notes on mapping choices:
-
-*   `_SCALAR_TYPE_MAP` stores callables (`Boolean`, `lambda: Decimal(precision=38, scale=9)`) rather than singleton instances so every column receives a fresh `DataType` object.
-*   **Outer-wrapped `ARRAY<JSON>` and `ARRAY<GEOGRAPHY>`:** In Arrow IPC streams from the BigQuery Storage Read API, `ARROW:extension:name` is attached to the outer Arrow `List` field rather than the inner `String` child. Checking `_EXTENSION_TYPE_MAP` inside the `mode == "repeated"` branch before recursing produces `Extension(name, List(String()), metadata)`, matching the stream Polars imports. By contrast, `STRUCT<j JSON>` and `ARRAY<STRUCT<j JSON>>` keep the extension wrapper on the inner `Struct` field.
-*   **Parameter-preserving `REPEATED` recursion:** When `mode == "repeated"` and `type_` is not in `_EXTENSION_TYPE_MAP`, recursion passes `{**field, "mode": "NULLABLE"}` so field attributes such as `timestampPrecision` and `fields` stay intact (for example, `ARRAY<TIMESTAMP>` with `timestampPrecision: "12"` is caught rather than misclassified as microsecond `TIMESTAMP`).
-*   **`timestampPrecision` check:** Accepts `None` (absent / default microsecond), integer `6` (excluding `bool`, since `isinstance(True, int)`), or string `"6"` (proto-JSON encoding). Rejects `12`, `"12"`, `"9"`, `True`, floats, and other precisions.
-*   **`extension_dtype_builder` injection and error propagation:** Both `extract_schema_metadata()` and `extract_polars_schema_from_fields()` default `extension_dtype_builder` to `core.types.build_extension_dtype`. No `try/except` catches errors from `extension_dtype_builder`; if a user-registered `pl.BaseExtension.ext_from_params(...)` fails or returns an invalid object, the exception propagates directly in both `scan_table` and `scan_query`.
-
-**Mode resolution across Polars extension configurations:**
-
-| Extension setting (`build_extension_dtype`) | Scalar `JSON` in `polars_schema` | `ARRAY<JSON>` in `polars_schema` | `bq_types` entry |
+| BigQuery REST `type` (casefolded) | REST `mode` | Polars `DataType` | Dispatch path |
 | --- | --- | --- | --- |
-| Default (`load_as_extension`) | `Extension("google:sqlType:json", String())` | `Extension("google:sqlType:json", List(String()))` | `JSON` / `ARRAY` |
-| Registered `BaseExtension` subclass | `MyExt("google:sqlType:json", String(), None)` | `MyExt("google:sqlType:json", List(String()), None)` | `JSON` / `ARRAY` |
-| `as_storage=True` or `load_as_storage` | `String()` | `List(String())` | `JSON` / `ARRAY` |
+| `bool`, `boolean` | non-`REPEATED` | `pl.Boolean()` | scalar table |
+| `bytes` | non-`REPEATED` | `pl.Binary()` | scalar table |
+| `date` | non-`REPEATED` | `pl.Date()` | scalar table |
+| `datetime` | non-`REPEATED` | `pl.Datetime(time_unit="us")` | scalar table |
+| `float`, `float64` | non-`REPEATED` | `pl.Float64()` | scalar table |
+| `integer`, `int64` | non-`REPEATED` | `pl.Int64()` | scalar table |
+| `numeric`, `decimal` | non-`REPEATED` | `pl.Decimal(precision=38, scale=9)` | scalar table |
+| `string` | non-`REPEATED` | `pl.String()` | scalar table |
+| `time` | non-`REPEATED` | `pl.Time()` | scalar table |
+| `json` | non-`REPEATED` | `build_extension_dtype("google:sqlType:json", pl.String(), None)` | extension table |
+| `json` | `REPEATED` | `build_extension_dtype("google:sqlType:json", pl.List(pl.String()), None)` | extension table |
+| `geography` | non-`REPEATED` | `build_extension_dtype("google:sqlType:geography", pl.String(), '{"encoding": "WKT"}')` | extension table |
+| `geography` | `REPEATED` | `build_extension_dtype("google:sqlType:geography", pl.List(pl.String()), '{"encoding": "WKT"}')` | extension table |
+| `timestamp` (`timestampPrecision` in `None`, `6`, `"6"`) | non-`REPEATED` | `pl.Datetime(time_unit="us", time_zone="UTC")` | timestamp branch |
+| `record`, `struct` | non-`REPEATED` | `pl.Struct([...])` | unified struct helper |
+| Any other supported type | `REPEATED` | `pl.List(inner_dtype)` | recursive branch |
+| `bignumeric`, `bigdecimal` | any | Unsupported (`BIGNUMERIC`) | unsupported table |
+| `interval` | any | Unsupported (`INTERVAL`) | unsupported table |
+| `range` | any | Unsupported (`RANGE`) | unsupported table |
+| `timestamp` (`timestampPrecision` not in `None`, `6`, `"6"`) | any | Unsupported (`TIMESTAMP(precision=...)`) | timestamp branch |
+| Unrecognized `mode` (not in `""`, `nullable`, `required`, `repeated`) | any | Unsupported (`unsupported mode ...`) | mode check |
+| Any unrecognized `type` | any | Unsupported (`unsupported type ...`) | fallback branch |
 
-**Why `scan_query` is strict (`strict=True`) while `scan_table` skips (`strict=False`):**
+*Notes:* **`non-REPEATED`** means `mode` is `"NULLABLE"`, `"REQUIRED"`, `""`, `None`, or omitted. Scalar lookups use callables so every column receives a fresh `pl.DataType` instance. When recursing for `mode="REPEATED"`, field attributes (`timestampPrecision`, `fields`) are preserved so `ARRAY<TIMESTAMP>` with non-microsecond precision is rejected rather than misclassified.
 
-1.  **Server projection limitation on queries.** `scan_table` passes an explicit `selected_fields=[...]` allowlist to BigQuery Storage Read API, so omitted columns are never encoded or streamed over the wire. By contrast, `scan_query` executes the user's SQL verbatim by default (`maintain_order=True`) and also falls back to verbatim SQL on oversized pipe rewrites (`maintain_order=False`). If `scan_query` silently dropped an unsupported column like `INTERVAL` or `BIGNUMERIC` from its registered `pl.Schema`, BigQuery would still execute the query and return that column inside the Arrow IPC stream, failing immediately at `.collect()` time inside `arrow_bigquery`'s `UnsupportedTypeError` guard (or with a Polars `SchemaError` for an unexpected extra column).
-2.  **Caller control over column list.** With `scan_table`, a user often scans a shared table whose DDL they do not own and wants the supported columns. With `scan_query`, the user authored the `SELECT` list directly and can drop or cast columns in SQL (`SELECT * EXCEPT (col)` or `CAST(col AS STRING)`).
+### Extension Dtype Resolution Across Polars Configurations
 
-**Table (`scan_table`) vs. query (`scan_query`) `STRUCT` divergence:**
+`polars_bigquery.core.types.build_extension_dtype(name, storage, metadata)` resolves `JSON` (`google:sqlType:json`, `metadata=None`) and `GEOGRAPHY` (`google:sqlType:geography`, `metadata='{"encoding": "WKT"}'`) according to the active Polars configuration:
 
-The only structural rule that diverges between `strict=False` (`scan_table`) and `strict=True` (`scan_query`) is `STRUCT` subfield handling:
+| Configuration | Scalar `JSON` in `pl.Schema` | `ARRAY<JSON>` in `pl.Schema` |
+| --- | --- | --- |
+| Default (`load_as_extension`) | `pl.Extension("google:sqlType:json", pl.String(), None)` | `pl.Extension("google:sqlType:json", pl.List(pl.String()), None)` |
+| Registered `pl.BaseExtension` subclass | `MyExt("google:sqlType:json", pl.String(), None)` | `MyExt("google:sqlType:json", pl.List(pl.String()), None)` |
+| `register_extension_type(..., as_storage=True)` or `POLARS_UNKNOWN_EXTENSION_TYPE_BEHAVIOR=load_as_storage` | `pl.String()` | `pl.List(pl.String())` |
 
-*   **`scan_table` (skip mode):** Mirrors BigQuery stored-table constraints. A field or nested subfield whose type is unsupported (e.g., `BIGNUMERIC`, `INTERVAL`, `RANGE`, picosecond `TIMESTAMP`, or unrecognized future type) raises `_UnsupportedBigQueryType(reason, path)` to skip the entire enclosing top-level column.
-*   **`scan_query` (strict mode):** Cannot drop selected output columns from verbatim SQL. Accepts valid GoogleSQL query results that cannot occur in stored tables: empty `STRUCT([])`, a single unnamed subfield `""` (e.g., `SELECT STRUCT(1)`), and case-differing subfield names (`a` vs `A`). Raises `ValueError` only when exact duplicate names collide (such as `SELECT STRUCT(1, 2)`, which produces two `""` subfields that Polars `pl.Struct` rejects, hinting users to add `AS` aliases). Raises `TypeError` for unsupported types naming the top-level column.
+*(Rows for `GEOGRAPHY` follow the same rules with metadata `'{"encoding": "WKT"}'`. Custom `BaseExtension` subclasses registered for these extension names receive **both** `pl.String()` for scalars and `pl.List(pl.String())` for `ARRAY<...>` inside `ext_from_params`.)*
 
-**Ingestion-time partitioning pseudo-columns (`extract_schema_metadata`):**
+**Purity / env-var latch caveat:** Schema extraction is pure given a deterministic injected `extension_dtype_builder`. The default `build_extension_dtype` reads Polars' global extension registry and compares `os.environ` against its module-import latch of `POLARS_UNKNOWN_EXTENSION_TYPE_BEHAVIOR`, logging a warning if mutated after import. Set `POLARS_UNKNOWN_EXTENSION_TYPE_BEHAVIOR` before importing `polars` or `polars_bigquery` (or prefer `pl.register_extension_type(..., as_storage=True)`).
 
-```text
-if table_metadata.get("timePartitioning") is not None:
-    part_field = time_partitioning.get("field")
-    if not part_field:   # None or "" => ingestion-time partitioned
-        raw_type = time_partitioning.get("type")
-        is_daily = not raw_type or raw_type.casefold() == "day"
-        if is_daily and "_partitiondate" not in seen_names:
-            add _PARTITIONDATE : Date()                   (BQType.DATE)
-        if "_partitiontime" not in seen_names:
-            add _PARTITIONTIME : Datetime("us", "UTC")    (BQType.TIMESTAMP)
-```
+### Why `scan_query()` Is Strict While `scan_table()` Skips Columns
 
-No closed allowlist rejects unknown `timePartitioning.type` values. If BigQuery adds a new granularity (for example, `MINUTE` or `WEEK`), `_PARTITIONDATE` is omitted and `_PARTITIONTIME` is retained without breaking the scan.
+1.  **Server projection limitation:** `scan_table()` passes an explicit `selected_fields=[...]` allowlist to the BigQuery Storage Read API, so omitted columns are never encoded or streamed over the wire. By contrast, `scan_query()` executes verbatim SQL by default (`maintain_order=True`) and falls back to verbatim SQL when GoogleSQL pipe rewrites (`|> SELECT` / `|> WHERE` / `|> LIMIT`) exceed BigQuery's ~1 MB query-size limit under `maintain_order=False` (see [`polars_bigquery_scan_query.md`](./polars_bigquery_scan_query.md)). Omitting a column from `pl.Schema` without removing it from SQL would still stream that column and crash at `.collect()` time with `UnsupportedTypeError` or Polars `SchemaError`.
+2.  **Caller control:** With `scan_table()`, a caller often reads a shared table they do not own and wants the supported columns. With `scan_query()`, the caller authored the `SELECT` list directly and can drop or cast columns in SQL.
 
-Similarly, column `mode` checks only `(field.get("mode") or "").casefold() == "repeated"` rather than rejecting unknown modes through a closed allowlist, and impossible BigQuery REST payload checks (such as non-dict `table_metadata`, integer `mode`/`type`, duplicate physical table columns, or excessive nesting depth past BigQuery's hard limit of 15) are omitted.
+Both modes share the same unified `STRUCT` helper. Exact duplicate top-level columns (in `scan_query()`) and exact duplicate `STRUCT` subfield names raise `ValueError`. Non-duplicate empty `STRUCT([])`, single unnamed subfield (`""`), and case-differing names (`a` vs. `A`) are accepted.
 
-**`has_bignumeric_dtype(dtype)` guard:**
+### Ingestion-Time Partitioning Pseudo-Columns
 
-Iteratively traverses `pl.Decimal`, `pl.List`, `pl.Array`, `pl.Struct`, and optional `pl.Map` (`getattr(pl, "Map", None)`). Checks `current.precision is not None and current.precision > 38` before comparing so unparameterized `Decimal` values (`precision=None`) do not raise `TypeError` during explicit-schema validation in `_register_io_source_safe`.
+For ingestion-time partitioned tables (`timePartitioning` present with absent or `""` `field`) that have **at least one physical column in `schema.fields`**:
 
-#### 2. Public Warning Class (`polars_bigquery/exceptions.py`)
+*   Append `_PARTITIONDATE` (`pl.Date()`) only when `timePartitioning.type` is `"DAY"` (case-insensitive), `None`, `""`, or omitted — never when already present in the table schema (including skipped columns, matched case-insensitively).
+*   Append `_PARTITIONTIME` (`pl.Datetime("us", "UTC")`) for any granularity (unless already present, including skipped columns). No closed allowlist rejects unknown future `timePartitioning.type` values (`WEEK`, `MINUTE`, etc.).
+*   When `schema.fields` is empty or absent (a schemaless zero-column partitioned table), **do not** append pseudo-columns so the table short-circuits cleanly to `(0, 0)`.
 
-Defines `UnsupportedTypeWarning(UserWarning)` exported in `__all__` alongside `BigQueryError` and `UnsupportedTypeError`. Callers can ignore, promote to an error (`warnings.filterwarnings("error", category=UnsupportedTypeWarning)`), or inspect these warnings with the standard Python `warnings` module.
+### Exception & Warning Contract
 
-#### 3. Logical Plan Propagation (`polars_bigquery/core/plan.py`)
+| Failure Condition | `scan_table()` | `scan_query()` | `read_table()` / `read_query()` |
+| --- | --- | --- | --- |
+| Mixed table with >=1 supported column (or partition pseudo-column) and >=1 unsupported column | Emits `UnsupportedTypeWarning` (lists up to 5 entries); omits unsupported column(s) | `TypeError` naming the top-level column | `UnsupportedTypeError` (`BigQueryError` subclass) |
+| All columns unsupported (non-partitioned table) | **`UnsupportedTypeError`** (no warning emitted) | `TypeError` | `UnsupportedTypeError` |
+| Explicit empty `schema={}` | `ValueError` | `ValueError` | — |
+| Explicit `schema=` containing `Decimal(precision > 38)` | `TypeError` | `TypeError` | — |
+| Exact duplicate column / `STRUCT` subfield names | `ValueError` (`STRUCT`) | `ValueError` | — |
+| Malformed outer REST metadata envelope or nesting depth > `64` | `BigQueryError` | `BigQueryError` | `BigQueryError` |
+| User-registered `BaseExtension.ext_from_params(...)` error / non-`DataType` return | Propagates original exception (e.g., `TypeError`) | Propagates original exception | Propagates original exception |
 
-`TableScan` gains one optional field:
+### Zero-Column Fallback Column Selection (`ReadApiExecutor`)
 
-*   `bq_types: Mapping[str, BQType] | None = None`
+When Polars pushes down a zero-column projection (`selected_fields=[]` would instruct the Storage Read API to stream *every* column, including skipped unsupported ones), `ReadApiExecutor` chooses a single narrowest column via **`core/types.py::column_width_rank`**:
 
-In `TableScan.__post_init__`, if `bq_types` is supplied, it is defensively copied into a `types.MappingProxyType(dict(self.bq_types))` so external caller mutations cannot modify an immutable frozen plan node. (`QueryScan` remains untouched in this design; `QueryScan.schema` and `QueryScan.bq_types` are out of scope.)
+*   `1`: `BOOL`
+*   `2`: `DATE` (`_PARTITIONDATE`)
+*   `3`: `INT64`, `FLOAT64`, `TIME`, `DATETIME`, `TIMESTAMP` (`_PARTITIONTIME`)
+*   `4`: `NUMERIC` (`Decimal` within precision 38, scale 9)
+*   `5`: `STRING`, `BYTES`, `JSON`, `GEOGRAPHY`
+*   `6`: `ARRAY` (`List`), `STRUCT`
+*   `7`: unknown/unsupported dtypes (`Duration`, `Float16`, `BIGNUMERIC` / nested `BIGNUMERIC`, unparameterized `Decimal(precision=None)`, `Null`, `Unknown`, `Object`)
 
-#### 4. Zero-Column Fallback Ranking (`polars_bigquery/core/executors/read_api.py`)
+Custom non-BigQuery `pl.BaseExtension` types unwrap `ext_storage()` before ranking. Physical columns always take priority over ingestion-time pseudo-columns so explicit schemas and mixed tables read a concrete column first. When only pseudo-columns remain (all physical columns were omitted as unsupported), the same `(rank, schema_index)` rule picks `_PARTITIONDATE` (`DATE`, rank `2`) ahead of `_PARTITIONTIME` (`TIMESTAMP`, rank `3`) on daily tables, and `_PARTITIONTIME` on non-daily tables.
 
-When Polars pushes down a zero-column projection (no columns selected and no columns referenced by a filter predicate), BigQuery Storage Read API still requires at least one entry in `selected_fields` (sending `selected_fields=[]` instructs the API to read *every* column in the table, pulling skipped unsupported columns and inflating scan cost).
+### Verified Live BigQuery Wire-Format Probes (2026-11-24)
 
-`_BQ_TYPE_FALLBACK_RANK` maps all 14 `BQType` members to relative wire-size ranks:
+Verified live against project `bigframes-dev` using `polars 2.1.0`:
 
-*   `0`: `BOOL` (1 bit / 1 byte)
-*   `3`: `DATE` (4 bytes)
-*   `4`: `INT64`, `FLOAT64`, `TIME`, `DATETIME`, `TIMESTAMP` (8 bytes)
-*   `5`: `NUMERIC` (16 bytes)
-*   `6`: `STRING`, `BYTES`, `JSON`, `GEOGRAPHY` (variable-length bytes/text)
-*   `7`: `ARRAY`, `STRUCT` (nested)
-
-`_dtype_fallback_rank(dtype, bq_type=None)` resolves rank in this order:
-
-1.  If authoritative `bq_type` is present, return `_BQ_TYPE_FALLBACK_RANK[bq_type]`. (This keeps a storage-loaded `JSON` / `ARRAY<JSON>` column ranked accurately as 6 / 7 even if Polars sees plain `String` / `List(String)`.)
-2.  If `dtype` is a `pl.BaseExtension`, unwrap `dtype.ext_storage()` and recurse.
-3.  Otherwise fall back to Polars `DataType` inspection (with `pl.Decimal` guarded by `dtype.precision is not None and dtype.precision <= 38`, else rank `8`).
-
-`_select_zero_column_fallback(schema, bq_types=None)` splits candidates into physical columns vs. ingestion-time pseudo-columns (`_partitiondate`, `_partitiontime` matched via `.casefold()`):
-
-1.  If any physical column exists, select `min(physical_columns, key=(rank, schema_index))` so the smallest column wins and rank ties pick the first column in schema order.
-2.  If *only* ingestion-time pseudo-columns exist (all physical columns were omitted as unsupported), apply the **same** `min(..., key=(rank, schema_index))` selector over the pseudo-columns. On `DAY`-partitioned tables, `_PARTITIONDATE` (`DATE`, rank `3`, index `0`) wins over `_PARTITIONTIME` (`TIMESTAMP`, rank `4`, index `1`). On non-daily tables, only `_PARTITIONTIME` exists and is selected.
-
-#### 5. Client Integration & Empty-Schema Short-Circuit (`polars_bigquery/_read_bigquery.py`)
-
-*   **Warning formatting:** `_format_skipped_columns` formats up to `_MAX_SKIPPED_COLUMNS_DISPLAY = 5` entries (`"col (reason)"` when `path == name`, `"col (reason at path)"` for nested fields), appending `"... and N more"` when truncated.
-*   **`Client.scan_table` warning/error contract (`schema=None`):**
-    *   Calls `extract_schema_metadata(table_metadata)` directly (no broad `except (TypeError, ValueError)` wrapper masking user `BaseExtension` bugs as `BigQueryError`).
-    *   If `skipped_columns` is non-empty **and** `len(polars_schema) == 0`: raises `ValueError` listing the skipped summary with a `client.read_query()` hint. Does **not** emit `UnsupportedTypeWarning`.
-    *   If `skipped_columns` is non-empty **and** `len(polars_schema) > 0`: logs a `DEBUG` entry and emits one `UnsupportedTypeWarning` with `stacklevel=2` (pointing directly to the user's `client.scan_table(...)` line).
-*   **Empty-schema short-circuit (`schema={}` or 0-column table):**
-    *   `_normalize_schema(schema, require_non_empty=False)` allows empty `schema={}` / `pl.Schema()`.
-    *   When `len(polars_schema) == 0`, skip instantiating `TableScan` and `ReadApiExecutor`. Inside `source_generator`, check `closed_event.is_set()` **first** (raising `RuntimeError` if the client was closed), then log at `DEBUG` and yield a single `pl.DataFrame(schema=polars_schema)` (`(0, 0)`) without calling `arrow_client.read_table(...)`.
-*   **Docstring cross-links:** Inline code names (`UnsupportedTypeWarning`, `UnsupportedTypeError`, `polars_bigquery.dtypes.JSON`) avoid broken MkDocs cross-references until the dedicated API documentation page PR lands.
+| Probe | API | Observed Wire / Schema Output | Result |
+| --- | --- | --- | --- |
+| `JSON`, `GEOGRAPHY`, `ARRAY<JSON>`, `ARRAY<GEOGRAPHY>`, `STRUCT<...>`, `ARRAY<STRUCT<...>>` | `jobs.query` (`read_query` / `scan_query`) & Storage Read API (`read_table` / `scan_table`) | Identical extension tags on both paths: `google:sqlType:json` (`meta=None`), `google:sqlType:geography` (`meta='{"encoding": "WKT"}'`), outer `List(String)` wrapping for `ARRAY<JSON>`/`ARRAY<GEOGRAPHY>` including inside `STRUCT`. | Both collected (`(1, 6)` and `(1, 7)`) |
+| `DAY` table with single column `(dur INTERVAL)` | Storage Read API (`selected_fields`) | `["_PARTITIONDATE"]` → `(2, 1) Date`; `["_PARTITIONTIME"]` → `(2, 1) Datetime('us', 'UTC')`; `scan_table().collect()` → `(2, 2)` + `UnsupportedTypeWarning`. | Confirmed CUJ 3 |
+| `HOUR` table with single column `(dur INTERVAL)` | Storage Read API (`selected_fields`) | `["_PARTITIONTIME"]` → `(1, 1) Datetime('us', 'UTC')`; `["_PARTITIONDATE"]` → `INVALID_ARGUMENT` (`Name _PARTITIONDATE not found`). | Confirmed `DAY`-only gate |
+| Empty 0-column `DAY` table (`{"timePartitioning": {"type": "DAY"}}`, no `schema`) | Storage Read API | `CreateReadSession` **failed** with `FAILED_PRECONDITION` (`empty schema`) even when selecting `["_PARTITIONDATE"]` or `["_PARTITIONTIME"]`. | Confirmed skipping pseudo-columns on empty `schema.fields` |
+| Empty 0-column unpartitioned table (`{}`) | `scan_table()` | Short-circuits without `CreateReadSession` to `(0, 0) pl.DataFrame`. | Matches CUJ 4 |
+| Parameterized `NUMERIC(10, 2)` table column | `tables.get` + Storage Read API vs `jobs.query` | `read_table` emits **`Decimal(10, 2)`** (`scan_table()` fails `SchemaError` against `Decimal(38, 9)`); `read_query` / dry-run emits **`Decimal(38, 9)`**. | Deferred to [issue #128](https://github.com/pola-rs/polars-bigquery-client/issues/128) |
+| `SELECT STRUCT(1)`, `STRUCT(1, 2)`, `STRUCT(1 AS a, 'x' AS A)` | `jobs.query` dry run + Arrow IPC | BigQuery auto-synthesizes `_field_1` / `_field_2` (and renames case-duplicate `A` to `_field_2`) in both `bigquerySchema` JSON and Arrow IPC. | Collected (`(1, 1)`) |
 
 ### Backward-Incompatible Behavioral Changes
 
-| Case | Previous behavior | New behavior |
+| Case | Previous behavior (`32fdc1f`) | New behavior |
 | --- | --- | --- |
-| `TIMESTAMP` / `_PARTITIONTIME` timezone | `Datetime("us", "utc")` | `Datetime("us", "UTC")` |
-| `JSON` / `GEOGRAPHY` default dtype | `pl.String()` | `pl.Extension("google:sqlType:json" \| "google:sqlType:geography", pl.String(), ...)` |
-| `ARRAY<JSON>` / `ARRAY<GEOGRAPHY>` default dtype | `pl.List(pl.String())` | `pl.Extension(..., pl.List(pl.String()), ...)` |
-| Mixed table with an unsupported column | Fails entire `scan_table` (`TypeError` or Polars `InvalidOperationError`) | Skips top-level column with `UnsupportedTypeWarning` |
-| Non-partitioned table with *only* unsupported columns | `TypeError` / `InvalidOperationError` | `ValueError` (no warning emitted) |
-| Non-`DAY` (`HOUR`/`MONTH`/`YEAR`) ingestion-time table | Included `_PARTITIONDATE` and `_PARTITIONTIME` | Includes `_PARTITIONTIME` only |
-| 0-column table or explicit `schema={}` | `BigQueryError` / `ValueError` | Short-circuits to `(0, 0)` `DataFrame` without `CreateReadSession` |
-| `scan_query` with `INTERVAL` | Mapped to `Duration("us")` | Raises `TypeError` |
-
-### Deltas Between Current Branch Code and This Design
-
-Because this document was drafted alongside an existing branch implementation, four concrete code areas currently diverge from the design above and are tracked in the Detailed Implementation Plan:
-
-1.  **`core/schema.py` — `_build_extension_dtype_checked` wrapper:** Branch currently wraps `extension_dtype_builder` in a 5-exception `try/except` boundary (`TypeError`, `ValueError`, `RuntimeError`, `AttributeError`, `LookupError`). Target design calls `extension_dtype_builder` directly so errors propagate.
-2.  **`core/schema.py` — speculative client-side REST validation & closed allowlists:** Branch currently rejects unknown `timePartitioning.type` values (`_VALID_TIME_PARTITIONING_TYPES`), unknown `field.mode` values (`_VALID_FIELD_MODES`), `MAX_SCHEMA_NESTING_DEPTH` > 64, and impossible JSON shapes (`table_metadata` not a mapping, non-string `mode`/`type`, non-list `fields`, etc.). Target design removes closed allowlists and guards for impossible BigQuery payloads.
-3.  **`_read_bigquery.py` — `except (TypeError, ValueError)` wrapper & `QueryScan` wiring:** Branch currently catches `(TypeError, ValueError)` around `extract_schema_metadata()` (which would mislabel propagated `BaseExtension` errors as `BigQueryError`), and constructs `QueryScan(..., schema=..., bq_types=...)`. Target design removes both.
-4.  **`core/plan.py` & `core/executors/read_api.py`:** `QueryScan.schema` and `QueryScan.bq_types` are scheduled for removal from `plan.py`. In `read_api.py`, `_select_zero_column_fallback` currently prefers `_PARTITIONTIME` over `_PARTITIONDATE` in the pseudo-column loop instead of ranking by size (`_PARTITIONDATE` first on `DAY` tables).
+| `TIMESTAMP` / `_PARTITIONTIME` timezone (`scan_table`, `scan_query`) | `pl.Datetime("us", "utc")` | `pl.Datetime("us", "UTC")` |
+| `JSON` / `GEOGRAPHY` default dtype (`scan_table`, `scan_query`) | `pl.String()` | `pl.Extension("google:sqlType:json", pl.String())` / `pl.Extension("google:sqlType:geography", pl.String(), '{"encoding": "WKT"}')` |
+| `ARRAY<JSON>` / `ARRAY<GEOGRAPHY>` default dtype (`scan_table`, `scan_query`) | `pl.List(pl.String())` | `pl.Extension("google:sqlType:json", pl.List(pl.String()))` / `pl.Extension("google:sqlType:geography", pl.List(pl.String()), '{"encoding": "WKT"}')` |
+| Mixed table with an unsupported column (`scan_table`) | Fails with `TypeError` or Polars `InvalidOperationError` (`Decimal(76, 38)`) | Skips enclosing top-level column with `UnsupportedTypeWarning` |
+| Non-partitioned table with *only* unsupported columns (`scan_table`) | Raises `TypeError` / `InvalidOperationError` | Raises `UnsupportedTypeError` (no warning emitted) |
+| Ingestion-time partitioned table with *only* unsupported physical columns (`scan_table`) | Raises `TypeError` / `InvalidOperationError` | Emits `UnsupportedTypeWarning`; retains `_PARTITIONDATE`/`_PARTITIONTIME` (`DAY`) or `_PARTITIONTIME` (non-`DAY`) |
+| Non-`DAY` (`HOUR`/`MONTH`/`YEAR`) ingestion-time table (`scan_table`) | Exposed `_PARTITIONDATE` and `_PARTITIONTIME` | Exposes `_PARTITIONTIME` only |
+| Discovered 0-column table (`scan_table`, `schema=None`) | Raises `BigQueryError` (or `FAILED_PRECONDITION`) | Short-circuits to `(0, 0)` `pl.DataFrame` without `CreateReadSession` |
+| `INTERVAL` / `RANGE` / `BIGNUMERIC` / non-microsecond `TIMESTAMP` (`scan_query`) | `INTERVAL` → `pl.Duration("us")`; `BIGNUMERIC` → `pl.Decimal(76, 38)` | Raises `TypeError` naming the top-level column |
 
 --------------------------------------------------------------------------------
 
@@ -321,221 +272,187 @@ Because this document was drafted alongside an existing branch implementation, f
 
 ### Alternative A: Support Both Polars 1.x and 2.x Dynamically for `JSON` and `GEOGRAPHY`
 
-*   **Pros:** Keeps existing Polars `1.x` installations working without requiring `polars >= 2.0.0`.
-*   **Cons:** Polars `1.x` defaults to loading unknown Arrow extensions as storage (`pl.String`), while Polars `2.0+` defaults to `pl.Extension(...)`. Supporting both requires version-gated schema logic, separate documentation, and a split CI matrix.
-*   **Reason for Rejection:** Polars `2.x` is the target runtime (`polars >= 2.0.0, < 3.0.0` in `pyproject.toml`), allowing a single default `pl.Extension` path matching `read_table()` and `read_query()`.
+*   **Pros:** Keeps Polars 1.x installations working without requiring `polars >= 2.0.0`.
+*   **Cons:** Requires version-gated schema logic, separate documentation, and a split CI matrix.
+*   **Reason for Rejection:** Polars 2.x is the target runtime (`polars >= 2.0.0, < 3.0.0` in `py-polars-bigquery/pyproject.toml`).
 
 ### Alternative B: Unwrap `JSON` and `GEOGRAPHY` to Plain `pl.String` Inside `scan_table()`
 
-*   **Pros:** Lets callers invoke `.str.*` directly without calling `.ext.storage()`, and avoids exposing Polars' `@unstable` `pl.Extension` dtype by default.
-*   **Cons:** Makes `scan_table().collect_schema()` disagree with `read_table().schema` and `read_query().schema`, erases BigQuery type identity on explicit `schema=` inputs, and risks semantic confusion because BigQuery rejects `CAST(JSON AS STRING)` / `CAST(GEOGRAPHY AS STRING)` inside Storage Read API filters.
+*   **Pros:** Avoids exposing Polars' unstable `pl.Extension` dtype by default and lets callers invoke `.str.*` directly without `.ext.storage()`.
+*   **Cons:** Makes `scan_table().collect_schema()` disagree with `read_table().schema` and `read_query().schema`, erases BigQuery type identity, and causes invalid SQL filter pushdown on `JSON`/`GEOGRAPHY`.
 *   **Reason for Rejection:** Keeping Polars 2.0+ native Arrow extension dtypes preserves parity across `read_table()`, `read_query()`, `scan_table()`, and `scan_query()`.
 
 ### Alternative C: Fail Fast on Any Unsupported Column in `scan_table()`, or Strip Nested `STRUCT` Subfields
 
-*   **Pros:** Failing fast keeps `lf.collect_schema()` strictly identical to the BigQuery table DDL. Stripping only unsupported *nested* subfields would keep sibling subfields inside a `STRUCT` readable.
-*   **Cons:** Failing fast blocks an entire mixed table because of a single `INTERVAL`, `BIGNUMERIC`, `RANGE`, or picosecond `TIMESTAMP` column even when the caller never selects it. Dropping a nested subfield from `polars_schema` does not work without extra machinery because Storage Read API `selected_fields` projects by top-level name and still returns the unmapped subfield in the Arrow stream; partial `STRUCT` reading requires nested field projection and client-side `STRUCT` reconstruction.
-*   **Reason for Rejection:** Omitting the enclosing top-level column with `UnsupportedTypeWarning` unblocks mixed tables with bounded complexity; partial `STRUCT` subfield exclusion is left as a future improvement.
+*   **Fail fast (`Pros`/`Cons`):** Keeps `collect_schema()` equal to table DDL, but blocks scanning an entire table when one unused `INTERVAL`, `BIGNUMERIC`, `RANGE`, or non-microsecond `TIMESTAMP` column exists. Callers wanting fail-fast behavior can promote `UnsupportedTypeWarning` via `warnings.filterwarnings("error", category=UnsupportedTypeWarning)`.
+*   **Strip nested `STRUCT` subfields (`Pros`/`Cons`):** Keeps sibling `STRUCT` subfields readable, but the Storage Read API projects by top-level column name, requiring nested projection and client-side `STRUCT` reconstruction.
+*   **Reason for Rejection:** Omitting the enclosing top-level column with `UnsupportedTypeWarning` unblocks mixed tables without implementing nested projection or client-side reconstruction.
 
-### Alternative D: Silently Skip Unsupported Columns in `scan_query()` Like `scan_table()`
+### Alternative D: Skip Unsupported Columns with a Warning in `scan_query()`
 
-*   **Pros:** Uniform warning behavior across both `scan_table()` and `scan_query()`.
-*   **Cons:** Under default `maintain_order=True` (and under oversized pipe fallback on `maintain_order=False`), `scan_query()` executes verbatim SQL without appending `|> SELECT`. BigQuery still encodes and streams the unsupported column over Arrow IPC, causing collection to fail anyway with `UnsupportedTypeError` or Polars `SchemaError`. Users also write the query's `SELECT` list explicitly and expect errors rather than missing output columns.
-*   **Reason for Rejection:** Fail-fast `strict=True` validation in `scan_query()` stops doomed queries before billing/execution and avoids surprising users with dropped `SELECT` expressions.
+*   **Pros:** Uniform warning behavior across `scan_table()` and `scan_query()`.
+*   **Cons:** Under default `maintain_order=True` (and on oversized pipe-rewrite fallback under `maintain_order=False`), `scan_query()` runs verbatim SQL without `|> SELECT`. BigQuery still encodes and streams the unsupported column, crashing at `.collect()` with `UnsupportedTypeError` or Polars `SchemaError`.
+*   **Reason for Rejection:** Fail-fast `TypeError` inside `scan_query()` stops queries before execution and billing and avoids dropping columns the user explicitly requested.
 
-### Alternative E: Separate `_extract_data_type` and `_extract_strict_data_type` Functions with `if` Chains
+### Alternative E: Catch Custom `BaseExtension.ext_from_params` Errors and Convert Them into `SkippedColumn` Entries
 
-*   **Pros:** Slightly shallower call depth inside each function with zero `strict: bool` parameter threading.
-*   **Cons:** Duplicates the full 14-type mapping, `REPEATED` recursion, `timestampPrecision` check, and Arrow extension wrapping across two ~170-line functions. Adding a new BigQuery type or alias requires editing two parallel `if` ladders that can easily fall out of sync.
-*   **Reason for Rejection:** Explicit declarative tables (`_SCALAR_TYPE_MAP`, `_EXTENSION_TYPE_MAP`, `_UNSUPPORTED_TYPE_MAP`) plus a single `_extract_field_dtype(..., strict=...)` dispatcher leave a single source of truth while isolating only the divergent `STRUCT` policy into small helpers.
+*   **Pros:** A scalar-only custom `pl.BaseExtension` subclass whose `ext_from_params` rejects `pl.List(pl.String())` would skip `ARRAY<JSON>` columns during `scan_table()`.
+*   **Cons:** Catching broad exceptions masks real defects inside third-party extension hooks as a dropped-column warning and diverges from `read_table()` and `scan_query()`, which raise immediately.
+*   **Reason for Rejection:** Propagating exceptions directly surfaces defects uniformly across `read_table()`, `scan_table()`, and `scan_query()`.
 
-### Alternative F: Catch Custom `BaseExtension.ext_from_params` Errors and Convert Them into `SkippedColumn`s
+### Alternative F: Short-Circuit Explicit `schema={}` to `(0, 0)` in `scan_table()`
 
-*   **Pros:** If a caller registers a scalar-only third-party `pl.BaseExtension` subclass for `google:sqlType:json` or `google:sqlType:geography` whose `ext_from_params` rejects `pl.List(pl.String())`, a mixed table containing an `ARRAY<JSON>` column could still skip just that array column during `scan_table()`.
-*   **Cons:** Catching `(TypeError, ValueError, RuntimeError, AttributeError, LookupError)` cannot distinguish intentional `List(String())` rejection from bugs in a user's extension code (typos, missing dict keys, wrong constructor signature), silently downgrading a broken hook into a dropped column warning. It also behaves inconsistently with `read_table()` and `scan_query()`, which raise immediately.
-*   **Reason for Rejection:** Propagating exceptions directly keeps failures loud and consistent across `read_table()`, `scan_table()`, and `scan_query()`. *(The current branch's `_build_extension_dtype_checked` wrapper is scheduled for removal.)*
+*   **Pros:** Uniform handling between explicit `schema={}` and discovered zero-column tables (`schema=None`).
+*   **Cons:** Silently yields `0` rows on non-empty tables (`lf.select(pl.len()).collect()` → `0`), skips table-existence and IAM permission checks, masks caller bugs, and contradicts `scan_query(..., schema={})` (`ValueError`, specified in `polars_bigquery_scan_query.md`).
+*   **Reason for Rejection:** Rejecting explicit `schema={}` with `ValueError` keeps `scan_table()` and `scan_query()` consistent; only metadata-discovered zero-column tables short-circuit.
 
-### Alternative G: Closed Client-Side Allowlists and Exhaustive REST Metadata Type Validation
+### Alternative G: Pre-Flight Schema Interception on Explicit `schema=` Mismatches
 
-*   **Pros:** Guards unit tests or corrupted proxy responses against unexpected types (`mode: 42`, `table_metadata: "bad"`, `timePartitioning.type: "WEEK"`).
-*   **Cons:** Adds client-side checks for conditions real BigQuery REST endpoints never produce, and closed allowlists (`_VALID_TIME_PARTITIONING_TYPES`, `_VALID_FIELD_MODES`) actively break valid user tables if BigQuery introduces a new partitioning granularity (e.g., `WEEK` or `MINUTE`) or a new field mode.
-*   **Reason for Rejection:** Only validate structural facts that real BigQuery can emit and that actually affect Polars Arrow mapping (unknown `field.type`, `timestampPrecision` values other than microsecond, duplicate query columns/subfields). Check `timePartitioning.type` strictly for daily (`"DAY"` / default) instead of rejecting unrecognized granularities.
+*   **Pros:** Could customize Polars' error when a caller supplies `pl.String()` for a `JSON` column.
+*   **Cons:** Requires adding a new `__arrow_c_schema__` export to `arrow_bigquery` and maintaining a duplicate Python schema comparator ahead of Polars' Rust importer.
+*   **Reason for Rejection:** Polars' native `SchemaError` already reports both expected and actual dtypes, including the extension name (`google:sqlType:json` / `google:sqlType:geography`).
 
-### Alternative H: Prefer `_PARTITIONTIME` Over `_PARTITIONDATE` in Zero-Column Pseudo-Column Fallback
+*Smaller design choices kept declarative rather than parallel:* One recursive dispatcher with lookup tables (rather than duplicated `if` chains for table vs. query modes), unified `core/types.py::column_width_rank` (rather than a separate rank map in `read_api.py`), and width-first ranking of pseudo-columns (`_PARTITIONDATE` over `_PARTITIONTIME` on daily tables).
 
-*   **Pros:** Uniformly selects `_PARTITIONTIME` regardless of whether an ingestion-time partitioned table is `DAY`, `HOUR`, `MONTH`, or `YEAR`.
-*   **Cons:** On `DAY`-partitioned tables whose physical columns were all skipped, `_PARTITIONDATE` is 4 bytes (`DATE`) while `_PARTITIONTIME` is 8 bytes (`TIMESTAMP`), and `_PARTITIONDATE` appears first in the schema (`["_PARTITIONDATE", "_PARTITIONTIME"]`). Hardcoding `_PARTITIONTIME` scans twice the width per row and breaks the project's general rule of picking the narrowest column (tie-broken to first in schema order).
-*   **Reason for Rejection:** Using the same `(rank, schema_index)` rule for both physical and pseudo-columns selects `_PARTITIONDATE` on daily tables and `_PARTITIONTIME` on non-daily tables (matching Polars' own column selection for `lf.select(pl.len())`).
+--------------------------------------------------------------------------------
 
-### Alternative I: Pre-Flight Schema Interception on Explicit `schema=` Mismatches
+## Risks & Mitigations
 
-*   **Pros:** Could reword Polars' mismatch error when a caller passes `pl.String` for a `JSON` column to recommend `polars_bigquery.dtypes.JSON`.
-*   **Cons:** Requires adding a new `__arrow_c_schema__` PyO3 export to `arrow_bigquery`'s `ArrowStreamExporter` (coupling this Python change to a Rust wheel release and version pin bump in `py-arrow-bigquery`), plus maintaining a Python-side schema comparator that risks drifting from Polars' Rust Arrow importer rules (`time_zone`, `BaseExtension`, `load_as_storage`). Without `__arrow_c_schema__`, calling the single-use `__arrow_c_stream__` ahead of `pl.scan_arrow_c_stream()` would consume the stream.
-*   **Reason for Rejection:** Polars' native `SchemaError` already identifies both expected and actual dtypes, including the Arrow extension name (`google:sqlType:json` / `google:sqlType:geography`). Adding `__arrow_c_schema__` on `ArrowStreamExporter` independently for general Arrow PyCapsule ecosystem interop is tracked under [Future Improvements](#future-improvements).
+| Risk | Impact | Mitigation |
+| --- | --- | --- |
+| `polars-bigquery` wheel installed with older `arrow-bigquery == 0.3.2` (missing `#116` and `#123`) | Every `DATETIME` scan fails with `SchemaError` (`google:sqlType:datetime`) | Release `arrow-bigquery` first and bump `arrow-bigquery >= <next-version>` in `py-polars-bigquery/pyproject.toml` (rollback reverses both versions together). |
+| Interim filter pushdown under `load_as_storage` before `core/compiler/` PR lands | String ops pushed on `JSON`/`GEOGRAPHY` columns fail in BigQuery (`INVALID_ARGUMENT`) | Document behavior and scope `core/compiler/` schema awareness as the follow-up PR. |
+| Parameterized `NUMERIC(P, S)` columns on `scan_table()` | `read_table` returns `Decimal(P, S)` while `scan_table()` declares `Decimal(38, 9)` (`SchemaError`) | Documented exclusion; tracked in [issue #128](https://github.com/pola-rs/polars-bigquery-client/issues/128). Workaround: pass explicit `schema=` with `pl.Decimal(P, S)`. |
+| Time-of-check/time-of-use drift between scan construction and `.collect()` | Table DDL changes or mid-process `pl.register_extension_type()` mutations raise `SchemaError` | Set `POLARS_UNKNOWN_EXTENSION_TYPE_BEHAVIOR` before importing `polars` and avoid mutating the global extension registry between `scan_table()` and `.collect()`. |
+| Future BigQuery `timePartitioning.type` lacking `_PARTITIONTIME` | Calling `scan_table()` includes `_PARTITIONTIME` in schema | Only emitted when `timePartitioning.field` is empty; no closed allowlist breaks reads of physical columns. |
+| Scalar-only custom `BaseExtension` on tables containing `ARRAY<JSON>` / `ARRAY<GEOGRAPHY>` | `scan_table()` raises immediately instead of skipping `ARRAY<...>` | Document that registered `BaseExtension` subclasses for `JSON`/`GEOGRAPHY` must handle both `pl.String()` and `pl.List(pl.String())`. |
 
 --------------------------------------------------------------------------------
 
 ## Non-Functional Requirements
 
-*   **Privacy & logging:** `UnsupportedTypeWarning` messages and `DEBUG` logs record table IDs, column names, dotted schema paths, and BigQuery type names only. No row data or predicate literal values are logged. Warning summaries cap output at `_MAX_SKIPPED_COLUMNS_DISPLAY = 5` entries (`"... and N more"`) so wide tables with many unsupported columns do not flood logs.
+*   **Release dependency order:** `arrow-bigquery` must release with `#116` (`UnsupportedTypeError`) and `#123` (`google:sqlType:datetime` stripping) before releasing `polars-bigquery`. `py-polars-bigquery/pyproject.toml` pins the floor alongside the release note already tracked on lines 15–17.
+*   **Privacy & logging:** `UnsupportedTypeWarning` messages and `DEBUG` logs record table IDs, column names, dotted schema paths, and BigQuery type names only (`timestampPrecision` uses `repr` formatting so empty/control-character values render safely). No row data or predicate literal values are logged. Warning summaries cap output at 5 entries (`"... and N more"`). Note that Python's `warnings` module writes to `stderr` by default and suppresses duplicate alerts at the same call site.
 *   **Network & cost impact:**
-    *   Short-circuiting empty `0`-column tables and explicit `schema={}` avoids an unserviceable `CreateReadSession` RPC (and skips `tables.get` for explicit `schema={}`).
-    *   Zero-column fallback requests a single narrowest safe column (`BOOL` before `DATE` before `INT64`, and `_PARTITIONDATE` before `_PARTITIONTIME` when only pseudo-columns remain) rather than `selected_fields=[]`, preventing full-table scans over Storage Read API.
-*   **Immutability:** `TableScan.bq_types` is wrapped in `types.MappingProxyType(dict(...))` so external mutation of caller dictionaries cannot alter a cached or normalized logical plan.
-*   **Rollout & backward compatibility:** Callers upgrading should inspect the behavioral changes table above (`"utc"` -> `"UTC"`, `JSON`/`GEOGRAPHY` extension types, `UnsupportedTypeWarning` on mixed tables, `ValueError` when no supported columns remain, `schema={}` short-circuit). Callers wanting the prior fail-fast behavior on mixed tables can run `warnings.filterwarnings("error", category=UnsupportedTypeWarning)`.
+    *   Short-circuiting discovered zero-column tables (including schemaless ingestion-time partitioned tables) avoids a failing `CreateReadSession` RPC.
+    *   Zero-column fallback requests a single narrowest column (`column_width_rank`) rather than `selected_fields=[]`, preventing full-table scans over the Storage Read API. (Uncompressed Arrow width: `_PARTITIONDATE` is 4 bytes vs. `_PARTITIONTIME` 8 bytes; billing/compressed wire impact is negligible since both are per-partition metadata columns.)
+*   **Rollout & backward compatibility:** Callers needing strict failure on mixed tables can set `warnings.filterwarnings("error", category=UnsupportedTypeWarning)` and catch `(UnsupportedTypeWarning, UnsupportedTypeError)`. See [Backward-Incompatible Behavioral Changes](#backward-incompatible-behavioral-changes).
 
 --------------------------------------------------------------------------------
 
-### Future Improvements
+## Future Improvements
 
-*   **Partial `STRUCT` subfield exclusion:** Support omitting only unsupported nested subfields of a `STRUCT` and reconstructing the remaining subfields client-side, once Storage Read API nested field projection support is wired through `arrow-bigquery`.
-*   **Schema-aware predicate pushdown:** Consume `TableScan.bq_types` (and query dry-run types) inside `core/compiler/` so SQL generation avoids invalid GoogleSQL expressions on `JSON`/`GEOGRAPHY`, integer bitwise operators, `NaN`/`Inf`, and cross-temporal comparisons.
-*   **Dedicated API data-types documentation:** Publish `docs/source/api/data-types.md` and register `UnsupportedTypeWarning`, `UnsupportedTypeError`, and `polars_bigquery.dtypes` entries in `docs/source/api/index.md` so docstring links resolve under `mkdocs build --strict`.
-*   **Zero-column row-height preservation (`Polars 2.0–2.1`):** Pair the narrowest-column fallback with incremental empty-`Project(())` execution in `core/executors/base.py` so direct `io_source([], ...)` yields keep exact row height (`shape == (N, 0)`) rather than dropping batches via `drop(pl.all()).collect_batches()`.
-*   **Non-destructive `__arrow_c_schema__` on `arrow_bigquery.ArrowStreamExporter`:** `ArrowStreamExporter` in `py-arrow-bigquery/src/stream.rs` already retains `schema: ArrowSchemaRef` independently of the single-use `source` mutex. Implementing the Arrow PyCapsule `__arrow_c_schema__` hook (`export_field_to_c` gated by `schema_ffi_validated`) in a standalone `arrow-bigquery` change enables repeated, non-destructive schema inspection for ecosystem consumers (`pyarrow.schema(exporter)`, `arro3`, DuckDB) without consuming the stream.
+*   **Parameterized `NUMERIC(P, S)` support:** Tracked in [issue #128](https://github.com/pola-rs/polars-bigquery-client/issues/128) (`tables.get` includes `"precision"` and `"scale"` strings for `NUMERIC(P, S)` columns).
+*   **Partial `STRUCT` subfield exclusion:** Support omitting only unsupported nested subfields of a `STRUCT` and reconstructing remaining subfields client-side once nested field projection is wired in `arrow-bigquery`.
+*   **Schema-aware predicate pushdown:** Introduce BigQuery type propagation on plan nodes and consume it inside `core/compiler/` to reject invalid GoogleSQL expressions on `JSON`/`GEOGRAPHY` under `load_as_storage`, bitwise operators, `NaN`/`Inf`, and cross-temporal comparisons.
+*   **Dedicated API data-types documentation:** Publish `docs/source/api/data-types.md` and register `UnsupportedTypeWarning`, `UnsupportedTypeError`, and `polars_bigquery.dtypes` inside `docs/source/api/index.md`.
+*   **Zero-column row-height preservation (Polars 2.0–2.1):** Avoid batch collapse during empty zero-column projections in `core/executors/base.py`.
+*   **Non-destructive `__arrow_c_schema__` on `arrow_bigquery.ArrowStreamExporter`:** Expose Arrow PyCapsule schema export without consuming the single-use stream for ecosystem interop (`pyarrow`, `arro3`, DuckDB).
 
 --------------------------------------------------------------------------------
 
 ## Detailed Implementation Plan
 
-Each entry below lists the complete design-state changes for the file (relative to `docs/designs/`). Where the existing branch implementation diverges from the finalized design choices in this document, the exact alignment change is labeled **[Alignment Update]**.
+Each entry lists the required changes for a target file (Markdown links resolve relative to `docs/designs/`). All source and test updates below are relative to the pre-change baseline (`main` at commit `32fdc1f`).
 
 ### Target Files to Modify
 
-#### 1. [`py-polars-bigquery/polars_bigquery/core/schema.py`](../../py-polars-bigquery/polars_bigquery/core/schema.py) (Modify)
+#### 1. [`py-polars-bigquery/polars_bigquery/core/types.py`](../../py-polars-bigquery/polars_bigquery/core/types.py) (Modify)
 
-*   **Type / Scope:** Pure Python schema-extraction module (`polars_bigquery.core.schema`).
-*   **Rationale:** Centralizes BigQuery-to-Polars schema mapping across both `scan_table` (skip/warn on unsupported types) and `scan_query` (strict extraction) so mapping tables and alias lists cannot drift out of sync, while stripping speculative REST payload checks and closed allowlists that break on new BigQuery features.
+*   **Type / Scope:** Canonical BigQuery type & width-rank helper module.
+*   **Rationale:** Avoids duplicating a second 14-type width-rank lookup table in `read_api.py`.
 *   **Required Changes:**
-    *   Define frozen dataclasses `SkippedColumn(name: str, reason: str, path: str)` and `ExtractedSchema(polars_schema: pl.Schema, bq_types: dict[str, BQType], skipped_columns: tuple[SkippedColumn, ...])`, internal sentinel `_UnsupportedBigQueryType(reason: str, path: str)`, internal `_ExtensionTypeSpec(extension_name: str, metadata: str | None, bq_type: BQType)`, and type alias `ExtensionDtypeBuilder = Callable[[str, DataType, str | None], DataType]`.
-    *   Define explicit module-level lookup tables:
-        *   `_SCALAR_TYPE_MAP`: casefolded aliases (`bool`, `boolean`, `bytes`, `date`, `datetime`, `float`, `float64`, `integer`, `int64`, `numeric`, `decimal`, `string`, `time`) mapping to `(dtype_factory, BQType)` callables producing fresh `DataType` instances.
-        *   `_EXTENSION_TYPE_MAP`: `json` (`google:sqlType:json`, `metadata=None`, `BQType.JSON`) and `geography` (`google:sqlType:geography`, `metadata='{"encoding": "WKT"}'`, `BQType.GEOGRAPHY`).
-        *   `_UNSUPPORTED_TYPE_MAP`: `bignumeric` / `bigdecimal` (`"BIGNUMERIC"`), `interval` (`"INTERVAL"`), and `range` (`"RANGE"`) mapped to `(skip_reason, strict_message_template)`.
-    *   Define shared recursive `_extract_field_dtype(field, *, path, strict, top_col_name="", extension_dtype_builder=build_extension_dtype) -> tuple[DataType, BQType]`:
-        *   Check `mode == "repeated"` first (`(field.get("mode") or "").casefold() == "repeated"`). For `type_` in `_EXTENSION_TYPE_MAP`, call `extension_dtype_builder(spec.extension_name, List(String()), spec.metadata)` and return `(dtype, BQType.ARRAY)`. Otherwise recurse on `{**field, "mode": "NULLABLE"}` so field parameters (including `timestampPrecision`) are preserved.
-        *   Dispatch scalar types via `_SCALAR_TYPE_MAP` and `_EXTENSION_TYPE_MAP`.
-        *   Map `timestamp` to `Datetime(time_unit="us", time_zone="UTC")`, validating `timestampPrecision` via `_is_supported_timestamp_precision(precision)` (`None`, integer `6` excluding `bool`, or string `"6"`). Non-microsecond precision raises `_UnsupportedBigQueryType` (`strict=False`) or `TypeError` (`strict=True`).
-        *   Dispatch `record`/`struct` to small mode-specific helpers:
-            *   Table-scan (`strict=False`): walk subfields recursively, tracking dotted paths (`f"{path}.{sub_name}"`) so nested unsupported types unwind and skip the top-level column.
-            *   Query-scan (`strict=True`): keep empty `STRUCT([])`, permit a single unnamed subfield (`""`), allow case-differing subfield names (`a` vs `A`), collect exact duplicate names, and raise `ValueError` with the `AS` alias hint when duplicates collide.
-        *   Dispatch known-unsupported aliases via `_UNSUPPORTED_TYPE_MAP`; treat unknown `type` values as skipped (`strict=False`) or `TypeError` (`strict=True`).
-    *   Expose `extract_schema_metadata(table_metadata, *, extension_dtype_builder=build_extension_dtype) -> ExtractedSchema` (pure; no warning side effects):
-        *   Read `(table_metadata.get("schema") or {}).get("fields") or []`.
-        *   Track casefolded `seen_names` before checking each field's type so skipped columns do not collide with appended pseudo-columns.
-        *   Handle `timePartitioning` when `field` is absent (`None` or `""`): append `_PARTITIONDATE` (`Date()`, `BQType.DATE`) only when `type` is `None`, `""`, or `"day"` (case-insensitive); always append `_PARTITIONTIME` (`Datetime("us", "UTC")`, `BQType.TIMESTAMP`) if not already in `seen_names`.
-    *   Update `extract_polars_schema(table_metadata, *, extension_dtype_builder=build_extension_dtype, require_non_empty=False) -> pl.Schema` to delegate to `extract_schema_metadata()`.
-    *   Update `has_bignumeric_dtype(dtype)` to guard `current.precision is not None and current.precision > 38`.
-    *   **[Alignment Update]** Remove `_build_extension_dtype_checked` and `_build_extension_for_spec` exception catching so `extension_dtype_builder(...)` exceptions propagate directly in both `scan_table` and `scan_query`.
-    *   **[Alignment Update]** Remove closed allowlists `_VALID_TIME_PARTITIONING_TYPES` and `_VALID_FIELD_MODES` so future BigQuery partitioning granularities (`WEEK`, `MINUTE`, etc.) retain `_PARTITIONTIME` without raising and future field modes do not break parsing.
-    *   **[Alignment Update]** Remove speculative client-side REST checks for payloads real BigQuery cannot produce (`table_metadata` non-mapping guard, non-mapping `schema`/`timePartitioning`, non-list `fields`, non-string `name`/`mode`/`type`, duplicate/unnamed table columns, `MAX_SCHEMA_NESTING_DEPTH` > 64 guard). Keep genuine null-safety (`schema: None`, `fields: None`, `mode: None`, `type: None`, `field: ""`).
-    *   **[Alignment Update]** Fold `extract_query_schema_from_fields` directly into `extract_polars_schema_from_fields(fields, *, extension_dtype_builder=build_extension_dtype) -> pl.Schema` (removing the unconsumed tuple return API until schema-aware query pushdown requires `bq_types`).
+    *   Update `column_width_rank(dtype, *, bq_type=None) -> int` so unknown/unsupported dtypes (such as `pl.Duration`, `pl.Float16`, `pl.Decimal(76, 38)`, unparameterized `pl.Decimal` with `precision=None`, `pl.Null`, `pl.Unknown`, `pl.Object`) return rank `7` (strictly behind `ARRAY`/`STRUCT` at `6`).
+    *   For custom non-BigQuery `pl.BaseExtension` types (`resolved is None`), unwrap `dtype.ext_storage()` and recurse.
 
-#### 2. [`py-polars-bigquery/polars_bigquery/exceptions.py`](../../py-polars-bigquery/polars_bigquery/exceptions.py) (Modify)
+#### 2. [`py-polars-bigquery/polars_bigquery/core/schema.py`](../../py-polars-bigquery/polars_bigquery/core/schema.py) (Modify)
+
+*   **Type / Scope:** Schema-extraction module.
+*   **Rationale:** Centralizes BigQuery-to-Polars schema mapping across `scan_table()` (skip/warn on unsupported types) and `scan_query()` (strict extraction) using one set of lookup tables and one unified `STRUCT` helper.
+*   **Required Changes:**
+    *   Define data structures and type alias:
+        *   `SkippedColumn(name: str, reason: str, path: str)` (frozen dataclass).
+        *   `ExtractedSchema(polars_schema: pl.Schema, skipped_columns: tuple[SkippedColumn, ...])` (frozen dataclass).
+        *   `_UnsupportedBigQueryType(reason: str, path: str)` (internal `Exception` subclass).
+        *   `_ExtensionTypeSpec(extension_name: str, metadata: str | None)` (internal frozen, slotted dataclass).
+        *   `ExtensionDtypeBuilder = Callable[[str, pl.DataType, str | None], pl.DataType]`.
+    *   Define module-level lookup tables (reusing `BQ_NUMERIC_MAX_PRECISION` and `BQ_NUMERIC_MAX_SCALE` from `polars_bigquery.core.types`):
+        *   `_SCALAR_TYPE_MAP`: map casefolded type names and aliases (`bool`, `boolean`, `bytes`, `date`, `datetime`, `float`, `float64`, `integer`, `int64`, `numeric`, `decimal`, `string`, `time`) to zero-arg callables returning fresh `pl.DataType` instances.
+        *   `_EXTENSION_TYPE_MAP`: map `json` and `geography` to `_ExtensionTypeSpec` instances (`google:sqlType:json`, `metadata=None`; `google:sqlType:geography`, `metadata='{"encoding": "WKT"}'`).
+        *   `_UNSUPPORTED_TYPE_MAP`: map `bignumeric`/`bigdecimal`, `interval`, and `range` to `(skip_reason, strict_message_template)` tuples.
+    *   Define recursive `_extract_field_dtype(field, *, path, strict, top_col_name="", depth=0, extension_dtype_builder=build_extension_dtype) -> pl.DataType`:
+        *   Raise `BigQueryError` when `depth > MAX_SCHEMA_NESTING_DEPTH` (`64`).
+        *   Validate casefolded `mode` against `_VALID_FIELD_MODES = frozenset({"", "nullable", "required", "repeated"})` (skip in `scan_table()`, `TypeError` in `scan_query()`).
+        *   Handle `mode == "repeated"` first: for extension types, invoke `extension_dtype_builder(spec.extension_name, pl.List(pl.String()), spec.metadata)` directly (no `try/except`); otherwise recurse on `{**field, "mode": "NULLABLE"}` to preserve `timestampPrecision` and nested attributes.
+        *   Map `timestamp` to `pl.Datetime(time_unit="us", time_zone="UTC")`; validate `timestampPrecision` via `_is_supported_timestamp_precision(precision)` (`None`, `int` `6` excluding `bool`, or `"6"`). Format non-microsecond errors with `{precision!r}`.
+        *   Dispatch `record`/`struct` to one unified `_extract_struct_dtype` helper supporting empty `STRUCT([])`, single unnamed subfield `""`, and case-differing subfield names while raising `ValueError` on exact duplicate subfield names.
+        *   For unrecognized `type`, raise `_UnsupportedBigQueryType` (`strict=False`) or `TypeError` naming `top_col_name` (`strict=True`).
+    *   In `extract_schema_metadata(table_metadata, *, extension_dtype_builder=build_extension_dtype) -> ExtractedSchema`:
+        *   Validate outer envelope (`table_metadata`, `schema`, `schema.fields`, `timePartitioning`), raising `BigQueryError` directly on malformed non-mapping/non-sequence envelopes (allowing `None`).
+        *   Record each column's casefolded `name` in `seen_names` before evaluating its type so a skipped column prevents pseudo-column shadowing.
+        *   Gate ingestion-time partition pseudo-columns on **non-empty `fields`** (`if fields and time_partitioning is not None:`) so schemaless zero-column partitioned tables return `pl.Schema({})`. Append `_PARTITIONDATE` (`pl.Date()`) only when `type` is `None`, `""`, or `"day"` (case-insensitive), and `_PARTITIONTIME` (`pl.Datetime(time_unit="us", time_zone="UTC")`) for any granularity without rejecting unrecognized future `timePartitioning.type` values. Skip either pseudo-column if its casefolded name is already in `seen_names`.
+    *   Retain `extract_polars_schema(table_metadata, *, extension_dtype_builder=build_extension_dtype, require_non_empty=False) -> pl.Schema` delegating to `extract_schema_metadata()`.
+    *   Update `has_bignumeric_dtype(dtype)` to guard `current.precision is not None and current.precision > BQ_NUMERIC_MAX_PRECISION` and unwrap `pl.BaseExtension` (`current.ext_storage()`).
+
+#### 3. [`py-polars-bigquery/polars_bigquery/exceptions.py`](../../py-polars-bigquery/polars_bigquery/exceptions.py) (Modify)
 
 *   **Type / Scope:** Public exceptions and warnings module.
-*   **Rationale:** Exposes a dedicated warning subclass so callers can programmatically ignore, capture, or promote skipped-column warnings to errors with Python's `warnings` module.
+*   **Rationale:** Exposes `UnsupportedTypeWarning` so callers can capture, ignore, or promote skipped-column warnings with Python's `warnings` module.
 *   **Required Changes:**
-    *   Define `UnsupportedTypeWarning(UserWarning)` with docstring detailing the omitted column categories and a `warnings.filterwarnings("error", category=UnsupportedTypeWarning)` example.
+    *   Define `UnsupportedTypeWarning(UserWarning)` with a docstring listing omitted categories (`BIGNUMERIC`, `INTERVAL`, `RANGE<T>`, non-microsecond `TIMESTAMP`, unrecognized future types/modes) and a `warnings.filterwarnings("error", category=UnsupportedTypeWarning)` example.
     *   Export `"UnsupportedTypeWarning"` in `__all__` alongside `"BigQueryError"` and `"UnsupportedTypeError"`.
-
-#### 3. [`py-polars-bigquery/polars_bigquery/core/plan.py`](../../py-polars-bigquery/polars_bigquery/core/plan.py) (Modify)
-
-*   **Type / Scope:** Immutable logical scan plan IR.
-*   **Rationale:** Preserves authoritative BigQuery column types on `TableScan` even when Polars loads extension columns as plain storage (`load_as_storage` / `as_storage=True`), while keeping plan nodes protected against caller dict mutation.
-*   **Required Changes:**
-    *   Import `types`, `Mapping`, and `BQType`.
-    *   Add optional `bq_types: Mapping[str, BQType] | None = None` to `TableScan`; in `TableScan.__post_init__`, copy any non-`None` mapping into `types.MappingProxyType(dict(self.bq_types))`.
-    *   **[Alignment Update]** Remove the unconsumed `schema: pl.Schema | None = None` and `bq_types: Mapping[str, BQType] | None = None` fields (and associated `__post_init__` checks) from `QueryScan`, leaving `QueryScan` unchanged.
 
 #### 4. [`py-polars-bigquery/polars_bigquery/core/executors/read_api.py`](../../py-polars-bigquery/polars_bigquery/core/executors/read_api.py) (Modify)
 
 *   **Type / Scope:** Storage Read API plan compiler and executor.
-*   **Rationale:** Avoids passing `selected_fields=[]` (which causes BigQuery to stream every column, including skipped unsupported ones) by choosing the single narrowest column using authoritative `BQType` widths and unwrapping `pl.BaseExtension`.
+*   **Rationale:** Avoids passing `selected_fields=[]` (which streams every column, including skipped unsupported ones) using a single width-rank function shared with `core/types.py`.
 *   **Required Changes:**
-    *   Add `_BQ_TYPE_FALLBACK_RANK: dict[BQType, int]` covering all 14 `BQType` enum members (`BOOL`: 0, `DATE`: 3, `INT64`/`FLOAT64`/`TIME`/`DATETIME`/`TIMESTAMP`: 4, `NUMERIC`: 5, `STRING`/`BYTES`/`JSON`/`GEOGRAPHY`: 6, `ARRAY`/`STRUCT`: 7).
-    *   Update `_dtype_fallback_rank(dtype: pl.DataType, bq_type: BQType | None = None) -> int`: prefer `_BQ_TYPE_FALLBACK_RANK[bq_type]` when `bq_type` is supplied; unwrap `pl.BaseExtension` via `dtype.ext_storage()`; guard `pl.Decimal` precision with `dtype.precision is not None and dtype.precision <= 38`.
-    *   Update `_select_zero_column_fallback(schema: pl.Schema, bq_types: Mapping[str, BQType] | None = None) -> str` and wire `source.bq_types` inside `compile_read_api_plan()`. Do **not** alter `compiler.compile_predicate(op.predicate)` arguments here.
-    *   **[Alignment Update]** Replace the hardcoded `_partitiontime` loop in `_select_zero_column_fallback` with the same `min(..., key=(rank, schema_index))` comparator used for physical columns, so `_PARTITIONDATE` (`DATE`, 4 bytes, rank `3`) wins over `_PARTITIONTIME` (`TIMESTAMP`, 8 bytes, rank `4`) on daily tables and ties break by first column in schema order.
+    *   Replace the duplicated dtype ranking ladder with `_zero_column_rank(dtype: pl.DataType) -> int`, returning `7` when `has_bignumeric_dtype(dtype)` is true and `column_width_rank(dtype)` otherwise.
+    *   In `_select_zero_column_fallback(schema: pl.Schema) -> str`, select `min(candidates, key=lambda item: (_zero_column_rank(item[2]), item[0]))` where `candidates` prefers physical columns over ingestion-time pseudo-columns. When only pseudo-columns remain, `_PARTITIONDATE` (`DATE`, rank `2`) is chosen over `_PARTITIONTIME` (`TIMESTAMP`, rank `3`).
 
 #### 5. [`py-polars-bigquery/polars_bigquery/_read_bigquery.py`](../../py-polars-bigquery/polars_bigquery/_read_bigquery.py) (Modify)
 
 *   **Type / Scope:** Public `Client` implementation and docstrings.
-*   **Rationale:** Coordinates `extract_schema_metadata()` warning emission, all-unsupported `ValueError` exits, empty-schema short-circuiting without `CreateReadSession`, `bq_types` handoff to `TableScan`, and updated API docstrings.
+*   **Rationale:** Coordinates warnings, all-unsupported `UnsupportedTypeError`, empty-schema short-circuiting for discovered zero-column tables, and accurate API docstrings.
 *   **Required Changes:**
-    *   Add `_MAX_SKIPPED_COLUMNS_DISPLAY = 5` and `_format_skipped_columns(skipped_columns)` formatting `"col (reason)"`, `"col (reason at path)"`, and `"... and N more"` truncation.
-    *   In `Client.scan_table`:
-        *   Call `extract_schema_metadata(table_metadata)` directly when `schema is None`.
-        *   If `extracted.skipped_columns` is non-empty and `len(polars_schema) == 0`, raise `ValueError` with the skipped summary and a `client.read_query()` hint (do **not** emit a warning).
-        *   If `extracted.skipped_columns` is non-empty and `len(polars_schema) > 0`, log `DEBUG` and emit `warnings.warn(..., UnsupportedTypeWarning, stacklevel=2)`.
-        *   For explicit `schema=`, call `_normalize_schema(schema, require_non_empty=False)` and leave `bq_types = None`.
-        *   When `len(polars_schema) == 0` (empty table or `schema={}`), leave `source = None` and `executor = None`; inside `source_generator`, check `closed_event.is_set()` first, then short-circuit to `iter([pl.DataFrame(schema=polars_schema)])` without calling `read_table()`.
-        *   When `len(polars_schema) > 0`, pass `bq_types=bq_types` into `TableScan(...)`.
-    *   Update `read_table()` and `scan_table()` docstrings (UTC casing, `JSON`/`GEOGRAPHY` extension types, `UnsupportedTypeWarning`, `DAY`-gated `_PARTITIONDATE`, `schema={}` short-circuit) using inline code spans rather than unresolved cross-reference links (`data-types.md` does not exist yet).
-    *   **[Alignment Update]** Remove the `except (TypeError, ValueError)` wrapper around `extract_schema_metadata(table_metadata)` inside `scan_table` so errors from custom `BaseExtension.ext_from_params(...)` hooks propagate directly with their original type and traceback instead of being wrapped as `BigQueryError("Invalid BigQuery table metadata...")`.
-    *   **[Alignment Update]** Inside `Client.scan_query`, keep calling `extract_polars_schema_from_fields(fields)` and drop the `schema=polars_schema, bq_types=bq_types` keyword arguments to `QueryScan(...)`.
+    *   Add `_MAX_SKIPPED_COLUMNS_DISPLAY = 5` and `_format_skipped_columns(skipped_columns)` formatting entries as `"col (reason)"` or `"col (reason at path)"`, appending `"... and N more"` when truncated.
+    *   In `Client.scan_table()`:
+        *   When `schema is None`, call `extract_schema_metadata(table_metadata)` directly (no `except (TypeError, ValueError)` wrapper so custom `BaseExtension` exceptions propagate with their original type and traceback).
+        *   If `extracted.skipped_columns` is non-empty and `len(polars_schema) == 0`, raise `UnsupportedTypeError` with the skipped-column summary and a hint pointing to `client.scan_query()` / `client.read_query()` (no warning emitted).
+        *   If `extracted.skipped_columns` is non-empty and `len(polars_schema) > 0`, log at `DEBUG` level and emit `warnings.warn(..., UnsupportedTypeWarning, stacklevel=2)`.
+        *   For explicit `schema=`, call `_normalize_schema(schema, require_non_empty=True)` (raising `ValueError` on empty `schema={}`, matching `Client.scan_query()`).
+        *   When `len(polars_schema) == 0` (discovered zero-column table), leave `source = None` and `executor = None`; inside `source_generator`, check `closed_event.is_set()` first, then short-circuit to `iter([pl.DataFrame(schema=polars_schema)])` without calling `arrow_client.read_table()`.
+    *   Update docstrings on `Client.read_table()`, `Client.scan_table()`, and `Client.scan_query()` (uppercase `"UTC"`, explicit `schema=` guidance across default / registered / `load_as_storage` modes, outer-wrapped `ARRAY<JSON>` spelling warning, `UnsupportedTypeWarning` / `UnsupportedTypeError`, `DAY`-gated `_PARTITIONDATE`, full list of `scan_query()` `TypeError` types).
 
-#### 6. [`py-polars-bigquery/tests/unit/core/test_schema.py`](../../py-polars-bigquery/tests/unit/core/test_schema.py) (Modify)
+#### 6. [`docs/source/api/predicate-pushdown.md`](../../docs/source/api/predicate-pushdown.md) (Modify)
 
-*   **Type / Scope:** Unit test suite for `core/schema.py`.
-*   **Rationale:** Validates all 14 supported `BQType` mappings, outer-wrapped extension arrays, nesting depth, `timestampPrecision`, partitioning granularities, skipped column paths, and strict query extraction.
-*   **Required Changes:**
-    *   Cover primitive types, `ARRAY<JSON>` / `ARRAY<GEOGRAPHY>`, deeply nested `STRUCT`s with `DATETIME` / `JSON` / `GEOGRAPHY` (15 levels), Mode B `load_as_storage` and `register_extension_type(..., as_storage=True)` preserving `bq_types`, `timestampPrecision` (`6`, `"6"`, `12`, `"12"`, `"9"`, `True`, inside `REPEATED`), ingestion-time partitioning granularity (`DAY`, omitted, `None`, `HOUR`, `MONTH`, `YEAR`, plus future unknown granularity such as `WEEK` retaining `_PARTITIONTIME` without `_PARTITIONDATE`), explicit `field=""`, non-overwriting pseudo-column checks, strict `extract_polars_schema_from_fields` type/duplicate errors (including single unnamed `STRUCT` subfield accepted, duplicate unnamed subfields rejected), and `has_bignumeric_dtype` (including `precision=None`).
-    *   **[Alignment Update]** Replace `test_extract_schema_custom_extension_rejection_becomes_skipped_column` and `test_extract_schema_extension_builder_non_datatype_and_lookup_error` assertions to verify direct exception propagation instead of `SkippedColumn` omission.
-    *   **[Alignment Update]** Remove test assertions for impossible BigQuery REST shapes and closed `timePartitioning.type`/`field.mode` allowlist rejections; verify unrecognized future `timePartitioning.type` values omit `_PARTITIONDATE` and retain `_PARTITIONTIME`.
-    *   **[Alignment Update]** Update the strict-extraction test to invoke `extract_polars_schema_from_fields` directly if `extract_query_schema_from_fields` is folded in.
+*   **Type / Scope:** Published MkDocs reference page linked by `Client.scan_table()`.
+*   **Rationale:** Keeps the published BigQuery-to-Polars schema mapping table accurate with updated `TIMESTAMP` casing, `JSON`/`GEOGRAPHY` extensions, outer-wrapped arrays, skipped types, and `DAY`-only `_PARTITIONDATE`.
+*   **Required Changes:** Update lines 97–124 (`### BigQuery-to-Polars Schema Mapping`).
 
-#### 7. [`py-polars-bigquery/tests/unit/core/test_types.py`](../../py-polars-bigquery/tests/unit/core/test_types.py) (Modify)
+#### 7. Unit & System Tests (Modify)
 
-*   **Type / Scope:** Unit test suite for `core/types.py` and public exports.
-*   **Rationale:** Guards the public export contract for `UnsupportedTypeWarning` in `polars_bigquery.exceptions`.
-*   **Required Changes:**
-    *   Assert `"UnsupportedTypeWarning" in polars_bigquery.exceptions.__all__` and `issubclass(UnsupportedTypeWarning, UserWarning)` inside `test_public_dtypes_and_warning_exports()`.
-
-#### 8. [`py-polars-bigquery/tests/unit/core/test_plan.py`](../../py-polars-bigquery/tests/unit/core/test_plan.py) (Modify)
-
-*   **Type / Scope:** Unit test suite for `core/plan.py`.
-*   **Rationale:** Covers immutability of the new `TableScan.bq_types` field.
-*   **Required Changes:**
-    *   **[Alignment Update]** Add assertions inside `test_table_scan_validation_and_mutation_isolation` verifying `isinstance(scan.bq_types, types.MappingProxyType)`, rejecting item assignment (`TypeError`), and confirming caller dict mutation after construction does not modify `scan.bq_types`.
-
-#### 9. [`py-polars-bigquery/tests/unit/core/test_read_api_executor.py`](../../py-polars-bigquery/tests/unit/core/test_read_api_executor.py) (Modify)
-
-*   **Type / Scope:** Unit test suite for `core/executors/read_api.py`.
-*   **Rationale:** Validates zero-column fallback ranking using `bq_types`, `pl.BaseExtension` unwrapping, `Decimal(precision=None)` guard, and the `_PARTITIONDATE` size-first tie-breaking rule.
-*   **Required Changes:**
-    *   **[Alignment Update]** Update `test_compile_read_api_plan_zero_column_fallback_priority_tiers` and `test_compile_read_api_plan_case_insensitive_pseudo_column_fallback` to use uppercase `"UTC"` and assert `("_PARTITIONDATE",)` / `("_partitiondate",)` win over `_PARTITIONTIME` when both pseudo-columns are present.
-    *   **[Alignment Update]** Add focused assertions checking `_BQ_TYPE_FALLBACK_RANK` covers all `BQType` values, `bq_types` overrides `pl.String()` rank for `ARRAY`/`BOOL`, `pl.BaseExtension` unwraps `ext_storage()`, and `pl.Decimal` with `precision=None` ranks safely at `8`.
-
-#### 10. [`py-polars-bigquery/tests/unit/test_read_bigquery.py`](../../py-polars-bigquery/tests/unit/test_read_bigquery.py) (Modify)
-
-*   **Type / Scope:** Unit test suite for `polars_bigquery.Client`.
-*   **Rationale:** Exercises end-to-end `Client.scan_table()` schema extraction, real non-mocked Arrow C Stream import via `_FakeArrowStreamExporter`, warning stack levels and formatting, empty-schema short-circuits, and lifecycle guards.
-*   **Required Changes:**
-    *   Add `_FakeArrowStreamExporter` and unit tests covering: warning emission with dotted paths and `stacklevel=2`, 5-entry truncation cap, all-unsupported non-partitioned `ValueError` without warning, all-unsupported ingestion-time partitioned tables (`DAY` vs `HOUR`), empty schema (`{}` / 0-column table) short-circuiting without `read_table`, zero-column narrowest-column fallback selection, non-mocked Arrow C Stream roundtrip for `"UTC"` `TIMESTAMP` and `JSON`/`GEOGRAPHY`/`ARRAY<JSON>`/`ARRAY<GEOGRAPHY>`, and explicit `schema=` with `polars_bigquery.dtypes` (including `SchemaError` mismatch on plain `pl.String`).
-    *   Update `test_client_close_invalidates_pending_lazy_scan` to assert pending empty-schema scans (`schema={}`) also raise `RuntimeError` after `client.close()`.
-    *   Update `test_client_scan_table_eager_validation` (`schema={}` short-circuit, unknown type `ValueError`).
-    *   Update `test_client_scan_bignumeric_raises_clear_type_error` (`scan_table` metadata raises `ValueError` for all-`BIGNUMERIC`; explicit `schema={"bn": pl.Decimal(76, 38)}` raises `TypeError`).
-    *   **[Alignment Update]** Remove `test_scan_table_wraps_malformed_metadata_as_bigquery_error` and the `bad_meta` loop in `test_client_input_type_and_wire_payload_validation` matching removal of impossible-payload wrappers; add a test verifying a custom `BaseExtension.ext_from_params` `TypeError` propagates directly out of `client.scan_table(...)` without being wrapped as `BigQueryError`.
+*   [`py-polars-bigquery/tests/unit/core/test_types.py`](../../py-polars-bigquery/tests/unit/core/test_types.py): Verify `UnsupportedTypeWarning` public export, rank `7` for unknown/unsupported dtypes and unparameterized `pl.Decimal` (`precision=None` mutated per Polars 2.x normalization), and `pl.BaseExtension` storage unwrapping.
+*   [`py-polars-bigquery/tests/unit/core/test_schema.py`](../../py-polars-bigquery/tests/unit/core/test_schema.py): Cover all 14 `BQType` mappings, `ARRAY<JSON>`/`ARRAY<GEOGRAPHY>`, 15-level nested `STRUCT`s, storage-mode loading (`load_as_storage` and `as_storage=True`), `timestampPrecision` (`6`, `"6"`, `12`, `"12"`, `"9"`, `True`, `6.0`, `""`, and inside `REPEATED`), ingestion-time partitioning granularities (`DAY`, `"day"`, `""`, `None`, omitted, `HOUR`, `MONTH`, `YEAR`, unknown `"WEEK"` retaining `_PARTITIONTIME`), schemaless zero-column partitioned tables returning empty `pl.Schema({})`, `_PARTITIONTIME` skip-shadowing prevention, direct exception propagation from `extension_dtype_builder` / custom `BaseExtension.ext_from_params`, strict `extract_polars_schema_from_fields` (empty `STRUCT`, single unnamed `""`, case-differing nested `STRUCT`, unknown `type` column name, unknown `mode`), and `has_bignumeric_dtype` (`precision=None` and `pl.BaseExtension` unwrapping).
+*   [`py-polars-bigquery/tests/unit/core/test_read_api_executor.py`](../../py-polars-bigquery/tests/unit/core/test_read_api_executor.py): Update zero-column fallback tier test to real BigQuery width tiers (`1`–`7`), uppercase `"UTC"`, custom `pl.BaseExtension` unwrapping, `_PARTITIONDATE` winning over `_PARTITIONTIME` in both declaration orders, and nested `BIGNUMERIC` inside `pl.BaseExtension`.
+*   [`py-polars-bigquery/tests/unit/test_read_bigquery.py`](../../py-polars-bigquery/tests/unit/test_read_bigquery.py): Update warning formatting/stacklevel/5-entry cap tests, all-unsupported `UnsupportedTypeError` without warning, `DAY`/`HOUR` pseudo-column retention (including direct `io_source([], None, None, None)` check), discovered empty table short-circuit (including schemaless `DAY`/`HOUR` partitioned tables), explicit `schema={}` rejecting with `ValueError`, client-close guards for empty scans, in-memory Arrow C Stream round-trips via `_FakeArrowStreamExporter`, custom `BaseExtension` `TypeError` propagation (with `try/finally: pl.unregister_extension_type`), and malformed envelope `BigQueryError` assertions.
+*   [`py-polars-bigquery/tests/system/test_read_bigquery_integration.py`](../../py-polars-bigquery/tests/system/test_read_bigquery_integration.py): Live tests confirming `scan_query` / `scan_table` extension parity (`JSON`, `GEOGRAPHY`, `ARRAY<JSON>`, `ARRAY<GEOGRAPHY>`, `STRUCT`), BigQuery synthetic `_field_1`/`_field_2` naming, `DAY`/`HOUR` `INTERVAL`-only ingestion-time tables, non-partitioned all-unsupported `UnsupportedTypeError`, and empty 0-column `DAY` table short-circuit.
 
 ### Verification Plan
 
-*   **Rust / Build:** No Rust (`crates/arrow-bigquery`, `py-arrow-bigquery`) changes are required by this design.
+*   **Rust / Build:** None; this design requires no changes to `crates/arrow-bigquery` or `py-arrow-bigquery`.
 *   **Python Unit Tests:**
-    *   `uv run pytest py-polars-bigquery/tests/unit/core/test_types.py`
-    *   `uv run pytest py-polars-bigquery/tests/unit/core/test_schema.py`
-    *   `uv run pytest py-polars-bigquery/tests/unit/core/test_plan.py`
-    *   `uv run pytest py-polars-bigquery/tests/unit/core/test_read_api_executor.py`
-    *   `uv run pytest py-polars-bigquery/tests/unit/test_read_bigquery.py`
-    *   Full suite: `uv run pytest py-polars-bigquery/tests/unit` and `uv run pytest py-arrow-bigquery/tests/unit`
+    *   `uv run --project py-polars-bigquery --group test pytest -n auto py-polars-bigquery/tests/unit`
+    *   `uv run --project py-arrow-bigquery --group test pytest -n auto py-arrow-bigquery/tests/unit`
 *   **Static Analysis & Formatting:**
     *   `uv run --project py-polars-bigquery --group dev ruff check --no-fix py-polars-bigquery/`
     *   `uv run --project py-polars-bigquery --group dev ruff format --diff py-polars-bigquery/`
 *   **Documentation Build (`strict: true`):**
-    *   `uv run --with-requirements docs/source/requirements.txt mkdocs build --strict` (verifies updated `Client.read_table` / `Client.scan_table` docstrings contain zero unresolved autoref or relative links before `data-types.md` lands).
-*   **Notes on Polars CI Matrix:** Verify both `--resolution lowest` (`polars 2.0.0`, Python 3.11) and latest `polars 2.x` (`--resolution highest --upgrade`) match `test-py-polars-unit.yml`.
-*   **Integration / Live Verification:** Defer new live Storage Read API differential tests (`tests/system/`) to the paired integration test PR; verify manually when `GOOGLE_CLOUD_PROJECT` is configured with `uv run --project py-polars-bigquery --group test pytest py-polars-bigquery/tests/system`.
+    *   `uv run --with-requirements docs/source/requirements.txt mkdocs build --strict`
+*   **Polars CI Matrix ([`.github/workflows/test-py-polars-unit.yml`](../../.github/workflows/test-py-polars-unit.yml)):** Verify unit tests pass with both `--isolated --resolution lowest` (`polars 2.0.0`, Python 3.11) and `--isolated --resolution highest --upgrade` (latest `polars 2.x`), passing `--isolated` locally to avoid mutating `uv.lock`.
+*   **Live Integration Tests:** With `GOOGLE_CLOUD_PROJECT` configured:
+    `uv run --project py-polars-bigquery --group test pytest py-polars-bigquery/tests/system -k "extension or partition_skipping"`
 
 --------------------------------------------------------------------------------
 
-*Drafted with EGM*
+*Drafted with the Elephant-Goldfish Model (EGM)*

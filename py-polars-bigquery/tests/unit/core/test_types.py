@@ -430,18 +430,23 @@ def test_polars_datetime_time_unit(dtype, expected):
             ),
             6,
         ),
-        (pl.Duration("us"), 6),
-        (pl.Float16(), 6),
-        (pl.Decimal(76, 38), 6),
+        (pl.Duration("us"), 7),
+        (pl.Float16(), 7),
+        (pl.Decimal(76, 38), 7),
+        (pl.Extension("custom:bool", pl.Boolean()), 1),
+        (pl.Extension("custom:bin", pl.Binary()), 5),
     ],
 )
 def test_column_width_rank(dtype, expected_rank):
     assert column_width_rank(dtype) == expected_rank
 
 
-def test_column_width_rank_prefers_authoritative_bq_type():
-    # Under Mode B storage loading, dtype alone might be pl.String(), while
-    # authoritative BQType controls the true rank.
+def test_column_width_rank_unparameterized_decimal_and_bq_type_override():
+    unparam_decimal = pl.Decimal(38, 9)
+    unparam_decimal.precision = None  # type: ignore[misc]
+    assert column_width_rank(unparam_decimal) == 7
+
+    # When authoritative bq_type is passed, it overrides dtype inference.
     assert column_width_rank(pl.String(), bq_type=BQType.ARRAY) == 6
     assert column_width_rank(pl.String(), bq_type=BQType.BOOL) == 1
     assert column_width_rank(pl.Int64(), bq_type=BQType.STRUCT) == 6
