@@ -298,7 +298,7 @@ def test_json_literal_to_sql_all_scalar_types_and_immutability() -> None:
     assert _json_literal_to_sql({"Boolean": False}) == "FALSE"
     assert _json_literal_to_sql({"Null": None}) == "NULL"
 
-    # DateTime units: Microseconds and Milliseconds only (Nanoseconds unsupported)
+    # DateTime units: Microseconds, Milliseconds, Nanoseconds (exact and inexact)
     assert (
         _json_literal_to_sql({"DateTime": [1000, "Microseconds"]})
         == "TIMESTAMP_MICROS(1000)"
@@ -307,8 +307,16 @@ def test_json_literal_to_sql_all_scalar_types_and_immutability() -> None:
         _json_literal_to_sql({"DateTime": [2000, "Milliseconds"]})
         == "TIMESTAMP_MILLIS(2000)"
     )
-    assert _json_literal_to_sql({"DateTime": [5000, "Nanoseconds"]}) is None
+    assert (
+        _json_literal_to_sql({"DateTime": [5000, "Nanoseconds"]})
+        == "TIMESTAMP_MICROS(5)"
+    )
+    assert (
+        _json_literal_to_sql({"DateTime": [-5000, "Nanoseconds"]})
+        == "TIMESTAMP_MICROS(-5)"
+    )
     assert _json_literal_to_sql({"DateTime": [5555, "Nanoseconds"]}) is None
+    assert _json_literal_to_sql({"DateTime": [-5555, "Nanoseconds"]}) is None
     assert _json_literal_to_sql({"DateTime": [10, "Seconds"]}) is None
 
     # Malformed literal values catch ValueError/TypeError locally and return None
@@ -962,7 +970,9 @@ def test_parse_temporal_literals_enforce_bigquery_date_and_timestamp_bounds() ->
         compiler.parser.temporal.parse_ticks_and_unit(
             300_000_000_000_000, "Milliseconds"
         )
-    with pytest.raises(ValueError, match="Unsupported datetime unit or precision"):
+    with pytest.raises(
+        ValueError, match="Timestamp nanoseconds out of BigQuery bounds"
+    ):
         compiler.parser.temporal.parse_ticks_and_unit(
             300_000_000_000_000_000_000, "Nanoseconds"
         )
@@ -4053,16 +4063,37 @@ def test_float32_literal_widens_through_ieee754_binary32() -> None:
     ) == compiler.CompiledPredicate(conjuncts=(), is_exact=False)
 
 
-def test_nanosecond_datetime_literals_degrade_to_unsupported() -> None:
-    """Nanosecond Datetime literals must degrade to Unsupported (never widened to us)."""
+def test_nanosecond_datetime_literals_preserve_unit_and_reject_submicrosecond() -> None:
+    """Exact-microsecond `ns` literals preserve `TimestampUnit.NANOSECONDS`; inexact ones degrade."""
     import datetime as dt
 
-    # Exact-microsecond scalar `ns` literals must degrade to Unsupported.
+    ts_us_2024 = 1_704_067_200_000_000
+    ts_ns_2024 = ts_us_2024 * 1_000
+
+    # IR preserves `TimestampUnit.NANOSECONDS` (does NOT collapse to `MICROSECONDS`)
+    # so downstream unit-sensitive passes (e.g. `fill_null(strategy="one")`) keep
+    # the original `"ns"` unit.
+    assert compiler.json_to_ir(
+        {"Literal": {"Scalar": {"Datetime": [ts_ns_2024, "Nanoseconds", None]}}}
+    ) == compiler.ir.TimestampLiteral(
+        ticks=ts_ns_2024,
+        unit=compiler.ir.TimestampUnit.NANOSECONDS,
+        tz=None,
+    )
+    assert compiler.json_to_ir(
+        {"Literal": {"Scalar": {"Datetime": [-1000, "Nanoseconds", "UTC"]}}}
+    ) == compiler.ir.TimestampLiteral(
+        ticks=-1000,
+        unit=compiler.ir.TimestampUnit.NANOSECONDS,
+        tz="UTC",
+    )
+
+    # Exact-microsecond scalar `ns` literals push down to BigQuery `TIMESTAMP_MICROS`.
     assert (
         compiler.predicate_to_row_restriction(
             pl.col("dt_us") == pl.lit(dt.datetime(2024, 1, 1), dtype=pl.Datetime("ns"))  # noqa: DTZ001
         )
-        == ""
+        == f"(`dt_us` = DATETIME(TIMESTAMP_MICROS({ts_us_2024})))"
     )
     assert (
         compiler.predicate_to_row_restriction(
@@ -4072,37 +4103,91 @@ def test_nanosecond_datetime_literals_degrade_to_unsupported() -> None:
                 dtype=pl.Datetime("ns", "UTC"),
             )
         )
-        == ""
+        == f"(`ts_us` = TIMESTAMP_MICROS({ts_us_2024}))"
+    )
+    # Pre-1970 exact-microsecond `ns` literal (`-1000 ns` == `-1 us`).
+    assert (
+        compiler.predicate_to_row_restriction(
+            pl.col("dt_us")
+            == pl.lit(
+                dt.datetime(1969, 12, 31, 23, 59, 59, 999999),  # noqa: DTZ001
+                dtype=pl.Datetime("ns"),
+            )
+        )
+        == "(`dt_us` = DATETIME(TIMESTAMP_MICROS(-1)))"
     )
 
-    # Regression: previously an exact-microsecond `ns` literal lost its unit and
-    # caused `fill_null(strategy="one")` to emit `TIMESTAMP_MICROS(1)` instead of
-    # matching Polars' 1-nanosecond physical value (silent row drop).
+    # Sub-microsecond scalar `ns` literals (`ticks % 1000 != 0`) degrade to Unsupported.
+    for bad_ns in (1, 500, -1, -1500):
+        assert compiler._json_expr_to_compiled_predicate(
+            {
+                "BinaryExpr": {
+                    "left": {"Column": "ts_us"},
+                    "op": "Eq",
+                    "right": {
+                        "Literal": {
+                            "Scalar": {"Datetime": [bad_ns, "Nanoseconds", "UTC"]}
+                        }
+                    },
+                }
+            }
+        ) == compiler.CompiledPredicate(conjuncts=(), is_exact=False)
+
+    # Defensive guard inside SQL emitter for manually constructed inexact `ns` IR nodes.
+    with pytest.raises(ValueError, match="Sub-microsecond nanosecond timestamp"):
+        compiler.ir_to_sql(
+            compiler.ir.TimestampLiteral(
+                ticks=5555, unit=compiler.ir.TimestampUnit.NANOSECONDS, tz="UTC"
+            )
+        )
+
+    # Verify `when(...).then(<ns literal>).otherwise(None)` retains `NANOSECONDS` on the
+    # IR branch so downstream unit-sensitive lowering passes (e.g. `fill_null(strategy="one")`)
+    # do not mistake a `Datetime("ns")` literal for `"us"`.
     when_ns_naive = (
         pl.when(pl.col("flag"))
         .then(pl.lit(dt.datetime(2024, 1, 1), dtype=pl.Datetime("ns")))  # noqa: DTZ001
         .otherwise(None)
-        .fill_null(strategy="one")
-        < dt.datetime(1970, 1, 1, 0, 0, 0, 1)  # noqa: DTZ001
     )
-    assert compiler.predicate_to_row_restriction(when_ns_naive) == ""
+    when_buf = io.BytesIO()
+    when_ns_naive.meta.serialize(when_buf, format="json")
+    when_ir = compiler.json_to_ir(json.loads(when_buf.getvalue()))
+    assert isinstance(when_ir, compiler.ir.Ternary)
+    assert when_ir.truthy == compiler.ir.TimestampLiteral(
+        ticks=ts_ns_2024,
+        unit=compiler.ir.TimestampUnit.NANOSECONDS,
+        tz=None,
+    )
 
-    when_ns_utc = pl.when(pl.col("flag")).then(
-        pl.lit(
-            dt.datetime(2024, 1, 1, tzinfo=dt.timezone.utc),
-            dtype=pl.Datetime("ns", "UTC"),
+    when_ns_utc = (
+        pl.when(pl.col("flag"))
+        .then(
+            pl.lit(
+                dt.datetime(2024, 1, 1, tzinfo=dt.timezone.utc),
+                dtype=pl.Datetime("ns", "UTC"),
+            )
         )
-    ).otherwise(None).fill_null(strategy="one") < dt.datetime(
-        1970, 1, 1, 0, 0, 0, 1, tzinfo=dt.timezone.utc
+        .otherwise(None)
     )
-    assert compiler.predicate_to_row_restriction(when_ns_utc) == ""
+    when_utc_buf = io.BytesIO()
+    when_ns_utc.meta.serialize(when_utc_buf, format="json")
+    when_utc_ir = compiler.json_to_ir(json.loads(when_utc_buf.getvalue()))
+    assert isinstance(when_utc_ir, compiler.ir.Ternary)
+    assert when_utc_ir.truthy == compiler.ir.TimestampLiteral(
+        ticks=ts_ns_2024,
+        unit=compiler.ir.TimestampUnit.NANOSECONDS,
+        tz="UTC",
+    )
 
-    # `is_in` with a Datetime("ns") Series also degrades safely.
+    # `is_in` with an exact-microsecond `Datetime("ns")` Series pushes down.
     ns_series = pl.Series(
         [dt.datetime(2024, 1, 1)],  # noqa: DTZ001
         dtype=pl.Datetime("ns"),
     )
-    assert compiler.predicate_to_row_restriction(pl.col("dt_us").is_in(ns_series)) == ""
+    assert (
+        compiler.predicate_to_row_restriction(pl.col("dt_us").is_in(ns_series))
+        == f"(`dt_us` IN (DATETIME(TIMESTAMP_MICROS({ts_us_2024}))))"
+    )
 
     ns_utc_series = pl.Series(
         [dt.datetime(2024, 1, 1, tzinfo=dt.timezone.utc)],
@@ -4110,12 +4195,43 @@ def test_nanosecond_datetime_literals_degrade_to_unsupported() -> None:
     )
     assert (
         compiler.predicate_to_row_restriction(pl.col("ts_us").is_in(ns_utc_series))
+        == f"(`ts_us` IN (TIMESTAMP_MICROS({ts_us_2024})))"
+    )
+
+    # `is_in` IPC Series also preserves `TimestampUnit.NANOSECONDS` in the IR.
+    ipc_buf = io.BytesIO()
+    ns_utc_series.to_frame().write_ipc_stream(ipc_buf)
+    assert compiler.parser.list_.parse_ipc_series_to_list_literal(
+        ipc_buf.getvalue()
+    ) == compiler.ir.ListLiteral(
+        values=(
+            compiler.ir.TimestampLiteral(
+                ticks=ts_ns_2024,
+                unit=compiler.ir.TimestampUnit.NANOSECONDS,
+                tz="UTC",
+            ),
+        )
+    )
+
+    # `is_in` with ANY sub-microsecond `Datetime("ns")` element degrades to Unsupported.
+    inexact_ns_series = pl.Series([0, 500], dtype=pl.Int64).cast(pl.Datetime("ns"))
+    assert (
+        compiler.predicate_to_row_restriction(pl.col("dt_us").is_in(inexact_ns_series))
+        == ""
+    )
+    inexact_ns_utc_series = pl.Series([0, -1500], dtype=pl.Int64).cast(
+        pl.Datetime("ns", "UTC")
+    )
+    assert (
+        compiler.predicate_to_row_restriction(
+            pl.col("ts_us").is_in(inexact_ns_utc_series)
+        )
         == ""
     )
 
-    # Exact sibling conjunct survives partial pushdown.
-    partial = when_ns_naive & pl.col("flag")
-    assert compiler.predicate_to_row_restriction(partial) == "`flag`"
+    # Exact sibling conjunct survives partial pushdown alongside an unsupported `ns` branch.
+    inexact_partial = pl.col("dt_us").is_in(inexact_ns_series) & pl.col("flag")
+    assert compiler.predicate_to_row_restriction(inexact_partial) == "`flag`"
 
 
 def test_is_in_series_excludes_float16_and_uint128() -> None:

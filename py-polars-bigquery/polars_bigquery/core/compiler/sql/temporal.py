@@ -21,6 +21,14 @@ def format_timestamp_literal(node: TimestampLiteral) -> str:
         ts_sql = f"TIMESTAMP_MICROS({node.ticks})"
     elif node.unit == TimestampUnit.MILLISECONDS:
         ts_sql = f"TIMESTAMP_MILLIS({node.ticks})"
+    elif node.unit == TimestampUnit.NANOSECONDS:
+        if node.ticks % 1000 != 0:
+            msg = (
+                "Sub-microsecond nanosecond timestamp literal cannot be formatted "
+                f"as BigQuery TIMESTAMP_MICROS: {node.ticks!r}"
+            )
+            raise ValueError(msg)
+        ts_sql = f"TIMESTAMP_MICROS({node.ticks // 1000})"
     else:
         msg = f"Unhandled timestamp unit: {node.unit!r}"
         raise TypeError(msg)

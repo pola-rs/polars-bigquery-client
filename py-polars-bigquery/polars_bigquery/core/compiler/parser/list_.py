@@ -43,6 +43,7 @@ MAX_IPC_BYTES = 1_048_576
 _DATETIME_UNIT_NAMES: dict[str, str] = {
     "us": "Microseconds",
     "ms": "Milliseconds",
+    "ns": "Nanoseconds",
 }
 
 
