@@ -9,6 +9,7 @@ from collections.abc import Iterator
 from typing import Any, Literal, cast
 
 import polars as pl
+from polars.datatypes import DataType, DataTypeClass
 
 from polars_bigquery.core import compiler
 from polars_bigquery.core.executors.base import (
@@ -71,20 +72,91 @@ def _validate_max_row_restriction_bytes(max_bytes: Any) -> int:
     return max_bytes
 
 
-def _select_zero_column_fallback(schema: pl.Schema) -> str:
-    """Select the single narrowest safe column to request for a 0-column read.
+def _is_dot_selectable_segment(name: str) -> bool:
+    """Return `True` if a field name can appear in a dotted `selected_fields` path."""
+    return bool(name) and "." not in name
 
-    Prefers supported physical columns (ranks 1–6) ahead of ingestion-time
-    pseudo-columns so explicit schemas (or mixed tables where pseudo-columns
-    remain optional) read a concrete column first, short-circuiting immediately
-    when a rank-1 `BOOL` physical column is encountered. If no supported
-    physical column exists (all physical columns are rank 7 / unsupported, or
-    only pseudo-columns remain), prefers a supported pseudo-column
-    (`_PARTITIONDATE` `DATE`, rank 2, before `_PARTITIONTIME` `TIMESTAMP`,
-    rank 3) ahead of rank-7 unsupported physical columns.
+
+def _iter_selectable_struct_leaves(
+    prefix: str,
+    dtype: pl.Struct,
+    depth: int,
+) -> Iterator[tuple[str, DataType | DataTypeClass, int]]:
+    """Yield `(field_path, leaf_dtype, depth)` leaves inside a non-repeated `pl.Struct`.
+
+    BigQuery Storage Read API `TableReadOptions.selected_fields` accepts dotted
+    sub-field paths (e.g. `"struct_field.leaf"`) for non-repeated `STRUCT`
+    columns and returns only those nested fields. Does not descend through
+    `pl.List` (`ARRAY`) or `pl.BaseExtension`. Skips unnamed (`""`) or
+    dot-containing subfield names; if a nested `pl.Struct` has no dot-selectable
+    children, yields the nested `pl.Struct` path itself.
     """
-    best_physical: tuple[int, str] | None = None
+    for field in dtype.fields:
+        if not _is_dot_selectable_segment(field.name):
+            continue
+        child_path = f"{prefix}.{field.name}"
+        child_dtype = field.dtype
+        if isinstance(child_dtype, pl.Struct) and child_dtype.fields:
+            yielded_child = False
+            for leaf in _iter_selectable_struct_leaves(
+                child_path, child_dtype, depth + 1
+            ):
+                yielded_child = True
+                yield leaf
+            if not yielded_child:
+                yield (child_path, child_dtype, depth)
+        else:
+            yield (child_path, child_dtype, depth)
+
+
+def _select_zero_column_fallback(schema: pl.Schema) -> str:
+    """Select the single narrowest safe field path to request for a 0-column read.
+
+    Includes leaf subfields of non-repeated `pl.Struct` columns using dotted
+    paths (e.g. `"column.field"`) supported by BigQuery Storage Read API
+    `TableReadOptions.selected_fields` (without descending through `pl.List` /
+    `ARRAY` columns). Ranks candidates by `(column_width_rank(dtype), depth)`,
+    breaking ties in favor of shallower paths (top-level columns before nested
+    `STRUCT` leaves of equal width) and earliest schema declaration order.
+
+    Prefers supported physical columns/leaves (ranks 1–6) ahead of
+    ingestion-time pseudo-columns so explicit schemas (or mixed tables where
+    pseudo-columns remain optional) read a concrete column first,
+    short-circuiting immediately when a top-level rank-1 `BOOL` column is
+    encountered. If no supported physical candidate exists (all physical
+    candidates are rank 7 / unsupported, or only pseudo-columns remain), prefers
+    a supported pseudo-column (`_PARTITIONDATE` `DATE`, rank 2, before
+    `_PARTITIONTIME` `TIMESTAMP`, rank 3) ahead of rank-7 unsupported physical
+    candidates.
+    """
+    best_physical: tuple[int, int, str] | None = None
     best_pseudo: tuple[int, str] | None = None
+
+    def _consider_physical(
+        path: str, dtype: DataType | DataTypeClass, depth: int
+    ) -> None:
+        nonlocal best_physical
+        if best_physical is not None:
+            best_key = (best_physical[0], best_physical[1])
+            # The lowest possible width rank is 1 (`BOOL`); skip calling
+            # `column_width_rank` if nothing at `depth` can strictly beat it.
+            if best_key <= (1, depth):
+                return
+            # Un-descended `pl.List` (`ARRAY`) and un-descendable `pl.Struct`
+            # can only rank 6 or 7, so skip deep subtree DFS once a candidate
+            # at `(<= 6, <= depth)` is already known.
+            if isinstance(dtype, (pl.List, pl.Struct)) and best_key <= (
+                _NESTED_WIDTH_RANK,
+                depth,
+            ):
+                return
+        rank = column_width_rank(dtype)
+        if best_physical is None or (rank, depth) < (
+            best_physical[0],
+            best_physical[1],
+        ):
+            best_physical = (rank, depth, path)
+
     for name, dtype in schema.items():
         if name.casefold() in _INGESTION_TIME_PSEUDO_COLUMNS_CASEFOLD:
             if best_physical is None or best_physical[0] >= _UNKNOWN_WIDTH_RANK:
@@ -92,28 +164,43 @@ def _select_zero_column_fallback(schema: pl.Schema) -> str:
                 if best_pseudo is None or rank < best_pseudo[0]:
                     best_pseudo = (rank, name)
             continue
-        # `pl.List` and `pl.Struct` can only rank 6 (`ARRAY`/`STRUCT`) or 7
-        # (unsupported nested dtype), so skip deep subtree DFS once a valid
-        # physical column of rank <= 6 has already been found.
+        if (
+            isinstance(dtype, pl.Struct)
+            and dtype.fields
+            and _is_dot_selectable_segment(name)
+        ):
+            # All dotted leaves have `depth >= 1`, so skip descending when a
+            # rank-1 leaf at `depth <= 1` has already been found.
+            if best_physical is not None and (
+                best_physical[0],
+                best_physical[1],
+            ) <= (1, 1):
+                continue
+            yielded = False
+            for leaf_path, leaf_dtype, leaf_depth in _iter_selectable_struct_leaves(
+                name, dtype, depth=1
+            ):
+                yielded = True
+                _consider_physical(leaf_path, leaf_dtype, leaf_depth)
+            if not yielded:
+                _consider_physical(name, dtype, 0)
+            continue
+        _consider_physical(name, dtype, 0)
         if (
             best_physical is not None
-            and best_physical[0] <= _NESTED_WIDTH_RANK
-            and isinstance(dtype, (pl.List, pl.Struct))
+            and best_physical[0] == 1
+            and best_physical[1] == 0
         ):
-            continue
-        rank = column_width_rank(dtype)
-        if rank == 1:
-            return name
-        if best_physical is None or rank < best_physical[0]:
-            best_physical = (rank, name)
+            return best_physical[2]
+
     if best_physical is not None and best_physical[0] < _UNKNOWN_WIDTH_RANK:
-        return best_physical[1]
+        return best_physical[2]
     if best_pseudo is not None and (
         best_physical is None or best_pseudo[0] < best_physical[0]
     ):
         return best_pseudo[1]
     if best_physical is not None:
-        return best_physical[1]
+        return best_physical[2]
     msg = "Cannot select zero-column fallback from an empty schema."
     raise ValueError(msg)
 

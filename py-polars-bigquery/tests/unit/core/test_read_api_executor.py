@@ -106,7 +106,7 @@ def test_compile_read_api_plan_zero_column_fallback_priority_tiers() -> None:
             ),
         ),
         ("tier6_list", pl.List(pl.Int64())),
-        ("tier6_struct", pl.Struct({"x": pl.Int64()})),
+        ("tier6_empty_struct", pl.Struct([])),
         (
             "tier6_json_arr",
             pl.Extension("google:sqlType:json", pl.List(pl.String())),
@@ -438,7 +438,7 @@ def test_zero_column_fallback_short_circuits_on_rank_one_bool() -> None:
     mock_rank.assert_called_once_with(pl.Boolean())
 
 
-def test_zero_column_fallback_skips_nested_dfs_when_better_rank_known() -> None:
+def test_zero_column_fallback_skips_list_dfs_when_better_rank_known() -> None:
     scan = _tscan(
         {
             "dt": pl.Date(),
@@ -448,11 +448,225 @@ def test_zero_column_fallback_skips_nested_dfs_when_better_rank_known() -> None:
     )
     with patch(
         "polars_bigquery.core.executors.read_api.column_width_rank",
-        return_value=2,
+        side_effect=[2, 5],
     ) as mock_rank:
         compiled = compile_read_api_plan(Project(input=scan, columns=()))
     assert compiled.selected_fields == ("dt",)
-    mock_rank.assert_called_once_with(pl.Date())
+    # `wide_list` (`ARRAY`) is skipped without DFS, while `wide_struct.b` is inspected
+    # because a `STRUCT` leaf may be narrower (`BOOL`, rank 1) than top-level `dt` (`DATE`).
+    assert [call.args[0] for call in mock_rank.call_args_list] == [
+        pl.Date(),
+        pl.String(),
+    ]
+
+
+def test_zero_column_fallback_selects_narrowest_struct_leaf_path() -> None:
+    # Nested BOOL leaf beats wider top-level STRING / INT64 / DATE columns.
+    scan_nested_bool = _tscan(
+        {
+            "payload": pl.String(),
+            "dt": pl.Date(),
+            "meta": pl.Struct(
+                {
+                    "note": pl.String(),
+                    "nested": pl.Struct({"flag": pl.Boolean(), "count": pl.Int64()}),
+                }
+            ),
+        }
+    )
+    assert compile_read_api_plan(
+        Project(input=scan_nested_bool, columns=())
+    ).selected_fields == ("meta.nested.flag",)
+
+    # Top-level BOOL wins ties over nested BOOL (`depth=0` < `depth=1`).
+    scan_top_tie = _tscan(
+        {
+            "meta": pl.Struct({"flag": pl.Boolean()}),
+            "top_flag": pl.Boolean(),
+        }
+    )
+    assert compile_read_api_plan(
+        Project(input=scan_top_tie, columns=())
+    ).selected_fields == ("top_flag",)
+
+    # Shallower STRUCT leaf wins ties over deeper STRUCT leaf of equal width rank.
+    scan_depth_tie = _tscan(
+        {
+            "deep": pl.Struct({"mid": pl.Struct({"flag": pl.Boolean()})}),
+            "shallow": pl.Struct({"flag": pl.Boolean()}),
+        }
+    )
+    assert compile_read_api_plan(
+        Project(input=scan_depth_tie, columns=())
+    ).selected_fields == ("shallow.flag",)
+
+    # Equal rank and depth tie-breaks by declaration order; skips later STRUCT once (1, 1) found.
+    scan_skip_struct = _tscan(
+        {
+            "first": pl.Struct({"flag": pl.Boolean()}),
+            "second": pl.Struct({"also_flag": pl.Boolean(), "note": pl.String()}),
+            "after_str": pl.String(),
+        }
+    )
+    with patch(
+        "polars_bigquery.core.executors.read_api.column_width_rank",
+        side_effect=[1, 5],
+    ) as mock_rank:
+        compiled = compile_read_api_plan(Project(input=scan_skip_struct, columns=()))
+    assert compiled.selected_fields == ("first.flag",)
+    assert [call.args[0] for call in mock_rank.call_args_list] == [
+        pl.Boolean(),
+        pl.String(),
+    ]
+
+    # Does NOT descend inside ARRAY<STRUCT> (`pl.List(pl.Struct(...))`).
+    scan_array_of_struct = _tscan(
+        {
+            "items": pl.List(pl.Struct({"flag": pl.Boolean()})),
+            "note": pl.String(),
+        }
+    )
+    assert compile_read_api_plan(
+        Project(input=scan_array_of_struct, columns=())
+    ).selected_fields == ("note",)
+    scan_array_only = _tscan({"items": pl.List(pl.Struct({"flag": pl.Boolean()}))})
+    assert compile_read_api_plan(
+        Project(input=scan_array_only, columns=())
+    ).selected_fields == ("items",)
+
+    # Stops at pl.List inside a STRUCT (`meta.tags` instead of whole `meta`).
+    scan_struct_with_array = _tscan(
+        {
+            "meta": pl.Struct(
+                {
+                    "tags": pl.List(pl.String()),
+                    "bad": pl.Duration("us"),
+                }
+            )
+        }
+    )
+    assert compile_read_api_plan(
+        Project(input=scan_struct_with_array, columns=())
+    ).selected_fields == ("meta.tags",)
+
+    # Top-level ARRAY beats nested `STRUCT.tags` (`depth=0` < `depth=1`).
+    scan_nested_vs_top_array = _tscan(
+        {
+            "meta": pl.Struct({"tags": pl.List(pl.String())}),
+            "top_tags": pl.List(pl.String()),
+        }
+    )
+    assert compile_read_api_plan(
+        Project(input=scan_nested_vs_top_array, columns=())
+    ).selected_fields == ("top_tags",)
+
+    # Supported leaf inside STRUCT avoids unsupported sibling (`BIGNUMERIC` / `INTERVAL`).
+    scan_mixed_struct = _tscan(
+        {
+            "meta": pl.Struct(
+                {
+                    "bad_bn": pl.Decimal(precision=76, scale=38),
+                    "ok_id": pl.Int64(),
+                }
+            ),
+            "_PARTITIONDATE": pl.Date(),
+        }
+    )
+    assert compile_read_api_plan(
+        Project(input=scan_mixed_struct, columns=())
+    ).selected_fields == ("meta.ok_id",)
+
+    # All-unsupported STRUCT leaves fall back behind valid pseudo-columns.
+    scan_bad_struct_pseudo = _tscan(
+        {
+            "meta": pl.Struct({"bad": pl.Duration("us")}),
+            "_PARTITIONDATE": pl.Date(),
+            "_PARTITIONTIME": pl.Datetime("us", "UTC"),
+        }
+    )
+    assert compile_read_api_plan(
+        Project(input=scan_bad_struct_pseudo, columns=())
+    ).selected_fields == ("_PARTITIONDATE",)
+
+    # Subfield named `_PARTITIONDATE` inside a STRUCT is a physical leaf, not a pseudo-column.
+    scan_nested_pseudo_name = _tscan(
+        {
+            "meta": pl.Struct({"_PARTITIONDATE": pl.Date()}),
+            "note": pl.String(),
+        }
+    )
+    assert compile_read_api_plan(
+        Project(input=scan_nested_pseudo_name, columns=())
+    ).selected_fields == ("meta._PARTITIONDATE",)
+
+    # Empty, unnamed (`""`), or dot-containing field segments fall back to enclosing STRUCT.
+    assert compile_read_api_plan(
+        Project(
+            input=_tscan({"s": pl.Struct([pl.Field("", pl.Boolean())])}),
+            columns=(),
+        )
+    ).selected_fields == ("s",)
+    assert compile_read_api_plan(
+        Project(
+            input=_tscan(
+                {
+                    "s": pl.Struct(
+                        [
+                            pl.Field("", pl.Boolean()),
+                            pl.Field("has.dot", pl.Boolean()),
+                            pl.Field("ok", pl.String()),
+                        ]
+                    )
+                }
+            ),
+            columns=(),
+        )
+    ).selected_fields == ("s.ok",)
+    assert compile_read_api_plan(
+        Project(
+            input=_tscan({"a.b": pl.Struct({"flag": pl.Boolean()})}),
+            columns=(),
+        )
+    ).selected_fields == ("a.b",)
+    assert compile_read_api_plan(
+        Project(
+            input=_tscan(
+                {
+                    "meta": pl.Struct(
+                        {
+                            "unnamed_inner": pl.Struct([pl.Field("", pl.Int64())]),
+                            "bad": pl.Duration("us"),
+                        }
+                    )
+                }
+            ),
+            columns=(),
+        )
+    ).selected_fields == ("meta.unnamed_inner",)
+
+    # Custom BaseExtension wrapping a Struct is NOT descended into with dot notation.
+    ext_struct = pl.Extension("custom:record", pl.Struct({"flag": pl.Boolean()}))
+    assert compile_read_api_plan(
+        Project(input=_tscan({"wrapped": ext_struct}), columns=())
+    ).selected_fields == ("wrapped",)
+
+    # Single rank-7 STRUCT still returns a leaf path; top-level rank-7 beats nested rank-7.
+    assert compile_read_api_plan(
+        Project(
+            input=_tscan({"meta": pl.Struct({"bad": pl.Duration("us")})}), columns=()
+        )
+    ).selected_fields == ("meta.bad",)
+    assert compile_read_api_plan(
+        Project(
+            input=_tscan(
+                {
+                    "meta": pl.Struct({"bad": pl.Duration("us")}),
+                    "top_bad": pl.Duration("us"),
+                }
+            ),
+            columns=(),
+        )
+    ).selected_fields == ("top_bad",)
 
 
 def test_zero_column_fallback_handles_decimal_none_precision() -> None:

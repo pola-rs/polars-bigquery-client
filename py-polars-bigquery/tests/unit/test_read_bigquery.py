@@ -1461,6 +1461,77 @@ def test_scan_table_zero_column_projection_picks_narrowest_column(
         assert lf.filter(pl.col("num") > 10).select(pl.len()).collect().item() == 2
 
 
+def test_scan_table_zero_column_projection_picks_nested_struct_leaf(
+    mock_arrow_client,
+):
+    metadata = {
+        "schema": {
+            "fields": [
+                {"name": "payload", "type": "STRING"},
+                {
+                    "name": "meta",
+                    "type": "RECORD",
+                    "fields": [
+                        {"name": "description", "type": "STRING"},
+                        {"name": "active", "type": "BOOL"},
+                    ],
+                },
+            ]
+        }
+    }
+    full_df = pl.DataFrame(
+        {
+            "payload": ["a", "b", "c"],
+            "meta": [
+                {"description": "one", "active": True},
+                {"description": "two", "active": False},
+                {"description": "three", "active": True},
+            ],
+        }
+    )
+
+    def _fake_read_table(table_ref, *, selected_fields, **kwargs):
+        if selected_fields == ["meta.active"]:
+            # BigQuery Storage Read API returns a trimmed STRUCT containing only
+            # the selected nested leaf field (`meta { active }`).
+            return _FakeArrowStreamExporter(
+                pl.DataFrame(
+                    {"meta": [{"active": True}, {"active": False}, {"active": True}]}
+                )
+            )
+        return _FakeArrowStreamExporter(full_df.select(selected_fields))
+
+    mock_arrow_client.read_table.side_effect = _fake_read_table
+
+    with (
+        patch(
+            "polars_bigquery.core.bigquery_rest.get_table_metadata",
+            return_value=metadata,
+        ),
+        patch(
+            "polars.io.plugins.register_io_source",
+            wraps=pl.io.plugins.register_io_source,
+        ) as mock_register,
+    ):
+        client = Client(quota_project_id="q")
+        lf = client.scan_table("p.d.t")
+        io_source = mock_register.call_args.kwargs["io_source"]
+
+        batches = list(io_source([], None, None, None))
+        assert sum(b.height for b in batches) == 3
+        assert all(b.width == 0 for b in batches)
+        assert mock_arrow_client.read_table.call_args.kwargs["selected_fields"] == [
+            "meta.active"
+        ]
+
+        # When a table's zero-column projection flows through Polars (`drop(pl.all())`).
+        dropped = lf.drop(pl.all()).collect()
+        assert dropped.shape == (3, 0)
+        assert mock_arrow_client.read_table.call_args.kwargs["selected_fields"] == [
+            "meta.active"
+        ]
+
+
 def test_scan_table_non_mocked_arrow_c_stream_utc_and_extension_types(
     mock_arrow_client, monkeypatch
 ):
