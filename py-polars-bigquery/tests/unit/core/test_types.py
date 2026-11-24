@@ -280,12 +280,33 @@ def test_build_extension_dtype_explicit_load_as_storage_and_env_warning(
     import polars_bigquery.core.types as types_mod
 
     monkeypatch.setattr(types_mod, "_INITIAL_UNKNOWN_EXTENSION_BEHAVIOR", None)
+    monkeypatch.setattr(types_mod, "_last_warned_env_drift", None)
     monkeypatch.setenv("POLARS_UNKNOWN_EXTENSION_TYPE_BEHAVIOR", "load_as_storage")
     with caplog.at_level("WARNING", logger=types_mod.__name__):
         assert build_extension_dtype(JSON_EXTENSION_NAME, pl.String()) == pl.Extension(
             JSON_EXTENSION_NAME, pl.String()
         )
+        # Subsequent calls with identical drift must be throttled (1 warning total).
+        assert build_extension_dtype(
+            GEOGRAPHY_EXTENSION_NAME, pl.String(), GEOGRAPHY_EXTENSION_METADATA
+        ) == pl.Extension(
+            GEOGRAPHY_EXTENSION_NAME, pl.String(), GEOGRAPHY_EXTENSION_METADATA
+        )
+    assert len(caplog.records) == 1
     assert "POLARS_UNKNOWN_EXTENSION_TYPE_BEHAVIOR" in caplog.text
+
+    # Restoring the initial value clears the latch; drifting again warns once.
+    caplog.clear()
+    monkeypatch.delenv("POLARS_UNKNOWN_EXTENSION_TYPE_BEHAVIOR", raising=False)
+    with caplog.at_level("WARNING", logger=types_mod.__name__):
+        assert build_extension_dtype(JSON_EXTENSION_NAME, pl.String()) == pl.Extension(
+            JSON_EXTENSION_NAME, pl.String()
+        )
+    assert caplog.records == []
+    monkeypatch.setenv("POLARS_UNKNOWN_EXTENSION_TYPE_BEHAVIOR", "load_as_storage")
+    with caplog.at_level("WARNING", logger=types_mod.__name__):
+        build_extension_dtype(JSON_EXTENSION_NAME, pl.String())
+    assert len(caplog.records) == 1
 
     caplog.clear()
     monkeypatch.setattr(
@@ -294,6 +315,7 @@ def test_build_extension_dtype_explicit_load_as_storage_and_env_warning(
     monkeypatch.delenv("POLARS_UNKNOWN_EXTENSION_TYPE_BEHAVIOR", raising=False)
     with caplog.at_level("WARNING", logger=types_mod.__name__):
         assert build_extension_dtype(JSON_EXTENSION_NAME, pl.String()) == pl.String()
+    assert len(caplog.records) == 1
     assert "POLARS_UNKNOWN_EXTENSION_TYPE_BEHAVIOR" in caplog.text
 
 
@@ -440,6 +462,48 @@ def test_polars_datetime_time_unit(dtype, expected):
         (pl.Struct({"x": pl.Duration("us")}), 7),
         (pl.Extension(JSON_EXTENSION_NAME, pl.Decimal(76, 38)), 7),
         (pl.Extension(JSON_EXTENSION_NAME, pl.List(pl.Decimal(76, 38))), 7),
+        # Invalid storage on BigQuery extension names MUST rank 7 (never unwrapped).
+        (pl.Extension(JSON_EXTENSION_NAME, pl.Boolean()), 7),
+        (pl.Extension(JSON_EXTENSION_NAME, pl.Int64()), 7),
+        (pl.Extension(JSON_EXTENSION_NAME, pl.List(pl.Int64())), 7),
+        (pl.Extension(GEOGRAPHY_EXTENSION_NAME, pl.Boolean()), 7),
+        (pl.Extension(GEOGRAPHY_EXTENSION_NAME, pl.Int64()), 7),
+        (pl.Extension(GEOGRAPHY_EXTENSION_NAME, pl.List(pl.Int64())), 7),
+        (pl.List(pl.Extension(JSON_EXTENSION_NAME, pl.Int64())), 7),
+        (pl.Struct({"x": pl.Extension(JSON_EXTENSION_NAME, pl.Boolean())}), 7),
+        (
+            pl.Extension(
+                "custom:outer",
+                pl.Extension(JSON_EXTENSION_NAME, pl.Boolean()),
+            ),
+            7,
+        ),
+        (
+            pl.Struct(
+                {
+                    "x": pl.Extension(
+                        "custom:outer",
+                        pl.Extension(GEOGRAPHY_EXTENSION_NAME, pl.Int64()),
+                    )
+                }
+            ),
+            7,
+        ),
+        # Valid BigQuery extensions wrapped by a custom outer extension keep BQ rank.
+        (
+            pl.Extension(
+                "custom:outer",
+                pl.Extension(JSON_EXTENSION_NAME, pl.String()),
+            ),
+            5,
+        ),
+        (
+            pl.Extension(
+                "custom:outer",
+                pl.Extension(JSON_EXTENSION_NAME, pl.List(pl.String())),
+            ),
+            6,
+        ),
         (pl.Extension("custom:bn", pl.Decimal(76, 38)), 7),
         (pl.Extension("custom:bool", pl.Boolean()), 1),
         (pl.Extension("custom:bin", pl.Binary()), 5),
@@ -494,6 +558,63 @@ def test_extension_cycle_and_depth_guards():
     assert has_bignumeric_dtype(fresh_cycle) is False
     assert column_width_rank(fresh_cycle) == 7
     assert column_width_rank(pl.Struct({"x": fresh_cycle})) == 7
+
+
+def test_dtype_traversals_prevent_id_reuse_on_fresh_ext_storage():
+    """Verify strong-reference tracking prevents CPython id() aliasing across loops."""
+
+    class _ChainExt(pl.BaseExtension):
+        def __init__(self, remaining: int, leaf_factory):
+            self._rem = remaining
+            self._leaf_factory = leaf_factory
+            super().__init__("custom:chain", pl.Int64())
+
+        def ext_storage(self):
+            if self._rem > 0:
+                return _ChainExt(self._rem - 1, self._leaf_factory)
+            return self._leaf_factory()
+
+    # Repeated runs exercise pymalloc free-list address reuse.
+    for _ in range(50):
+        assert column_width_rank(_ChainExt(5, pl.Boolean)) == 1
+        assert has_bignumeric_dtype(_ChainExt(5, lambda: pl.Decimal(76, 38))) is True
+
+        struct_with_dec = pl.Struct(
+            [
+                pl.Field("bad", _ChainExt(0, lambda: pl.Decimal(76, 38))),
+                pl.Field("ok1", _ChainExt(0, lambda: pl.Decimal(38, 9))),
+                pl.Field("ok2", _ChainExt(0, lambda: pl.Decimal(38, 9))),
+                pl.Field("ok3", _ChainExt(0, lambda: pl.Decimal(38, 9))),
+                pl.Field("ok4", _ChainExt(0, lambda: pl.Decimal(38, 9))),
+            ]
+        )
+        assert column_width_rank(struct_with_dec) == 7
+
+
+def test_has_bignumeric_dtype_deep_containers_and_extension_diamond_dag():
+    from polars_bigquery.core.types import _MAX_TYPE_DEPTH
+
+    # Finite Polars List containers deeper than _MAX_TYPE_DEPTH still detect BIGNUMERIC.
+    deep_bn: pl.DataType = pl.Decimal(precision=76, scale=38)
+    for _ in range(_MAX_TYPE_DEPTH + 5):
+        deep_bn = pl.List(deep_bn)
+    assert has_bignumeric_dtype(deep_bn) is True
+
+    # Shared extension DAG reached at depth _MAX_TYPE_DEPTH AND depth 0 must detect
+    # BIGNUMERIC regardless of field order (minimum ext_depth tracking).
+    shared_ext = pl.Extension("custom:shared", pl.Decimal(precision=76, scale=38))
+    deep_chain: pl.DataType = shared_ext
+    for idx in range(_MAX_TYPE_DEPTH):
+        deep_chain = pl.Extension(f"custom:w{idx}", deep_chain)
+
+    dag_deep_last = pl.Struct(
+        [pl.Field("shallow", shared_ext), pl.Field("deep", deep_chain)]
+    )
+    dag_deep_first = pl.Struct(
+        [pl.Field("deep", deep_chain), pl.Field("shallow", shared_ext)]
+    )
+    assert has_bignumeric_dtype(dag_deep_last) is True
+    assert has_bignumeric_dtype(dag_deep_first) is True
 
 
 def test_has_bignumeric_dtype_nested():

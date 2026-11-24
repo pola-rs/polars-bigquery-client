@@ -121,8 +121,28 @@ def test_compile_read_api_plan_zero_column_fallback_priority_tiers() -> None:
     ]
     # Add in reverse order so the narrowest type wins by rank, not position.
     for i in range(len(ordered_candidates)):
+        expected_name = ordered_candidates[i][0]
+        expected_tier = expected_name.split("_")[0]
         slice_map = dict(reversed(ordered_candidates[i:]))
-        # Include ingestion-time pseudo-columns to confirm physical column wins.
+        if expected_tier == "tier7":
+            # Without pseudo-columns, rank-7 physical columns tie-break by schema order.
+            scan = _tscan(slice_map)
+            compiled = compile_read_api_plan(Project(input=scan, columns=()))
+            assert compiled.selected_fields == (next(iter(slice_map)),)
+            # With valid ingestion-time pseudo-columns, _PARTITIONDATE (rank 2)
+            # takes precedence over rank-7 unsupported physical columns.
+            slice_with_pseudo = {
+                **slice_map,
+                "_PARTITIONDATE": pl.Date(),
+                "_PARTITIONTIME": pl.Datetime("us", "UTC"),
+            }
+            compiled_pseudo = compile_read_api_plan(
+                Project(input=_tscan(slice_with_pseudo), columns=())
+            )
+            assert compiled_pseudo.selected_fields == ("_PARTITIONDATE",)
+            continue
+
+        # Supported physical columns (tiers 1–6) take priority over pseudo-columns.
         slice_map["_PARTITIONDATE"] = pl.Date()
         slice_map["_PARTITIONTIME"] = pl.Datetime("us", "UTC")
         scan = _tscan(slice_map)
@@ -131,11 +151,40 @@ def test_compile_read_api_plan_zero_column_fallback_priority_tiers() -> None:
         winner = compiled.selected_fields[0]
         assert winner not in {"_PARTITIONDATE", "_PARTITIONTIME"}
         # Verify strictly matching rank tier of expected front candidate
-        expected_name = ordered_candidates[i][0]
-        expected_tier = expected_name.split("_")[0]
         assert winner.startswith(expected_tier), (
             f"For slice starting at {expected_name}, got {winner}"
         )
+
+    # Unsupported physical column + _PARTITIONTIME (non-DAY) in both orders picks _PARTITIONTIME.
+    for schema_map in (
+        {"bad_dur": pl.Duration("us"), "_PARTITIONTIME": pl.Datetime("us", "UTC")},
+        {"_PARTITIONTIME": pl.Datetime("us", "UTC"), "bad_dur": pl.Duration("us")},
+    ):
+        assert compile_read_api_plan(
+            Project(input=_tscan(schema_map), columns=())
+        ).selected_fields == ("_PARTITIONTIME",)
+
+    # Invalid BigQuery extension storage (rank 7) never wins ahead of String or pseudo-columns.
+    bad_ext = pl.Extension("google:sqlType:json", pl.Boolean())
+    assert compile_read_api_plan(
+        Project(input=_tscan({"bad_json": bad_ext, "note": pl.String()}), columns=())
+    ).selected_fields == ("note",)
+    assert compile_read_api_plan(
+        Project(
+            input=_tscan({"bad_json": bad_ext, "_PARTITIONDATE": pl.Date()}),
+            columns=(),
+        )
+    ).selected_fields == ("_PARTITIONDATE",)
+
+    # If both physical and pseudo-columns are rank 7, physical column wins.
+    assert compile_read_api_plan(
+        Project(
+            input=_tscan(
+                {"bad_dur": pl.Duration("us"), "_PARTITIONTIME": pl.Duration("us")}
+            ),
+            columns=(),
+        )
+    ).selected_fields == ("bad_dur",)
 
     # Custom non-BigQuery BaseExtension unwraps its storage dtype for ranking.
     ext_scan = _tscan(
@@ -366,6 +415,23 @@ def test_zero_column_fallback_short_circuits_on_rank_one_bool() -> None:
         compiled = compile_read_api_plan(Project(input=scan, columns=()))
     assert compiled.selected_fields == ("flag",)
     mock_rank.assert_called_once_with(pl.Boolean())
+
+
+def test_zero_column_fallback_skips_nested_dfs_when_better_rank_known() -> None:
+    scan = _tscan(
+        {
+            "dt": pl.Date(),
+            "wide_list": pl.List(pl.Struct([pl.Field("a", pl.Int64())])),
+            "wide_struct": pl.Struct([pl.Field("b", pl.String())]),
+        }
+    )
+    with patch(
+        "polars_bigquery.core.executors.read_api.column_width_rank",
+        return_value=2,
+    ) as mock_rank:
+        compiled = compile_read_api_plan(Project(input=scan, columns=()))
+    assert compiled.selected_fields == ("dt",)
+    mock_rank.assert_called_once_with(pl.Date())
 
 
 def test_zero_column_fallback_handles_decimal_none_precision() -> None:

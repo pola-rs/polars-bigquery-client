@@ -755,3 +755,92 @@ def test_extract_polars_schema_from_fields_types_and_strict_rejections(monkeypat
         extract_polars_schema_from_fields(
             [{"name": "bad", "type": "STRING", "mode": "STREAMING"}]
         )
+
+
+def test_extract_polars_schema_from_fields_preserves_nested_paths_in_errors():
+    nested_interval = [
+        {
+            "name": "payload",
+            "type": "STRUCT",
+            "fields": [
+                {
+                    "name": "nested",
+                    "type": "STRUCT",
+                    "fields": [{"name": "bad_dur", "type": "INTERVAL"}],
+                }
+            ],
+        }
+    ]
+    with pytest.raises(
+        UnsupportedTypeError,
+        match=r"INTERVAL column 'payload' \(at 'payload\.nested\.bad_dur'\)",
+    ):
+        extract_polars_schema_from_fields(nested_interval)
+
+    nested_unnamed_range = [
+        {
+            "name": "payload",
+            "type": "STRUCT",
+            "fields": [
+                {"name": "ok", "type": "INT64"},
+                {"name": "", "type": "RANGE"},
+            ],
+        }
+    ]
+    with pytest.raises(
+        UnsupportedTypeError,
+        match=r"RANGE column 'payload' \(at 'payload\[1\]'\)",
+    ):
+        extract_polars_schema_from_fields(nested_unnamed_range)
+
+    nested_bignum = [
+        {
+            "name": "doc",
+            "type": "RECORD",
+            "fields": [{"name": "amt", "type": "BIGNUMERIC"}],
+        }
+    ]
+    with pytest.raises(
+        UnsupportedTypeError,
+        match=r"BIGNUMERIC/BIGDECIMAL.*'doc' \(at 'doc\.amt'\)",
+    ):
+        extract_polars_schema_from_fields(nested_bignum)
+
+    nested_ts = [
+        {
+            "name": "evt",
+            "type": "STRUCT",
+            "fields": [{"name": "ts", "type": "TIMESTAMP", "timestampPrecision": "12"}],
+        }
+    ]
+    with pytest.raises(
+        UnsupportedTypeError,
+        match=r"TIMESTAMP\(precision='12'\) column 'evt' \(at 'evt\.ts'\)",
+    ):
+        extract_polars_schema_from_fields(nested_ts)
+
+    nested_mode = [
+        {
+            "name": "evt",
+            "type": "STRUCT",
+            "fields": [{"name": "m", "type": "STRING", "mode": "STREAMING"}],
+        }
+    ]
+    with pytest.raises(
+        UnsupportedTypeError,
+        match=r"column 'evt' \(at 'evt\.m'\) uses unsupported field mode 'STREAMING'",
+    ):
+        extract_polars_schema_from_fields(nested_mode)
+
+    nested_unknown = [
+        {
+            "name": "evt",
+            "type": "STRUCT",
+            "fields": [{"name": "u", "type": "FUTURE_TYPE"}],
+        }
+    ]
+    with pytest.raises(
+        UnsupportedTypeError,
+        match=r"unexpected BigQuery type: future_type \(column 'evt' \(at 'evt\.u'\)\)",
+    ):
+        extract_polars_schema_from_fields(nested_unknown)

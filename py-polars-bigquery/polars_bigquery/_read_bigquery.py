@@ -143,8 +143,7 @@ def _register_io_source_safe(
 ) -> pl.LazyFrame:
     bignum_cols = _extract_bignumeric_columns(schema)
     if bignum_cols:
-        cols_repr = ", ".join(repr(col) for col in bignum_cols)
-        msg = polars_bigquery.core.schema.format_bignumeric_error(cols_repr)
+        msg = polars_bigquery.core.schema.format_bignumeric_error(bignum_cols)
         raise polars_bigquery.exceptions.UnsupportedTypeError(msg)
     return polars.io.plugins.register_io_source(
         io_source=io_source,
@@ -779,13 +778,14 @@ class Client:
           in `scan_table` (and `|> WHERE` clauses in `scan_query`) degrade
           automatically in tiers (pruning largest top-level `AND` conjuncts first)
           and log one `WARNING` without exposing raw SQL literals.
-        - **Polars `2.0.0–2.1.0` upstream note**: In `polars 2.0.0–2.1.0`, two
-          upstream `pl.scan_arrow_c_stream` issues affect default
-          `collect_batches()` execution: `lf.limit(n).filter(p)` may evaluate
+        - **Polars `2.0.0–2.1.0` upstream note**: In `polars 2.0.0–2.1.0`, an
+          upstream `pl.scan_arrow_c_stream` issue causes
+          `lf.limit(n).filter(p)` under default `collect_batches()` to evaluate
           `filter` before `limit`
           ([pola-rs/polars#30916](https://github.com/pola-rs/polars/issues/30916)),
-          and zero-column `lf.drop(pl.all()).collect()` can yield zero rows.
-          Both issues are fixed on the upstream Polars `main` branch.
+          which is fixed on the upstream Polars `main` branch. (Empty zero-column
+          projections such as `lf.drop(pl.all()).collect()` are already handled
+          locally by `polars_bigquery` so batch row heights are preserved.)
 
         Collection-time errors from BigQuery, query compilation, or mid-stream
         readers (including exceeding ~10 GB compressed, disallowed column
@@ -803,7 +803,18 @@ class Client:
             column names to Polars data types) for the query result. Passing a
             full or partial `schema` skips the construction-time dry-run RPC and
             its `SELECT`-only guard. Under `maintain_order=False`, `|> SELECT`
-            is always emitted for the needed columns declared in `schema`.
+            is always emitted for the needed columns declared in `schema`. Use
+            uppercase `"UTC"` for `TIMESTAMP` columns
+            (`pl.Datetime("us", "UTC")`). For `JSON` and `GEOGRAPHY` columns,
+            the dtype must match the active Polars Arrow extension mode:
+            `polars_bigquery.dtypes.JSON` / `polars_bigquery.dtypes.GEOGRAPHY`
+            by default, your registered `polars.BaseExtension` subclass, or
+            `pl.String()` when loaded as storage (`as_storage=True` or
+            `POLARS_UNKNOWN_EXTENSION_TYPE_BEHAVIOR=load_as_storage`). For
+            `ARRAY<JSON>` and `ARRAY<GEOGRAPHY>` under default extension mode,
+            BigQuery wraps the outer `List` field rather than the element (for
+            example, `pl.Extension("google:sqlType:json", pl.List(pl.String()))`
+            instead of `pl.List(polars_bigquery.dtypes.JSON)`).
         arrow_buffer_compression
             Compression codec for Arrow record batch buffers (`"lz4frame"`,
             `"zstd"`, or `"unspecified"`). Defaults to `"lz4frame"`.

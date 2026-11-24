@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import dataclasses
 from collections.abc import Callable, Mapping, Sequence
-from typing import Any
+from typing import Any, Literal
 
 import polars as pl
 from polars.datatypes import (
@@ -58,13 +58,24 @@ class ExtractedSchema:
     skipped_columns: tuple[SkippedColumn, ...]
 
 
+_UnsupportedKind = Literal[
+    "bignumeric",
+    "interval",
+    "range",
+    "timestamp_precision",
+    "mode",
+    "type",
+]
+
+
 @dataclasses.dataclass(frozen=True, slots=True)
 class _UnsupportedField:
-    """Sentinel returned when a field or nested subfield cannot be mapped to Polars."""
+    """Structural sentinel returned when a field or nested subfield cannot be mapped."""
 
+    kind: _UnsupportedKind
     reason: str
     path: str
-    message: str
+    detail: str = ""
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -75,14 +86,47 @@ class _ExtensionTypeSpec:
     metadata: str | None
 
 
-def format_bignumeric_error(cols_repr: str) -> str:
-    """Format the canonical `UnsupportedTypeError` message for `BIGNUMERIC` columns."""
+def _format_bignumeric_message(target: str) -> str:
     return (
         f"Polars does not support BigQuery BIGNUMERIC/BIGDECIMAL columns "
         f"(Decimal precision > {BQ_NUMERIC_MAX_PRECISION}) in LazyFrame schema "
-        f"for column(s): {cols_repr}. "
+        f"for column(s): {target}. "
         "Cast them to NUMERIC, FLOAT64, or STRING in SQL or exclude them."
     )
+
+
+def format_bignumeric_error(columns: Sequence[str]) -> str:
+    """Format the canonical `UnsupportedTypeError` message for `BIGNUMERIC` columns."""
+    return _format_bignumeric_message(", ".join(repr(col) for col in columns))
+
+
+def _format_unsupported_field_error(top_col_name: str, field: _UnsupportedField) -> str:
+    """Format a strict `UnsupportedTypeError` message preserving nested field paths."""
+    location = (
+        repr(top_col_name)
+        if field.path == top_col_name
+        else f"{top_col_name!r} (at {field.path!r})"
+    )
+    if field.kind == "bignumeric":
+        return _format_bignumeric_message(location)
+    if field.kind == "interval":
+        return (
+            f"BigQuery INTERVAL column {location} is not supported over "
+            "Arrow C Data Interface FFI. Cast it in SQL or exclude it."
+        )
+    if field.kind == "range":
+        return (
+            f"BigQuery RANGE column {location} is not supported in Polars. "
+            "Cast it in SQL or exclude it."
+        )
+    if field.kind == "timestamp_precision":
+        return (
+            f"BigQuery {field.reason} column {location} "
+            "is not supported in Polars. Cast to microsecond TIMESTAMP in SQL."
+        )
+    if field.kind == "mode":
+        return f"BigQuery column {location} uses unsupported field mode {field.detail}."
+    return f"got unexpected BigQuery type: {field.detail} (column {location})"
 
 
 # Mapping of casefolded BigQuery REST scalar type names (and legacy SQL aliases)
@@ -124,24 +168,12 @@ _EXTENSION_TYPE_MAP: dict[str, _ExtensionTypeSpec] = {
 }
 
 # Known BigQuery types that cannot be represented in Polars schemas or exported
-# over Arrow C Data Interface FFI: REST alias -> `(skip_reason, message_builder)`.
-_UNSUPPORTED_TYPE_MAP: dict[str, tuple[str, Callable[[str], str]]] = {
-    "bignumeric": ("BIGNUMERIC", lambda col: format_bignumeric_error(repr(col))),
-    "bigdecimal": ("BIGNUMERIC", lambda col: format_bignumeric_error(repr(col))),
-    "interval": (
-        "INTERVAL",
-        lambda col: (
-            f"BigQuery INTERVAL column {col!r} is not supported over "
-            "Arrow C Data Interface FFI. Cast it in SQL or exclude it."
-        ),
-    ),
-    "range": (
-        "RANGE",
-        lambda col: (
-            f"BigQuery RANGE column {col!r} is not supported in Polars. "
-            "Cast it in SQL or exclude it."
-        ),
-    ),
+# over Arrow C Data Interface FFI: REST alias -> `(kind, skip_reason)`.
+_UNSUPPORTED_TYPE_MAP: dict[str, tuple[_UnsupportedKind, str]] = {
+    "bignumeric": ("bignumeric", "BIGNUMERIC"),
+    "bigdecimal": ("bignumeric", "BIGNUMERIC"),
+    "interval": ("interval", "INTERVAL"),
+    "range": ("range", "RANGE"),
 }
 
 
@@ -161,7 +193,6 @@ def _extract_struct_dtype(
     field: Mapping[str, Any],
     *,
     path: str,
-    top_col_name: str,
     depth: int,
     extension_dtype_builder: ExtensionDtypeBuilder,
 ) -> DataType | _UnsupportedField:
@@ -194,7 +225,6 @@ def _extract_struct_dtype(
         sub_dtype = _extract_field_dtype(
             subfield,
             path=sub_path,
-            top_col_name=top_col_name,
             depth=depth + 1,
             extension_dtype_builder=extension_dtype_builder,
         )
@@ -222,7 +252,6 @@ def _extract_field_dtype(
     field: Mapping[str, Any],
     *,
     path: str,
-    top_col_name: str,
     depth: int = 0,
     extension_dtype_builder: ExtensionDtypeBuilder = build_extension_dtype,
 ) -> DataType | _UnsupportedField:
@@ -250,12 +279,10 @@ def _extract_field_dtype(
     mode = (raw_mode or "").casefold()
     if mode not in _VALID_FIELD_MODES:
         return _UnsupportedField(
+            kind="mode",
             reason=f"unsupported mode {raw_mode!r}",
             path=path,
-            message=(
-                f"BigQuery column {top_col_name!r} uses unsupported field mode "
-                f"{raw_mode!r}."
-            ),
+            detail=repr(raw_mode),
         )
 
     type_ = (field.get("type") or "").casefold()
@@ -273,7 +300,6 @@ def _extract_field_dtype(
         inner_type = _extract_field_dtype(
             {**field, "mode": "NULLABLE"},
             path=path,
-            top_col_name=top_col_name,
             depth=depth + 1,
             extension_dtype_builder=extension_dtype_builder,
         )
@@ -296,36 +322,33 @@ def _extract_field_dtype(
         if _is_supported_timestamp_precision(precision):
             return Datetime(time_unit="us", time_zone="UTC")
         return _UnsupportedField(
+            kind="timestamp_precision",
             reason=f"TIMESTAMP(precision={precision!r})",
             path=path,
-            message=(
-                f"BigQuery TIMESTAMP(precision={precision!r}) column {top_col_name!r} "
-                "is not supported in Polars. Cast to microsecond TIMESTAMP in SQL."
-            ),
         )
 
     if type_ in ("record", "struct"):
         return _extract_struct_dtype(
             field,
             path=path,
-            top_col_name=top_col_name,
             depth=depth,
             extension_dtype_builder=extension_dtype_builder,
         )
 
     if (unsupported := _UNSUPPORTED_TYPE_MAP.get(type_)) is not None:
-        skip_reason, build_message = unsupported
+        kind, skip_reason = unsupported
         return _UnsupportedField(
+            kind=kind,
             reason=skip_reason,
             path=path,
-            message=build_message(top_col_name),
         )
 
     type_label = type_ or "<missing>"
     return _UnsupportedField(
+        kind="type",
         reason=f"unsupported type {type_label}",
         path=path,
-        message=f"got unexpected BigQuery type: {type_label} (column {top_col_name!r})",
+        detail=type_label,
     )
 
 
@@ -355,11 +378,12 @@ def extract_polars_schema_from_fields(
         result = _extract_field_dtype(
             field,
             path=name,
-            top_col_name=name,
             extension_dtype_builder=extension_dtype_builder,
         )
         if isinstance(result, _UnsupportedField):
-            raise polars_bigquery.exceptions.UnsupportedTypeError(result.message)
+            raise polars_bigquery.exceptions.UnsupportedTypeError(
+                _format_unsupported_field_error(name, result)
+            )
         pl_schema[name] = result
 
     if duplicates:
@@ -430,7 +454,6 @@ def extract_schema_metadata(
         result = _extract_field_dtype(
             field,
             path=name,
-            top_col_name=name,
             extension_dtype_builder=extension_dtype_builder,
         )
         if isinstance(result, _UnsupportedField):

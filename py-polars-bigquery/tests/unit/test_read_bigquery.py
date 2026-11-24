@@ -2274,6 +2274,14 @@ def test_client_scan_bignumeric_raises_clear_unsupported_type_error(mock_arrow_c
         ):
             client.scan_query("SELECT col FROM t")
 
+    # Explicit schema with deeply nested BIGNUMERIC (>64 List levels) also raises
+    # UnsupportedTypeError rather than leaking Polars InvalidOperationError.
+    deep_bn: pl.DataType = pl.Decimal(76, 38)
+    for _ in range(70):
+        deep_bn = pl.List(deep_bn)
+    with pytest.raises(UnsupportedTypeError, match="BIGNUMERIC/BIGDECIMAL.*'deep'"):
+        client.scan_table("p.d.t", schema={"deep": deep_bn})
+
     # Explicit schema with nested BIGNUMERIC also raises UnsupportedTypeError without calling Polars.
     with pytest.raises(UnsupportedTypeError, match="BIGNUMERIC/BIGDECIMAL.*'s'"):
         client.scan_query(
@@ -2571,7 +2579,10 @@ def test_bigquery_rest_retry_has_jitter_and_handles_401_and_errors():
     resp_200 = MagicMock()
     resp_200.status_code = 200
     resp_200.raise_for_status.return_value = None
-    resp_200.json.return_value = {"schema": {"fields": []}}
+    resp_200.json.return_value = {
+        "kind": "bigquery#table",
+        "schema": {"fields": []},
+    }
 
     mock_session = MagicMock()
     mock_session.get.side_effect = [resp_401, resp_200]
@@ -2582,7 +2593,7 @@ def test_bigquery_rest_retry_has_jitter_and_handles_401_and_errors():
         user_agent="test-ua",
         session=mock_session,
     )
-    assert result == {"schema": {"fields": []}}
+    assert result == {"kind": "bigquery#table", "schema": {"fields": []}}
     assert creds.clear_calls == 1
     assert mock_session.get.call_count == 2
     assert (

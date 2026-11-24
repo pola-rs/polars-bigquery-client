@@ -39,6 +39,8 @@ _SINGLE_STREAM_ROW_LIMIT = 10_000
 _INGESTION_TIME_PSEUDO_COLUMNS_CASEFOLD = frozenset(
     {"_partitiondate", "_partitiontime"}
 )
+_NESTED_WIDTH_RANK = 6
+_UNKNOWN_WIDTH_RANK = 7
 
 ReadApiDegradedReason = Literal[
     "row_restriction_length_pruned_conjuncts",
@@ -72,32 +74,46 @@ def _validate_max_row_restriction_bytes(max_bytes: Any) -> int:
 def _select_zero_column_fallback(schema: pl.Schema) -> str:
     """Select the single narrowest safe column to request for a 0-column read.
 
-    Prefers physical columns ahead of ingestion-time pseudo-columns so explicit
-    schemas (or mixed tables where pseudo-columns remain optional) always read
-    a real column first, short-circuiting immediately when a rank-1 `BOOL`
-    physical column is encountered. When only pseudo-columns remain (all physical
-    columns were skipped), applies the same width-then-order tie breaker so
-    `_PARTITIONDATE` (`DATE`, rank 2) is chosen before `_PARTITIONTIME`
-    (`TIMESTAMP`, rank 3).
+    Prefers supported physical columns (ranks 1–6) ahead of ingestion-time
+    pseudo-columns so explicit schemas (or mixed tables where pseudo-columns
+    remain optional) read a concrete column first, short-circuiting immediately
+    when a rank-1 `BOOL` physical column is encountered. If no supported
+    physical column exists (all physical columns are rank 7 / unsupported, or
+    only pseudo-columns remain), prefers a supported pseudo-column
+    (`_PARTITIONDATE` `DATE`, rank 2, before `_PARTITIONTIME` `TIMESTAMP`,
+    rank 3) ahead of rank-7 unsupported physical columns.
     """
     best_physical: tuple[int, str] | None = None
     best_pseudo: tuple[int, str] | None = None
     for name, dtype in schema.items():
         if name.casefold() in _INGESTION_TIME_PSEUDO_COLUMNS_CASEFOLD:
-            if best_physical is None:
+            if best_physical is None or best_physical[0] >= _UNKNOWN_WIDTH_RANK:
                 rank = column_width_rank(dtype)
                 if best_pseudo is None or rank < best_pseudo[0]:
                     best_pseudo = (rank, name)
+            continue
+        # `pl.List` and `pl.Struct` can only rank 6 (`ARRAY`/`STRUCT`) or 7
+        # (unsupported nested dtype), so skip deep subtree DFS once a valid
+        # physical column of rank <= 6 has already been found.
+        if (
+            best_physical is not None
+            and best_physical[0] <= _NESTED_WIDTH_RANK
+            and isinstance(dtype, (pl.List, pl.Struct))
+        ):
             continue
         rank = column_width_rank(dtype)
         if rank == 1:
             return name
         if best_physical is None or rank < best_physical[0]:
             best_physical = (rank, name)
+    if best_physical is not None and best_physical[0] < _UNKNOWN_WIDTH_RANK:
+        return best_physical[1]
+    if best_pseudo is not None and (
+        best_physical is None or best_pseudo[0] < best_physical[0]
+    ):
+        return best_pseudo[1]
     if best_physical is not None:
         return best_physical[1]
-    if best_pseudo is not None:
-        return best_pseudo[1]
     msg = "Cannot select zero-column fallback from an empty schema."
     raise ValueError(msg)
 
