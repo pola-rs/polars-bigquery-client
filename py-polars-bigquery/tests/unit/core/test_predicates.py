@@ -311,7 +311,12 @@ def test_json_literal_to_sql_all_scalar_types_and_immutability() -> None:
         _json_literal_to_sql({"DateTime": [5000, "Nanoseconds"]})
         == "TIMESTAMP_MICROS(5)"
     )
+    assert (
+        _json_literal_to_sql({"DateTime": [-5000, "Nanoseconds"]})
+        == "TIMESTAMP_MICROS(-5)"
+    )
     assert _json_literal_to_sql({"DateTime": [5555, "Nanoseconds"]}) is None
+    assert _json_literal_to_sql({"DateTime": [-5555, "Nanoseconds"]}) is None
     assert _json_literal_to_sql({"DateTime": [10, "Seconds"]}) is None
 
     # Malformed literal values catch ValueError/TypeError locally and return None
@@ -3985,3 +3990,273 @@ def test_compile_ir_conjuncts_to_sql_skips_null_literal() -> None:
     assert compiler.compile_predicate(
         (pl.col("a") == 1) & pl.lit(None)
     ) == compiler.CompiledPredicate(conjuncts=("(`a` = 1)",), is_exact=False)
+
+
+def test_float32_literal_widens_through_ieee754_binary32() -> None:
+    """Float32 literal 0.1 must match Polars' f32->f64 widened value, not f64 0.1."""
+    import math
+    import struct
+
+    expected_val = struct.unpack("<f", struct.pack("<f", 0.1))[0]
+    assert expected_val != 0.1
+
+    sql = compiler.predicate_to_row_restriction(
+        pl.col("f") == pl.lit(0.1, dtype=pl.Float32),
+    )
+    assert sql == f"(`f` = {expected_val!r})"
+
+    # Exact dyadic rationals remain unchanged through binary32 packing
+    for exact in (0.25, 0.5, 1.5):
+        assert (
+            compiler.predicate_to_row_restriction(
+                pl.col("f") == pl.lit(exact, dtype=pl.Float32)
+            )
+            == f"(`f` = {exact!r})"
+        )
+
+    # Subnormal binary32 value preserves single-precision rounding
+    subnormal_expected = struct.unpack("<f", struct.pack("<f", 1e-40))[0]
+    assert compiler.parser.numeric.parse_float32_literal(
+        1e-40
+    ) == compiler.ir.FloatLiteral(value=subnormal_expected)
+
+    # Special IEEE-754 float32 values round-trip cleanly
+    nan_ir = compiler.parser.numeric.parse_float32_literal(float("nan"))
+    assert isinstance(nan_ir, compiler.ir.FloatLiteral) and math.isnan(nan_ir.value)
+    assert compiler.parser.numeric.parse_float32_literal(
+        float("inf")
+    ) == compiler.ir.FloatLiteral(value=float("inf"))
+    assert compiler.parser.numeric.parse_float32_literal(
+        float("-inf")
+    ) == compiler.ir.FloatLiteral(value=float("-inf"))
+
+    # bool and float64/float32 overflows degrade cleanly to Unsupported
+    assert (
+        compiler.parser.numeric.parse_float32_literal(True) == compiler.ir.Unsupported()
+    )
+    assert (
+        compiler.parser.numeric.parse_float32_literal(False)
+        == compiler.ir.Unsupported()
+    )
+    assert (
+        compiler.parser.numeric.parse_float32_literal(10**400)
+        == compiler.ir.Unsupported()
+    )
+    assert (
+        compiler.parser.numeric.parse_float32_literal("1e500")
+        == compiler.ir.Unsupported()
+    )
+    assert (
+        compiler.parser.numeric.parse_float32_literal(-1e50)
+        == compiler.ir.Unsupported()
+    )
+
+    # Out-of-range float32 value overflows binary32 -> falls back to Unsupported ("")
+    assert compiler._json_expr_to_compiled_predicate(
+        {
+            "BinaryExpr": {
+                "left": {"Column": "f"},
+                "op": "Eq",
+                "right": {"Literal": {"Scalar": {"Float32": 1e50}}},
+            }
+        },
+    ) == compiler.CompiledPredicate(conjuncts=(), is_exact=False)
+
+
+def test_nanosecond_datetime_literals_preserve_unit_and_reject_submicrosecond() -> None:
+    """Exact-microsecond `ns` literals preserve `TimestampUnit.NANOSECONDS`; inexact ones degrade."""
+    import datetime as dt
+
+    ts_us_2024 = 1_704_067_200_000_000
+    ts_ns_2024 = ts_us_2024 * 1_000
+
+    # IR preserves `TimestampUnit.NANOSECONDS` (does NOT collapse to `MICROSECONDS`)
+    # so downstream unit-sensitive passes (e.g. `fill_null(strategy="one")`) keep
+    # the original `"ns"` unit.
+    assert compiler.json_to_ir(
+        {"Literal": {"Scalar": {"Datetime": [ts_ns_2024, "Nanoseconds", None]}}}
+    ) == compiler.ir.TimestampLiteral(
+        ticks=ts_ns_2024,
+        unit=compiler.ir.TimestampUnit.NANOSECONDS,
+        tz=None,
+    )
+    assert compiler.json_to_ir(
+        {"Literal": {"Scalar": {"Datetime": [-1000, "Nanoseconds", "UTC"]}}}
+    ) == compiler.ir.TimestampLiteral(
+        ticks=-1000,
+        unit=compiler.ir.TimestampUnit.NANOSECONDS,
+        tz="UTC",
+    )
+
+    # Exact-microsecond scalar `ns` literals push down to BigQuery `TIMESTAMP_MICROS`.
+    assert (
+        compiler.predicate_to_row_restriction(
+            pl.col("dt_us") == pl.lit(dt.datetime(2024, 1, 1), dtype=pl.Datetime("ns"))  # noqa: DTZ001
+        )
+        == f"(`dt_us` = DATETIME(TIMESTAMP_MICROS({ts_us_2024})))"
+    )
+    assert (
+        compiler.predicate_to_row_restriction(
+            pl.col("ts_us")
+            == pl.lit(
+                dt.datetime(2024, 1, 1, tzinfo=dt.timezone.utc),
+                dtype=pl.Datetime("ns", "UTC"),
+            )
+        )
+        == f"(`ts_us` = TIMESTAMP_MICROS({ts_us_2024}))"
+    )
+    # Pre-1970 exact-microsecond `ns` literal (`-1000 ns` == `-1 us`).
+    assert (
+        compiler.predicate_to_row_restriction(
+            pl.col("dt_us")
+            == pl.lit(
+                dt.datetime(1969, 12, 31, 23, 59, 59, 999999),  # noqa: DTZ001
+                dtype=pl.Datetime("ns"),
+            )
+        )
+        == "(`dt_us` = DATETIME(TIMESTAMP_MICROS(-1)))"
+    )
+
+    # Sub-microsecond scalar `ns` literals (`ticks % 1000 != 0`) degrade to Unsupported.
+    for bad_ns in (1, 500, -1, -1500):
+        assert compiler._json_expr_to_compiled_predicate(
+            {
+                "BinaryExpr": {
+                    "left": {"Column": "ts_us"},
+                    "op": "Eq",
+                    "right": {
+                        "Literal": {
+                            "Scalar": {"Datetime": [bad_ns, "Nanoseconds", "UTC"]}
+                        }
+                    },
+                }
+            }
+        ) == compiler.CompiledPredicate(conjuncts=(), is_exact=False)
+
+    # Defensive guard inside SQL emitter for manually constructed inexact `ns` IR nodes.
+    with pytest.raises(ValueError, match="Sub-microsecond nanosecond timestamp"):
+        compiler.ir_to_sql(
+            compiler.ir.TimestampLiteral(
+                ticks=5555, unit=compiler.ir.TimestampUnit.NANOSECONDS, tz="UTC"
+            )
+        )
+
+    # Verify `when(...).then(<ns literal>).otherwise(None)` retains `NANOSECONDS` on the
+    # IR branch so downstream unit-sensitive lowering passes (e.g. `fill_null(strategy="one")`)
+    # do not mistake a `Datetime("ns")` literal for `"us"`.
+    when_ns_naive = (
+        pl.when(pl.col("flag"))
+        .then(pl.lit(dt.datetime(2024, 1, 1), dtype=pl.Datetime("ns")))  # noqa: DTZ001
+        .otherwise(None)
+    )
+    when_buf = io.BytesIO()
+    when_ns_naive.meta.serialize(when_buf, format="json")
+    when_ir = compiler.json_to_ir(json.loads(when_buf.getvalue()))
+    assert isinstance(when_ir, compiler.ir.Ternary)
+    assert when_ir.truthy == compiler.ir.TimestampLiteral(
+        ticks=ts_ns_2024,
+        unit=compiler.ir.TimestampUnit.NANOSECONDS,
+        tz=None,
+    )
+
+    when_ns_utc = (
+        pl.when(pl.col("flag"))
+        .then(
+            pl.lit(
+                dt.datetime(2024, 1, 1, tzinfo=dt.timezone.utc),
+                dtype=pl.Datetime("ns", "UTC"),
+            )
+        )
+        .otherwise(None)
+    )
+    when_utc_buf = io.BytesIO()
+    when_ns_utc.meta.serialize(when_utc_buf, format="json")
+    when_utc_ir = compiler.json_to_ir(json.loads(when_utc_buf.getvalue()))
+    assert isinstance(when_utc_ir, compiler.ir.Ternary)
+    assert when_utc_ir.truthy == compiler.ir.TimestampLiteral(
+        ticks=ts_ns_2024,
+        unit=compiler.ir.TimestampUnit.NANOSECONDS,
+        tz="UTC",
+    )
+
+    # `is_in` with an exact-microsecond `Datetime("ns")` Series pushes down.
+    ns_series = pl.Series(
+        [dt.datetime(2024, 1, 1)],  # noqa: DTZ001
+        dtype=pl.Datetime("ns"),
+    )
+    assert (
+        compiler.predicate_to_row_restriction(pl.col("dt_us").is_in(ns_series))
+        == f"(`dt_us` IN (DATETIME(TIMESTAMP_MICROS({ts_us_2024}))))"
+    )
+
+    ns_utc_series = pl.Series(
+        [dt.datetime(2024, 1, 1, tzinfo=dt.timezone.utc)],
+        dtype=pl.Datetime("ns", "UTC"),
+    )
+    assert (
+        compiler.predicate_to_row_restriction(pl.col("ts_us").is_in(ns_utc_series))
+        == f"(`ts_us` IN (TIMESTAMP_MICROS({ts_us_2024})))"
+    )
+
+    # `is_in` IPC Series also preserves `TimestampUnit.NANOSECONDS` in the IR.
+    ipc_buf = io.BytesIO()
+    ns_utc_series.to_frame().write_ipc_stream(ipc_buf)
+    assert compiler.parser.list_.parse_ipc_series_to_list_literal(
+        ipc_buf.getvalue()
+    ) == compiler.ir.ListLiteral(
+        values=(
+            compiler.ir.TimestampLiteral(
+                ticks=ts_ns_2024,
+                unit=compiler.ir.TimestampUnit.NANOSECONDS,
+                tz="UTC",
+            ),
+        )
+    )
+
+    # `is_in` with ANY sub-microsecond `Datetime("ns")` element degrades to Unsupported.
+    inexact_ns_series = pl.Series([0, 500], dtype=pl.Int64).cast(pl.Datetime("ns"))
+    assert (
+        compiler.predicate_to_row_restriction(pl.col("dt_us").is_in(inexact_ns_series))
+        == ""
+    )
+    inexact_ns_utc_series = pl.Series([0, -1500], dtype=pl.Int64).cast(
+        pl.Datetime("ns", "UTC")
+    )
+    assert (
+        compiler.predicate_to_row_restriction(
+            pl.col("ts_us").is_in(inexact_ns_utc_series)
+        )
+        == ""
+    )
+
+    # Exact sibling conjunct survives partial pushdown alongside an unsupported `ns` branch.
+    inexact_partial = pl.col("dt_us").is_in(inexact_ns_series) & pl.col("flag")
+    assert compiler.predicate_to_row_restriction(inexact_partial) == "`flag`"
+
+
+def test_is_in_series_excludes_float16_and_uint128() -> None:
+    """`parser/list_.py` must reject `Float16` and `UInt128` Series like `core/types.py`."""
+    import struct
+    import warnings
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", DeprecationWarning)
+        f16_expr = pl.col("f").is_in(pl.Series([0.1], dtype=pl.Float16))
+        u128_expr = pl.col("i").is_in(pl.Series([1, 2], dtype=pl.UInt128))
+    assert compiler.predicate_to_row_restriction(f16_expr) == ""
+    assert compiler.predicate_to_row_restriction(u128_expr) == ""
+
+    # Supported Float32/Int128 Series still compile (with Float32 rounded to binary32).
+    expected_f32 = struct.unpack("<f", struct.pack("<f", 0.1))[0]
+    assert (
+        compiler.predicate_to_row_restriction(
+            pl.col("f").is_in(pl.Series([0.1], dtype=pl.Float32))
+        )
+        == f"(`f` IN ({expected_f32!r}))"
+    )
+    assert (
+        compiler.predicate_to_row_restriction(
+            pl.col("i").is_in(pl.Series([1, 2], dtype=pl.Int128))
+        )
+        == "(`i` IN (1, 2))"
+    )
