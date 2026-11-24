@@ -11,6 +11,7 @@ class TimestampUnit(enum.Enum):
 
     MICROSECONDS = "Microseconds"
     MILLISECONDS = "Milliseconds"
+    NANOSECONDS = "Nanoseconds"
 
 
 @dataclasses.dataclass(frozen=True)

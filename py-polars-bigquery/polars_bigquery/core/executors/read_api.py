@@ -26,12 +26,15 @@ from polars_bigquery.core.plan import (
     decompose_linear_plan,
     validate_and_normalize_linear_plan,
 )
-from polars_bigquery.core.schema import has_bignumeric_dtype
 from polars_bigquery.core.types import column_width_rank
 
 logger = logging.getLogger(__name__)
 
 MAX_ROW_RESTRICTION_BYTES = 1_000_000
+# Cap `read_table` fanout to a single stream when Polars pushes a small row
+# limit (`n_rows`), avoiding spinning up `available_parallelism()` parallel gRPC
+# streams and prefetch buffers only to discard nearly all rows.
+_SINGLE_STREAM_ROW_LIMIT = 10_000
 
 _INGESTION_TIME_PSEUDO_COLUMNS_CASEFOLD = frozenset(
     {"_partitiondate", "_partitiontime"}
@@ -66,36 +69,37 @@ def _validate_max_row_restriction_bytes(max_bytes: Any) -> int:
     return max_bytes
 
 
-def _zero_column_rank(dtype: pl.DataType) -> int:
-    """Return a width/safety priority rank (lower is preferred) for 0-column fallback."""
-    if has_bignumeric_dtype(dtype):
-        return 7
-    return column_width_rank(dtype)
-
-
 def _select_zero_column_fallback(schema: pl.Schema) -> str:
     """Select the single narrowest safe column to request for a 0-column read.
 
     Prefers physical columns ahead of ingestion-time pseudo-columns so explicit
     schemas (or mixed tables where pseudo-columns remain optional) always read
-    a real column first. When only pseudo-columns remain (all physical columns
-    were skipped), applies the same width-then-order tie breaker so
+    a real column first, short-circuiting immediately when a rank-1 `BOOL`
+    physical column is encountered. When only pseudo-columns remain (all physical
+    columns were skipped), applies the same width-then-order tie breaker so
     `_PARTITIONDATE` (`DATE`, rank 2) is chosen before `_PARTITIONTIME`
     (`TIMESTAMP`, rank 3).
     """
-    physical_columns = [
-        (idx, name, dtype)
-        for idx, (name, dtype) in enumerate(schema.items())
-        if name.casefold() not in _INGESTION_TIME_PSEUDO_COLUMNS_CASEFOLD
-    ]
-    candidates = physical_columns or [
-        (idx, name, dtype) for idx, (name, dtype) in enumerate(schema.items())
-    ]
-    _, best_name, _ = min(
-        candidates,
-        key=lambda item: (_zero_column_rank(item[2]), item[0]),
-    )
-    return best_name
+    best_physical: tuple[int, str] | None = None
+    best_pseudo: tuple[int, str] | None = None
+    for name, dtype in schema.items():
+        if name.casefold() in _INGESTION_TIME_PSEUDO_COLUMNS_CASEFOLD:
+            if best_physical is None:
+                rank = column_width_rank(dtype)
+                if best_pseudo is None or rank < best_pseudo[0]:
+                    best_pseudo = (rank, name)
+            continue
+        rank = column_width_rank(dtype)
+        if rank == 1:
+            return name
+        if best_physical is None or rank < best_physical[0]:
+            best_physical = (rank, name)
+    if best_physical is not None:
+        return best_physical[1]
+    if best_pseudo is not None:
+        return best_pseudo[1]
+    msg = "Cannot select zero-column fallback from an empty schema."
+    raise ValueError(msg)
 
 
 def _prune_conjuncts_to_budget(
@@ -238,11 +242,27 @@ class ReadApiExecutor(PlanExecutor):
                     compiled.degraded_reason,
                 )
 
+        read_kwargs: dict[str, Any] = {
+            "maintain_order": source.maintain_order,
+            "selected_fields": list(compiled.selected_fields),
+            "row_restriction": compiled.row_restriction,
+        }
+        has_filter = any(isinstance(op, Filter) for op in residual_ops)
+        has_leading_small_slice = False
+        if not has_filter:
+            for op in residual_ops:
+                if isinstance(op, Slice):
+                    if op.offset > 0:
+                        break
+                    if op.length <= _SINGLE_STREAM_ROW_LIMIT:
+                        has_leading_small_slice = True
+                        break
+        if has_leading_small_slice:
+            read_kwargs["max_stream_count"] = 1
+
         arrow_stream_exporter = self._arrow_client.read_table(
             source.table_ref,
-            maintain_order=source.maintain_order,
-            selected_fields=list(compiled.selected_fields),
-            row_restriction=compiled.row_restriction,
+            **read_kwargs,
         )
         lazyframe: pl.LazyFrame | None = None
         try:

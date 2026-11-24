@@ -36,25 +36,28 @@ from polars_bigquery.core.plan import (
 logger = logging.getLogger(__name__)
 
 _VALID_ARROW_BUFFER_COMPRESSIONS = frozenset({"lz4frame", "zstd", "unspecified"})
-_EXPLAIN_CONTROL_CHARS_RE = re.compile(r"[\x00-\x1f\x7f\u2028\u2029]+")
+_CONTROL_CHARS_RE = re.compile(r"[\x00-\x1f\x7f\u2028\u2029]+")
 _MAX_SKIPPED_COLUMNS_DISPLAY = 5
 
 
-def _sanitize_explain_value(value: str) -> str:
-    """Normalize an `explain_detail` token value so output remains single-line."""
-    return _EXPLAIN_CONTROL_CHARS_RE.sub(" ", value).strip()
+def _sanitize_single_line(value: str) -> str:
+    """Replace ASCII/Unicode line & control characters with spaces for safe logging."""
+    return _CONTROL_CHARS_RE.sub(" ", value).strip()
 
 
 def _format_skipped_columns(
     skipped_columns: Sequence[polars_bigquery.core.schema.SkippedColumn],
 ) -> str:
     """Format omitted top-level columns with reasons/paths, capped at 5 entries."""
-    entries = [
-        f"{col.name} ({col.reason})"
-        if col.path == col.name
-        else f"{col.name} ({col.reason} at {col.path})"
-        for col in skipped_columns[:_MAX_SKIPPED_COLUMNS_DISPLAY]
-    ]
+    entries: list[str] = []
+    for col in skipped_columns[:_MAX_SKIPPED_COLUMNS_DISPLAY]:
+        safe_name = _sanitize_single_line(col.name)
+        safe_reason = _sanitize_single_line(col.reason)
+        if col.path == col.name:
+            entries.append(f"{safe_name} ({safe_reason})")
+        else:
+            safe_path = _sanitize_single_line(col.path)
+            entries.append(f"{safe_name} ({safe_reason} at {safe_path})")
     if len(skipped_columns) > _MAX_SKIPPED_COLUMNS_DISPLAY:
         entries.append(
             f"... and {len(skipped_columns) - _MAX_SKIPPED_COLUMNS_DISPLAY} more"
@@ -127,7 +130,7 @@ def _extract_bignumeric_columns(schema: pl.Schema) -> list[str]:
     return [
         name
         for name, dtype in schema.items()
-        if polars_bigquery.core.schema.has_bignumeric_dtype(dtype)
+        if polars_bigquery.core.types.has_bignumeric_dtype(dtype)
     ]
 
 
@@ -138,24 +141,17 @@ def _register_io_source_safe(
     explain_name: str,
     explain_detail: str,
 ) -> pl.LazyFrame:
-    try:
-        return polars.io.plugins.register_io_source(
-            io_source=io_source,
-            schema=schema,
-            explain_name=explain_name,
-            explain_detail=explain_detail,
-        )
-    except pl.exceptions.InvalidOperationError as exc:
-        bignum_cols = _extract_bignumeric_columns(schema)
-        if bignum_cols:
-            cols_repr = ", ".join(repr(col) for col in bignum_cols)
-            msg = (
-                f"Polars does not support BigQuery BIGNUMERIC/BIGDECIMAL columns "
-                f"(Decimal precision > 38) in LazyFrame schema for column(s): {cols_repr}. "
-                "Cast them to NUMERIC, FLOAT64, or STRING in SQL or exclude them."
-            )
-            raise TypeError(msg) from exc
-        raise
+    bignum_cols = _extract_bignumeric_columns(schema)
+    if bignum_cols:
+        cols_repr = ", ".join(repr(col) for col in bignum_cols)
+        msg = polars_bigquery.core.schema.format_bignumeric_error(cols_repr)
+        raise polars_bigquery.exceptions.UnsupportedTypeError(msg)
+    return polars.io.plugins.register_io_source(
+        io_source=io_source,
+        schema=schema,
+        explain_name=explain_name,
+        explain_detail=explain_detail,
+    )
 
 
 class Client:
@@ -572,17 +568,20 @@ class Client:
         polars_bigquery.exceptions.UnsupportedTypeError
             If `schema` is `None` and a table with one or more defined columns
             has zero supported columns (and zero ingestion-time partition
-            pseudo-columns) remaining after omitting unsupported columns.
+            pseudo-columns) remaining after omitting unsupported columns, or if
+            an explicit `schema` contains an unsupported `BIGNUMERIC` decimal
+            (`precision > 38`).
         polars_bigquery.exceptions.BigQueryError
             If `schema` is `None` and fetching table metadata from the BigQuery
             REST API fails or returns a malformed metadata envelope, or if
             reading from the Storage Read API fails during collection.
         ValueError
-            If an explicit `schema` is empty (contains zero columns).
+            If an explicit `schema` is empty (contains zero columns), or if the
+            table metadata contains exact duplicate nested `STRUCT` subfield
+            names.
         TypeError
             If an explicit `schema` contains an unspecified Polars data type
-            class (such as bare `pl.Datetime`) or an unsupported `BIGNUMERIC`
-            decimal (`precision > 38`).
+            class (such as bare `pl.Datetime`).
         RuntimeError
             If called on a closed `Client` instance.
 
@@ -619,10 +618,11 @@ class Client:
             )
             polars_schema = extracted.polars_schema
             if extracted.skipped_columns:
+                safe_table_ref = _sanitize_single_line(str(table_ref))
                 skipped_summary = _format_skipped_columns(extracted.skipped_columns)
                 if len(polars_schema) == 0:
                     msg = (
-                        f"Table '{table_ref}' has no supported columns to scan. "
+                        f"Table '{safe_table_ref}' has no supported columns to scan. "
                         f"Skipped {len(extracted.skipped_columns)} unsupported "
                         f"column(s): {skipped_summary}. "
                         "Use client.scan_query() or client.read_query() to cast or "
@@ -632,12 +632,12 @@ class Client:
                 logger.debug(
                     "Omitting %d unsupported column(s) from table '%s': %s",
                     len(extracted.skipped_columns),
-                    table_ref,
+                    safe_table_ref,
                     skipped_summary,
                 )
                 warnings.warn(
                     f"Skipping {len(extracted.skipped_columns)} unsupported column(s) "
-                    f"in table '{table_ref}': {skipped_summary}. "
+                    f"in table '{safe_table_ref}': {skipped_summary}. "
                     "Use client.scan_query() or client.read_query() to cast or "
                     "exclude these columns in SQL.",
                     polars_bigquery.exceptions.UnsupportedTypeWarning,
@@ -843,17 +843,21 @@ class Client:
             reports a non-`SELECT` statement type, or the dry-run result schema
             contains exact duplicate column names (or duplicate nested `STRUCT`
             subfield names).
+        polars_bigquery.exceptions.UnsupportedTypeError
+            If the dry-run result schema contains an unsupported BigQuery field
+            type (`BIGNUMERIC` / `BIGDECIMAL`, `INTERVAL`, `RANGE`,
+            non-microsecond `TIMESTAMP`, or an unrecognized type or mode), or
+            if an explicit `schema` contains an unsupported `BIGNUMERIC`
+            decimal (`precision > 38`).
         polars_bigquery.exceptions.BigQueryError
             If the BigQuery dry run fails (for example, due to invalid SQL,
             unshifted `[line:col]` positions on `query`) or returns a missing,
             malformed, or empty schema response.
         TypeError
             If `query`, `maintain_order`, `use_query_cache`, or
-            `maximum_bytes_billed` have invalid types, if the dry-run result
-            schema contains an unsupported BigQuery field type (`BIGNUMERIC` /
-            `BIGDECIMAL`, `INTERVAL`, `RANGE`, non-microsecond `TIMESTAMP`, or
-            an unrecognized type or mode), or if an explicit `schema` contains
-            an unspecified Polars data type class (such as bare `pl.Datetime`).
+            `maximum_bytes_billed` have invalid types, or if an explicit
+            `schema` contains an unspecified Polars data type class (such as
+            bare `pl.Datetime`).
         RuntimeError
             If called on a closed `Client` instance.
 
@@ -987,7 +991,7 @@ class Client:
             f"schema={schema_mode}",
         ]
         if isinstance(location, str):
-            safe_location = _sanitize_explain_value(location)
+            safe_location = _sanitize_single_line(location)
             if safe_location:
                 explain_parts.append(f"location={safe_location}")
         if maximum_bytes_billed is not None:

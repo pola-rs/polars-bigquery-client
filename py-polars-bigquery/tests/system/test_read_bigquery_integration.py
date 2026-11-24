@@ -507,22 +507,60 @@ def test_scan_table_zero_column_hour_ingestion_time_partitioned(client):
         client.read_query(f"DROP SCHEMA IF EXISTS `{project}.{dataset}` CASCADE")
 
 
-def _rest_bigquery_post(client, project: str, path: str, payload: dict) -> dict:
-    import requests
-
+def _rest_bigquery_headers(client, project: str) -> dict[str, str]:
     token_data, _ = client.credentials_provider()
-    resp = requests.post(
+    return {
+        "Authorization": f"Bearer {token_data['bearer_token']}",
+        "Content-Type": "application/json",
+        "User-Agent": client._user_agent,
+        "x-goog-user-project": project,
+    }
+
+
+def _rest_bigquery_post(client, project: str, path: str, payload: dict) -> dict:
+    session = client._rest_client.session
+    with session.post(
         f"https://bigquery.googleapis.com/bigquery/v2/projects/{project}/{path}",
-        headers={
-            "Authorization": f"Bearer {token_data['bearer_token']}",
-            "Content-Type": "application/json",
-            "x-goog-user-project": project,
-        },
+        headers=_rest_bigquery_headers(client, project),
         json=payload,
         timeout=60,
+    ) as resp:
+        resp.raise_for_status()
+        return resp.json()
+
+
+def _rest_bigquery_query(client, project: str, sql: str) -> dict:
+    """Execute DDL/DML via BigQuery REST `jobs.query` and wait until complete."""
+    import time
+
+    session = client._rest_client.session
+    data = _rest_bigquery_post(
+        client,
+        project,
+        "queries",
+        {"query": sql, "useLegacySql": False, "timeoutMs": 60_000},
     )
-    resp.raise_for_status()
-    return resp.json()
+    deadline = time.monotonic() + 120.0
+    while not data.get("jobComplete", False):
+        if time.monotonic() >= deadline:
+            raise TimeoutError(f"Timed out waiting for BigQuery query job: {data!r}")
+        job_ref = data["jobReference"]
+        job_id = job_ref["jobId"]
+        params: dict[str, str | int] = {"timeoutMs": 30_000}
+        if "location" in job_ref:
+            params["location"] = job_ref["location"]
+        with session.get(
+            f"https://bigquery.googleapis.com/bigquery/v2/projects/{project}/queries/{job_id}",
+            headers=_rest_bigquery_headers(client, project),
+            params=params,
+            timeout=60,
+        ) as resp:
+            resp.raise_for_status()
+            data = resp.json()
+    errors = data.get("errors")
+    if errors:
+        raise AssertionError(f"BigQuery query failed with errors: {errors!r}")
+    return data
 
 
 def test_scan_query_extension_and_struct_wire_parity(client):
@@ -598,23 +636,15 @@ def test_scan_table_extension_partition_skipping_and_empty_tables(client):
 
         # 2. All-unsupported physical column on DAY ingestion-time partitioned table
         day_tbl = f"{fq_ds}.day_interval"
-        _rest_bigquery_post(
+        _rest_bigquery_query(
             client,
             project,
-            "queries",
-            {
-                "query": f"CREATE TABLE `{day_tbl}` (dur INTERVAL) PARTITION BY _PARTITIONDATE",
-                "useLegacySql": False,
-            },
+            f"CREATE TABLE `{day_tbl}` (dur INTERVAL) PARTITION BY _PARTITIONDATE",
         )
-        _rest_bigquery_post(
+        _rest_bigquery_query(
             client,
             project,
-            "queries",
-            {
-                "query": f"INSERT INTO `{day_tbl}` (dur) VALUES (INTERVAL 1 DAY), (INTERVAL 2 HOUR)",
-                "useLegacySql": False,
-            },
+            f"INSERT INTO `{day_tbl}` (dur) VALUES (INTERVAL 1 DAY), (INTERVAL 2 HOUR)",
         )
         with pytest.warns(UnsupportedTypeWarning, match=r"dur \(INTERVAL\)"):
             day_df = client.scan_table(day_tbl).collect()
@@ -628,23 +658,15 @@ def test_scan_table_extension_partition_skipping_and_empty_tables(client):
 
         # 3. All-unsupported physical column on HOUR ingestion-time partitioned table
         hour_tbl = f"{fq_ds}.hour_interval"
-        _rest_bigquery_post(
+        _rest_bigquery_query(
             client,
             project,
-            "queries",
-            {
-                "query": f"CREATE TABLE `{hour_tbl}` (dur INTERVAL) PARTITION BY TIMESTAMP_TRUNC(_PARTITIONTIME, HOUR)",
-                "useLegacySql": False,
-            },
+            f"CREATE TABLE `{hour_tbl}` (dur INTERVAL) PARTITION BY TIMESTAMP_TRUNC(_PARTITIONTIME, HOUR)",
         )
-        _rest_bigquery_post(
+        _rest_bigquery_query(
             client,
             project,
-            "queries",
-            {
-                "query": f"INSERT INTO `{hour_tbl}` (dur) VALUES (INTERVAL 1 DAY)",
-                "useLegacySql": False,
-            },
+            f"INSERT INTO `{hour_tbl}` (dur) VALUES (INTERVAL 1 DAY)",
         )
         with pytest.warns(UnsupportedTypeWarning, match=r"dur \(INTERVAL\)"):
             hour_df = client.scan_table(hour_tbl).collect()
@@ -653,14 +675,10 @@ def test_scan_table_extension_partition_skipping_and_empty_tables(client):
 
         # 4. Non-partitioned all-unsupported table raises UnsupportedTypeError without warning
         bad_tbl = f"{fq_ds}.bad_only"
-        _rest_bigquery_post(
+        _rest_bigquery_query(
             client,
             project,
-            "queries",
-            {
-                "query": f"CREATE TABLE `{bad_tbl}` (dur INTERVAL)",
-                "useLegacySql": False,
-            },
+            f"CREATE TABLE `{bad_tbl}` (dur INTERVAL)",
         )
         with warnings.catch_warnings(record=True) as caught:
             warnings.simplefilter("always")

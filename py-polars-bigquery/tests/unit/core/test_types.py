@@ -11,6 +11,7 @@ from polars_bigquery.core.types import (
     BQType,
     build_extension_dtype,
     column_width_rank,
+    has_bignumeric_dtype,
     polars_datetime_time_unit,
     polars_dtype_to_bq_type,
 )
@@ -433,12 +434,88 @@ def test_polars_datetime_time_unit(dtype, expected):
         (pl.Duration("us"), 7),
         (pl.Float16(), 7),
         (pl.Decimal(76, 38), 7),
+        (pl.List(pl.Decimal(76, 38)), 7),
+        (pl.Struct({"x": pl.Decimal(76, 38)}), 7),
+        (pl.List(pl.Duration("us")), 7),
+        (pl.Struct({"x": pl.Duration("us")}), 7),
+        (pl.Extension(JSON_EXTENSION_NAME, pl.Decimal(76, 38)), 7),
+        (pl.Extension(JSON_EXTENSION_NAME, pl.List(pl.Decimal(76, 38))), 7),
+        (pl.Extension("custom:bn", pl.Decimal(76, 38)), 7),
         (pl.Extension("custom:bool", pl.Boolean()), 1),
         (pl.Extension("custom:bin", pl.Binary()), 5),
+        (
+            pl.Extension(
+                "custom:outer",
+                pl.Extension("custom:inner", pl.Boolean()),
+            ),
+            1,
+        ),
     ],
 )
 def test_column_width_rank(dtype, expected_rank):
     assert column_width_rank(dtype) == expected_rank
+
+
+def test_column_width_rank_shared_struct_field_dtype_and_invalid_bq_extensions():
+    shared_int = pl.Int64()
+    shared_struct = pl.Struct([pl.Field("a", shared_int), pl.Field("b", shared_int)])
+    assert column_width_rank(shared_struct) == 6
+    assert column_width_rank(pl.Struct([])) == 6
+
+    assert (
+        polars_dtype_to_bq_type(pl.Extension(JSON_EXTENSION_NAME, pl.Decimal(76, 38)))
+        is None
+    )
+    assert (
+        polars_dtype_to_bq_type(pl.Extension(JSON_EXTENSION_NAME, pl.List(pl.Int64())))
+        is None
+    )
+    assert (
+        polars_dtype_to_bq_type(pl.Extension(GEOGRAPHY_EXTENSION_NAME, pl.Int64()))
+        is None
+    )
+
+
+def test_extension_cycle_and_depth_guards():
+    class _SelfCycleExt(pl.BaseExtension):
+        def ext_storage(self):
+            return self
+
+    class _FreshWrapperCycleExt(pl.BaseExtension):
+        def ext_storage(self):
+            return _FreshWrapperCycleExt("custom:fresh", pl.String())
+
+    self_cycle = _SelfCycleExt("custom:self", pl.String())
+    assert has_bignumeric_dtype(self_cycle) is False
+    assert column_width_rank(self_cycle) == 7
+    assert column_width_rank(pl.List(self_cycle)) == 7
+
+    fresh_cycle = _FreshWrapperCycleExt("custom:fresh", pl.String())
+    assert has_bignumeric_dtype(fresh_cycle) is False
+    assert column_width_rank(fresh_cycle) == 7
+    assert column_width_rank(pl.Struct({"x": fresh_cycle})) == 7
+
+
+def test_has_bignumeric_dtype_nested():
+    bn = pl.Decimal(precision=76, scale=38)
+    num = pl.Decimal(precision=38, scale=9)
+    unparam = pl.Decimal(precision=38, scale=9)
+    unparam.precision = None  # type: ignore[misc]
+
+    assert has_bignumeric_dtype(bn) is True
+    assert has_bignumeric_dtype(pl.List(bn)) is True
+    assert has_bignumeric_dtype(pl.Array(bn, 2)) is True
+    assert has_bignumeric_dtype(pl.Struct([pl.Field("x", pl.List(bn))])) is True
+    assert has_bignumeric_dtype(pl.Extension("custom:bn", bn)) is True
+    assert has_bignumeric_dtype(pl.Extension(JSON_EXTENSION_NAME, bn)) is True
+    assert has_bignumeric_dtype(num) is False
+    assert has_bignumeric_dtype(unparam) is False
+    assert has_bignumeric_dtype(pl.Extension("custom:num", num)) is False
+    assert has_bignumeric_dtype(pl.List(num)) is False
+    assert has_bignumeric_dtype(pl.Struct([pl.Field("x", pl.Int64())])) is False
+    if hasattr(pl, "Map"):
+        assert has_bignumeric_dtype(pl.Map(pl.String(), bn)) is True
+        assert has_bignumeric_dtype(pl.Map(pl.String(), pl.Int64())) is False
 
 
 def test_column_width_rank_unparameterized_decimal_and_bq_type_override():

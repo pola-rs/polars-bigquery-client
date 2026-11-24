@@ -311,7 +311,12 @@ def test_json_literal_to_sql_all_scalar_types_and_immutability() -> None:
         _json_literal_to_sql({"DateTime": [5000, "Nanoseconds"]})
         == "TIMESTAMP_MICROS(5)"
     )
+    assert (
+        _json_literal_to_sql({"DateTime": [-5000, "Nanoseconds"]})
+        == "TIMESTAMP_MICROS(-5)"
+    )
     assert _json_literal_to_sql({"DateTime": [5555, "Nanoseconds"]}) is None
+    assert _json_literal_to_sql({"DateTime": [-5555, "Nanoseconds"]}) is None
     assert _json_literal_to_sql({"DateTime": [10, "Seconds"]}) is None
 
     # Malformed literal values catch ValueError/TypeError locally and return None
@@ -2141,7 +2146,7 @@ def test_emit_coalesce_sql_rejects_invalid_inputs(
         ),
         pytest.param(
             pl.when(pl.col("a") == 1).then(True).otherwise(True),
-            "IF((`a` = 1), TRUE, TRUE)",
+            "",
             id="boolean_when_both_branches_true",
         ),
         pytest.param(
@@ -2238,7 +2243,7 @@ def test_emit_coalesce_sql_rejects_invalid_inputs(
             pl.when(pl.col("a") == 1)
             .then(pl.when(pl.col("b") == 2).then(True).otherwise(True))
             .otherwise(pl.col("c") == 3),
-            "IF((`a` = 1), IF((`b` = 2), TRUE, TRUE), (`c` = 3))",
+            "IF((`a` = 1), TRUE, (`c` = 3))",
             id="nested_truthy_when_in_truthy_branch",
         ),
         pytest.param(
@@ -3737,6 +3742,7 @@ def test_column_to_sql_identifier_rejects_control_and_line_break_whitespace(
 
 def test_column_to_sql_identifier_allows_unicode_space_separators() -> None:
     assert compiler.sql.column_to_sql_identifier("first name") == "`first name`"
+    assert compiler.sql.column_to_sql_identifier("a\u00a0b") == "`a\u00a0b`"
     assert compiler.sql.column_to_sql_identifier("a\u3000b") == "`a\u3000b`"
 
 
@@ -3780,4 +3786,477 @@ def test_drop_nulls_broadcast_superset_differential_regression() -> None:
     assert (
         compiler.predicate_to_row_restriction(pl.col("flag").is_not_null())
         == "(`flag` IS NOT NULL)"
+    )
+
+
+def test_flatten_expr_bfs_maintains_parent_before_child_invariant() -> None:
+    """`flatten_expr_bfs` returns nodes/edges with `parent < child` without recursion."""
+    from polars_bigquery.core.compiler._traversal import flatten_expr_bfs
+
+    deep: compiler.ir.Expr = compiler.ir.Column("z")
+    for _ in range(1_200):
+        deep = compiler.ir.And(left=compiler.ir.Column("a"), right=deep)
+
+    nodes, children_map = flatten_expr_bfs(deep)
+    assert len(nodes) == 2_401
+    assert len(children_map) == len(nodes)
+    for parent_idx, child_indices in enumerate(children_map):
+        for child_idx in child_indices:
+            assert parent_idx < child_idx
+
+
+def test_rewrite_boolean_when_expansion_cap_degrades_to_unsupported(
+    monkeypatch,
+) -> None:
+    """Bounding `MAX_BOOLEAN_WHEN_REWRITE_NODES` degrades huge `Ternary` rewrites."""
+    from polars_bigquery.core.compiler.rewriter import boolean as boolean_rewriter
+
+    nested = compiler.ir.Ternary(
+        predicate=compiler.ir.Eq(compiler.ir.Column("a"), compiler.ir.IntLiteral(1)),
+        truthy=compiler.ir.Eq(compiler.ir.Column("b"), compiler.ir.IntLiteral(2)),
+        falsy=compiler.ir.Unsupported(),
+    )
+    monkeypatch.setattr(boolean_rewriter, "MAX_BOOLEAN_WHEN_REWRITE_NODES", 5)
+    assert boolean_rewriter.rewrite_boolean_when(nested) == compiler.ir.Unsupported()
+
+    # `truthy` falsy (`Ternary(p, False, f)` -> `And(Not(Coalesce(p, False)), f)`)
+    # adds 2 nodes (`extra_cost = 2`); degrade when budget is insufficient.
+    truthy_false = compiler.ir.Ternary(
+        predicate=compiler.ir.Column("a"),
+        truthy=compiler.ir.BoolLiteral(False),
+        falsy=compiler.ir.Column("b"),
+    )
+    monkeypatch.setattr(boolean_rewriter, "MAX_BOOLEAN_WHEN_REWRITE_NODES", 5)
+    assert (
+        boolean_rewriter.rewrite_boolean_when(truthy_false) == compiler.ir.Unsupported()
+    )
+    monkeypatch.setattr(boolean_rewriter, "MAX_BOOLEAN_WHEN_REWRITE_NODES", 6)
+    assert boolean_rewriter.rewrite_boolean_when(truthy_false) == compiler.ir.And(
+        left=compiler.ir.Not(
+            expr=compiler.ir.Coalesce(
+                operands=(compiler.ir.Column("a"), compiler.ir.BoolLiteral(False))
+            )
+        ),
+        right=compiler.ir.Column("b"),
+    )
+
+
+def test_rewrite_boolean_when_suppresses_tautology_and_scales_linearly() -> None:
+    """Boolean `when` chains with only trivial branches omit tautological SQL and stay O(N)."""
+    import time
+
+    from polars_bigquery.core.compiler.rewriter import boolean as boolean_rewriter
+
+    # Two-branch chain where the fallback branch becomes Unsupported must NOT emit
+    # `((`good` = 1) OR (NOT COALESCE((`good` = 1), FALSE)))`.
+    taut_chain = (
+        pl.when(pl.col("good") == 1)
+        .then(True)
+        .when(pl.col("i") * 2 == 4)
+        .then(True)
+        .otherwise(False)
+    )
+    assert compiler.predicate_to_row_restriction(taut_chain) == ""
+    assert compiler.compile_predicate(taut_chain) == compiler.CompiledPredicate(
+        conjuncts=(), is_exact=False
+    )
+
+    # Both branches Unsupported (e.g. non-boolean expressions) degrades immediately.
+    unsup_both = (
+        pl.when(pl.col("good") == 1).then(pl.col("i") * 2).otherwise(pl.col("i") * 3)
+    )
+    assert compiler.predicate_to_row_restriction(unsup_both) == ""
+
+    # When both branches are `True`, an exact predicate simplifies to `TRUE` (`is_exact=True`),
+    # whereas an `Unsupported` predicate degrades to `Unsupported()` (`is_exact=False`).
+    assert compiler.compile_predicate(
+        pl.when(pl.col("good") == 1).then(True).otherwise(True)
+    ) == compiler.CompiledPredicate(conjuncts=(), is_exact=True)
+    assert compiler.compile_predicate(
+        pl.when(pl.col("i") * 2 == 4).then(True).otherwise(True)
+    ) == compiler.CompiledPredicate(conjuncts=(), is_exact=False)
+
+    # `Not(Or(...))` and negated `when(Or(...)).then(False).otherwise(True)` branches split
+    # via De Morgan's law must NOT be dropped as unconstrained tautologies.
+    de_morgan_chain = (
+        pl.when(pl.col("good") == 1)
+        .then(True)
+        .otherwise(~((pl.col("a") == 2) | (pl.col("i") * 2 == 4)))
+    )
+    assert (
+        compiler.predicate_to_row_restriction(de_morgan_chain)
+        == "((`good` = 1) OR ((NOT COALESCE((`good` = 1), FALSE)) AND (NOT (`a` = 2))))"
+    )
+    de_morgan_when_chain = (
+        pl.when(pl.col("good") == 1)
+        .then(True)
+        .when((pl.col("a") == 2) | (pl.col("i") * 2 == 4))
+        .then(False)
+        .otherwise(True)
+    )
+    assert (
+        compiler.predicate_to_row_restriction(de_morgan_when_chain)
+        == "((`good` = 1) OR ((NOT COALESCE((`good` = 1), FALSE)) AND (NOT COALESCE((`a` = 2), FALSE))))"
+    )
+
+    # `rewrite_boolean_when_node` and `rewrite_boolean_when` share the same tautology rule.
+    ir_taut = compiler.ir.Ternary(
+        predicate=compiler.ir.Eq(compiler.ir.Column("good"), compiler.ir.IntLiteral(1)),
+        truthy=compiler.ir.BoolLiteral(True),
+        falsy=compiler.ir.Unsupported(),
+    )
+    assert (
+        boolean_rewriter.rewrite_boolean_when_node(ir_taut) == compiler.ir.Unsupported()
+    )
+    assert boolean_rewriter.rewrite_boolean_when(ir_taut) == compiler.ir.Unsupported()
+
+    ir_taut_eq_unsup = compiler.ir.Ternary(
+        predicate=compiler.ir.Eq(compiler.ir.Column("good"), compiler.ir.IntLiteral(1)),
+        truthy=compiler.ir.BoolLiteral(True),
+        falsy=compiler.ir.Eq(compiler.ir.Unsupported(), compiler.ir.IntLiteral(4)),
+    )
+    assert (
+        boolean_rewriter.rewrite_boolean_when_node(ir_taut_eq_unsup)
+        == compiler.ir.Unsupported()
+    )
+    assert (
+        boolean_rewriter.rewrite_boolean_when(ir_taut_eq_unsup)
+        == compiler.ir.Unsupported()
+    )
+
+    ir_pred_unsup_true = compiler.ir.Ternary(
+        predicate=compiler.ir.Unsupported(),
+        truthy=compiler.ir.BoolLiteral(True),
+        falsy=compiler.ir.BoolLiteral(True),
+    )
+    assert (
+        boolean_rewriter.rewrite_boolean_when_node(ir_pred_unsup_true)
+        == compiler.ir.Unsupported()
+    )
+    assert (
+        boolean_rewriter.rewrite_boolean_when(ir_pred_unsup_true)
+        == compiler.ir.Unsupported()
+    )
+
+    # Verify linear O(N) runtime on a 1,600-deep chained Ternary (was ~1.45s quadratic).
+    deep_chain: compiler.ir.Expr = compiler.ir.Column("z")
+    for _ in range(1_600):
+        deep_chain = compiler.ir.Ternary(
+            predicate=compiler.ir.Column("p"),
+            truthy=compiler.ir.Column("t"),
+            falsy=deep_chain,
+        )
+    t0 = time.perf_counter()
+    rewritten = boolean_rewriter.rewrite_boolean_when(deep_chain)
+    elapsed = time.perf_counter() - t0
+    assert isinstance(rewritten, compiler.ir.Ternary)
+    assert elapsed < 0.5, f"expected linear rewrite, took {elapsed:.3f}s"
+
+
+def test_rewrite_boolean_when_weights_list_literals_against_budget(monkeypatch) -> None:
+    """Large `ListLiteral` predicates must count toward the expansion budget."""
+    from polars_bigquery.core.compiler.rewriter import boolean as boolean_rewriter
+
+    big_list = compiler.ir.ListLiteral(
+        values=tuple(compiler.ir.IntLiteral(i) for i in range(50))
+    )
+    nested = compiler.ir.Ternary(
+        predicate=compiler.ir.IsIn(compiler.ir.Column("a"), big_list),
+        truthy=compiler.ir.Eq(compiler.ir.Column("b"), compiler.ir.IntLiteral(2)),
+        falsy=compiler.ir.And(compiler.ir.Column("c"), compiler.ir.Unsupported()),
+    )
+    monkeypatch.setattr(boolean_rewriter, "MAX_BOOLEAN_WHEN_REWRITE_NODES", 80)
+    assert boolean_rewriter.rewrite_boolean_when(nested) == compiler.ir.Unsupported()
+
+
+def test_compile_ir_conjuncts_to_sql_skips_null_literal() -> None:
+    """Bare top-level `NullLiteral` conjuncts are omitted with `is_exact=False`."""
+    assert compiler.sql.compile_ir_conjuncts_to_sql(compiler.ir.NullLiteral()) == (
+        (),
+        False,
+    )
+    assert compiler.sql.compile_ir_conjuncts_to_sql(
+        compiler.ir.And(
+            left=compiler.ir.Eq(compiler.ir.Column("a"), compiler.ir.IntLiteral(1)),
+            right=compiler.ir.NullLiteral(),
+        )
+    ) == (("(`a` = 1)",), False)
+    assert compiler.compile_predicate(pl.lit(None)) == compiler.CompiledPredicate(
+        conjuncts=(), is_exact=False
+    )
+    assert compiler.compile_predicate(
+        pl.lit(True) & pl.lit(None)
+    ) == compiler.CompiledPredicate(conjuncts=(), is_exact=False)
+    assert compiler.compile_predicate(
+        (pl.col("a") == 1) & pl.lit(None)
+    ) == compiler.CompiledPredicate(conjuncts=("(`a` = 1)",), is_exact=False)
+
+
+def test_float32_literal_widens_through_ieee754_binary32() -> None:
+    """Float32 literal 0.1 must match Polars' f32->f64 widened value, not f64 0.1."""
+    import math
+    import struct
+
+    expected_val = struct.unpack("<f", struct.pack("<f", 0.1))[0]
+    assert expected_val != 0.1
+
+    sql = compiler.predicate_to_row_restriction(
+        pl.col("f") == pl.lit(0.1, dtype=pl.Float32),
+    )
+    assert sql == f"(`f` = {expected_val!r})"
+
+    # Exact dyadic rationals remain unchanged through binary32 packing
+    for exact in (0.25, 0.5, 1.5):
+        assert (
+            compiler.predicate_to_row_restriction(
+                pl.col("f") == pl.lit(exact, dtype=pl.Float32)
+            )
+            == f"(`f` = {exact!r})"
+        )
+
+    # Subnormal binary32 value preserves single-precision rounding
+    subnormal_expected = struct.unpack("<f", struct.pack("<f", 1e-40))[0]
+    assert compiler.parser.numeric.parse_float32_literal(
+        1e-40
+    ) == compiler.ir.FloatLiteral(value=subnormal_expected)
+
+    # Special IEEE-754 float32 values round-trip cleanly
+    nan_ir = compiler.parser.numeric.parse_float32_literal(float("nan"))
+    assert isinstance(nan_ir, compiler.ir.FloatLiteral) and math.isnan(nan_ir.value)
+    assert compiler.parser.numeric.parse_float32_literal(
+        float("inf")
+    ) == compiler.ir.FloatLiteral(value=float("inf"))
+    assert compiler.parser.numeric.parse_float32_literal(
+        float("-inf")
+    ) == compiler.ir.FloatLiteral(value=float("-inf"))
+
+    # bool and float64/float32 overflows degrade cleanly to Unsupported
+    assert (
+        compiler.parser.numeric.parse_float32_literal(True) == compiler.ir.Unsupported()
+    )
+    assert (
+        compiler.parser.numeric.parse_float32_literal(False)
+        == compiler.ir.Unsupported()
+    )
+    assert (
+        compiler.parser.numeric.parse_float32_literal(10**400)
+        == compiler.ir.Unsupported()
+    )
+    assert (
+        compiler.parser.numeric.parse_float32_literal("1e500")
+        == compiler.ir.Unsupported()
+    )
+    assert (
+        compiler.parser.numeric.parse_float32_literal(-1e50)
+        == compiler.ir.Unsupported()
+    )
+
+    # Out-of-range float32 value overflows binary32 -> falls back to Unsupported ("")
+    assert compiler._json_expr_to_compiled_predicate(
+        {
+            "BinaryExpr": {
+                "left": {"Column": "f"},
+                "op": "Eq",
+                "right": {"Literal": {"Scalar": {"Float32": 1e50}}},
+            }
+        },
+    ) == compiler.CompiledPredicate(conjuncts=(), is_exact=False)
+
+
+def test_nanosecond_datetime_literals_preserve_unit_and_reject_submicrosecond() -> None:
+    """Exact-microsecond `ns` literals preserve `TimestampUnit.NANOSECONDS`; inexact ones degrade."""
+    import datetime as dt
+
+    ts_us_2024 = 1_704_067_200_000_000
+    ts_ns_2024 = ts_us_2024 * 1_000
+
+    # IR preserves `TimestampUnit.NANOSECONDS` (does NOT collapse to `MICROSECONDS`)
+    # so downstream unit-sensitive passes (e.g. `fill_null(strategy="one")`) keep
+    # the original `"ns"` unit.
+    assert compiler.json_to_ir(
+        {"Literal": {"Scalar": {"Datetime": [ts_ns_2024, "Nanoseconds", None]}}}
+    ) == compiler.ir.TimestampLiteral(
+        ticks=ts_ns_2024,
+        unit=compiler.ir.TimestampUnit.NANOSECONDS,
+        tz=None,
+    )
+    assert compiler.json_to_ir(
+        {"Literal": {"Scalar": {"Datetime": [-1000, "Nanoseconds", "UTC"]}}}
+    ) == compiler.ir.TimestampLiteral(
+        ticks=-1000,
+        unit=compiler.ir.TimestampUnit.NANOSECONDS,
+        tz="UTC",
+    )
+
+    # Exact-microsecond scalar `ns` literals push down to BigQuery `TIMESTAMP_MICROS`.
+    assert (
+        compiler.predicate_to_row_restriction(
+            pl.col("dt_us") == pl.lit(dt.datetime(2024, 1, 1), dtype=pl.Datetime("ns"))  # noqa: DTZ001
+        )
+        == f"(`dt_us` = DATETIME(TIMESTAMP_MICROS({ts_us_2024})))"
+    )
+    assert (
+        compiler.predicate_to_row_restriction(
+            pl.col("ts_us")
+            == pl.lit(
+                dt.datetime(2024, 1, 1, tzinfo=dt.timezone.utc),
+                dtype=pl.Datetime("ns", "UTC"),
+            )
+        )
+        == f"(`ts_us` = TIMESTAMP_MICROS({ts_us_2024}))"
+    )
+    # Pre-1970 exact-microsecond `ns` literal (`-1000 ns` == `-1 us`).
+    assert (
+        compiler.predicate_to_row_restriction(
+            pl.col("dt_us")
+            == pl.lit(
+                dt.datetime(1969, 12, 31, 23, 59, 59, 999999),  # noqa: DTZ001
+                dtype=pl.Datetime("ns"),
+            )
+        )
+        == "(`dt_us` = DATETIME(TIMESTAMP_MICROS(-1)))"
+    )
+
+    # Sub-microsecond scalar `ns` literals (`ticks % 1000 != 0`) degrade to Unsupported.
+    for bad_ns in (1, 500, -1, -1500):
+        assert compiler._json_expr_to_compiled_predicate(
+            {
+                "BinaryExpr": {
+                    "left": {"Column": "ts_us"},
+                    "op": "Eq",
+                    "right": {
+                        "Literal": {
+                            "Scalar": {"Datetime": [bad_ns, "Nanoseconds", "UTC"]}
+                        }
+                    },
+                }
+            }
+        ) == compiler.CompiledPredicate(conjuncts=(), is_exact=False)
+
+    # Defensive guard inside SQL emitter for manually constructed inexact `ns` IR nodes.
+    with pytest.raises(ValueError, match="Sub-microsecond nanosecond timestamp"):
+        compiler.ir_to_sql(
+            compiler.ir.TimestampLiteral(
+                ticks=5555, unit=compiler.ir.TimestampUnit.NANOSECONDS, tz="UTC"
+            )
+        )
+
+    # Verify `when(...).then(<ns literal>).otherwise(None)` retains `NANOSECONDS` on the
+    # IR branch so downstream unit-sensitive lowering passes (e.g. `fill_null(strategy="one")`)
+    # do not mistake a `Datetime("ns")` literal for `"us"`.
+    when_ns_naive = (
+        pl.when(pl.col("flag"))
+        .then(pl.lit(dt.datetime(2024, 1, 1), dtype=pl.Datetime("ns")))  # noqa: DTZ001
+        .otherwise(None)
+    )
+    when_buf = io.BytesIO()
+    when_ns_naive.meta.serialize(when_buf, format="json")
+    when_ir = compiler.json_to_ir(json.loads(when_buf.getvalue()))
+    assert isinstance(when_ir, compiler.ir.Ternary)
+    assert when_ir.truthy == compiler.ir.TimestampLiteral(
+        ticks=ts_ns_2024,
+        unit=compiler.ir.TimestampUnit.NANOSECONDS,
+        tz=None,
+    )
+
+    when_ns_utc = (
+        pl.when(pl.col("flag"))
+        .then(
+            pl.lit(
+                dt.datetime(2024, 1, 1, tzinfo=dt.timezone.utc),
+                dtype=pl.Datetime("ns", "UTC"),
+            )
+        )
+        .otherwise(None)
+    )
+    when_utc_buf = io.BytesIO()
+    when_ns_utc.meta.serialize(when_utc_buf, format="json")
+    when_utc_ir = compiler.json_to_ir(json.loads(when_utc_buf.getvalue()))
+    assert isinstance(when_utc_ir, compiler.ir.Ternary)
+    assert when_utc_ir.truthy == compiler.ir.TimestampLiteral(
+        ticks=ts_ns_2024,
+        unit=compiler.ir.TimestampUnit.NANOSECONDS,
+        tz="UTC",
+    )
+
+    # `is_in` with an exact-microsecond `Datetime("ns")` Series pushes down.
+    ns_series = pl.Series(
+        [dt.datetime(2024, 1, 1)],  # noqa: DTZ001
+        dtype=pl.Datetime("ns"),
+    )
+    assert (
+        compiler.predicate_to_row_restriction(pl.col("dt_us").is_in(ns_series))
+        == f"(`dt_us` IN (DATETIME(TIMESTAMP_MICROS({ts_us_2024}))))"
+    )
+
+    ns_utc_series = pl.Series(
+        [dt.datetime(2024, 1, 1, tzinfo=dt.timezone.utc)],
+        dtype=pl.Datetime("ns", "UTC"),
+    )
+    assert (
+        compiler.predicate_to_row_restriction(pl.col("ts_us").is_in(ns_utc_series))
+        == f"(`ts_us` IN (TIMESTAMP_MICROS({ts_us_2024})))"
+    )
+
+    # `is_in` IPC Series also preserves `TimestampUnit.NANOSECONDS` in the IR.
+    ipc_buf = io.BytesIO()
+    ns_utc_series.to_frame().write_ipc_stream(ipc_buf)
+    assert compiler.parser.list_.parse_ipc_series_to_list_literal(
+        ipc_buf.getvalue()
+    ) == compiler.ir.ListLiteral(
+        values=(
+            compiler.ir.TimestampLiteral(
+                ticks=ts_ns_2024,
+                unit=compiler.ir.TimestampUnit.NANOSECONDS,
+                tz="UTC",
+            ),
+        )
+    )
+
+    # `is_in` with ANY sub-microsecond `Datetime("ns")` element degrades to Unsupported.
+    inexact_ns_series = pl.Series([0, 500], dtype=pl.Int64).cast(pl.Datetime("ns"))
+    assert (
+        compiler.predicate_to_row_restriction(pl.col("dt_us").is_in(inexact_ns_series))
+        == ""
+    )
+    inexact_ns_utc_series = pl.Series([0, -1500], dtype=pl.Int64).cast(
+        pl.Datetime("ns", "UTC")
+    )
+    assert (
+        compiler.predicate_to_row_restriction(
+            pl.col("ts_us").is_in(inexact_ns_utc_series)
+        )
+        == ""
+    )
+
+    # Exact sibling conjunct survives partial pushdown alongside an unsupported `ns` branch.
+    inexact_partial = pl.col("dt_us").is_in(inexact_ns_series) & pl.col("flag")
+    assert compiler.predicate_to_row_restriction(inexact_partial) == "`flag`"
+
+
+def test_is_in_series_excludes_float16_and_uint128() -> None:
+    """`parser/list_.py` must reject `Float16` and `UInt128` Series like `core/types.py`."""
+    import struct
+    import warnings
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", DeprecationWarning)
+        f16_expr = pl.col("f").is_in(pl.Series([0.1], dtype=pl.Float16))
+        u128_expr = pl.col("i").is_in(pl.Series([1, 2], dtype=pl.UInt128))
+    assert compiler.predicate_to_row_restriction(f16_expr) == ""
+    assert compiler.predicate_to_row_restriction(u128_expr) == ""
+
+    # Supported Float32/Int128 Series still compile (with Float32 rounded to binary32).
+    expected_f32 = struct.unpack("<f", struct.pack("<f", 0.1))[0]
+    assert (
+        compiler.predicate_to_row_restriction(
+            pl.col("f").is_in(pl.Series([0.1], dtype=pl.Float32))
+        )
+        == f"(`f` IN ({expected_f32!r}))"
+    )
+    assert (
+        compiler.predicate_to_row_restriction(
+            pl.col("i").is_in(pl.Series([1, 2], dtype=pl.Int128))
+        )
+        == "(`i` IN (1, 2))"
     )

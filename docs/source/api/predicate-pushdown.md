@@ -116,7 +116,7 @@ When [`Client.scan_table`][polars_bigquery.Client.scan_table] inspects a BigQuer
 | `ARRAY<GEOGRAPHY>` | `pl.Extension("google:sqlType:geography", pl.List(pl.String()), '{"encoding": "WKT"}')` | Extension tag wraps the outer `List` field. |
 | `ARRAY` (`mode="REPEATED"`) | `pl.List(...)` | Preserves field parameters across element recursion. |
 | `STRUCT` / `RECORD` | `pl.Struct(...)` | |
-| `BIGNUMERIC` / `BIGDECIMAL`, `INTERVAL`, `RANGE<T>`, non-microsecond `TIMESTAMP` | *(unsupported)* | Omitted with `UnsupportedTypeWarning` in `scan_table` (`UnsupportedTypeError` if no columns remain); raises `TypeError` in `scan_query`. |
+| `BIGNUMERIC` / `BIGDECIMAL`, `INTERVAL`, `RANGE<T>`, non-microsecond `TIMESTAMP` | *(unsupported)* | Omitted with `UnsupportedTypeWarning` in `scan_table` (`UnsupportedTypeError` if no columns remain); raises `UnsupportedTypeError` in `scan_query`. |
 
 For **ingestion-time partitioned tables** with at least one physical column, [`Client.scan_table`][polars_bigquery.Client.scan_table] (only — not `scan_query`) also exposes pseudo-columns in the `LazyFrame` schema that can be used in `.filter()` predicates for partition pruning:
 

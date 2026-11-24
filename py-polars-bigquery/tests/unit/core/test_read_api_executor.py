@@ -13,6 +13,7 @@ from polars_bigquery.core.executors import (
 )
 from polars_bigquery.core.plan import (
     Filter,
+    PlanNode,
     Project,
     QueryScan,
     Slice,
@@ -335,14 +336,99 @@ def test_compile_read_api_plan_row_restriction_length_guard(caplog) -> None:
     assert "selected_fields=2/2" in debugs[0]
 
 
-def test_zero_column_fallback_deprioritizes_nested_bignumeric() -> None:
+def test_zero_column_fallback_deprioritizes_nested_unsupported_dtypes() -> None:
     scan = _tscan(
         {
             "arr_bn": pl.List(pl.Decimal(precision=76, scale=38)),
             "struct_bn": pl.Struct([pl.Field("x", pl.Decimal(precision=76, scale=38))]),
             "ext_bn": pl.Extension("custom:bn", pl.Decimal(precision=76, scale=38)),
+            "arr_dur": pl.List(pl.Duration("us")),
+            "struct_f16": pl.Struct([pl.Field("f", pl.Float16())]),
             "nested_ok": pl.List(pl.String()),
         }
     )
     compiled = compile_read_api_plan(Project(input=scan, columns=()))
     assert compiled.selected_fields == ("nested_ok",)
+
+
+def test_zero_column_fallback_short_circuits_on_rank_one_bool() -> None:
+    scan = _tscan(
+        {
+            "flag": pl.Boolean(),
+            "later_str": pl.String(),
+            "later_struct": pl.Struct([pl.Field("x", pl.Int64())]),
+        }
+    )
+    with patch(
+        "polars_bigquery.core.executors.read_api.column_width_rank",
+        side_effect=[1],
+    ) as mock_rank:
+        compiled = compile_read_api_plan(Project(input=scan, columns=()))
+    assert compiled.selected_fields == ("flag",)
+    mock_rank.assert_called_once_with(pl.Boolean())
+
+
+def test_zero_column_fallback_handles_decimal_none_precision() -> None:
+    from polars_bigquery.core.types import column_width_rank
+
+    dec_unspec = pl.Decimal(38, 2)
+    dec_unspec.precision = None  # type: ignore[misc]
+    assert column_width_rank(dec_unspec) == 7
+    assert column_width_rank(pl.Decimal(38, 9)) == 4
+    assert column_width_rank(pl.Decimal(76, 38)) == 7
+
+
+def test_read_api_executor_max_stream_count_boundaries() -> None:
+    from polars_bigquery.core.executors.read_api import _SINGLE_STREAM_ROW_LIMIT
+
+    scan = _tscan({"id": pl.Int64()})
+    cases: list[tuple[str, PlanNode, int | None]] = [
+        ("zero_limit", Slice(input=scan, offset=0, length=0), 1),
+        (
+            "at_threshold",
+            Slice(input=scan, offset=0, length=_SINGLE_STREAM_ROW_LIMIT),
+            1,
+        ),
+        (
+            "above_threshold",
+            Slice(input=scan, offset=0, length=_SINGLE_STREAM_ROW_LIMIT + 1),
+            None,
+        ),
+        ("nonzero_offset", Slice(input=scan, offset=100_000, length=10), None),
+        (
+            "nonzero_offset_then_small_slice",
+            Slice(
+                input=Slice(input=scan, offset=100_000, length=50_000),
+                offset=0,
+                length=10,
+            ),
+            None,
+        ),
+        (
+            "large_leading_slice_then_small_slice",
+            Slice(
+                input=Slice(
+                    input=scan, offset=0, length=_SINGLE_STREAM_ROW_LIMIT + 100
+                ),
+                offset=0,
+                length=10,
+            ),
+            1,
+        ),
+    ]
+    for label, plan, expected_max_streams in cases:
+        mock_arrow_client = MagicMock()
+        mock_arrow_client.read_table.return_value = MagicMock(name="exporter")
+        executor = ReadApiExecutor(mock_arrow_client)
+        with patch(
+            "polars.scan_arrow_c_stream",
+            return_value=pl.LazyFrame({"id": [1, 2, 3]}),
+        ):
+            list(executor.execute(plan))
+        kwargs = mock_arrow_client.read_table.call_args.kwargs
+        if expected_max_streams is None:
+            assert "max_stream_count" not in kwargs, f"unexpected cap for {label}"
+        else:
+            assert kwargs.get("max_stream_count") == expected_max_streams, (
+                f"wrong cap for {label}"
+            )

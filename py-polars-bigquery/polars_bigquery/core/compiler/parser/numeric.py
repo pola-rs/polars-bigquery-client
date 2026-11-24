@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import struct
 from typing import Any
 
 from polars_bigquery.core.compiler.ir.base import (
@@ -35,8 +36,6 @@ INT_TYPES = frozenset(
         "UInt64",
     }
 )
-
-FLOAT_TYPES = frozenset({"Float", "Float32", "Float64"})
 
 BQ_INT64_MIN = -(1 << 63)
 BQ_INT64_MAX = (1 << 63) - 1
@@ -80,23 +79,54 @@ def parse_int_literal(value: Any) -> Expr:
     return IntLiteral(value=int_val)
 
 
-@register_parser(*(f"$.Literal..{float_type}" for float_type in sorted(FLOAT_TYPES)))
-def parse_float_literal(value: Any) -> Expr:
-    """Parse a float value from Polars JSON into a FloatLiteral or Unsupported."""
+def _parse_float_value(value: Any) -> float | None:
+    """Parse a JSON float payload into a Python float, or None when invalid/overflow."""
     if isinstance(value, bool) or not isinstance(value, (int, float, str)):
-        return Unsupported()
+        return None
     if isinstance(value, str):
         val_lower = value.strip().lower()
         if val_lower in ("nan", "+nan", "-nan"):
-            return FloatLiteral(value=float("nan"))
+            return float("nan")
         if val_lower in ("inf", "+inf", "infinity", "+infinity"):
-            return FloatLiteral(value=float("inf"))
+            return float("inf")
         if val_lower in ("-inf", "-infinity"):
-            return FloatLiteral(value=float("-inf"))
+            return float("-inf")
     try:
         float_val = float(value)
     except (TypeError, ValueError, OverflowError):
-        return Unsupported()
+        return None
     if math.isinf(float_val) and not (isinstance(value, float) and math.isinf(value)):
+        return None
+    return float_val
+
+
+@register_parser("$.Literal..Float", "$.Literal..Float64")
+def parse_float_literal(value: Any) -> Expr:
+    """Parse a Float/Float64 value from Polars JSON into a FloatLiteral or Unsupported."""
+    float_val = _parse_float_value(value)
+    if float_val is None:
         return Unsupported()
     return FloatLiteral(value=float_val)
+
+
+@register_parser("$.Literal..Float32")
+def parse_float32_literal(value: Any) -> Expr:
+    """Parse a Float32 value from Polars JSON preserving IEEE-754 single-precision rounding.
+
+    Polars serializes `Float32` literals as their shortest decimal form (e.g.
+    `0.1` instead of `0.10000000149011612`). Round-tripping finite values through
+    IEEE-754 binary32 keeps BigQuery `FLOAT64` comparisons aligned with Polars'
+    `f32 -> f64` promotion so equality pushdown does not drop matching rows.
+    """
+    float_val = _parse_float_value(value)
+    if float_val is None:
+        return Unsupported()
+    if math.isnan(float_val) or math.isinf(float_val):
+        return FloatLiteral(value=float_val)
+    try:
+        widened = struct.unpack("<f", struct.pack("<f", float_val))[0]
+    except OverflowError:
+        return Unsupported()
+    if math.isinf(widened):
+        return Unsupported()
+    return FloatLiteral(value=widened)

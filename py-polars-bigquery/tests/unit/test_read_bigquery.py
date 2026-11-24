@@ -1663,7 +1663,7 @@ def test_client_scan_query_eager_schema_validation(mock_arrow_client):
     with pytest.raises(BigQueryError, match="empty schema"):
         client.scan_query("SELECT 1")
 
-    # Unknown BigQuery type in dry-run raises TypeError eagerly.
+    # Unknown BigQuery type in dry-run raises UnsupportedTypeError eagerly.
     mock_arrow_client.read_query.return_value = pl.DataFrame(
         {
             "bigquerySchema": ['{"fields": [{"name": "x", "type": "BOGUS"}]}'],
@@ -1671,7 +1671,8 @@ def test_client_scan_query_eager_schema_validation(mock_arrow_client):
         }
     )
     with pytest.raises(
-        TypeError, match=r"got unexpected BigQuery type: bogus \(column 'x'\)"
+        UnsupportedTypeError,
+        match=r"got unexpected BigQuery type: bogus \(column 'x'\)",
     ):
         client.scan_query("SELECT x")
 
@@ -2231,7 +2232,7 @@ def test_client_input_type_and_wire_payload_validation(mock_arrow_client):
             client.scan_table("p.d.t")
 
 
-def test_client_scan_bignumeric_raises_clear_type_error(mock_arrow_client):
+def test_client_scan_bignumeric_raises_clear_unsupported_type_error(mock_arrow_client):
     client = Client(quota_project_id="q")
     mock_arrow_client.read_query.return_value = pl.DataFrame(
         {
@@ -2239,7 +2240,7 @@ def test_client_scan_bignumeric_raises_clear_type_error(mock_arrow_client):
             "statementType": ["SELECT"],
         }
     )
-    with pytest.raises(TypeError, match="BIGNUMERIC/BIGDECIMAL"):
+    with pytest.raises(UnsupportedTypeError, match="BIGNUMERIC/BIGDECIMAL"):
         client.scan_query("SELECT bn FROM t")
 
     with (
@@ -2251,10 +2252,10 @@ def test_client_scan_bignumeric_raises_clear_type_error(mock_arrow_client):
     ):
         client.scan_table("p.d.t")
 
-    with pytest.raises(TypeError, match="BIGNUMERIC/BIGDECIMAL.*'bn'"):
+    with pytest.raises(UnsupportedTypeError, match="BIGNUMERIC/BIGDECIMAL.*'bn'"):
         client.scan_table("p.d.t", schema={"bn": pl.Decimal(76, 38)})
 
-    # Nested BIGNUMERIC inside ARRAY (`mode="REPEATED"`) and STRUCT also raise TypeError.
+    # Nested BIGNUMERIC inside ARRAY (`mode="REPEATED"`) and STRUCT also raise UnsupportedTypeError.
     for schema_json, col_name in (
         (
             '{"fields": [{"name": "arr_bn", "type": "BIGNUMERIC", "mode": "REPEATED"}]}',
@@ -2268,11 +2269,13 @@ def test_client_scan_bignumeric_raises_clear_type_error(mock_arrow_client):
         mock_arrow_client.read_query.return_value = pl.DataFrame(
             {"bigquerySchema": [schema_json], "statementType": ["SELECT"]}
         )
-        with pytest.raises(TypeError, match=f"BIGNUMERIC/BIGDECIMAL.*{col_name}"):
+        with pytest.raises(
+            UnsupportedTypeError, match=f"BIGNUMERIC/BIGDECIMAL.*{col_name}"
+        ):
             client.scan_query("SELECT col FROM t")
 
-    # Explicit schema with nested BIGNUMERIC also produces a clear TypeError.
-    with pytest.raises(TypeError, match="BIGNUMERIC/BIGDECIMAL.*'s'"):
+    # Explicit schema with nested BIGNUMERIC also raises UnsupportedTypeError without calling Polars.
+    with pytest.raises(UnsupportedTypeError, match="BIGNUMERIC/BIGDECIMAL.*'s'"):
         client.scan_query(
             "SELECT s FROM t",
             schema={"s": pl.Struct([pl.Field("x", pl.Decimal(76, 38))])},
@@ -2821,3 +2824,144 @@ def test_arrow_bigquery_dependency_pin_tracks_polars_bigquery_version():
         f"py-polars-bigquery {data['project']['version']} must pin "
         f"arrow-bigquery >= {data['project']['version']} (found {arrow_deps[0]!r})"
     )
+
+
+def test_scan_table_sanitizes_control_chars_in_skipped_column_warning(
+    mock_arrow_client,
+):
+    metadata = {
+        "schema": {
+            "fields": [
+                {"name": "id", "type": "INT64"},
+                {"name": "bad\ncol\r\tinject", "type": "INTERVAL"},
+            ]
+        }
+    }
+    with patch(
+        "polars_bigquery.core.bigquery_rest.get_table_metadata", return_value=metadata
+    ):
+        client = Client(quota_project_id="q")
+        with pytest.warns(UnsupportedTypeWarning) as record:
+            client.scan_table("p.d.t")
+    msg = str(record[0].message)
+    assert "\n" not in msg
+    assert "\r" not in msg
+    assert "\t" not in msg
+    assert "bad col inject (INTERVAL)" in msg
+
+
+def test_drop_columns_iter_closes_underlying_batch_iterator():
+    from polars_bigquery.core.executors.base import _iter_project_batches
+
+    closed = False
+
+    def batch_gen():
+        nonlocal closed
+        try:
+            yield pl.DataFrame({"a": [1, 2]})
+            yield pl.DataFrame({"a": [3, 4]})
+        finally:
+            closed = True
+
+    it = _iter_project_batches(batch_gen(), ())
+    first = next(it)
+    assert first.shape == (2, 0)
+    assert not closed
+    it.close()
+    assert closed
+
+
+def test_scan_table_caps_stream_count_on_small_limit(mock_arrow_client):
+    from polars_bigquery.core.executors.read_api import _SINGLE_STREAM_ROW_LIMIT
+
+    df_source = pl.DataFrame({"id": [1, 2, 3, 4, 5]})
+    mock_arrow_client.read_table.side_effect = [
+        _FakeArrowStreamExporter(df_source),
+        _FakeArrowStreamExporter(df_source),
+    ]
+    client = Client(quota_project_id="test-proj")
+    lf = client.scan_table("my-project.my_dataset.tbl", schema={"id": pl.Int64()})
+
+    small = lf.limit(3).collect()
+    assert small.height == 3
+    assert (
+        mock_arrow_client.read_table.call_args_list[0].kwargs["max_stream_count"] == 1
+    )
+
+    large = lf.limit(_SINGLE_STREAM_ROW_LIMIT + 1).collect()
+    assert large.height == 5
+    assert (
+        "max_stream_count" not in mock_arrow_client.read_table.call_args_list[1].kwargs
+    )
+
+
+def test_scan_table_keeps_parallel_streams_when_predicate_and_n_rows_combined(
+    mock_arrow_client, monkeypatch
+):
+    """Do not force `max_stream_count=1` if a caller passes both predicate and small n_rows."""
+    captured_io_source = {}
+    orig_register = pl.io.plugins.register_io_source
+
+    def _capture(io_source, schema, **kwargs):
+        captured_io_source["fn"] = io_source
+        return orig_register(io_source=io_source, schema=schema, **kwargs)
+
+    monkeypatch.setattr(pl.io.plugins, "register_io_source", _capture)
+    df_source = pl.DataFrame({"id": [1, 2, 3]})
+    mock_arrow_client.read_table.return_value = _FakeArrowStreamExporter(df_source)
+
+    client = Client(quota_project_id="test-proj")
+    client.scan_table("my-project.my_dataset.tbl", schema={"id": pl.Int64()})
+
+    batches = list(
+        captured_io_source["fn"](
+            with_columns=["id"],
+            predicate=pl.col("id") > 1,
+            n_rows=5,
+            batch_size=None,
+        )
+    )
+    assert sum(b.height for b in batches) == 2
+    assert "max_stream_count" not in mock_arrow_client.read_table.call_args.kwargs
+
+
+def test_scan_table_zero_column_preserves_height_across_batches(
+    mock_arrow_client, monkeypatch
+):
+    """Zero-column projections via real Arrow C stream preserve exact row height."""
+    captured_io_source = {}
+    orig_register = pl.io.plugins.register_io_source
+
+    def _capture(io_source, schema, **kwargs):
+        captured_io_source["fn"] = io_source
+        return orig_register(io_source=io_source, schema=schema, **kwargs)
+
+    monkeypatch.setattr(pl.io.plugins, "register_io_source", _capture)
+    full_df = pl.DataFrame(
+        {
+            "flag": [True, False, True, True, False],
+            "num": [1, 20, 30, 4, 50],
+        }
+    )
+
+    def _fake_read_table(table_ref, *, selected_fields, **kwargs):
+        return _FakeArrowStreamExporter(full_df.select(selected_fields))
+
+    mock_arrow_client.read_table.side_effect = _fake_read_table
+
+    client = Client(quota_project_id="test-proj")
+    lf = client.scan_table(
+        "my-project.my_dataset.tbl",
+        schema={"flag": pl.Boolean(), "num": pl.Int64()},
+    )
+
+    # Chunked zero-column batch streaming preserves total height and zero width.
+    batches = list(captured_io_source["fn"]([], None, None, 2))
+    assert len(batches) > 1
+    assert sum(b.height for b in batches) == 5
+    assert all(b.width == 0 for b in batches)
+
+    # End-to-end LazyFrame row counts with unfiltered scan, limit, and filter.
+    assert lf.select(pl.len()).collect().item() == 5
+    assert lf.limit(2).select(pl.len()).collect().item() == 2
+    assert lf.filter(pl.col("num") > 10).select(pl.len()).collect().item() == 3

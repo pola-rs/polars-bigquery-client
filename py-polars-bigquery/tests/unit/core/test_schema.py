@@ -7,17 +7,15 @@ from polars_bigquery.core.schema import (
     MAX_SCHEMA_NESTING_DEPTH,
     ExtractedSchema,
     SkippedColumn,
-    extract_polars_schema,
     extract_polars_schema_from_fields,
     extract_schema_metadata,
-    has_bignumeric_dtype,
 )
 from polars_bigquery.core.types import (
     GEOGRAPHY_EXTENSION_METADATA,
     GEOGRAPHY_EXTENSION_NAME,
     JSON_EXTENSION_NAME,
 )
-from polars_bigquery.exceptions import BigQueryError
+from polars_bigquery.exceptions import BigQueryError, UnsupportedTypeError
 
 
 def test_extract_polars_schema_primitive_types(monkeypatch):
@@ -49,7 +47,6 @@ def test_extract_polars_schema_primitive_types(monkeypatch):
     assert extracted.skipped_columns == ()
 
     schema = extracted.polars_schema
-    assert schema == extract_polars_schema(metadata)
     assert schema["bool_col"] == pl.Boolean()
     assert schema["bool_alias"] == pl.Boolean()
     assert schema["bytes_col"] == pl.Binary()
@@ -337,6 +334,14 @@ def test_extract_schema_omits_unsupported_top_level_and_nested_columns():
                     ],
                 },
                 {"name": "bad_mode", "type": "STRING", "mode": "STREAMING"},
+                {
+                    "name": "unnamed_nested_bad",
+                    "type": "STRUCT",
+                    "fields": [
+                        {"name": "ok", "type": "INT64"},
+                        {"name": "", "type": "INTERVAL"},
+                    ],
+                },
             ]
         }
     }
@@ -351,6 +356,7 @@ def test_extract_schema_omits_unsupported_top_level_and_nested_columns():
         SkippedColumn("missing_type", "unsupported type <missing>", "missing_type"),
         SkippedColumn("nested_bad", "INTERVAL", "nested_bad.inner.bad"),
         SkippedColumn("bad_mode", "unsupported mode 'STREAMING'", "bad_mode"),
+        SkippedColumn("unnamed_nested_bad", "INTERVAL", "unnamed_nested_bad[1]"),
     )
 
 
@@ -533,7 +539,8 @@ def test_extract_schema_skipped_partitiontime_prevents_pseudo_column_shadowing()
 def test_extract_polars_schema_from_fields_unexpected_type():
     fields = [{"name": "bad", "type": "UNKNOWN_TYPE"}]
     with pytest.raises(
-        TypeError, match=r"got unexpected BigQuery type: unknown_type \(column 'bad'\)"
+        UnsupportedTypeError,
+        match=r"got unexpected BigQuery type: unknown_type \(column 'bad'\)",
     ):
         extract_polars_schema_from_fields(fields)
 
@@ -637,8 +644,11 @@ def test_extract_polars_schema_rejects_duplicate_struct_subfields():
 
 
 def test_extract_polars_schema_handles_null_and_malformed_envelopes():
-    assert extract_polars_schema({"schema": None}) == pl.Schema()
-    assert extract_polars_schema({"schema": {"fields": None}}) == pl.Schema()
+    assert extract_schema_metadata({"schema": None}).polars_schema == pl.Schema()
+    assert (
+        extract_schema_metadata({"schema": {"fields": None}}).polars_schema
+        == pl.Schema()
+    )
     assert extract_polars_schema_from_fields(
         [{"name": "a", "type": "INT64", "mode": None}]
     ) == pl.Schema({"a": pl.Int64()})
@@ -647,18 +657,19 @@ def test_extract_polars_schema_handles_null_and_malformed_envelopes():
     ) == pl.Schema({"s": pl.Struct([])})
 
     with pytest.raises(
-        TypeError, match=r"got unexpected BigQuery type:  \(column 'a'\)"
+        UnsupportedTypeError,
+        match=r"got unexpected BigQuery type: <missing> \(column 'a'\)",
     ):
         extract_polars_schema_from_fields([{"name": "a", "type": None}])
 
     with pytest.raises(BigQueryError, match="expected table metadata object"):
-        extract_polars_schema(["not", "a", "dict"])  # type: ignore[arg-type]
+        extract_schema_metadata(["not", "a", "dict"])  # type: ignore[arg-type]
 
     with pytest.raises(BigQueryError, match="'schema' must be an object"):
-        extract_polars_schema({"schema": "bad"})
+        extract_schema_metadata({"schema": "bad"})
 
     with pytest.raises(BigQueryError, match="'schema.fields' must be a list"):
-        extract_polars_schema({"schema": {"fields": "bad"}})
+        extract_schema_metadata({"schema": {"fields": "bad"}})
 
     with pytest.raises(BigQueryError, match="'timePartitioning' must be an object"):
         extract_schema_metadata(
@@ -673,9 +684,6 @@ def test_extract_polars_schema_handles_null_and_malformed_envelopes():
             [{"name": "s", "type": "STRUCT", "fields": "bad"}]
         )
 
-    with pytest.raises(BigQueryError, match="did not contain any schema fields"):
-        extract_polars_schema({"schema": {"fields": []}}, require_non_empty=True)
-
 
 def test_extract_polars_schema_rejects_excessive_nesting_depth():
     node: dict = {"name": "leaf", "type": "INT64"}
@@ -686,27 +694,6 @@ def test_extract_polars_schema_rejects_excessive_nesting_depth():
         extract_polars_schema_from_fields([node])
     with pytest.raises(BigQueryError, match="nesting depth exceeds maximum"):
         extract_schema_metadata({"schema": {"fields": [node]}})
-
-
-def test_has_bignumeric_dtype_nested():
-    bn = pl.Decimal(precision=76, scale=38)
-    num = pl.Decimal(precision=38, scale=9)
-    unparam = pl.Decimal(precision=38, scale=9)
-    unparam.precision = None  # type: ignore[misc]
-
-    assert has_bignumeric_dtype(bn) is True
-    assert has_bignumeric_dtype(pl.List(bn)) is True
-    assert has_bignumeric_dtype(pl.Array(bn, 2)) is True
-    assert has_bignumeric_dtype(pl.Struct([pl.Field("x", pl.List(bn))])) is True
-    assert has_bignumeric_dtype(pl.Extension("custom:bn", bn)) is True
-    assert has_bignumeric_dtype(num) is False
-    assert has_bignumeric_dtype(unparam) is False
-    assert has_bignumeric_dtype(pl.Extension("custom:num", num)) is False
-    assert has_bignumeric_dtype(pl.List(num)) is False
-    assert has_bignumeric_dtype(pl.Struct([pl.Field("x", pl.Int64())])) is False
-    if hasattr(pl, "Map"):
-        assert has_bignumeric_dtype(pl.Map(pl.String(), bn)) is True
-        assert has_bignumeric_dtype(pl.Map(pl.String(), pl.Int64())) is False
 
 
 def test_extract_polars_schema_from_fields_types_and_strict_rejections(monkeypatch):
@@ -743,13 +730,15 @@ def test_extract_polars_schema_from_fields_types_and_strict_rejections(monkeypat
         }
     )
 
-    with pytest.raises(TypeError, match="INTERVAL column 'dur'"):
+    with pytest.raises(UnsupportedTypeError, match="INTERVAL column 'dur'"):
         extract_polars_schema_from_fields([{"name": "dur", "type": "INTERVAL"}])
-    with pytest.raises(TypeError, match="RANGE column 'rng'"):
+    with pytest.raises(UnsupportedTypeError, match="RANGE column 'rng'"):
         extract_polars_schema_from_fields([{"name": "rng", "type": "RANGE"}])
-    with pytest.raises(TypeError, match="BIGNUMERIC/BIGDECIMAL.*'bd'"):
+    with pytest.raises(UnsupportedTypeError, match="BIGNUMERIC/BIGDECIMAL.*'bd'"):
         extract_polars_schema_from_fields([{"name": "bd", "type": "BIGDECIMAL"}])
-    with pytest.raises(TypeError, match=r"TIMESTAMP\(precision='12'\).*'ts_pico'"):
+    with pytest.raises(
+        UnsupportedTypeError, match=r"TIMESTAMP\(precision='12'\).*'ts_pico'"
+    ):
         extract_polars_schema_from_fields(
             [
                 {
@@ -760,7 +749,9 @@ def test_extract_polars_schema_from_fields_types_and_strict_rejections(monkeypat
                 }
             ]
         )
-    with pytest.raises(TypeError, match="unsupported field mode 'STREAMING'"):
+    with pytest.raises(
+        UnsupportedTypeError, match="unsupported field mode 'STREAMING'"
+    ):
         extract_polars_schema_from_fields(
             [{"name": "bad", "type": "STRING", "mode": "STREAMING"}]
         )

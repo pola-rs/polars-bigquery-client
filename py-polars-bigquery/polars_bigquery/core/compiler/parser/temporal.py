@@ -32,7 +32,15 @@ def parse_date_literal(value: Any) -> Expr:
 
 
 def parse_ticks_and_unit(ticks_raw: Any, units_raw: Any) -> tuple[int, TimestampUnit]:
-    """Parse ticks and unit from Polars JSON, converting exact nanoseconds to microseconds."""
+    """Parse ticks and unit from Polars JSON, keeping exact-microsecond nanoseconds.
+
+    Nanosecond timestamps are accepted only when `ticks % 1000 == 0` so that they
+    map losslessly to BigQuery microsecond precision. The original
+    `TimestampUnit.NANOSECONDS` unit is preserved on the IR node (rather than
+    normalizing to `TimestampUnit.MICROSECONDS`) so downstream passes can
+    distinguish `"ns"` literals for unit-sensitive operators like
+    `fill_null(strategy="one")`.
+    """
     if isinstance(ticks_raw, bool) or not isinstance(ticks_raw, (int, str)):
         raise TypeError("Invalid timestamp tick count type")
     ticks = int(ticks_raw)
@@ -48,7 +56,7 @@ def parse_ticks_and_unit(ticks_raw: Any, units_raw: Any) -> tuple[int, Timestamp
         micros = ticks // 1000
         if not (BQ_MIN_TIMESTAMP_MICROS <= micros <= BQ_MAX_TIMESTAMP_MICROS):
             raise ValueError("Timestamp nanoseconds out of BigQuery bounds")
-        return micros, TimestampUnit.MICROSECONDS
+        return ticks, TimestampUnit.NANOSECONDS
     raise ValueError(f"Unsupported datetime unit or precision: {units_raw!r}")
 
 

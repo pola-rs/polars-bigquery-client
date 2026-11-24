@@ -58,41 +58,13 @@ class ExtractedSchema:
     skipped_columns: tuple[SkippedColumn, ...]
 
 
-class _UnsupportedBigQueryType(Exception):
-    """Internal exception raised when a field cannot be represented in `scan_table`."""
+@dataclasses.dataclass(frozen=True, slots=True)
+class _UnsupportedField:
+    """Sentinel returned when a field or nested subfield cannot be mapped to Polars."""
 
-    def __init__(self, reason: str, path: str) -> None:
-        super().__init__(reason)
-        self.reason = reason
-        self.path = path
-
-
-def has_bignumeric_dtype(dtype: pl.DataType) -> bool:
-    """Return `True` if `dtype` is or nests a `BIGNUMERIC` (`Decimal(precision > 38)`)."""
-    map_cls = getattr(pl, "Map", None)
-    stack: list[pl.DataType] = [dtype]
-    while stack:
-        current = stack.pop()
-        if isinstance(current, pl.Decimal):
-            if (
-                current.precision is not None
-                and current.precision > BQ_NUMERIC_MAX_PRECISION
-            ):
-                return True
-        elif isinstance(current, pl.BaseExtension):
-            stack.append(current.ext_storage())
-        elif isinstance(current, (pl.List, pl.Array)):
-            if current.inner is not None:
-                stack.append(current.inner)
-        elif isinstance(current, pl.Struct):
-            for field in current.fields:
-                stack.append(field.dtype)
-        elif map_cls is not None and isinstance(current, map_cls):
-            if current.key is not None:
-                stack.append(current.key)
-            if current.value is not None:
-                stack.append(current.value)
-    return False
+    reason: str
+    path: str
+    message: str
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -101,6 +73,16 @@ class _ExtensionTypeSpec:
 
     extension_name: str
     metadata: str | None
+
+
+def format_bignumeric_error(cols_repr: str) -> str:
+    """Format the canonical `UnsupportedTypeError` message for `BIGNUMERIC` columns."""
+    return (
+        f"Polars does not support BigQuery BIGNUMERIC/BIGDECIMAL columns "
+        f"(Decimal precision > {BQ_NUMERIC_MAX_PRECISION}) in LazyFrame schema "
+        f"for column(s): {cols_repr}. "
+        "Cast them to NUMERIC, FLOAT64, or STRING in SQL or exclude them."
+    )
 
 
 # Mapping of casefolded BigQuery REST scalar type names (and legacy SQL aliases)
@@ -141,31 +123,22 @@ _EXTENSION_TYPE_MAP: dict[str, _ExtensionTypeSpec] = {
     ),
 }
 
-_BIGNUMERIC_UNSUPPORTED = (
-    "BIGNUMERIC",
-    (
-        "Polars does not support BigQuery BIGNUMERIC/BIGDECIMAL columns "
-        "(Decimal precision > 38) in LazyFrame schema for column(s): {col!r}. "
-        "Cast them to NUMERIC, FLOAT64, or STRING in SQL or exclude them."
-    ),
-)
-
 # Known BigQuery types that cannot be represented in Polars schemas or exported
-# over Arrow C Data Interface FFI: REST alias -> `(skip_reason, strict_message)`.
-_UNSUPPORTED_TYPE_MAP: dict[str, tuple[str, str]] = {
-    "bignumeric": _BIGNUMERIC_UNSUPPORTED,
-    "bigdecimal": _BIGNUMERIC_UNSUPPORTED,
+# over Arrow C Data Interface FFI: REST alias -> `(skip_reason, message_builder)`.
+_UNSUPPORTED_TYPE_MAP: dict[str, tuple[str, Callable[[str], str]]] = {
+    "bignumeric": ("BIGNUMERIC", lambda col: format_bignumeric_error(repr(col))),
+    "bigdecimal": ("BIGNUMERIC", lambda col: format_bignumeric_error(repr(col))),
     "interval": (
         "INTERVAL",
-        (
-            "BigQuery INTERVAL column {col!r} is not supported over "
+        lambda col: (
+            f"BigQuery INTERVAL column {col!r} is not supported over "
             "Arrow C Data Interface FFI. Cast it in SQL or exclude it."
         ),
     ),
     "range": (
         "RANGE",
-        (
-            "BigQuery RANGE column {col!r} is not supported in Polars. "
+        lambda col: (
+            f"BigQuery RANGE column {col!r} is not supported in Polars. "
             "Cast it in SQL or exclude it."
         ),
     ),
@@ -188,11 +161,10 @@ def _extract_struct_dtype(
     field: Mapping[str, Any],
     *,
     path: str,
-    strict: bool,
     top_col_name: str,
     depth: int,
     extension_dtype_builder: ExtensionDtypeBuilder,
-) -> DataType:
+) -> DataType | _UnsupportedField:
     raw_subfields = field.get("fields")
     if raw_subfields is None:
         raw_subfields = []
@@ -209,7 +181,7 @@ def _extract_struct_dtype(
     seen_names: set[str] = set()
     dup_names: list[str] = []
     dup_seen: set[str] = set()
-    for subfield in raw_subfields:
+    for idx, subfield in enumerate(raw_subfields):
         raw_sub_name = subfield.get("name", "")
         sub_name = "" if raw_sub_name is None else raw_sub_name
         if sub_name in seen_names:
@@ -218,14 +190,16 @@ def _extract_struct_dtype(
                 dup_seen.add(sub_name)
             continue
         seen_names.add(sub_name)
+        sub_path = f"{path}.{sub_name}" if sub_name else f"{path}[{idx}]"
         sub_dtype = _extract_field_dtype(
             subfield,
-            path=f"{path}.{sub_name}",
-            strict=strict,
+            path=sub_path,
             top_col_name=top_col_name,
             depth=depth + 1,
             extension_dtype_builder=extension_dtype_builder,
         )
+        if isinstance(sub_dtype, _UnsupportedField):
+            return sub_dtype
         polars_fields.append(Field(sub_name, sub_dtype))
 
     if dup_names:
@@ -248,17 +222,17 @@ def _extract_field_dtype(
     field: Mapping[str, Any],
     *,
     path: str,
-    strict: bool,
-    top_col_name: str = "",
+    top_col_name: str,
     depth: int = 0,
     extension_dtype_builder: ExtensionDtypeBuilder = build_extension_dtype,
-) -> DataType:
+) -> DataType | _UnsupportedField:
     """Convert a BigQuery REST `TableFieldSchema` dict into a Polars `DataType`.
 
-    Shared by table-metadata extraction (`strict=False`, which omits
-    unsupported columns via `_UnsupportedBigQueryType`) and dry-run query
-    schema extraction (`strict=True`, which fails eagerly with `TypeError` or
-    `ValueError` since verbatim queries cannot skip selected columns).
+    Returns `_UnsupportedField` when the field (or a nested subfield) uses a
+    BigQuery type or mode that cannot be represented over Arrow C Data
+    Interface / Polars. Callers translate that sentinel at the top-level
+    boundary: `extract_schema_metadata()` skips the column with a warning, while
+    `extract_polars_schema_from_fields()` raises `UnsupportedTypeError`.
 
     Note: the REST API uses Legacy SQL data type names, but user-entered schemas
     may include the newer aliases (https://cloud.google.com/bigquery/docs/data-types).
@@ -275,13 +249,14 @@ def _extract_field_dtype(
     raw_mode = field.get("mode")
     mode = (raw_mode or "").casefold()
     if mode not in _VALID_FIELD_MODES:
-        if strict:
-            msg = (
+        return _UnsupportedField(
+            reason=f"unsupported mode {raw_mode!r}",
+            path=path,
+            message=(
                 f"BigQuery column {top_col_name!r} uses unsupported field mode "
                 f"{raw_mode!r}."
-            )
-            raise TypeError(msg)
-        raise _UnsupportedBigQueryType(f"unsupported mode {raw_mode!r}", path)
+            ),
+        )
 
     type_ = (field.get("type") or "").casefold()
 
@@ -298,11 +273,12 @@ def _extract_field_dtype(
         inner_type = _extract_field_dtype(
             {**field, "mode": "NULLABLE"},
             path=path,
-            strict=strict,
             top_col_name=top_col_name,
             depth=depth + 1,
             extension_dtype_builder=extension_dtype_builder,
         )
+        if isinstance(inner_type, _UnsupportedField):
+            return inner_type
         return List(inner_type)
 
     if (dtype_factory := _SCALAR_TYPE_MAP.get(type_)) is not None:
@@ -319,34 +295,38 @@ def _extract_field_dtype(
         precision = field.get("timestampPrecision")
         if _is_supported_timestamp_precision(precision):
             return Datetime(time_unit="us", time_zone="UTC")
-        if strict:
-            msg = (
+        return _UnsupportedField(
+            reason=f"TIMESTAMP(precision={precision!r})",
+            path=path,
+            message=(
                 f"BigQuery TIMESTAMP(precision={precision!r}) column {top_col_name!r} "
                 "is not supported in Polars. Cast to microsecond TIMESTAMP in SQL."
-            )
-            raise TypeError(msg)
-        raise _UnsupportedBigQueryType(f"TIMESTAMP(precision={precision!r})", path)
+            ),
+        )
 
     if type_ in ("record", "struct"):
         return _extract_struct_dtype(
             field,
             path=path,
-            strict=strict,
             top_col_name=top_col_name,
             depth=depth,
             extension_dtype_builder=extension_dtype_builder,
         )
 
     if (unsupported := _UNSUPPORTED_TYPE_MAP.get(type_)) is not None:
-        skip_reason, strict_template = unsupported
-        if strict:
-            raise TypeError(strict_template.format(col=top_col_name))
-        raise _UnsupportedBigQueryType(skip_reason, path)
+        skip_reason, build_message = unsupported
+        return _UnsupportedField(
+            reason=skip_reason,
+            path=path,
+            message=build_message(top_col_name),
+        )
 
-    if strict:
-        msg = f"got unexpected BigQuery type: {type_} (column {top_col_name!r})"
-        raise TypeError(msg)
-    raise _UnsupportedBigQueryType(f"unsupported type {type_ or '<missing>'}", path)
+    type_label = type_ or "<missing>"
+    return _UnsupportedField(
+        reason=f"unsupported type {type_label}",
+        path=path,
+        message=f"got unexpected BigQuery type: {type_label} (column {top_col_name!r})",
+    )
 
 
 def extract_polars_schema_from_fields(
@@ -357,7 +337,8 @@ def extract_polars_schema_from_fields(
     """Convert BigQuery `TableFieldSchema` entries into a Polars schema.
 
     Strictly validates every entry (no column skipping) for use with
-    `scan_query` dry-run schema discovery.
+    `scan_query` dry-run schema discovery. Raises `UnsupportedTypeError` when
+    any column uses an unsupported BigQuery type or field mode.
 
     See: https://docs.cloud.google.com/bigquery/docs/reference/rest/v2/tables#TableFieldSchema
     """
@@ -371,13 +352,15 @@ def extract_polars_schema_from_fields(
                 duplicates.append(name)
                 seen_duplicates.add(name)
             continue
-        pl_schema[name] = _extract_field_dtype(
+        result = _extract_field_dtype(
             field,
             path=name,
-            strict=True,
             top_col_name=name,
             extension_dtype_builder=extension_dtype_builder,
         )
+        if isinstance(result, _UnsupportedField):
+            raise polars_bigquery.exceptions.UnsupportedTypeError(result.message)
+        pl_schema[name] = result
 
     if duplicates:
         dup_list = ", ".join(repr(name) for name in duplicates)
@@ -444,19 +427,18 @@ def extract_schema_metadata(
         # Record the casefolded name before evaluating the column type so a
         # skipped column prevents appending a colliding pseudo-column.
         seen_names.add(name.casefold())
-        try:
-            dtype = _extract_field_dtype(
-                field,
-                path=name,
-                strict=False,
-                extension_dtype_builder=extension_dtype_builder,
-            )
-        except _UnsupportedBigQueryType as exc:
+        result = _extract_field_dtype(
+            field,
+            path=name,
+            top_col_name=name,
+            extension_dtype_builder=extension_dtype_builder,
+        )
+        if isinstance(result, _UnsupportedField):
             skipped_columns.append(
-                SkippedColumn(name=name, reason=exc.reason, path=exc.path)
+                SkippedColumn(name=name, reason=result.reason, path=result.path)
             )
             continue
-        pl_schema[name] = dtype
+        pl_schema[name] = result
 
     # For ingestion-time partitioned tables with at least one physical field,
     # append partition pseudo-columns. Schemaless (0-column) partitioned tables
@@ -487,34 +469,3 @@ def extract_schema_metadata(
         polars_schema=pl.Schema(pl_schema),
         skipped_columns=tuple(skipped_columns),
     )
-
-
-def extract_polars_schema(
-    table_metadata: Mapping[str, Any],
-    *,
-    extension_dtype_builder: ExtensionDtypeBuilder = build_extension_dtype,
-    require_non_empty: bool = False,
-) -> pl.Schema:
-    """Convert a BigQuery table REST response into a Polars schema.
-
-    When `require_non_empty=True`, raises `BigQueryError` if `schema.fields` is
-    missing or empty *before* appending ingestion-time partitioning pseudo-columns.
-
-    See: https://docs.cloud.google.com/bigquery/docs/reference/rest/v2/tables#Table
-    """
-    extracted = extract_schema_metadata(
-        table_metadata,
-        extension_dtype_builder=extension_dtype_builder,
-    )
-    if require_non_empty:
-        raw_schema = table_metadata.get("schema")
-        raw_fields = (
-            raw_schema.get("fields") if isinstance(raw_schema, Mapping) else None
-        )
-        if not raw_fields:
-            msg = (
-                "Invalid response from BigQuery: table metadata did not "
-                "contain any schema fields."
-            )
-            raise polars_bigquery.exceptions.BigQueryError(msg)
-    return extracted.polars_schema
