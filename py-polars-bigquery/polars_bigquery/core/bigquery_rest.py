@@ -86,7 +86,7 @@ def _get_table_metadata_url(
     return (
         f"{_BIGQUERY_ENDPOINT}/projects/{project_id}"
         f"/datasets/{dataset_id}/tables/{table_id}"
-        "?fields=kind,schema,timePartitioning"
+        "?fields=schema,timePartitioning"
     )
 
 
@@ -165,13 +165,6 @@ def get_table_metadata(
             msg = (
                 f"BigQuery REST API returned unexpected metadata payload type "
                 f"{type(payload).__name__} for table '{table_ref}'"
-            )
-            raise polars_bigquery.exceptions.BigQueryError(msg)
-        kind = payload.get("kind")
-        if kind != "bigquery#table":
-            msg = (
-                f"BigQuery REST API returned unexpected metadata response for "
-                f"table '{table_ref}': expected kind 'bigquery#table', got {kind!r}"
             )
             raise polars_bigquery.exceptions.BigQueryError(msg)
         return payload

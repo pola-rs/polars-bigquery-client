@@ -83,8 +83,7 @@ def test_raise_for_bigquery_error_falls_back_when_json_invalid():
 def test_get_table_metadata_uses_field_mask_and_session():
     mock_cp = MagicMock(return_value=({"bearer_token": "tok"}, 123))
     mock_session = MagicMock()
-    expected_payload = {"kind": "bigquery#table", "schema": {"fields": []}}
-    mock_session.get.return_value.json.return_value = expected_payload
+    mock_session.get.return_value.json.return_value = {"schema": {"fields": []}}
 
     table_ref = arrow_bigquery.api.resources.BigQueryTableId("p", "d", "t")
     metadata = get_table_metadata(
@@ -95,10 +94,10 @@ def test_get_table_metadata_uses_field_mask_and_session():
         session=mock_session,
     )
 
-    assert metadata == expected_payload
+    assert metadata == {"schema": {"fields": []}}
     called_url = mock_session.get.call_args.args[0]
     assert called_url.endswith(
-        "/projects/p/datasets/d/tables/t?fields=kind,schema,timePartitioning"
+        "/projects/p/datasets/d/tables/t?fields=schema,timePartitioning"
     )
 
 
@@ -195,7 +194,7 @@ def test_get_table_metadata_url_encodes_valid_segments(
     url = _get_table_metadata_url(table_ref=table_ref)
     assert (
         url
-        == f"https://bigquery.googleapis.com/bigquery/v2{expected_path}?fields=kind,schema,timePartitioning"
+        == f"https://bigquery.googleapis.com/bigquery/v2{expected_path}?fields=schema,timePartitioning"
     )
     # Verify requests does not double-encode or unquote reserved characters.
     prepared_url = requests.Request("GET", url).prepare().url
@@ -212,7 +211,7 @@ def test_get_table_metadata_url_defense_in_depth_encodes_metacharacters():
     parsed = urllib.parse.urlsplit(url)
     assert parsed.scheme == "https"
     assert parsed.netloc == "bigquery.googleapis.com"
-    assert parsed.query == "fields=kind,schema,timePartitioning"
+    assert parsed.query == "fields=schema,timePartitioning"
     assert parsed.fragment == ""
     assert (
         parsed.path
@@ -278,19 +277,6 @@ def test_get_table_metadata_rejects_invalid_json_or_non_object():
             user_agent="ua",
             session=mock_session,
         )
-
-    # Empty `{}` or wrong `kind` must raise BigQueryError so stripped/corrupted
-    # gateway responses cannot silently short-circuit as empty schemaless tables.
-    for bad_payload in ({}, {"kind": "bigquery#dataset"}, {"kind": None}):
-        mock_session.get.return_value.json.return_value = bad_payload
-        with pytest.raises(BigQueryError, match="expected kind 'bigquery#table'"):
-            get_table_metadata(
-                table_ref,
-                quota_project_id="q",
-                credentials_provider=mock_cp,
-                user_agent="ua",
-                session=mock_session,
-            )
 
 
 @pytest.mark.parametrize(

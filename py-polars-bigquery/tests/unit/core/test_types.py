@@ -613,9 +613,7 @@ def test_column_width_rank_shared_struct_field_dtype_and_invalid_bq_extensions()
     assert polars_dtype_to_bq_type(pl.Extension(JSON_EXTENSION_NAME, pl.List)) is None
 
 
-def test_extension_cycle_and_depth_guards():
-    from polars_bigquery.exceptions import UnsupportedTypeError
-
+def test_recursive_extension_cycles_raise_recursion_error():
     class _SelfCycleExt(pl.BaseExtension):
         def ext_storage(self):
             return self
@@ -624,155 +622,67 @@ def test_extension_cycle_and_depth_guards():
         def ext_storage(self):
             return _FreshWrapperCycleExt("custom:fresh", pl.String())
 
+    class _NonDtypeExt(pl.BaseExtension):
+        def ext_storage(self):
+            return "not-a-dtype"
+
     self_cycle = _SelfCycleExt("custom:self", pl.String())
-    assert has_bignumeric_dtype(self_cycle) is False
-    assert column_width_rank(self_cycle) == 7
-    assert column_width_rank(pl.List(self_cycle)) == 7
+    with pytest.raises(RecursionError):
+        has_bignumeric_dtype(self_cycle)
+    with pytest.raises(RecursionError):
+        column_width_rank(self_cycle)
+    with pytest.raises(RecursionError):
+        column_width_rank(pl.List(self_cycle))
 
     fresh_cycle = _FreshWrapperCycleExt("custom:fresh", pl.String())
-    # Dynamic/unbounded ext_storage() fails closed instead of returning False.
-    with pytest.raises(UnsupportedTypeError, match="nesting depth exceeds maximum"):
+    with pytest.raises(RecursionError):
         has_bignumeric_dtype(fresh_cycle)
-    assert column_width_rank(fresh_cycle) == 7
-    assert column_width_rank(pl.Struct({"x": fresh_cycle})) == 7
+    with pytest.raises(RecursionError):
+        column_width_rank(fresh_cycle)
+    with pytest.raises(RecursionError):
+        column_width_rank(pl.Struct({"x": fresh_cycle}))
 
-    # Materialized cyclic pl.Extension._storage terminates safely via id() tracking.
     mutated_cycle = pl.Extension("custom:mut", pl.String())
     mutated_cycle._storage = mutated_cycle
-    assert has_bignumeric_dtype(mutated_cycle) is False
-    assert column_width_rank(mutated_cycle) == 7
+    with pytest.raises(RecursionError):
+        has_bignumeric_dtype(mutated_cycle)
+    with pytest.raises(RecursionError):
+        column_width_rank(mutated_cycle)
+
+    bad_ext = _NonDtypeExt("custom:bad", pl.String())
+    assert has_bignumeric_dtype(bad_ext) is False
+    assert column_width_rank(bad_ext) == 7
+    assert column_width_rank(pl.Struct({"x": bad_ext})) == 7
 
 
-def test_dtype_traversals_prevent_id_reuse_on_fresh_ext_storage():
-    """Verify strong-reference tracking prevents CPython id() aliasing across loops."""
-
+def test_dtype_traversals_deep_and_chained_extensions():
     class _ChainExt(pl.BaseExtension):
-        def __init__(self, remaining: int, leaf_factory):
+        def __init__(self, remaining: int, target: pl.DataType | type[pl.DataType]):
             self._rem = remaining
-            self._leaf_factory = leaf_factory
+            self._target = target
             super().__init__("custom:chain", pl.Int64())
 
         def ext_storage(self):
             if self._rem > 0:
-                return _ChainExt(self._rem - 1, self._leaf_factory)
-            return self._leaf_factory()
-
-    # Repeated runs exercise pymalloc free-list address reuse.
-    for _ in range(50):
-        assert column_width_rank(_ChainExt(5, pl.Boolean)) == 1
-        assert has_bignumeric_dtype(_ChainExt(5, lambda: pl.Decimal(76, 38))) is True
-
-        struct_with_dec = pl.Struct(
-            [
-                pl.Field("bad", _ChainExt(0, lambda: pl.Decimal(76, 38))),
-                pl.Field("ok1", _ChainExt(0, lambda: pl.Decimal(38, 9))),
-                pl.Field("ok2", _ChainExt(0, lambda: pl.Decimal(38, 9))),
-                pl.Field("ok3", _ChainExt(0, lambda: pl.Decimal(38, 9))),
-                pl.Field("ok4", _ChainExt(0, lambda: pl.Decimal(38, 9))),
-            ]
-        )
-        assert column_width_rank(struct_with_dec) == 7
-
-
-def test_has_bignumeric_dtype_deep_containers_and_extension_diamond_dag():
-    from polars_bigquery.core.types import _MAX_TYPE_DEPTH
-    from polars_bigquery.exceptions import UnsupportedTypeError
-
-    # Finite Polars List containers deeper than _MAX_TYPE_DEPTH still detect BIGNUMERIC.
-    deep_bn: pl.DataType = pl.Decimal(precision=76, scale=38)
-    for _ in range(_MAX_TYPE_DEPTH + 5):
-        deep_bn = pl.List(deep_bn)
-    assert has_bignumeric_dtype(deep_bn) is True
-
-    # Finite built-in pl.Extension chains deeper than _MAX_TYPE_DEPTH do not fail open.
-    deep_ext_bn: pl.DataType = pl.Decimal(precision=76, scale=38)
-    deep_ext_ok: pl.DataType = pl.Int64()
-    for idx in range(_MAX_TYPE_DEPTH + 5):
-        deep_ext_bn = pl.Extension(f"custom:bn_{idx}", deep_ext_bn)
-        deep_ext_ok = pl.Extension(f"custom:ok_{idx}", deep_ext_ok)
-    assert has_bignumeric_dtype(deep_ext_bn) is True
-    assert has_bignumeric_dtype(deep_ext_ok) is False
-
-    # Dynamic custom ext_storage() chain exceeding _MAX_TYPE_DEPTH fails closed.
-    class _DynChainExt(pl.BaseExtension):
-        def __init__(self, remaining: int, target: pl.DataType):
-            self._rem = remaining
-            self._target = target
-            super().__init__("custom:dyn", pl.String())
-
-        def ext_storage(self):
-            if self._rem > 0:
-                return _DynChainExt(self._rem - 1, self._target)
+                return _ChainExt(self._rem - 1, self._target)
             return self._target
 
-    with pytest.raises(UnsupportedTypeError, match="nesting depth exceeds maximum"):
-        has_bignumeric_dtype(_DynChainExt(_MAX_TYPE_DEPTH + 1, pl.Decimal(76, 38)))
+    assert column_width_rank(_ChainExt(5, pl.Boolean)) == 1
+    assert column_width_rank(_ChainExt(5, pl.List(pl.String()))) == 6
+    assert column_width_rank(_ChainExt(5, pl.List(pl.Decimal(76, 38)))) == 7
+    assert has_bignumeric_dtype(_ChainExt(5, pl.Decimal(76, 38))) is True
+    assert has_bignumeric_dtype(_ChainExt(5, pl.Int64())) is False
 
-    # Shared extension DAG reached at dynamic depth _MAX_TYPE_DEPTH AND depth 0
-    # must detect BIGNUMERIC regardless of field order (0-1 BFS).
-    shared_ext = pl.Extension("custom:shared", pl.Decimal(precision=76, scale=38))
-    deep_chain = _DynChainExt(_MAX_TYPE_DEPTH, shared_ext)
-
-    dag_deep_last = pl.Struct(
-        [pl.Field("shallow", shared_ext), pl.Field("deep", deep_chain)]
-    )
-    dag_deep_first = pl.Struct(
-        [pl.Field("deep", deep_chain), pl.Field("shallow", shared_ext)]
-    )
-    assert has_bignumeric_dtype(dag_deep_last) is True
-    assert has_bignumeric_dtype(dag_deep_first) is True
-
-
-def test_column_width_rank_diamond_dag_and_extension_depth_budget():
-    from polars_bigquery.core.types import _MAX_TYPE_DEPTH
-
-    # Shared List chain of height 40 reached at both depth 1 (41 <= 64) and
-    # depth 30 (70 > 64) must return rank 7 in BOTH field declaration orders.
-    shared_chain: pl.DataType = pl.Int64()
-    for _ in range(40):
-        shared_chain = pl.List(shared_chain)
-    deep_branch: pl.DataType = shared_chain
-    for _ in range(29):
-        deep_branch = pl.List(deep_branch)
-
-    shallow_first = pl.Struct(
-        [pl.Field("shallow", shared_chain), pl.Field("deep", deep_branch)]
-    )
-    deep_first = pl.Struct(
-        [pl.Field("deep", deep_branch), pl.Field("shallow", shared_chain)]
-    )
-    assert column_width_rank(shallow_first) == 7
-    assert column_width_rank(deep_first) == 7
-
-    # Shared chain within total budget (depth 20 + height 40 = 60 <= 64) stays rank 6.
-    safe_branch: pl.DataType = shared_chain
-    for _ in range(19):
-        safe_branch = pl.List(safe_branch)
-    assert (
-        column_width_rank(
-            pl.Struct(
-                [pl.Field("shallow", shared_chain), pl.Field("deep", safe_branch)]
-            )
-        )
-        == 6
-    )
-    assert (
-        column_width_rank(
-            pl.Struct(
-                [pl.Field("deep", safe_branch), pl.Field("shallow", shared_chain)]
-            )
-        )
-        == 6
-    )
-
-    # Custom BaseExtension wrapping List carries its depth budget instead of resetting to 0.
-    ext_boundary_ok: pl.DataType = pl.List(pl.Int64())
-    for idx in range(_MAX_TYPE_DEPTH - 1):
-        ext_boundary_ok = pl.Extension(f"custom:ok{idx}", ext_boundary_ok)
-    assert column_width_rank(ext_boundary_ok) == 6
-
-    ext_boundary_over = pl.Extension("custom:extra", ext_boundary_ok)
-    assert column_width_rank(ext_boundary_over) == 7
+    # BigQuery maximum STRUCT nesting depth is 15; verify depth-15+ chains work.
+    deep_bn: pl.DataType = pl.Decimal(precision=76, scale=38)
+    deep_ok: pl.DataType = pl.Int64()
+    for _ in range(15):
+        deep_bn = pl.Struct([pl.Field("nested", deep_bn)])
+        deep_ok = pl.Struct([pl.Field("nested", deep_ok)])
+    assert has_bignumeric_dtype(deep_bn) is True
+    assert has_bignumeric_dtype(deep_ok) is False
+    assert column_width_rank(deep_bn) == 7
+    assert column_width_rank(deep_ok) == 6
 
 
 def test_has_bignumeric_dtype_nested():

@@ -507,6 +507,9 @@ def test_scan_table_zero_column_hour_ingestion_time_partitioned(client):
         client.read_query(f"DROP SCHEMA IF EXISTS `{project}.{dataset}` CASCADE")
 
 
+# Direct REST helpers avoid `client.read_query()` (which enables Arrow output
+# and rejects `INTERVAL` schemas) when running DDL/DML for `INTERVAL`-typed
+# test tables or calling `tables.insert` to create a schemaless 0-column table.
 def _rest_bigquery_headers(client, project: str) -> dict[str, str]:
     token_data, _ = client.credentials_provider()
     return {
@@ -647,7 +650,8 @@ def test_scan_table_extension_partition_skipping_and_empty_tables(client):
             f"INSERT INTO `{day_tbl}` (dur) VALUES (INTERVAL 1 DAY), (INTERVAL 2 HOUR)",
         )
         with pytest.warns(UnsupportedTypeWarning, match=r"dur \(INTERVAL\)"):
-            day_df = client.scan_table(day_tbl).collect()
+            day_lf = client.scan_table(day_tbl)
+        day_df = day_lf.collect()
         assert day_df.schema == pl.Schema(
             {
                 "_PARTITIONDATE": pl.Date(),
@@ -655,6 +659,10 @@ def test_scan_table_extension_partition_skipping_and_empty_tables(client):
             }
         )
         assert day_df.shape == (2, 2)
+        # Zero-column projections exercise ReadApiExecutor's pseudo-column fallback
+        # (_PARTITIONDATE on DAY tables).
+        assert day_lf.select(pl.len()).collect().item() == 2
+        assert day_lf.drop(pl.all()).collect().width == 0
 
         # 3. All-unsupported physical column on HOUR ingestion-time partitioned table
         hour_tbl = f"{fq_ds}.hour_interval"
@@ -669,9 +677,12 @@ def test_scan_table_extension_partition_skipping_and_empty_tables(client):
             f"INSERT INTO `{hour_tbl}` (dur) VALUES (INTERVAL 1 DAY)",
         )
         with pytest.warns(UnsupportedTypeWarning, match=r"dur \(INTERVAL\)"):
-            hour_df = client.scan_table(hour_tbl).collect()
+            hour_lf = client.scan_table(hour_tbl)
+        hour_df = hour_lf.collect()
         assert hour_df.schema == pl.Schema({"_PARTITIONTIME": pl.Datetime("us", "UTC")})
         assert hour_df.shape == (1, 1)
+        assert hour_lf.select(pl.len()).collect().item() == 1
+        assert hour_lf.drop(pl.all()).collect().width == 0
 
         # 4. Non-partitioned all-unsupported table raises UnsupportedTypeError without warning
         bad_tbl = f"{fq_ds}.bad_only"

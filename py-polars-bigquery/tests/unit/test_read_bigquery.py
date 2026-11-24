@@ -2585,10 +2585,7 @@ def test_bigquery_rest_retry_has_jitter_and_handles_401_and_errors():
     resp_200 = MagicMock()
     resp_200.status_code = 200
     resp_200.raise_for_status.return_value = None
-    resp_200.json.return_value = {
-        "kind": "bigquery#table",
-        "schema": {"fields": []},
-    }
+    resp_200.json.return_value = {"schema": {"fields": []}}
 
     mock_session = MagicMock()
     mock_session.get.side_effect = [resp_401, resp_200]
@@ -2599,7 +2596,7 @@ def test_bigquery_rest_retry_has_jitter_and_handles_401_and_errors():
         user_agent="test-ua",
         session=mock_session,
     )
-    assert result == {"kind": "bigquery#table", "schema": {"fields": []}}
+    assert result == {"schema": {"fields": []}}
     assert creds.clear_calls == 1
     assert mock_session.get.call_count == 2
     assert (

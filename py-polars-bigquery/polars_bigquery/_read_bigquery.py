@@ -522,7 +522,9 @@ class Client:
         column), `_PARTITIONTIME` (`pl.Datetime("us", "UTC")`) is added to the
         `LazyFrame` schema when `schema` is `None`; `_PARTITIONDATE`
         (`pl.Date`) is additionally added when the table uses daily (`DAY`)
-        partitioning.
+        partitioning. Discovered zero-column tables (including schemaless
+        ingestion-time partitioned tables) short-circuit on collection to an
+        empty `(0, 0)` `DataFrame` without opening a Storage Read API session.
 
         Parameters
         ----------
