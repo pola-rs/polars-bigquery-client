@@ -32,6 +32,16 @@ def test_query_scan_validation_and_immutability() -> None:
     assert scan.arrow_buffer_compression == "lz4frame"
     assert scan.use_query_cache is None
     assert scan.explicit_schema is False
+    assert [f.name for f in dataclasses.fields(QueryScan)] == [
+        "raw_query",
+        "columns",
+        "maintain_order",
+        "arrow_buffer_compression",
+        "use_query_cache",
+        "explicit_schema",
+        "maximum_bytes_billed",
+    ]
+    assert isinstance(hash(scan), int)
 
     with pytest.raises(dataclasses.FrozenInstanceError):
         scan.raw_query = "SELECT 2"  # type: ignore[misc]

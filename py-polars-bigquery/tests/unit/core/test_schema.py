@@ -8,7 +8,6 @@ from polars_bigquery.core.schema import (
     SkippedColumn,
     extract_polars_schema,
     extract_polars_schema_from_fields,
-    extract_query_schema_from_fields,
     extract_schema_metadata,
 )
 from polars_bigquery.core.types import (
@@ -848,11 +847,11 @@ def test_has_bignumeric_dtype_nested():
         assert has_bignumeric_dtype(pl.Map(pl.String(), pl.Int64())) is False
 
 
-def test_extract_query_schema_from_fields_types_and_strict_rejections(monkeypatch):
+def test_extract_polars_schema_from_fields_types_and_strict_rejections(monkeypatch):
     from polars_bigquery.exceptions import BigQueryError
 
     monkeypatch.delenv("POLARS_UNKNOWN_EXTENSION_TYPE_BEHAVIOR", raising=False)
-    schema, bq_types = extract_query_schema_from_fields(
+    schema = extract_polars_schema_from_fields(
         [
             {"name": "b", "type": "BOOL"},
             {"name": "ts", "type": "TIMESTAMP", "timestampPrecision": 6},
@@ -883,24 +882,15 @@ def test_extract_query_schema_from_fields_types_and_strict_rejections(monkeypatc
             ),
         }
     )
-    assert bq_types == {
-        "b": BQType.BOOL,
-        "ts": BQType.TIMESTAMP,
-        "ts_arr": BQType.ARRAY,
-        "j": BQType.JSON,
-        "g": BQType.GEOGRAPHY,
-        "j_arr": BQType.ARRAY,
-        "g_arr": BQType.ARRAY,
-    }
 
     with pytest.raises(TypeError, match="INTERVAL column 'dur'"):
-        extract_query_schema_from_fields([{"name": "dur", "type": "INTERVAL"}])
+        extract_polars_schema_from_fields([{"name": "dur", "type": "INTERVAL"}])
     with pytest.raises(TypeError, match="RANGE column 'rng'"):
-        extract_query_schema_from_fields([{"name": "rng", "type": "RANGE"}])
+        extract_polars_schema_from_fields([{"name": "rng", "type": "RANGE"}])
     with pytest.raises(TypeError, match="BIGNUMERIC/BIGDECIMAL.*'bd'"):
-        extract_query_schema_from_fields([{"name": "bd", "type": "BIGDECIMAL"}])
+        extract_polars_schema_from_fields([{"name": "bd", "type": "BIGDECIMAL"}])
     with pytest.raises(TypeError, match=r"TIMESTAMP\(precision=12\).*'ts_pico'"):
-        extract_query_schema_from_fields(
+        extract_polars_schema_from_fields(
             [
                 {
                     "name": "ts_pico",
@@ -911,6 +901,6 @@ def test_extract_query_schema_from_fields_types_and_strict_rejections(monkeypatc
             ]
         )
     with pytest.raises(BigQueryError, match="unsupported field 'mode' 'STREAMING'"):
-        extract_query_schema_from_fields(
+        extract_polars_schema_from_fields(
             [{"name": "bad", "type": "STRING", "mode": "STREAMING"}]
         )

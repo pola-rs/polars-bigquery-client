@@ -64,8 +64,6 @@ class QueryScan(PlanNode):
     use_query_cache: bool | None = None
     explicit_schema: bool = False
     maximum_bytes_billed: int | None = None
-    schema: pl.Schema | None = None
-    bq_types: Mapping[str, BQType] | None = None
 
     def __post_init__(self) -> None:
         if len(self.columns) == 0:
@@ -75,16 +73,6 @@ class QueryScan(PlanNode):
             msg = "QueryScan columns must be unique."
             raise ValueError(msg)
         validate_maximum_bytes_billed(self.maximum_bytes_billed)
-        if self.schema is not None:
-            copied_schema = pl.Schema(self.schema)
-            if tuple(copied_schema.keys()) != self.columns:
-                msg = "QueryScan schema columns must match QueryScan.columns."
-                raise ValueError(msg)
-            object.__setattr__(self, "schema", copied_schema)
-        if self.bq_types is not None:
-            object.__setattr__(
-                self, "bq_types", types.MappingProxyType(dict(self.bq_types))
-            )
 
     def children(self) -> tuple[PlanNode, ...]:
         return ()

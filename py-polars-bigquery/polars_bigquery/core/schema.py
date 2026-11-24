@@ -506,12 +506,12 @@ def _extract_field_dtype(
     raise _UnsupportedBigQueryType(f"unsupported type {type_ or '<missing>'}", path)
 
 
-def extract_query_schema_from_fields(
+def extract_polars_schema_from_fields(
     fields: Sequence[Mapping[str, Any]],
     *,
     extension_dtype_builder: ExtensionDtypeBuilder = build_extension_dtype,
-) -> tuple[pl.Schema, dict[str, BQType]]:
-    """Convert BigQuery `TableFieldSchema` entries into `(pl.Schema, bq_types)`.
+) -> pl.Schema:
+    """Convert BigQuery `TableFieldSchema` entries into a Polars schema.
 
     Strictly validates every entry (no silent column skipping) for use with
     `scan_query` dry-run schema discovery.
@@ -519,7 +519,6 @@ def extract_query_schema_from_fields(
     See: https://docs.cloud.google.com/bigquery/docs/reference/rest/v2/tables#TableFieldSchema
     """
     pl_schema: dict[str, DataType] = {}
-    bq_types: dict[str, BQType] = {}
     duplicates: list[str] = []
     seen_duplicates: set[str] = set()
     for field in fields:
@@ -547,7 +546,7 @@ def extract_query_schema_from_fields(
                 duplicates.append(raw_name)
                 seen_duplicates.add(raw_name)
             continue
-        dtype, bq_type = _extract_field_dtype(
+        dtype, _ = _extract_field_dtype(
             field,
             path=raw_name,
             strict=True,
@@ -555,30 +554,13 @@ def extract_query_schema_from_fields(
             extension_dtype_builder=extension_dtype_builder,
         )
         pl_schema[raw_name] = dtype
-        bq_types[raw_name] = bq_type
 
     if duplicates:
         dup_list = ", ".join(repr(name) for name in duplicates)
         msg = f"BigQuery schema contains duplicate column name(s): {dup_list}."
         raise ValueError(msg)
 
-    return pl.Schema(pl_schema), bq_types
-
-
-def extract_polars_schema_from_fields(
-    fields: Sequence[Mapping[str, Any]],
-    *,
-    extension_dtype_builder: ExtensionDtypeBuilder = build_extension_dtype,
-) -> pl.Schema:
-    """Convert BigQuery `TableFieldSchema` entries into a Polars schema.
-
-    See: https://docs.cloud.google.com/bigquery/docs/reference/rest/v2/tables#TableFieldSchema
-    """
-    pl_schema, _ = extract_query_schema_from_fields(
-        fields,
-        extension_dtype_builder=extension_dtype_builder,
-    )
-    return pl_schema
+    return pl.Schema(pl_schema)
 
 
 _VALID_TIME_PARTITIONING_TYPES = frozenset({"day", "hour", "month", "year"})

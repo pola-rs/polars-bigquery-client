@@ -888,10 +888,8 @@ class Client:
         if not has_non_comment_sql(raw_query):
             raise ValueError("query must be a non-empty SELECT statement")
 
-        bq_types: Mapping[str, polars_bigquery.core.types.BQType] | None
         if schema is not None:
             polars_schema = _normalize_schema(schema, require_non_empty=True)
-            bq_types = None
             location: Any = None
             schema_mode = "explicit"
         else:
@@ -965,8 +963,8 @@ class Client:
                 )
                 raise polars_bigquery.exceptions.BigQueryError(msg)
 
-            polars_schema, bq_types = (
-                polars_bigquery.core.schema.extract_query_schema_from_fields(fields)
+            polars_schema = (
+                polars_bigquery.core.schema.extract_polars_schema_from_fields(fields)
             )
             location = _dry_run_scalar(metadata, "location")
             if logger.isEnabledFor(logging.DEBUG):
@@ -1005,8 +1003,6 @@ class Client:
             use_query_cache=use_query_cache,
             explicit_schema=schema is not None,
             maximum_bytes_billed=maximum_bytes_billed,
-            schema=polars_schema,
-            bq_types=bq_types,
         )
         executor = QueryExecutor(self._arrow_client)
         closed_event = self._closed_event
